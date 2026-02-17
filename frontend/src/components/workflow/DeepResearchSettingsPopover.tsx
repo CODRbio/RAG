@@ -201,6 +201,22 @@ export function DeepResearchSettingsPopover({ open, onClose }: Props) {
             className="accent-indigo-500"
           />
         </label>
+
+        {/* Skip Claim Generation */}
+        <label className="flex items-center justify-between text-[11px] text-gray-600 cursor-pointer px-0.5">
+          <span className="flex items-center gap-1">
+            跳过前置论点提炼 (Skip Claim Generation)
+            <Tip content="When OFF (default): before writing each section, the system first extracts 3–5 core claims from evidence with [ref_hash] citations, then expands them into prose. When ON: skip claim extraction and write directly from evidence. Use ON for faster runs or when you prefer free-form section writing.">
+              <HelpCircle size={11} />
+            </Tip>
+          </span>
+          <input
+            type="checkbox"
+            checked={deepResearchDefaults.skipClaimGeneration}
+            onChange={(e) => updateDeepResearchDefaults({ skipClaimGeneration: e.target.checked })}
+            className="accent-indigo-500"
+          />
+        </label>
       </div>
 
       {/* Footer */}

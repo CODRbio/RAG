@@ -115,6 +115,7 @@ export function DeepResearchDialog() {
   const [depth, setDepth] = useState<'lite' | 'comprehensive'>('comprehensive');
   const [skipDraftReview, setSkipDraftReview] = useState(false);
   const [skipRefineReview, setSkipRefineReview] = useState(false);
+  const [skipClaimGeneration, setSkipClaimGeneration] = useState(false);
   const [keepPreviousJobId, setKeepPreviousJobId] = useState(true);
   const [optimizationPromptDraft, setOptimizationPromptDraft] = useState('');
   const contextFileInputRef = useRef<HTMLInputElement | null>(null);
@@ -231,6 +232,7 @@ export function DeepResearchDialog() {
         setDepth(defaults.depth);
         setOutputLanguage(defaults.outputLanguage);
         setStepModelStrict(defaults.stepModelStrict);
+        setSkipClaimGeneration(defaults.skipClaimGeneration);
         setStepModels({ ...defaults.stepModels });
         setAnswers({});
       }
@@ -878,6 +880,7 @@ export function DeepResearchDialog() {
       depth,
       skip_draft_review: skipDraftReview,
       skip_refine_review: skipRefineReview,
+      skip_claim_generation: skipClaimGeneration,
     };
 
     let submitted = false;
@@ -1301,6 +1304,16 @@ export function DeepResearchDialog() {
                     <span>精炼修改 (Refine with Directives)</span>
                     <span className="ml-auto text-[10px] text-gray-400">{skipRefineReview ? '已跳过' : '可选'}</span>
                   </label>
+                  <label className="flex items-center gap-2 text-xs text-gray-600 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={skipClaimGeneration}
+                      onChange={(e) => setSkipClaimGeneration(e.target.checked)}
+                      className="accent-indigo-500"
+                    />
+                    <span>跳过前置论点提炼 (Skip Claim Generation)</span>
+                    <span className="ml-auto text-[10px] text-gray-400">{skipClaimGeneration ? '已跳过' : '可选'}</span>
+                  </label>
                 </div>
                 <label className="flex items-center gap-2 text-xs text-gray-500 pt-1 border-t border-gray-200 cursor-pointer">
                   <input
@@ -1309,6 +1322,7 @@ export function DeepResearchDialog() {
                     onChange={(e) => {
                       setSkipDraftReview(e.target.checked);
                       setSkipRefineReview(e.target.checked);
+                      setSkipClaimGeneration(e.target.checked);
                     }}
                     className="accent-gray-400"
                   />

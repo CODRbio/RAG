@@ -583,6 +583,10 @@ class DeepResearchConfirmRequest(BaseModel):
         False,
         description="跳过精炼审阅（Refine 阶段直接展示最终结果）",
     )
+    skip_claim_generation: bool = Field(
+        False,
+        description="跳过前置论点提炼（Claim Generation）阶段，直接进入写作",
+    )
 
 
 class DeepResearchSubmitResponse(BaseModel):

@@ -1051,6 +1051,7 @@ def _run_deep_research_job_safe(
             review_waiter=lambda section_id: get_pending_review(job_id, section_id),
             skip_draft_review=bool(body.skip_draft_review),
             skip_refine_review=bool(body.skip_refine_review),
+            skip_claim_generation=bool(body.skip_claim_generation),
             job_id=job_id,
             depth=body.depth or "comprehensive",
         )
@@ -1190,6 +1191,7 @@ def confirm_deep_research_endpoint(
         progress_callback=_progress_cb,
         skip_draft_review=bool(body.skip_draft_review),
         skip_refine_review=bool(body.skip_refine_review),
+        skip_claim_generation=bool(body.skip_claim_generation),
         depth=body.depth or "comprehensive",
     )
     response_text = result.get("markdown", "")

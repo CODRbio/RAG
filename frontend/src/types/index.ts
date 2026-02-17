@@ -302,6 +302,7 @@ export interface DeepResearchConfirmRequest {
   // 阶段跳过控制
   skip_draft_review?: boolean;
   skip_refine_review?: boolean;
+  skip_claim_generation?: boolean;
 }
 
 export interface DeepResearchSubmitResponse {
@@ -538,6 +539,7 @@ export interface DeepResearchDefaults {
   outputLanguage: 'auto' | 'en' | 'zh';
   stepModelStrict: boolean;
   stepModels: Record<string, string>;
+  skipClaimGeneration: boolean;
 }
 
 // ============================================================

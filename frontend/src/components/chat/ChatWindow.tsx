@@ -19,6 +19,7 @@ export function ChatWindow() {
   const toolTrace = useChatStore((s) => s.toolTrace);
   const setShowDeepResearchDialog = useChatStore((s) => s.setShowDeepResearchDialog);
   const setDeepResearchTopic = useChatStore((s) => s.setDeepResearchTopic);
+  const isStreaming = useChatStore((s) => s.isStreaming);
   const addToast = useToastStore((s) => s.addToast);
   const addComparePreselected = useCompareStore((s) => s.addComparePreselected);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -262,7 +263,12 @@ export function ChatWindow() {
       {lastEvidenceSummary && lastEvidenceSummary.total_chunks > 0 && (
         <RetrievalDebugPanel summary={lastEvidenceSummary} />
       )}
-      {messages.map((msg, idx) => (
+      {messages.map((msg, idx) => {
+        const displayContent =
+          isStreaming && idx === messages.length - 1
+            ? msg.content.replace(/\[([a-fA-F0-9]{8})\]/g, '[⏳...]')
+            : msg.content;
+        return (
         <div
           key={idx}
           className={`flex ${
@@ -290,7 +296,7 @@ export function ChatWindow() {
                 prose-blockquote:border-l-sky-500/50 prose-blockquote:bg-slate-800/20 prose-blockquote:py-1 prose-blockquote:px-4
                 prose-table:border-collapse prose-th:border-b prose-th:border-slate-700 prose-td:border-b prose-td:border-slate-800/50">
                 <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                  {msg.content}
+                  {displayContent}
                 </ReactMarkdown>
               </div>
             ) : (
@@ -399,7 +405,8 @@ export function ChatWindow() {
             )}
           </div>
         </div>
-      ))}
+      );
+      })}
     </div>
   );
 }

@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import re
 import time
+import copy
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypedDict
 
@@ -197,6 +198,7 @@ class DeepResearchState(TypedDict, total=False):
     markdown_parts: List[str]
     citations: List[Any]
     evidence_chunks: List[Any]  # 运行期累计的 EvidenceChunk（用于 hash->cite_key 后处理）
+    evidence_chunk_empty_value: Any  # state 紧凑化时用于覆盖 text/raw_content 的值（默认 ""）
     citation_doc_key_map: Dict[str, str]  # doc_group_key -> cite_key（跨阶段保持稳定）
     citation_existing_keys: List[str]  # 已分配 cite_key（用于 numeric/hash/author_date 去重）
     iteration_count: int
@@ -215,6 +217,8 @@ class DeepResearchState(TypedDict, total=False):
     review_waiter: Optional[Callable[[str], Optional[Dict[str, Any]]]]
     skip_draft_review: bool
     skip_refine_review: bool
+    skip_claim_generation: bool
+    verified_claims: str  # generated claims text, empty if skipped
     review_gate_next: str
     review_handled_at: Dict[str, float]
     # ── Depth preset (controls all loop bounds) ──
@@ -482,12 +486,24 @@ def _accumulate_evidence_chunks(state: DeepResearchState, chunks: List[Any]) -> 
     if not chunks:
         return
     existing = state.setdefault("evidence_chunks", [])
+    empty_value = state.get("evidence_chunk_empty_value", "")
     seen_ids = {str(getattr(c, "chunk_id", "")) for c in existing if getattr(c, "chunk_id", None)}
     for c in chunks:
         cid = str(getattr(c, "chunk_id", "") or "")
         if cid and cid in seen_ids:
             continue
-        existing.append(c)
+        compact_chunk = copy.copy(c)
+        if isinstance(compact_chunk, dict):
+            if "text" in compact_chunk:
+                compact_chunk["text"] = empty_value
+            if "raw_content" in compact_chunk:
+                compact_chunk["raw_content"] = empty_value
+        else:
+            if hasattr(compact_chunk, "text"):
+                setattr(compact_chunk, "text", empty_value)
+            if hasattr(compact_chunk, "raw_content"):
+                setattr(compact_chunk, "raw_content", empty_value)
+        existing.append(compact_chunk)
         if cid:
             seen_ids.add(cid)
 
@@ -1306,6 +1322,52 @@ Return JSON:
     return state
 
 
+def generate_claims_node(state: DeepResearchState) -> DeepResearchState:
+    """Extract 3-5 core claims from section evidence (with [ref_hash]) before writing."""
+    _ensure_not_cancelled(state)
+    _tick_cost_monitor(state, "generate_claims")
+    dashboard = state["dashboard"]
+    section = dashboard.get_section(state.get("current_section", ""))
+    if section is None:
+        return state
+
+    preset = state.get("depth_preset") or get_depth_preset(state.get("depth", DEFAULT_DEPTH))
+    write_top_k = int(preset.get("search_top_k_write", 8))
+    svc = _get_retrieval_svc(state)
+    dr_filters = dict(state.get("filters") or {})
+    dr_filters["use_query_optimizer"] = False
+    pack = svc.search(
+        query=f"{dashboard.brief.topic} {section.title}",
+        mode=state.get("search_mode", "hybrid"),
+        top_k=write_top_k,
+        filters=dr_filters,
+    )
+    evidence_str = pack.to_context_string(max_chunks=write_top_k)
+
+    client, model_override = _resolve_step_client_and_model(state, "write")
+    prompt = f"""Based on the following evidence for section "{section.title}", extract 3-5 core claims (Claims).
+Each claim MUST retain the [ref_hash] citation markers from the evidence.
+Output format: numbered list, one claim per line. Do not add extra commentary."""
+
+    user_content = f"{prompt}\n\nEvidence:\n{evidence_str[:4000]}"
+    try:
+        resp = client.chat(
+            messages=[
+                {"role": "system", "content": "You are an expert at extracting concise, citation-backed claims from evidence. Preserve every [ref_hash] in each claim."},
+                {"role": "user", "content": user_content},
+            ],
+            model=model_override,
+            max_tokens=800,
+        )
+        verified_claims = (resp.get("final_text") or "").strip()
+    except Exception as e:
+        logger.warning("generate_claims_node LLM call failed: %s", e)
+        verified_claims = ""
+
+    state["verified_claims"] = verified_claims
+    return state
+
+
 def write_node(state: DeepResearchState) -> DeepResearchState:
     """Phase 4: 写作 — 生成当前章节内容"""
     _ensure_not_cancelled(state)
@@ -1401,6 +1463,13 @@ def write_node(state: DeepResearchState) -> DeepResearchState:
                 "- Include a short 'Open Gaps' paragraph at the end listing unresolved evidence gaps.\n"
                 "- Target length: 200-350 words (not 400-600) under low coverage.\n"
             )
+        claims_block = ""
+        if state.get("verified_claims"):
+            claims_block = (
+                "\nPre-verified claims for this section (you MUST address each claim):\n"
+                f"{state['verified_claims']}\n"
+                "Expand each claim into well-supported prose. Do not omit any claim.\n"
+            )
         prompt = f"""Write the section "{section.title}" for the review using the evidence below.
 
 Requirements:
@@ -1412,6 +1481,7 @@ Requirements:
 {_language_instruction(state)}
 {_build_user_context_block(state, max_chars=1800)}
 {caution_block}
+{claims_block}
 
 Available evidence:
 {evidence_str[:4000]}
@@ -2297,6 +2367,14 @@ Document:
 # 路由函数
 # ────────────────────────────────────────────────
 
+
+def _write_or_claims(state: DeepResearchState) -> str:
+    """When moving to writing: go to generate_claims unless skip_claim_generation or depth is lite."""
+    if state.get("skip_claim_generation") or state.get("depth") == "lite":
+        return "write"
+    return "generate_claims"
+
+
 def _should_continue_research(state: DeepResearchState) -> str:
     """决定评估后是继续搜索还是进入写作。
 
@@ -2307,15 +2385,16 @@ def _should_continue_research(state: DeepResearchState) -> str:
     """
     dashboard = state.get("dashboard")
     if dashboard is None:
-        return "write"
+        return _write_or_claims(state)
 
     section = dashboard.get_section(state.get("current_section", ""))
     if section is None:
-        return "write"
+        return _write_or_claims(state)
 
     preset = state.get("depth_preset") or get_depth_preset(state.get("depth", DEFAULT_DEPTH))
 
     # Guard 0: forced summarize mode from cost monitor
+    # Always short-circuit to write to minimize extra LLM hops under cost pressure.
     if bool(state.get("force_synthesize", False)):
         return "write"
 
@@ -2323,18 +2402,18 @@ def _should_continue_research(state: DeepResearchState) -> str:
     max_iter = state.get("max_iterations", 30)
     if state.get("iteration_count", 0) >= max_iter:
         logger.info("Global iteration cap reached (%d), moving to write", max_iter)
-        return "write"
+        return _write_or_claims(state)
 
     # Guard 2: per-section research round cap
     max_rounds = int(preset.get("max_section_research_rounds", 3))
     if section.research_rounds >= max_rounds:
         logger.info("Section '%s' hit per-section cap (%d rounds), moving to write", section.title, max_rounds)
-        return "write"
+        return _write_or_claims(state)
 
     # Guard 3: coverage threshold
     cov_threshold = float(preset.get("coverage_threshold", 0.6))
     if section.coverage_score >= cov_threshold or not section.gaps:
-        return "write"
+        return _write_or_claims(state)
 
     # Guard 4: diminishing-return early stop (coverage curve plateau)
     history = (state.get("coverage_history") or {}).get(section.title, [])
@@ -2355,7 +2434,7 @@ def _should_continue_research(state: DeepResearchState) -> str:
                     "message": "Coverage gain curve flattened; early stop triggered for cost efficiency.",
                 },
             )
-            return "write"
+            return _write_or_claims(state)
 
     # Still have gaps → continue research
     return "research"
@@ -2405,6 +2484,7 @@ def build_research_graph(include_scope_plan: bool = True) -> StateGraph:
     graph.add_node("plan", plan_node)
     graph.add_node("research", research_node)
     graph.add_node("evaluate", evaluate_node)
+    graph.add_node("generate_claims", generate_claims_node)
     graph.add_node("write", write_node)
     graph.add_node("verify", verify_node)
     graph.add_node("review_gate", review_gate_node)
@@ -2421,7 +2501,9 @@ def build_research_graph(include_scope_plan: bool = True) -> StateGraph:
     graph.add_conditional_edges("evaluate", _should_continue_research, {
         "research": "research",
         "write": "write",
+        "generate_claims": "generate_claims",
     })
+    graph.add_edge("generate_claims", "write")
     graph.add_edge("write", "verify")
     graph.add_conditional_edges("verify", _after_verify, {
         "research": "research",
@@ -2461,6 +2543,7 @@ def _build_initial_state(
     review_waiter: Optional[Callable[[str], Optional[Dict[str, Any]]]] = None,
     skip_draft_review: bool = False,
     skip_refine_review: bool = False,
+    skip_claim_generation: bool = False,
     job_id: str = "",
     depth: str = DEFAULT_DEPTH,
 ) -> DeepResearchState:
@@ -2483,6 +2566,7 @@ def _build_initial_state(
         "markdown_parts": [],
         "citations": [],
         "evidence_chunks": [],
+        "evidence_chunk_empty_value": "",
         "citation_doc_key_map": {},
         "citation_existing_keys": [],
         "iteration_count": 0,
@@ -2501,6 +2585,8 @@ def _build_initial_state(
         "review_waiter": review_waiter,
         "skip_draft_review": bool(skip_draft_review),
         "skip_refine_review": bool(skip_refine_review),
+        "skip_claim_generation": bool(skip_claim_generation),
+        "verified_claims": "",
         "depth": resolved_depth,
         "depth_preset": preset,
         "review_gate_rounds": 0,
@@ -2618,6 +2704,7 @@ def execute_deep_research(
     review_waiter: Optional[Callable[[str], Optional[Dict[str, Any]]]] = None,
     skip_draft_review: bool = False,
     skip_refine_review: bool = False,
+    skip_claim_generation: bool = False,
     job_id: str = "",
     depth: str = DEFAULT_DEPTH,
 ) -> Dict[str, Any]:
@@ -2649,6 +2736,7 @@ def execute_deep_research(
         review_waiter=review_waiter,
         skip_draft_review=skip_draft_review,
         skip_refine_review=skip_refine_review,
+        skip_claim_generation=skip_claim_generation,
         job_id=job_id,
         depth=depth,
     )

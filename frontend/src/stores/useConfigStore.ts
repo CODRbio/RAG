@@ -90,6 +90,7 @@ export const useConfigStore = create<ConfigState>()(
         depth: 'comprehensive',
         outputLanguage: 'auto',
         stepModelStrict: false,
+        skipClaimGeneration: false,
         stepModels: {
           scope: 'sonar::sonar-pro',
           plan: '',

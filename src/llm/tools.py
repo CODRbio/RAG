@@ -11,7 +11,11 @@ Usage:
 from __future__ import annotations
 
 import json
+import os
 import re
+import subprocess
+import sys
+import tempfile
 import traceback
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
@@ -470,31 +474,38 @@ def _handle_compare(paper_ids: List[str], aspects: Optional[List[str]] = None, *
 
 
 def _handle_run_code(code: str, **_) -> str:
-    """安全沙盒执行简单 Python 代码"""
-    import io
-    import contextlib
-    # 限制危险操作
-    forbidden = ["import os", "import sys", "import subprocess", "exec(", "eval(", "__import__",
-                 "open(", "shutil", "pathlib"]
-    for f in forbidden:
-        if f in code:
-            return f"安全限制: 不允许使用 '{f}'"
-    stdout = io.StringIO()
-    local_ns: Dict[str, Any] = {}
+    """以子进程方式执行 Python 代码。"""
+    # TODO(Security): 生产环境强烈建议将 subprocess 替换为安全的隔离沙盒 API (如 E2B)。
+    tmp_file = None
     try:
-        with contextlib.redirect_stdout(stdout):
-            exec(code, {"__builtins__": {"print": print, "range": range, "len": len,
-                                          "sum": sum, "min": min, "max": max, "abs": abs,
-                                          "round": round, "sorted": sorted, "enumerate": enumerate,
-                                          "zip": zip, "map": map, "filter": filter,
-                                          "int": int, "float": float, "str": str, "list": list,
-                                          "dict": dict, "set": set, "tuple": tuple, "bool": bool,
-                                          "True": True, "False": False, "None": None}},
-                 local_ns)
-        output = stdout.getvalue()
-        return output.strip() if output.strip() else "(代码执行完毕，无输出)"
+        tmp_file = tempfile.NamedTemporaryFile(
+            suffix=".py",
+            delete=False,
+            mode="w",
+            encoding="utf-8",
+        )
+        with tmp_file:
+            tmp_file.write(code)
+
+        result = subprocess.run(
+            [sys.executable, tmp_file.name],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.returncode == 0:
+            return result.stdout
+        return f"{result.stdout}{result.stderr}"
+    except subprocess.TimeoutExpired:
+        return "代码执行超时（15秒），已中止。"
     except Exception as e:
         return f"执行错误: {e}"
+    finally:
+        if tmp_file is not None:
+            try:
+                os.remove(tmp_file.name)
+            except OSError:
+                pass
 
 
 # ── 注册核心 Tools ──
