@@ -1,0 +1,70 @@
+---
+description: LLM 调用规范 - 使用 src/llm/llm_manager.py 统一管理
+alwaysApply: true
+---
+
+# LLM 调用规范
+
+本项目使用 `src/llm/llm_manager.py` 统一管理所有 LLM 调用。
+
+## 推荐方式（新代码）
+
+```python
+from src.llm import LLMManager
+
+# 加载配置
+manager = LLMManager.from_json("config/rag_config.json")
+
+# 获取客户端
+client = manager.get_client("deepseek")  # 或 claude, openai, gemini, kimi 等
+
+# 发送请求
+resp = client.chat(
+    messages=[
+        {"role": "system", "content": "你是一个助手"},
+        {"role": "user", "content": "问题内容"}
+    ],
+    model=None,           # 可选：覆盖默认模型
+    max_tokens=2000,      # 可选：覆盖默认参数
+)
+
+# 使用响应
+text = resp["final_text"]           # 最终回答（业务层使用）
+reasoning = resp["reasoning_text"]  # 思考过程（可选，thinking 模式）
+usage = resp["meta"]["usage"]       # token 用量
+```
+
+## 兼容方式（旧代码）
+
+```python
+from src.generation.llm_client import call_llm
+
+result = call_llm(
+    provider="deepseek",
+    system="系统提示",
+    user_prompt="用户问题",
+    model_override=None,
+    max_tokens=2000
+)
+# result 为字符串（final_text）
+```
+
+## 可用 Providers
+
+- `openai` / `openai-thinking`
+- `deepseek` / `deepseek-thinking`
+- `gemini` / `gemini-thinking` / `gemini-vision`
+- `claude` / `claude-thinking`
+- `kimi` / `kimi-thinking` / `kimi-vision`
+
+## 配置来源
+
+- 配置文件：`config/rag_config.json`
+- 环境变量覆盖 API Key：`RAG_LLM__{PROVIDER}__API_KEY`（如 `RAG_LLM__CLAUDE__API_KEY`）
+- 日志目录：`logs/llm_raw/YYYY-MM-DD.jsonl`
+
+## 禁止做法
+
+- ❌ 直接使用 `openai.OpenAI()` 或 `anthropic.Anthropic()`
+- ❌ 硬编码 API Key
+- ❌ 绕过 LLMManager 直接发 HTTP 请求

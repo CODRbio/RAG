@@ -1,0 +1,199 @@
+@import "tailwindcss";
+
+:root {
+  /* --- 深海主题配色 (Deep Sea Theme) --- */
+
+  /* 基础背景 - 深邃海洋 */
+  /* 使用渐变色模拟深海光影，从极深的午夜蓝过渡到深蓝 */
+  --bg-app: #020617;        /* slate-950/base black */
+  --bg-deep-gradient: radial-gradient(circle at top left, #1e293b 0%, #020617 40%, #020617 100%);
+  
+  /* 侧边栏 - 深海潜航器内壁感 */
+  --bg-sidebar: rgba(15, 23, 42, 0.95); /* slate-900 alpha */
+  
+  /* 面板/卡片 - 玻璃拟态/水下UI */
+  --bg-panel: rgba(30, 41, 59, 0.86);    /* slate-800 alpha */
+  --bg-surface: rgba(30, 41, 59, 0.72);  /* slate-800 alpha */
+  --bg-surface-hover: rgba(51, 65, 85, 0.85); /* slate-700 alpha */
+  --bg-muted: rgba(15, 23, 42, 0.72);    /* slate-900 alpha */
+  
+  /* 聊天气泡 */
+  /* 用户: 科技感青蓝渐变 */
+  --bg-bubble-user: linear-gradient(135deg, #0ea5e9 0%, #2563eb 100%);
+  /* AI: 深海半透明玻璃 */
+  --bg-bubble-ai: rgba(30, 41, 59, 0.8);
+
+  /* 文字颜色 - 生物荧光感 */
+  --text-primary: #f8fafc;   /* slate-50 - 提高主文本可读性 */
+  --text-secondary: #cbd5e1; /* slate-300 - 用于正文，避免过浅 */
+  --text-tertiary: #94a3b8;  /* slate-400 - 次级提示 */
+  --text-highlight: #38bdf8; /* sky-400 - 高亮荧光蓝 */
+  --text-on-primary: #ffffff;
+
+  /* 边框与分割线 - 微弱光晕 */
+  --border-subtle: rgba(148, 163, 184, 0.15);  /* 极淡的白线 */
+  --border-highlight: rgba(56, 189, 248, 0.4); /* 高亮蓝线 */
+  --border-focus: #22d3ee;   /* cyan-400 */
+
+  /* 品牌色 - 海洋之光 */
+  --primary: #0ea5e9;        /* sky-500 */
+  --primary-hover: #0284c7;  /* sky-600 */
+  --primary-glow: rgba(14, 165, 233, 0.5); /* 主色光晕 */
+  
+  /* 辅助色 */
+  --accent-cyan: #06b6d4;    /* cyan-500 */
+  --accent-teal: #14b8a6;    /* teal-500 */
+  --accent-indigo: #6366f1;  /* indigo-500 */
+
+  /* 功能色 */
+  --success: #10b981;        /* emerald-500 */
+  --warning: #f59e0b;        /* amber-500 */
+  --error: #ef4444;          /* red-500 */
+  
+  /* 特效 */
+  --glass-border: 1px solid rgba(255, 255, 255, 0.08);
+  --shadow-neon: 0 0 10px rgba(14, 165, 233, 0.3), 0 0 20px rgba(14, 165, 233, 0.1);
+  --backdrop-blur: blur(12px);
+}
+
+body {
+  background-color: var(--bg-app);
+  background-image: 
+    radial-gradient(circle at 15% 50%, rgba(14, 165, 233, 0.08) 0%, transparent 25%),
+    radial-gradient(circle at 85% 30%, rgba(99, 102, 241, 0.08) 0%, transparent 25%);
+  background-attachment: fixed;
+  color: var(--text-primary);
+}
+
+/* 滚动条 */
+.scrollbar-thin::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.scrollbar-thin::-webkit-scrollbar-track {
+  background: rgba(15, 23, 42, 0.5);
+}
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background: rgba(71, 85, 105, 0.6);
+  border-radius: 3px;
+  border: 1px solid rgba(255,255,255,0.05);
+}
+.scrollbar-thin::-webkit-scrollbar-thumb:hover {
+  background: rgba(100, 116, 139, 0.8);
+}
+
+.scrollbar-hide::-webkit-scrollbar {
+  display: none;
+}
+.scrollbar-hide {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+/* 动画定义 */
+@keyframes float {
+  0% { transform: translateY(0px); }
+  50% { transform: translateY(-6px); }
+  100% { transform: translateY(0px); }
+}
+@keyframes pulse-glow {
+  0%, 100% { box-shadow: 0 0 5px rgba(56, 189, 248, 0.2); opacity: 0.8; }
+  50% { box-shadow: 0 0 15px rgba(56, 189, 248, 0.6); opacity: 1; }
+}
+@keyframes ripple {
+  0% { box-shadow: 0 0 0 0 rgba(34, 211, 238, 0.2); }
+  100% { box-shadow: 0 0 0 10px rgba(34, 211, 238, 0); }
+}
+
+/* 动画类 */
+.animate-float { animation: float 6s ease-in-out infinite; }
+.animate-pulse-glow { animation: pulse-glow 3s infinite; }
+.animate-ripple { animation: ripple 2s infinite; }
+
+.animate-in {
+  animation-duration: 300ms;
+  animation-timing-function: ease-out;
+  animation-fill-mode: both;
+}
+.fade-in { animation-name: fade-in; }
+/* ...保持原有slide动画... */
+@keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes slide-in-from-right { from { transform: translateX(100%); } to { transform: translateX(0); } }
+@keyframes slide-in-from-bottom { from { transform: translateY(8px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+@keyframes slide-in-from-top { from { transform: translateY(-4px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+@keyframes zoom-in { from { transform: scale(0.95); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+
+.slide-in-from-right { animation-name: slide-in-from-right; }
+.slide-in-from-bottom-2 { animation-name: slide-in-from-bottom; }
+.slide-in-from-top-1, .slide-in-from-top-2 { animation-name: slide-in-from-top; }
+.zoom-in, .zoom-in-95 { animation-name: zoom-in; }
+
+.duration-200 { animation-duration: 200ms; }
+.duration-300 { animation-duration: 300ms; }
+
+/* 深海科技组件风格 */
+
+/* 玻璃面板 */
+.glass-panel {
+  background: var(--bg-panel);
+  backdrop-filter: var(--backdrop-blur);
+  border: var(--glass-border);
+  box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.36);
+}
+
+/* 侧边栏玻璃 */
+.glass-sidebar {
+  background: rgba(2, 6, 23, 0.85);
+  backdrop-filter: blur(8px);
+  border-right: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+/* 头部玻璃 */
+.glass-header {
+  background: rgba(2, 6, 23, 0.6);
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+/* 霓虹输入框 */
+.tech-input {
+  background-color: rgba(15, 23, 42, 0.6);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-primary);
+  transition: all 0.3s ease;
+}
+.tech-input:focus {
+  border-color: var(--border-highlight);
+  box-shadow: 0 0 10px rgba(56, 189, 248, 0.2);
+  outline: none;
+  background-color: rgba(15, 23, 42, 0.9);
+}
+
+/* 科技按钮 */
+.tech-button {
+  background: rgba(56, 189, 248, 0.1);
+  border: 1px solid rgba(56, 189, 248, 0.2);
+  color: var(--text-highlight);
+  transition: all 0.2s;
+}
+.tech-button:hover {
+  background: rgba(56, 189, 248, 0.2);
+  box-shadow: 0 0 8px rgba(56, 189, 248, 0.3);
+  border-color: rgba(56, 189, 248, 0.4);
+}
+.tech-button.active {
+  background: rgba(56, 189, 248, 0.25);
+  box-shadow: 0 0 12px rgba(56, 189, 248, 0.4);
+  border-color: var(--text-highlight);
+}
+
+/* Refine editor selection: semi-transparent highlight */
+textarea.refine-editor::selection {
+  background: rgba(56, 189, 248, 0.28) !important;
+  color: inherit;
+}
+
+textarea.refine-editor::-moz-selection {
+  background: rgba(56, 189, 248, 0.28) !important;
+  color: inherit;
+}

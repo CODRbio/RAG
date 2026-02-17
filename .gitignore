@@ -1,0 +1,90 @@
+# Environment
+.env
+.venv
+venv/
+env/
+
+# Config
+config/rag_config.local.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+
+# Node / Frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+frontend/.env.local
+
+# Data & Logs - Only structure + eval_mini.json; all runtime data stays local
+# Data & Logs
+logs/
+artifacts/
+
+# 1. 忽略 data 目录下的一切（默认规则）
+data/*
+
+# 2. 例外：保留必要的种子数据文件
+!data/eval_mini.json
+!data/.gitkeep
+
+# 3. 例外：保留必要的目录结构（让 git 知道这些文件夹存在）
+!data/raw_papers/
+!data/parsed/
+!data/parsed_test/
+!data/checkpoints/
+
+# 4. 但是：这些目录里面的内容还是要忽略（除了 .gitkeep）
+data/raw_papers/*
+!data/raw_papers/.gitkeep
+
+data/parsed/*
+!data/parsed/.gitkeep
+
+data/parsed_test/*
+!data/parsed_test/.gitkeep
+
+data/checkpoints/*
+!data/checkpoints/.gitkeep
+
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.wal
+*.shm
+
+# Serialized data
+*.pkl
+*.pickle
+*.pth
+*.pt
+*.bin
+*.safetensors
+
+# Cache and temporary files
+.cache/
+*.tmp
+*.temp
+*.log
+
+# Docker Volumes
+volumes/
+
+# System & IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
+.cursor/worktrees.json
+
+#CapSolverExtension
+extra_tools/CapSolverExtension/

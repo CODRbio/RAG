@@ -1,0 +1,385 @@
+{
+  "llm": {
+    "default": "deepseek", 
+    "dry_run": false,
+    "providers": {
+      "openai": {
+        "api_key": "sk-xxx",
+        "base_url": "https://api.openai.com/v1",
+        "default_model": "gpt-5.2",
+        "models": {
+          "gpt-5-mini": "gpt-5-mini",
+          "gpt-5.2": "gpt-5.2"
+        },
+        "params": {}
+      },
+      "openai-thinking": {
+        "api_key": "sk-xxx",
+        "base_url": "https://api.openai.com/v1",
+        "default_model": "gpt-5.2",
+        "models": {
+          "gpt-5.2": "gpt-5.2"
+        },
+        "params": {
+          "reasoning_effort": "high"
+        }
+      },
+      "deepseek": {
+        "api_key": "sk-xxx",
+        "base_url": "https://api.deepseek.com/v1",
+        "default_model": "deepseek-chat",
+        "models": {
+          "deepseek-chat": "deepseek-chat"
+        },
+        "params": {}
+      },
+      "deepseek-thinking": {
+        "api_key": "sk-xxx",
+        "base_url": "https://api.deepseek.com/v1",
+        "default_model": "deepseek-reasoner",
+        "models": {
+          "deepseek-reasoner": "deepseek-reasoner"
+        },
+        "params": {}
+      },
+      "gemini": {
+        "api_key": "AIzxxx",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "default_model": "gemini-pro-latest",
+        "models": {
+          "gemini-pro-latest": "gemini-pro-latest",
+          "gemini-flash-latest": "gemini-flash-latest"
+        },
+        "params": {}
+      },
+      "gemini-thinking": {
+        "api_key": "AIzxxx",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "default_model": "gemini-flash-latest",
+        "default_model_note": "修改默认模型：将 default_model 改为 models 里的 key（如 gemini-pro-latest）",
+        "models": {
+          "gemini-pro-latest": "gemini-pro-latest",
+          "gemini-flash-latest": "gemini-flash-latest"
+        },
+        "params": {
+          "reasoning_effort": "high"
+        }
+      },
+      "gemini-vision": {
+        "api_key": "AIzxxx",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "default_model": "gemini-2.5-flash",
+        "models": {
+          "gemini-pro-latest": "gemini-pro-latest",
+          "gemini-flash-latest": "gemini-flash-latest",
+          "gemini-2.5-flash": "gemini-2.5-flash"
+        },
+        "params": {
+          "temperature": 0.2,
+          "max_tokens": 8192
+        }
+      },
+      "claude": {
+        "api_key": "sk-ant-xxx",
+        "base_url": "https://api.anthropic.com",
+        "default_model": "claude-sonnet-4-5",
+        "models": {
+          "claude-sonnet-4-5": "claude-sonnet-4-5-20250929",
+          "claude-haiku-4-5": "claude-haiku-4-5-20251001",
+          "claude-opus-4-6": "claude-opus-4-6-20260205"
+        },
+        "params": {}
+      },
+      "claude-thinking": {
+        "api_key": "sk-ant-xxx",
+        "base_url": "https://api.anthropic.com",
+        "default_model": "claude-sonnet-4-5",
+        "models": {
+          "claude-sonnet-4-5": "claude-sonnet-4-5-20250929",
+          "claude-haiku-4-5": "claude-haiku-4-5-20251001",
+          "claude-opus-4-6": "claude-opus-4-6-20260205"
+        },
+        "params": {
+          "thinking": {
+            "type": "enabled",
+            "budget_tokens": 8000
+          },
+          "max_tokens": 16000
+        }
+      },
+      "kimi": {
+        "api_key": "sk-xxx",
+        "base_url": "https://api.moonshot.ai/v1",
+        "default_model": "kimi-k2.5",
+        "models": {
+          "kimi-k2.5": "kimi-k2.5"
+        },
+        "params": {}
+      },
+      "kimi-vision": {
+        "api_key": "sk-xxx",
+        "base_url": "https://api.moonshot.ai/v1",
+        "default_model": "kimi-k2.5",
+        "models": {
+          "kimi-k2.5": "kimi-k2.5"
+        },
+        "params": {
+          "response_format": {
+            "type": "json_object"
+          }
+        }
+      },
+      "kimi-thinking": {
+        "api_key": "sk-xxx",
+        "base_url": "https://api.moonshot.ai/v1",
+        "default_model": "kimi-k2.5",
+        "models": {
+          "kimi-k2.5": "kimi-k2.5"
+        },
+        "params": {
+          "enable_reasoning": true,
+          "reasoning_effort": "high"
+        }
+      },
+      "sonar": {
+        "api_key": "",
+        "base_url": "https://api.perplexity.ai",
+        "default_model": "sonar-pro",
+        "models": {
+          "sonar": "sonar",
+          "sonar-pro": "sonar-pro",
+          "sonar-reasoning-pro": "sonar-reasoning-pro"
+        },
+        "params": {}
+      }
+    }
+  },
+  "parser": {
+    "version": "1.0.0",
+    "docling_ocr": false,
+    "column_gap_min_ratio": 0.02,
+    "column_gap_max_ratio": 0.15,
+    "gravity_max_v_down_ratio": 0.06,
+    "gravity_min_x_overlap": 0.30,
+    "gravity_cross_page_penalty": 0.20,
+    "caption_patterns": ["^(Fig\\.|Figure)\\s*\\d+", "^图\\s*\\d+"],
+    "table_title_patterns": ["^Table\\s*\\d+", "^Tab\\.\\s*\\d+", "^表\\s*\\d+"],
+    "table_footnote_patterns": ["^Note:", "^\\*", "^注[：:]", "^Source:"],
+    "llm_text_provider": "deepseek",
+    "llm_vision_provider": "gemini-vision",
+    "llm_text_model": null,
+    "llm_vision_model": null,
+    "llm_vision_concurrency": 1,
+    "llm_text_max_tokens": 800,
+    "llm_vision_max_tokens": 1536,
+    "llm_json_repair_max_tokens": 1024,
+    "llm_temperature": 0.1,
+    "llm_max_retries": 2,
+    "enrich_tables": true,
+    "enrich_figures": true
+  },
+  "chunk": {
+    "target_chars": 1000,
+    "min_chars": 200,
+    "max_chars": 1800,
+    "overlap_sentences": 2,
+    "table_rows_per_chunk": 10
+  },
+  "search": {
+    "top_k": 20,
+    "rerank_top_k": 20,
+    "rrf_k": 60,
+    "dense_recall_k": 80,
+    "sparse_recall_k": 80,
+    "rrf_dense_weight": 0.6,
+    "rrf_sparse_weight": 0.4,
+    "rerank_input_k": 100,
+    "rerank_output_k": 20,
+    "per_doc_cap": 5,
+    "reranker_mode": "cascade",
+    "use_colbert_reranker": true,
+    "colbert_model": "jinaai/jina-colbert-v2",
+    "colbert_top_k": 30
+  },
+  "web_search": {
+    "enabled": true,
+    "provider": "tavily",
+    "api_key": "",
+    "search_depth": "advanced",
+    "max_results": 5,
+    "include_answer": true,
+    "include_domains": [],
+    "exclude_domains": [],
+    "enable_query_optimizer": true,
+    "enable_query_expansion": false,
+    "query_expansion_llm": "deepseek",
+    "max_queries": 4,
+    "smart_optimizer": {
+      "enabled": true,
+      "llm_provider": "deepseek",
+      "max_queries_per_provider": 3,
+      "enable_bilingual": true,
+      "fallback_to_simple": true
+    }
+  },
+  "google_search": {
+    "enabled": true,
+    "scholar_enabled": true,
+    "google_enabled": false,
+    "extension_path": "extra_tools/CapSolverExtension",
+    "headless": null,
+    "proxy": null,
+    "timeout": 60000,
+    "max_results": 5,
+    "user_data_dir": null
+  },
+  "semantic_scholar": {
+    "enabled": false,
+    "api_key": "",
+    "base_url": "https://ai4scholar.net/graph/v1",
+    "max_results": 5,
+    "timeout_seconds": 30
+  },
+  "content_fetcher": {
+    "enabled": false,
+    "only_academic": false,
+    "max_content_length": 8000,
+    "timeout_seconds": 15,
+    "brightdata_api_key": "",
+    "brightdata_zone": "",
+    "cache_enabled": true,
+    "cache_ttl_seconds": 3600,
+    "max_concurrent": 5
+  },
+  "api": {
+    "host": "127.0.0.1",
+    "port": 9999
+  },
+  "auth": {
+    "secret_key": "change-me-in-local",
+    "token_expire_hours": 24,
+    "admin_username": "admin",
+    "admin_default_password": "admin123"
+  },
+  "logging": {
+    "level": "INFO",
+    "max_size_mb": 100,
+    "max_age_days": 30,
+    "min_keep_mb": 20,
+    "console_output": true
+  },
+  "storage": {
+    "max_age_days": 30,
+    "max_size_gb": 5,
+    "cleanup_on_startup": true,
+    "cleanup_batch_size": 100
+  },
+  "citation": {
+    "key_format": "author_date",
+    "hash_length": 12,
+    "author_date_max_authors": 2,
+    "merge_level": "document"
+  },
+  "deep_research": {
+    "default_depth": "comprehensive",
+    "depth_presets": {
+      "lite": {
+        "max_iterations_per_section": 3,
+        "max_section_research_rounds": 3,
+        "coverage_threshold": 0.60,
+        "recall_queries_per_section": 2,
+        "precision_queries_per_section": 2,
+        "search_top_k_first": 18,
+        "search_top_k_gap": 10,
+        "search_top_k_write": 10,
+        "verification_k": 12,
+        "self_correction_trigger_coverage": 0.75,
+        "self_correction_min_round": 3,
+        "search_top_k_gap_decay_factor": 0.60,
+        "search_top_k_gap_min": 6,
+        "coverage_plateau_floor": 0.70,
+        "coverage_plateau_min_gain": 0.03,
+        "verify_light_threshold": 0.20,
+        "verify_medium_threshold": 0.40,
+        "verify_severe_threshold": 0.45,
+        "review_gate_max_rounds": 80,
+        "review_gate_base_sleep": 2,
+        "review_gate_max_sleep": 15,
+        "review_gate_early_stop_unchanged": 8,
+        "recursion_limit": 200,
+        "cost_warn_steps": 120,
+        "cost_force_summary_steps": 180,
+        "cost_tick_interval": 25
+      },
+      "comprehensive": {
+        "max_iterations_per_section": 6,
+        "max_section_research_rounds": 5,
+        "coverage_threshold": 0.80,
+        "recall_queries_per_section": 4,
+        "precision_queries_per_section": 4,
+        "search_top_k_first": 30,
+        "search_top_k_gap": 15,
+        "search_top_k_write": 12,
+        "verification_k": 16,
+        "self_correction_trigger_coverage": 0.78,
+        "self_correction_min_round": 3,
+        "search_top_k_gap_decay_factor": 0.70,
+        "search_top_k_gap_min": 8,
+        "coverage_plateau_floor": 0.78,
+        "coverage_plateau_min_gain": 0.02,
+        "verify_light_threshold": 0.15,
+        "verify_medium_threshold": 0.30,
+        "verify_severe_threshold": 0.35,
+        "review_gate_max_rounds": 200,
+        "review_gate_base_sleep": 2,
+        "review_gate_max_sleep": 20,
+        "review_gate_early_stop_unchanged": 12,
+        "recursion_limit": 500,
+        "cost_warn_steps": 300,
+        "cost_force_summary_steps": 420,
+        "cost_tick_interval": 30
+      }
+    }
+  },
+  "auto_complete": {
+    "enabled": true,
+    "max_sections": 6,
+    "max_words_per_section": 500,
+    "include_abstract": true,
+    "default_search_mode": "hybrid"
+  },
+  "performance": {
+    "retrieval": {
+      "timeout_seconds": 60,
+      "cache_enabled": false,
+      "cache_ttl_seconds": 3600,
+      "parallel_dense_sparse": true,
+      "max_workers": 4
+    },
+    "llm": {
+      "timeout_seconds": 120,
+      "max_retries": 2,
+      "retry_backoff": 1.5,
+      "cache_enabled": false,
+      "cache_ttl_seconds": 3600,
+      "max_concurrent_per_provider": 5
+    },
+    "web_search": {
+      "timeout_seconds": 30,
+      "cache_enabled": false,
+      "cache_ttl_seconds": 3600
+    },
+    "unified_web_search": {
+      "max_parallel_providers": 3,
+      "per_provider_timeout_seconds": 30,
+      "browser_providers_max_parallel": 1
+    },
+    "google_search": {
+      "browser_reuse": true,
+      "max_idle_seconds": 300,
+      "max_pages_per_browser": 10,
+      "cache_enabled": false,
+      "cache_ttl_seconds": 1800
+    }
+  }
+}

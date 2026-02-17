@@ -1,0 +1,492 @@
+{
+  "name": "deepsea_eval_v1",
+  "description": "Deep-sea RAG evaluation dataset — 50 cases across 14 papers, covering factual, synthesis, methodology, data_query, and unanswerable types",
+  "version": "1.0.0",
+  "cases": [
+    {
+      "id": "f01",
+      "query": "What effect does artificial light at night (ALAN) have on oyster microbiota?",
+      "mode": "local",
+      "tags": ["factual"],
+      "expected_doc_ids": ["2026_Botté_et_al_Artificial_Light_at_Night_Affects_Microbiota"],
+      "expected_citations": [],
+      "reference_answer": "ALAN exposure at low intensity (~1 lx) disrupts the gill microbiota of Crassostrea gigas, obliterating the day/night difference in microbial alpha diversity. A direct correlation was found between decreased daily rhythm robustness, limited shell growth, and changes in certain microbial strands."
+    },
+    {
+      "id": "f02",
+      "query": "What organisms dominate the cold seep ecosystem in the Krishna-Godavari basin?",
+      "mode": "local",
+      "tags": ["factual"],
+      "expected_doc_ids": ["2026_Peketi_et_al_Cold_seep_induced_elevated_water_column"],
+      "expected_citations": [],
+      "reference_answer": "The cold seep ecosystem is predominantly populated with Bathymodiolus species, along with tube worms (Siboglinidae) and goose barnacles. The ecosystem was found at site SN184/KG-1 at approximately 1750 m water depth."
+    },
+    {
+      "id": "f03",
+      "query": "How does microplastic exposure affect viral communities in Mytilus coruscus?",
+      "mode": "local",
+      "tags": ["factual"],
+      "expected_doc_ids": ["2026_Zhang_et_al_Microplastic_exposure_reshapes_the_virome_and"],
+      "expected_citations": [],
+      "reference_answer": "Microplastic exposure induces divergent responses in DNA and RNA viral communities. DNA viromes show suppressed diversity and downregulation of core viral metabolic pathways, while RNA viromes display metabolic activation including enriched glycan and nucleotide metabolism. Phage-bacteria interaction networks are restructured with increased associations with opportunistic pathogens like Vibrio cholerae and Enterobacter."
+    },
+    {
+      "id": "f04",
+      "query": "What is the Deep Ocean Omics (DOO) database and what data does it integrate?",
+      "mode": "local",
+      "tags": ["factual"],
+      "expected_doc_ids": ["2026_She_et_al_DOO_integrated_multi-omics_resources_for_deep"],
+      "expected_citations": [],
+      "reference_answer": "DOO (https://DeepOceanOmics.org) is a multi-omics atlas for deep ocean organisms. It integrates diverse omics resources from 68 species across seven phyla and 16 classes, encompassing 72 genomes, 950 bulk transcriptomes, 15 single-cell transcriptomes, and 1112 metagenomes, alongside functional support toolkits for functional and comparative analysis."
+    },
+    {
+      "id": "f05",
+      "query": "What cell types were identified in the oyster single-cell atlas?",
+      "mode": "local",
+      "tags": ["factual"],
+      "expected_doc_ids": ["2026_Chen_et_al_Oyster_Cellular_Architecture_and_Innate_Immune"],
+      "expected_citations": [],
+      "reference_answer": "The tissue-resolved single-cell atlas of Crassostrea hongkongensis defined twenty cell types. This includes a diversified phagocyte lineage of five phagocytic cells with three terminal strategies (rapid extracellular containment, deep intracellular clearance, resolution program), three humoral immune populations, barrier epithelial cells, and a neural-related compartment comprising neural progenitor-like, neuron-like, and neuroendocrine cells."
+    },
+    {
+      "id": "f06",
+      "query": "Does the deep-sea mussel Bathymodiolus azoricus have an endogenous circadian rhythm?",
+      "mode": "local",
+      "tags": ["factual"],
+      "expected_doc_ids": ["2026_Grace_et_al_Shell_trace_elemental_fingerprints_of_the"],
+      "expected_citations": [],
+      "reference_answer": "Yes. Isolated cells from B. azoricus displayed circadian oscillations under constant conditions despite tidal-dominant rhythms in situ. Reporter assays indicate a functional transcription-translation feedback loop (TTFL) underpins circadian timing even in the deep sea. Notably, BazPeriod lacks autonomous repressive activity but modulates BazCry2, and it oscillates tidally, which may explain how a single endogenous clock yields both tidal and diel rhythms."
+    },
+    {
+      "id": "f07",
+      "query": "What shell microstructures were found in Bathymodiolus marisindicus?",
+      "mode": "local",
+      "tags": ["factual"],
+      "expected_doc_ids": ["2026_Gozeoglu_et_al_Assessment_of_nickel_nanoparticle_toxicity_on"],
+      "expected_citations": [],
+      "reference_answer": "Using TEM and SEM characterization, the shell of B. marisindicus from ~2700 m depth in the Southwest Indian Ocean Ridge was found to have a trilayered structure: periostracum (outer layer), prismatic layer, and nacreous layer."
+    },
+    {
+      "id": "f08",
+      "query": "What genetic connectivity patterns were found in Atlantic Rimicaris vent shrimp?",
+      "mode": "local",
+      "tags": ["factual"],
+      "expected_doc_ids": ["2026_Portanier_et_al_High_gene_flow_in_Atlantic_vent"],
+      "expected_citations": [],
+      "reference_answer": "Using ddRAD sequencing, the study found high gene flow in Atlantic Rimicaris vent shrimp species. Rimicaris exoculata and R. chacei inhabit the Mid-Atlantic Ridge (MAR). The analysis examined genetic differentiation to understand past and present migration pathways and demographic history that led to their current distribution."
+    },
+    {
+      "id": "f09",
+      "query": "What are the key genes involved in ovarian development of Sepiella japonica?",
+      "mode": "local",
+      "tags": ["factual"],
+      "expected_doc_ids": ["2026_Xu_et_al_Comparative_transcriptomic_analysis_across_ovarian_developmental"],
+      "expected_citations": [],
+      "reference_answer": "Key regulatory genes showing consistently high expression across four ovarian developmental stages include FOXL2, HSD17B2, and BMP1. A total of 13,319 differentially expressed genes were identified. KEGG pathway analysis revealed enrichment in Ribosome, Prolactin signaling, FOXO signaling, and Lysosome pathways."
+    },
+    {
+      "id": "f10",
+      "query": "What is the performance of UCE sequencing for deep-sea mussel population genomics?",
+      "mode": "local",
+      "tags": ["factual"],
+      "expected_doc_ids": ["2026_Li_et_al_Sequencing_Ultraconserved_Elements_(UCEs)_for_Marine"],
+      "expected_citations": [],
+      "reference_answer": "UCE target capture sequencing was applied to 123 individuals of Gigantidas platifrons. The species has a panmictic genetic structure across its extensive distribution range in chemosynthetic ecosystems of the Western Pacific. UCEs were evaluated against published whole genome and 2b-RAD seq data as a tool for marine population genomics."
+    },
+    {
+      "id": "f11",
+      "query": "What dissolved methane concentrations were measured at SN184/KG-1?",
+      "mode": "local",
+      "tags": ["factual"],
+      "expected_doc_ids": ["2026_Peketi_et_al_Cold_seep_induced_elevated_water_column"],
+      "expected_citations": [],
+      "reference_answer": "Dissolved methane concentrations at SN184/KG-1 varied from 0.18 to 1.48 µmol/L. At the second site SN184/KG-2, concentrations were lower, ranging from 0.14 to 0.5 µmol/L. The high concentrations at KG-1 were attributed to gas bubbling from the cold seeps."
+    },
+    {
+      "id": "f12",
+      "query": "Which circadian clock genes were impaired by ALAN in oysters?",
+      "mode": "local",
+      "tags": ["factual"],
+      "expected_doc_ids": ["2026_Botté_et_al_Artificial_Light_at_Night_Affects_Microbiota"],
+      "expected_citations": [],
+      "reference_answer": "ALAN significantly impaired the expression of core circadian clock genes CgClock and CgBmal1 in Crassostrea gigas, affecting rhythmic characteristics such as robustness and daily profile."
+    },
+    {
+      "id": "f13",
+      "query": "What antibiotic resistance gene changes were caused by microplastic exposure in mussels?",
+      "mode": "local",
+      "tags": ["factual"],
+      "expected_doc_ids": ["2026_Zhang_et_al_Microplastic_exposure_reshapes_the_virome_and"],
+      "expected_citations": [],
+      "reference_answer": "The expression of antibiotic resistance genes (ARGs) in viral genomes was differentially regulated by microplastic exposure, suggesting pollutant-induced microbial selection that may challenge host immune resilience."
+    },
+    {
+      "id": "f14",
+      "query": "How many species and genomes does the DOO database cover?",
+      "mode": "local",
+      "tags": ["factual"],
+      "expected_doc_ids": ["2026_She_et_al_DOO_integrated_multi-omics_resources_for_deep"],
+      "expected_citations": [],
+      "reference_answer": "DOO integrates data from 68 species across seven phyla and 16 classes, encompassing 72 genomes, 950 bulk transcriptomes, 15 single-cell transcriptomes, and 1112 metagenomes."
+    },
+    {
+      "id": "f15",
+      "query": "What phagocytic strategies were identified in oyster immune cells?",
+      "mode": "local",
+      "tags": ["factual"],
+      "expected_doc_ids": ["2026_Chen_et_al_Oyster_Cellular_Architecture_and_Innate_Immune"],
+      "expected_citations": [],
+      "reference_answer": "Three terminal phagocytic strategies were identified: (1) rapid extracellular containment, (2) deep intracellular clearance, and (3) a resolution program that couples degradation with matrix restoration. These were carried out by five phagocytic cell types in a diversified phagocyte lineage."
+    },
+    {
+      "id": "f16",
+      "query": "What causes precocious sexual maturation in captive Sepiella japonica?",
+      "mode": "local",
+      "tags": ["factual"],
+      "expected_doc_ids": ["2026_Xu_et_al_Comparative_transcriptomic_analysis_across_ovarian_developmental"],
+      "expected_citations": [],
+      "reference_answer": "Under captive conditions, S. japonica frequently exhibits precocious sexual maturation, which results in reduced adult body size. The molecular mechanisms involve genes like FOXL2, HSD17B2, and BMP1, with pathways including Prolactin signaling and FOXO signaling being enriched."
+    },
+    {
+      "id": "f17",
+      "query": "At what depth was the deep-sea mussel B. marisindicus discovered?",
+      "mode": "local",
+      "tags": ["factual"],
+      "expected_doc_ids": ["2026_Gozeoglu_et_al_Assessment_of_nickel_nanoparticle_toxicity_on"],
+      "expected_citations": [],
+      "reference_answer": "Bathymodiolus marisindicus was discovered living at a depth of about 2,700 meters on the Southwest Indian Ocean Ridge."
+    },
+    {
+      "id": "f18",
+      "query": "What differentially expressed genes were identified across ovarian stages in cuttlefish?",
+      "mode": "local",
+      "tags": ["factual"],
+      "expected_doc_ids": ["2026_Xu_et_al_Comparative_transcriptomic_analysis_across_ovarian_developmental"],
+      "expected_citations": [],
+      "reference_answer": "Pairwise comparisons identified 10,050 DEGs between stages I and II, 2,564 between stages II and III, and 2,278 between stages III and IV, with a total of 13,319 differentially expressed genes across all comparisons."
+    },
+    {
+      "id": "f19",
+      "query": "What is the BazPeriod gene's role in deep-sea mussel circadian timing?",
+      "mode": "local",
+      "tags": ["factual"],
+      "expected_doc_ids": ["2026_Grace_et_al_Shell_trace_elemental_fingerprints_of_the"],
+      "expected_citations": [],
+      "reference_answer": "BazPeriod lacks autonomous repressive activity but modulates BazCry2. Since BazPeriod itself oscillates tidally, it may explain how a single endogenous clock yields both tidal and diel rhythms in B. azoricus."
+    },
+    {
+      "id": "f20",
+      "query": "What was the survey method used to study cold seep ecosystems in the K-G basin?",
+      "mode": "local",
+      "tags": ["factual"],
+      "expected_doc_ids": ["2026_Peketi_et_al_Cold_seep_induced_elevated_water_column"],
+      "expected_citations": [],
+      "reference_answer": "An autonomous underwater vehicle (AUV) survey was conducted at two cold seep locations in the Krishna-Godavari basin. The survey included water column methane concentration measurements and seabed surveys using underwater photographic studies."
+    },
+    {
+      "id": "s01",
+      "query": "How do different marine pollutants (artificial light vs microplastics) affect biological rhythms and microbiota in marine organisms?",
+      "mode": "local",
+      "tags": ["synthesis"],
+      "expected_doc_ids": [
+        "2026_Botté_et_al_Artificial_Light_at_Night_Affects_Microbiota",
+        "2026_Zhang_et_al_Microplastic_exposure_reshapes_the_virome_and"
+      ],
+      "expected_citations": [],
+      "reference_answer": "Both ALAN and microplastics disrupt marine organism microbiota but through different mechanisms. ALAN disrupts circadian clock genes and obliterates day/night microbial diversity differences in oyster gills. Microplastics reshape the virome, differentially affecting DNA and RNA viral communities, and restructure phage-bacteria networks with increased pathogen associations. Both pollutants ultimately challenge host immune resilience."
+    },
+    {
+      "id": "s02",
+      "query": "What population genomics approaches have been applied to deep-sea vent organisms, and what connectivity patterns do they reveal?",
+      "mode": "local",
+      "tags": ["synthesis"],
+      "expected_doc_ids": [
+        "2026_Portanier_et_al_High_gene_flow_in_Atlantic_vent",
+        "2026_Li_et_al_Sequencing_Ultraconserved_Elements_(UCEs)_for_Marine"
+      ],
+      "expected_citations": [],
+      "reference_answer": "Two major approaches: ddRAD sequencing was used for Atlantic Rimicaris vent shrimp, revealing high gene flow along the Mid-Atlantic Ridge. UCE target capture sequencing was applied to Gigantidas platifrons in the Western Pacific, confirming panmictic genetic structure. Both studies demonstrate extensive connectivity in deep-sea vent organisms despite large geographic distances, likely due to long larval dispersal periods."
+    },
+    {
+      "id": "s03",
+      "query": "Compare the biological adaptations of deep-sea mussels across different environments (cold seeps vs hydrothermal vents).",
+      "mode": "local",
+      "tags": ["synthesis"],
+      "expected_doc_ids": [
+        "2026_Peketi_et_al_Cold_seep_induced_elevated_water_column",
+        "2026_Grace_et_al_Shell_trace_elemental_fingerprints_of_the",
+        "2026_Gozeoglu_et_al_Assessment_of_nickel_nanoparticle_toxicity_on"
+      ],
+      "expected_citations": [],
+      "reference_answer": "Deep-sea mussels show distinct adaptations depending on their environment. In cold seeps (K-G basin), Bathymodiolus species dominate ecosystems with methane hydrates at ~1750 m depth. At hydrothermal vents, B. azoricus maintains both tidal and circadian rhythms at -1700 m despite lacking diel cues. B. marisindicus at 2700 m on the SW Indian Ocean Ridge exhibits specialized shell microstructures (periostracum, prismatic layer, nacreous layer) adapted to extreme depth."
+    },
+    {
+      "id": "s04",
+      "query": "What multi-omics approaches have been used to study deep ocean organisms?",
+      "mode": "local",
+      "tags": ["synthesis"],
+      "expected_doc_ids": [
+        "2026_She_et_al_DOO_integrated_multi-omics_resources_for_deep",
+        "2026_Chen_et_al_Oyster_Cellular_Architecture_and_Innate_Immune"
+      ],
+      "expected_citations": [],
+      "reference_answer": "Multiple omics approaches have been applied: The DOO database integrates genomes, bulk transcriptomes, single-cell transcriptomes, and metagenomes across 68 species. Single-cell RNA sequencing has been used to resolve cellular architecture in Crassostrea hongkongensis, identifying 20 cell types. Virome sequencing has revealed microbial interactions. These tools provide increasingly detailed views of marine organism biology from ecosystem to single-cell level."
+    },
+    {
+      "id": "s05",
+      "query": "How do different deep-sea species maintain biological rhythms in the absence of light?",
+      "mode": "local",
+      "tags": ["synthesis"],
+      "expected_doc_ids": [
+        "2026_Grace_et_al_Shell_trace_elemental_fingerprints_of_the",
+        "2026_Botté_et_al_Artificial_Light_at_Night_Affects_Microbiota"
+      ],
+      "expected_citations": [],
+      "reference_answer": "Deep-sea mussel B. azoricus maintains endogenous circadian rhythms via a functional TTFL involving BazPeriod and BazCry2, even at -1700 m without diel cues. Tidal rhythms appear dominant in situ. In contrast, shallow-water oysters C. gigas are highly sensitive to light disruption — even low-intensity ALAN (~1 lx) impairs circadian clock genes CgClock and CgBmal1, disrupting growth and microbiota rhythms."
+    },
+    {
+      "id": "s06",
+      "query": "What are the conservation concerns related to deep-sea vent ecosystems based on current research?",
+      "mode": "local",
+      "tags": ["synthesis"],
+      "expected_doc_ids": [
+        "2026_Portanier_et_al_High_gene_flow_in_Atlantic_vent",
+        "2026_Peketi_et_al_Cold_seep_induced_elevated_water_column",
+        "2026_She_et_al_DOO_integrated_multi-omics_resources_for_deep"
+      ],
+      "expected_citations": [],
+      "reference_answer": "Key conservation concerns include potential mineral extraction near hydrothermal vents, which requires understanding species connectivity. High gene flow in Rimicaris shrimp suggests interconnected populations along the MAR. Cold seep ecosystems in the K-G basin host unique biodiversity dominated by Bathymodiolus. The DOO database highlights that deep ocean environments remain Earth's least explored frontiers, and comprehensive omics data are needed to understand genetic adaptations before potential industrial impacts."
+    },
+    {
+      "id": "s07",
+      "query": "How do immune systems differ between oyster species studied in recent research?",
+      "mode": "local",
+      "tags": ["synthesis"],
+      "expected_doc_ids": [
+        "2026_Chen_et_al_Oyster_Cellular_Architecture_and_Innate_Immune",
+        "2026_Botté_et_al_Artificial_Light_at_Night_Affects_Microbiota"
+      ],
+      "expected_citations": [],
+      "reference_answer": "Single-cell analysis of C. hongkongensis revealed a sophisticated innate immune system with 20 cell types including five phagocytic cells with three terminal strategies and three humoral immune populations. In C. gigas, research focused on how ALAN disrupts the gill microbiota and biological rhythms, which are linked to immune function. Together these studies show that oyster immunity involves complex cellular architecture susceptible to environmental perturbation."
+    },
+    {
+      "id": "s08",
+      "query": "What environmental stressors affect marine bivalve health based on recent studies?",
+      "mode": "local",
+      "tags": ["synthesis"],
+      "expected_doc_ids": [
+        "2026_Botté_et_al_Artificial_Light_at_Night_Affects_Microbiota",
+        "2026_Zhang_et_al_Microplastic_exposure_reshapes_the_virome_and",
+        "2026_Gozeoglu_et_al_Assessment_of_nickel_nanoparticle_toxicity_on"
+      ],
+      "expected_citations": [],
+      "reference_answer": "Multiple stressors affect marine bivalves: (1) ALAN disrupts circadian rhythms and microbiota in oysters, reducing shell growth. (2) Microplastics reshape viral communities and increase antibiotic resistance gene expression in Mytilus coruscus. (3) Extreme depth environments require specialized shell microstructural adaptations in Bathymodiolus marisindicus. These stressors collectively challenge bivalve immune resilience and physiological function."
+    },
+    {
+      "id": "s09",
+      "query": "Summarize the advances in understanding deep-sea mussel biology from recent publications.",
+      "mode": "local",
+      "tags": ["synthesis"],
+      "expected_doc_ids": [
+        "2026_Grace_et_al_Shell_trace_elemental_fingerprints_of_the",
+        "2026_Gozeoglu_et_al_Assessment_of_nickel_nanoparticle_toxicity_on",
+        "2026_Li_et_al_Sequencing_Ultraconserved_Elements_(UCEs)_for_Marine",
+        "2026_Peketi_et_al_Cold_seep_induced_elevated_water_column"
+      ],
+      "expected_citations": [],
+      "reference_answer": "Recent advances span multiple dimensions: B. azoricus exhibits endogenous circadian rhythms driven by TTFL at hydrothermal vents (-1700 m). B. marisindicus has specialized trilayered shell microstructures at 2700 m. G. platifrons shows panmictic genetic structure across the Western Pacific via UCE genomics. Cold seep Bathymodiolus dominate K-G basin ecosystems. Collectively, these studies reveal remarkable adaptations to extreme environments in deep-sea mussels."
+    },
+    {
+      "id": "s10",
+      "query": "How has transcriptomics advanced our understanding of marine invertebrate reproduction?",
+      "mode": "local",
+      "tags": ["synthesis"],
+      "expected_doc_ids": [
+        "2026_Xu_et_al_Comparative_transcriptomic_analysis_across_ovarian_developmental",
+        "2026_Chen_et_al_Oyster_Cellular_Architecture_and_Innate_Immune"
+      ],
+      "expected_citations": [],
+      "reference_answer": "Transcriptomics has revealed key insights: RNA-seq across four ovarian stages in Sepiella japonica identified 13,319 DEGs including critical regulators FOXL2, HSD17B2, and BMP1. Single-cell transcriptomics in C. hongkongensis resolved 20 cell types including neural-related cells. These approaches uncover molecular mechanisms of reproduction and cellular organization in marine invertebrates."
+    },
+    {
+      "id": "m01",
+      "query": "What sequencing method was used to study genetic differentiation in Rimicaris shrimp?",
+      "mode": "local",
+      "tags": ["methodology"],
+      "expected_doc_ids": ["2026_Portanier_et_al_High_gene_flow_in_Atlantic_vent"],
+      "expected_citations": [],
+      "reference_answer": "ddRAD (double digest restriction site-associated DNA) sequencing was used to examine genetic differentiation of three Atlantic Rimicaris species to understand their past and present migration pathways."
+    },
+    {
+      "id": "m02",
+      "query": "How was the single-cell atlas of oyster constructed?",
+      "mode": "local",
+      "tags": ["methodology"],
+      "expected_doc_ids": ["2026_Chen_et_al_Oyster_Cellular_Architecture_and_Innate_Immune"],
+      "expected_citations": [],
+      "reference_answer": "A tissue-resolved single-cell atlas was generated using single-cell RNA sequencing of Crassostrea hongkongensis. Cell type identification was performed along with phagocyte lineage analysis, immune cell communication analysis, and ligand-receptor inference to resolve cellular architecture and innate immune programs."
+    },
+    {
+      "id": "m03",
+      "query": "What techniques were used to characterize the shell microstructure of deep-sea mussels?",
+      "mode": "local",
+      "tags": ["methodology"],
+      "expected_doc_ids": ["2026_Gozeoglu_et_al_Assessment_of_nickel_nanoparticle_toxicity_on"],
+      "expected_citations": [],
+      "reference_answer": "Transmission electron microscopy (TEM) and scanning electron microscopy (SEM) were used. SEM provided detailed information on shell surface morphology and layered structure. TEM was used for investigating high-resolution microstructural and crystallographic details."
+    },
+    {
+      "id": "m04",
+      "query": "How was the virome analyzed in the microplastic exposure study?",
+      "mode": "local",
+      "tags": ["methodology"],
+      "expected_doc_ids": ["2026_Zhang_et_al_Microplastic_exposure_reshapes_the_virome_and"],
+      "expected_citations": [],
+      "reference_answer": "Mytilus coruscus individuals were exposed to microplastics in situ for seven days. Virome sequencing and bioinformatic analyses were performed, separately analyzing DNA and RNA viral communities, phage-bacteria interaction networks, and antibiotic resistance gene expression in viral genomes."
+    },
+    {
+      "id": "m05",
+      "query": "What experimental design was used to study ALAN effects on oysters?",
+      "mode": "local",
+      "tags": ["methodology"],
+      "expected_doc_ids": ["2026_Botté_et_al_Artificial_Light_at_Night_Affects_Microbiota"],
+      "expected_citations": [],
+      "reference_answer": "ALAN exposure at low and realistic intensity (~1 lx) was applied to the coastal keystone species Crassostrea gigas. Measurements included circadian clock gene expression (CgClock and CgBmal1), valve opening behavior, daily shell growth, and gill microbiota analysis with microbial alpha diversity assessment."
+    },
+    {
+      "id": "m06",
+      "query": "How does UCE sequencing compare with other genomic methods for marine population studies?",
+      "mode": "local",
+      "tags": ["methodology"],
+      "expected_doc_ids": ["2026_Li_et_al_Sequencing_Ultraconserved_Elements_(UCEs)_for_Marine"],
+      "expected_citations": [],
+      "reference_answer": "UCE target capture sequencing was compared against published whole genome and 2b-RAD seq data using Gigantidas platifrons as a test species. UCEs have low DNA quality requirements and broad taxonomic applicability, making them suitable for marine taxa with metapopulations spanning thousands of kilometers."
+    },
+    {
+      "id": "m07",
+      "query": "What RNA sequencing approach was used for the cuttlefish ovarian development study?",
+      "mode": "local",
+      "tags": ["methodology"],
+      "expected_doc_ids": ["2026_Xu_et_al_Comparative_transcriptomic_analysis_across_ovarian_developmental"],
+      "expected_citations": [],
+      "reference_answer": "RNA sequencing was performed on ovary tissue of female S. japonica collected across four key developmental stages: oogonium production (stage I), protoplasmic growth (stage II), interstitial growth (stage III), and trophoplasmic growth (stage IV). A total of 354,393,214 clean reads (Q20 > 98.58%) were obtained from 16 samples."
+    },
+    {
+      "id": "m08",
+      "query": "How was endogenous circadian rhythm demonstrated in deep-sea mussels?",
+      "mode": "local",
+      "tags": ["methodology"],
+      "expected_doc_ids": ["2026_Grace_et_al_Shell_trace_elemental_fingerprints_of_the"],
+      "expected_citations": [],
+      "reference_answer": "Endogenous circadian rhythms were demonstrated using cell cultures under constant conditions — isolated cells displayed circadian oscillations. Reporter assays using genomic regions upstream of the mussel's per gene containing E-box motifs confirmed a functional transcription-translation feedback loop (TTFL)."
+    },
+    {
+      "id": "d01",
+      "query": "What methane concentration ranges were measured at the two cold seep sites?",
+      "mode": "local",
+      "tags": ["data_query"],
+      "expected_doc_ids": ["2026_Peketi_et_al_Cold_seep_induced_elevated_water_column"],
+      "expected_citations": [],
+      "reference_answer": "At SN184/KG-1 (water depth ~1750 m): dissolved methane varied from 0.18 to 1.48 µmol/L. At SN184/KG-2 (water depth ~950 m): dissolved methane varied from 0.14 to 0.5 µmol/L."
+    },
+    {
+      "id": "d02",
+      "query": "How many differentially expressed genes were found between each pair of ovarian developmental stages?",
+      "mode": "local",
+      "tags": ["data_query"],
+      "expected_doc_ids": ["2026_Xu_et_al_Comparative_transcriptomic_analysis_across_ovarian_developmental"],
+      "expected_citations": [],
+      "reference_answer": "Stage I vs II: 10,050 DEGs; Stage II vs III: 2,564 DEGs; Stage III vs IV: 2,278 DEGs. Total across all comparisons: 13,319 DEGs."
+    },
+    {
+      "id": "d03",
+      "query": "How many species and omics datasets are in the DOO database?",
+      "mode": "local",
+      "tags": ["data_query"],
+      "expected_doc_ids": ["2026_She_et_al_DOO_integrated_multi-omics_resources_for_deep"],
+      "expected_citations": [],
+      "reference_answer": "68 species across 7 phyla and 16 classes. Datasets: 72 genomes, 950 bulk transcriptomes, 15 single-cell transcriptomes, and 1,112 metagenomes."
+    },
+    {
+      "id": "d04",
+      "query": "How many cell types were identified in the oyster single-cell atlas?",
+      "mode": "local",
+      "tags": ["data_query"],
+      "expected_doc_ids": ["2026_Chen_et_al_Oyster_Cellular_Architecture_and_Innate_Immune"],
+      "expected_citations": [],
+      "reference_answer": "Twenty cell types were defined in the tissue-resolved single-cell atlas of Crassostrea hongkongensis, including five phagocytic cells, three humoral immune populations, barrier epithelial cells, and neural-related cells."
+    },
+    {
+      "id": "d05",
+      "query": "What was the ALAN light intensity used in the oyster experiment?",
+      "mode": "local",
+      "tags": ["data_query"],
+      "expected_doc_ids": ["2026_Botté_et_al_Artificial_Light_at_Night_Affects_Microbiota"],
+      "expected_citations": [],
+      "reference_answer": "ALAN exposure was at low and realistic intensity of approximately 1 lux (~1 lx)."
+    },
+    {
+      "id": "d06",
+      "query": "How many individuals were sequenced in the UCE study of Gigantidas platifrons?",
+      "mode": "local",
+      "tags": ["data_query"],
+      "expected_doc_ids": ["2026_Li_et_al_Sequencing_Ultraconserved_Elements_(UCEs)_for_Marine"],
+      "expected_citations": [],
+      "reference_answer": "UCE target capture sequencing was conducted on 123 individuals of Gigantidas platifrons."
+    },
+    {
+      "id": "d07",
+      "query": "What is the depth of the cold seep site KG-2 in the Krishna-Godavari basin?",
+      "mode": "local",
+      "tags": ["data_query"],
+      "expected_doc_ids": ["2026_Peketi_et_al_Cold_seep_induced_elevated_water_column"],
+      "expected_citations": [],
+      "reference_answer": "SN184/KG-2 is at approximately 950 m water depth."
+    },
+    {
+      "id": "u01",
+      "query": "What is the effect of deep-sea mining on hydrothermal vent biodiversity?",
+      "mode": "local",
+      "tags": ["unanswerable"],
+      "expected_doc_ids": [],
+      "expected_citations": [],
+      "reference_answer": ""
+    },
+    {
+      "id": "u02",
+      "query": "What is the global distribution of microplastic pollution in the Arctic Ocean?",
+      "mode": "local",
+      "tags": ["unanswerable"],
+      "expected_doc_ids": [],
+      "expected_citations": [],
+      "reference_answer": ""
+    },
+    {
+      "id": "u03",
+      "query": "How does climate change affect coral reef bleaching rates in the Caribbean?",
+      "mode": "local",
+      "tags": ["unanswerable"],
+      "expected_doc_ids": [],
+      "expected_citations": [],
+      "reference_answer": ""
+    },
+    {
+      "id": "u04",
+      "query": "What pharmaceutical compounds have been derived from deep-sea organisms?",
+      "mode": "local",
+      "tags": ["unanswerable"],
+      "expected_doc_ids": [],
+      "expected_citations": [],
+      "reference_answer": ""
+    },
+    {
+      "id": "u05",
+      "query": "What are the latest IPCC predictions for sea level rise by 2100?",
+      "mode": "local",
+      "tags": ["unanswerable"],
+      "expected_doc_ids": [],
+      "expected_citations": [],
+      "reference_answer": ""
+    }
+  ]
+}

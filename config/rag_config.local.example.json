@@ -1,0 +1,24 @@
+{
+  "llm": {
+    "providers": {
+      "openai": { "api_key": "sk-xxx" },
+      "openai-thinking": { "api_key": "sk-xxx" },
+      "deepseek": { "api_key": "sk-xxx" },
+      "deepseek-thinking": { "api_key": "sk-xxx" },
+      "gemini": { "api_key": "AIzxxx" },
+      "gemini-thinking": { "api_key": "AIzxxx" },
+      "gemini-vision": { "api_key": "AIzxxx" },
+      "claude": { "api_key": "sk-ant-xxx" },
+      "claude-thinking": { "api_key": "sk-ant-xxx" },
+      "kimi": { "api_key": "sk-xxx" },
+      "kimi-vision": { "api_key": "sk-xxx" },
+      "kimi-thinking": { "api_key": "sk-xxx" }
+    }
+  },
+  "web_search": {
+    "api_key": "tvly-xxx"
+  },
+  "semantic_scholar": {
+    "api_key": "ai4scholar-xxx"
+  }
+}

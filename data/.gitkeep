@@ -1,0 +1,9 @@
+# This file ensures the data directory structure is preserved in git
+# while actual data files are ignored by .gitignore
+# 
+# Allowed files in this directory:
+# - .gitkeep (this file)
+# - eval_mini.json (test dataset)
+# - Any subdirectories with .gitkeep files
+#
+# All other data files should be generated locally and not committed to git
