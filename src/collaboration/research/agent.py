@@ -16,7 +16,9 @@ import copy
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypedDict
 
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import StateGraph, END
+from langgraph.types import interrupt
 
 from src.collaboration.research.dashboard import (
     ResearchBrief,
@@ -1463,6 +1465,28 @@ def write_node(state: DeepResearchState) -> DeepResearchState:
                 "- Include a short 'Open Gaps' paragraph at the end listing unresolved evidence gaps.\n"
                 "- Target length: 200-350 words (not 400-600) under low coverage.\n"
             )
+        numeric_markers = (
+            "computed_stats",
+            "sample_size",
+            "mean",
+            "median",
+            "std",
+            "p-value",
+            "p value",
+            "confidence interval",
+            "effect size",
+        )
+        numeric_context = f"{evidence_str}\n{verification_evidence_str}".lower()
+        has_structured_numeric_data = any(m in numeric_context for m in numeric_markers)
+        quantitative_block = ""
+        if has_structured_numeric_data:
+            quantitative_block = (
+                "\nQuantitative strictness (MANDATORY):\n"
+                "- Structured numeric evidence (e.g., computed_stats/table-like values) is present.\n"
+                "- When any numeric comparison/difference is needed, you MUST call the `run_code` tool to run real Python/Pandas calculation.\n"
+                "- Do not estimate, round by intuition, or fabricate any number; only report values that come from tool execution.\n"
+                "- If calculation is not possible from available data, explicitly state the data limitation instead of guessing.\n"
+            )
         claims_block = ""
         if state.get("verified_claims"):
             claims_block = (
@@ -1481,6 +1505,7 @@ Requirements:
 {_language_instruction(state)}
 {_build_user_context_block(state, max_chars=1800)}
 {caution_block}
+{quantitative_block}
 {claims_block}
 
 Available evidence:
@@ -1494,15 +1519,45 @@ Relevant temporary materials from user:
 {supplement_block}"""
 
         try:
-            resp = client.chat(
-                messages=[
-                    {"role": "system", "content": f"You are an expert academic review writer.\n{context[:2000]}"},
-                    {"role": "user", "content": prompt},
-                ],
-                model=model_override,
-                max_tokens=1500,
-            )
-            section_text = (resp.get("final_text") or "").strip()
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an expert academic review writer."
+                        " When numeric comparisons are needed, use tools to compute instead of guessing.\n"
+                        f"{context[:2000]}"
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ]
+            if has_structured_numeric_data:
+                from src.llm.react_loop import react_loop
+                from src.llm.tools import CORE_TOOLS
+
+                run_code_tools = [t for t in CORE_TOOLS if getattr(t, "name", "") == "run_code"]
+                react_result = react_loop(
+                    messages=messages,
+                    tools=run_code_tools,
+                    llm_client=client,
+                    max_iterations=4,
+                    model=model_override,
+                    max_tokens=1500,
+                )
+                section_text = (react_result.final_text or "").strip()
+                if not section_text:
+                    resp = client.chat(
+                        messages=messages,
+                        model=model_override,
+                        max_tokens=1500,
+                    )
+                    section_text = (resp.get("final_text") or "").strip()
+            else:
+                resp = client.chat(
+                    messages=messages,
+                    model=model_override,
+                    max_tokens=1500,
+                )
+                section_text = (resp.get("final_text") or "").strip()
         except Exception as e:
             section_text = f"(Section '{section.title}' generation failed: {e})"
 
@@ -1797,62 +1852,6 @@ def review_gate_node(state: DeepResearchState) -> DeepResearchState:
         state["review_gate_next"] = "synthesize"
         return state
 
-    # ── Review gate timeout + exponential backoff + early-stop ──
-    preset = state.get("depth_preset") or get_depth_preset(state.get("depth", DEFAULT_DEPTH))
-    max_rounds = int(preset.get("review_gate_max_rounds", 150))
-    base_sleep = float(preset.get("review_gate_base_sleep", 2))
-    max_sleep = float(preset.get("review_gate_max_sleep", 15))
-    early_stop_n = int(preset.get("review_gate_early_stop_unchanged", 10))
-
-    gate_rounds = state.get("review_gate_rounds", 0) + 1
-    state["review_gate_rounds"] = gate_rounds
-
-    # ── Check 1: hard round limit ──
-    if gate_rounds >= max_rounds:
-        logger.warning(
-            "Review gate hard timeout: %d rounds — auto-approving remaining sections",
-            gate_rounds,
-        )
-        _emit_progress(
-            state,
-            "review_gate_timeout",
-            {
-                "rounds": gate_rounds,
-                "pending_sections": pending_sections,
-                "message": f"审核等待超时（{gate_rounds} 轮），自动通过剩余章节进入整合。",
-            },
-        )
-        state["review_gate_next"] = "synthesize"
-        return state
-
-    # ── Check 2: early-stop — no change for N consecutive polls ──
-    snapshot = f"{approved_count}:{','.join(sorted(pending_sections))}"
-    last_snapshot = state.get("review_gate_last_snapshot", "")
-    if snapshot == last_snapshot:
-        unchanged = state.get("review_gate_unchanged", 0) + 1
-    else:
-        unchanged = 0
-    state["review_gate_unchanged"] = unchanged
-    state["review_gate_last_snapshot"] = snapshot
-
-    if unchanged >= early_stop_n:
-        logger.info(
-            "Review gate early-stop: %d consecutive unchanged polls — auto-approving",
-            unchanged,
-        )
-        _emit_progress(
-            state,
-            "review_gate_early_stop",
-            {
-                "rounds": gate_rounds,
-                "unchanged": unchanged,
-                "pending_sections": pending_sections,
-                "message": f"审核无新输入（连续 {unchanged} 轮无变化），自动通过进入整合。",
-            },
-        )
-        state["review_gate_next"] = "synthesize"
-        return state
-
     _emit_progress(
         state,
         "waiting_review_all",
@@ -1863,10 +1862,12 @@ def review_gate_node(state: DeepResearchState) -> DeepResearchState:
             "message": "等待所有章节审核通过后进入最终整合。",
         },
     )
-    # ── Exponential backoff sleep: 2s → 4s → 8s → ... → max_sleep ──
-    sleep_sec = min(base_sleep * (2 ** min(gate_rounds - 1, 8)), max_sleep)
-    time.sleep(sleep_sec)
-    state["review_gate_next"] = "review_gate"
+    interrupt(
+        {
+            "reason": "waiting_for_review",
+            "pending_sections": pending_sections,
+        }
+    )
     return state
 
 
@@ -2068,6 +2069,11 @@ Content:
         for sec in getattr(dashboard, "sections", []) or []:
             aggregated_open_gaps.extend(getattr(sec, "gaps", []) or [])
     aggregated_open_gaps = _dedupe_keep_order(aggregated_open_gaps)
+    aggregated_conflict_notes: List[str] = []
+    aggregated_conflict_notes.extend(insights_by_type.get("conflict", []))
+    if dashboard:
+        aggregated_conflict_notes.extend(getattr(dashboard, "conflict_notes", []) or [])
+    aggregated_conflict_notes = _dedupe_keep_order(aggregated_conflict_notes)
 
     # 生成摘要
     full_md = "\n".join(state.get("markdown_parts", []))
@@ -2094,14 +2100,17 @@ Content:
     # ── Generate "Limitations and Future Directions" section from insights ──
     limitations_section = ""
     scarce_sections = [s.title for s in (dashboard.sections if dashboard else []) if getattr(s, "evidence_scarce", False)]
-    has_insights = any(len(v) > 0 for v in insights_by_type.values())
+    has_insights = any(len(v) > 0 for v in insights_by_type.values()) or bool(aggregated_conflict_notes)
     has_scarce_sections = len(scarce_sections) > 0
     if has_insights or has_scarce_sections:
         insight_block_parts: List[str] = []
         if insights_by_type["gap"]:
             insight_block_parts.append("Information Gaps:\n" + "\n".join(f"- {g}" for g in insights_by_type["gap"][:15]))
-        if insights_by_type["conflict"]:
-            insight_block_parts.append("Conflicts/Contradictions:\n" + "\n".join(f"- {c}" for c in insights_by_type["conflict"][:10]))
+        if aggregated_conflict_notes:
+            insight_block_parts.append(
+                "Conflicts/Contradictions with Attribution Clues:\n"
+                + "\n".join(f"- {c}" for c in aggregated_conflict_notes[:12])
+            )
         if insights_by_type["limitation"]:
             insight_block_parts.append("Reviewer Noted Limitations:\n" + "\n".join(f"- {l}" for l in insights_by_type["limitation"][:10]))
         if has_scarce_sections:
@@ -2125,6 +2134,8 @@ Requirements:
 - Acknowledge key limitations objectively
 - Propose specific future research directions based on the gaps
 - Explicitly mention evidence-scarce sections and avoid overstating conclusions for them
+- Integrate conflict_notes attribution and write one dedicated paragraph labeled "观点交锋与实验条件差异 (Debate & Divergence):"
+- In that dedicated paragraph, compare experimental-condition variables (e.g., sampling depth, sequencing platform/instrument, time span, sample size, cohort/region, statistical pipeline) and explain plausible causes of divergence
 - Be constructive and forward-looking
 - Output section body ONLY (no markdown heading, no duplicated title line)
 {_language_instruction(state)}"""
@@ -2681,7 +2692,46 @@ def start_deep_research(
         }
 
 
-def execute_deep_research(
+def build_deep_research_result_from_state(
+    state: Dict[str, Any],
+    *,
+    topic: str,
+    elapsed_ms: float,
+    fallback_outline: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Build stable API result from a terminal graph state."""
+    final_state: Dict[str, Any] = state if isinstance(state, dict) else {}
+    final_dashboard = final_state.get("dashboard", ResearchDashboard())
+    final_markdown = "\n".join(final_state.get("markdown_parts", []))
+    final_citations = final_state.get("citations", [])
+    all_chunks = final_state.get("evidence_chunks", [])
+    if final_markdown and all_chunks:
+        final_markdown, resolved_citations = _resolve_text_citations(
+            final_state,
+            final_markdown,
+            all_chunks,
+            include_unreferenced_documents=False,
+        )
+        if resolved_citations:
+            final_citations = resolved_citations
+    if isinstance(final_dashboard, ResearchDashboard):
+        outline = [s.title for s in final_dashboard.sections]
+        dashboard_dict = final_dashboard.to_dict()
+    else:
+        outline = list(fallback_outline or [])
+        dashboard_dict = final_dashboard if isinstance(final_dashboard, dict) else {}
+    return {
+        "markdown": final_markdown,
+        "canvas_id": final_state.get("canvas_id", ""),
+        "outline": outline,
+        "citations": final_citations,
+        "dashboard": dashboard_dict,
+        "total_time_ms": elapsed_ms,
+        "topic": topic,
+    }
+
+
+def prepare_deep_research_runtime(
     topic: str,
     llm_client: Any,
     confirmed_outline: List[str],
@@ -2708,15 +2758,16 @@ def execute_deep_research(
     job_id: str = "",
     depth: str = DEFAULT_DEPTH,
 ) -> Dict[str, Any]:
-    """Phase 2: run research loop with confirmed brief/outline."""
+    """Prepare compiled graph runtime for deep-research execution/resume."""
     t0 = time.perf_counter()
+    resolved_topic = topic.strip()
     preset = get_depth_preset(depth)
     graph = build_research_graph(include_scope_plan=False)
-    compiled = graph.compile()
-    # Set a sane recursion_limit driven by depth instead of LangGraph default 10000
+    checkpointer = MemorySaver()
+    compiled = graph.compile(checkpointer=checkpointer)
     compiled.recursion_limit = int(preset["recursion_limit"])
     initial_state = _build_initial_state(
-        topic=topic,
+        topic=resolved_topic,
         llm_client=llm_client,
         canvas_id=canvas_id,
         session_id=session_id,
@@ -2745,10 +2796,10 @@ def execute_deep_research(
     dashboard = initial_state["dashboard"]
     brief = confirmed_brief or {}
     dashboard.brief = ResearchBrief(
-        topic=brief.get("topic", topic),
-        scope=brief.get("scope", f"Comprehensive review of {topic}"),
+        topic=brief.get("topic", resolved_topic),
+        scope=brief.get("scope", f"Comprehensive review of {resolved_topic}"),
         success_criteria=brief.get("success_criteria", []),
-        key_questions=brief.get("key_questions", [topic]),
+        key_questions=brief.get("key_questions", [resolved_topic]),
         exclusions=brief.get("exclusions", []),
         time_range=brief.get("time_range", ""),
         source_priority=brief.get("source_priority", ["peer-reviewed"]),
@@ -2756,15 +2807,12 @@ def execute_deep_research(
 
     outline = [s.strip() for s in (confirmed_outline or []) if s and s.strip()]
     if not outline:
-        outline = [topic]
+        outline = [resolved_topic]
     dashboard.sections = []
     for idx, title in enumerate(outline):
         dashboard.add_section(title)
         initial_state["trajectory"].add_branch(f"sec_{idx+1}", title)
 
-    # ── Dynamic max_iterations: scale with section count ──
-    # max_iterations = max_iterations_per_section × num_sections
-    # This ensures large outlines get proportionally more budget.
     iter_per_sec = int(preset.get("max_iterations_per_section", 5))
     num_sections = len(outline)
     scaled_max_iter = iter_per_sec * num_sections
@@ -2775,7 +2823,6 @@ def execute_deep_research(
     )
     initial_state["markdown_parts"] = [f"# {dashboard.brief.topic}\n"]
 
-    # 将用户确认的大纲与 brief 写入 Canvas（execute 阶段也要做，避免前端看到空 Canvas）
     if initial_state.get("canvas_id"):
         try:
             from src.collaboration.canvas.canvas_manager import upsert_outline, update_canvas
@@ -2804,42 +2851,113 @@ def execute_deep_research(
             logger.warning("Failed to sync execute outline/brief to canvas: %s", e)
 
     _emit_progress(initial_state, "execute_started", {"outline": outline, "topic": dashboard.brief.topic})
+    thread_id = job_id.strip() if isinstance(job_id, str) else ""
+    if not thread_id:
+        seed = f"{session_id}:{resolved_topic}:{int(time.time() * 1000)}"
+        thread_id = f"dr-{abs(hash(seed))}"
+    config = {"configurable": {"thread_id": thread_id}}
+    return {
+        "compiled": compiled,
+        "config": config,
+        "initial_state": initial_state,
+        "outline": outline,
+        "topic": dashboard.brief.topic,
+        "started_at_perf": t0,
+    }
+
+
+def execute_deep_research(
+    topic: str,
+    llm_client: Any,
+    confirmed_outline: List[str],
+    confirmed_brief: Optional[Dict[str, Any]] = None,
+    canvas_id: Optional[str] = None,
+    session_id: str = "",
+    user_id: str = "",
+    search_mode: str = "hybrid",
+    filters: Optional[Dict[str, Any]] = None,
+    model_override: Optional[str] = None,
+    max_iterations: int = 30,
+    output_language: str = "auto",
+    step_models: Optional[Dict[str, Optional[str]]] = None,
+    step_model_strict: bool = False,
+    user_context: str = "",
+    user_context_mode: str = "supporting",
+    user_documents: Optional[List[Dict[str, str]]] = None,
+    progress_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
+    review_waiter: Optional[Callable[[str], Optional[Dict[str, Any]]]] = None,
+    skip_draft_review: bool = False,
+    skip_refine_review: bool = False,
+    skip_claim_generation: bool = False,
+    job_id: str = "",
+    depth: str = DEFAULT_DEPTH,
+) -> Dict[str, Any]:
+    """Phase 2: run research loop with confirmed brief/outline."""
+    runtime = prepare_deep_research_runtime(
+        topic=topic,
+        llm_client=llm_client,
+        confirmed_outline=confirmed_outline,
+        confirmed_brief=confirmed_brief,
+        canvas_id=canvas_id,
+        session_id=session_id,
+        user_id=user_id,
+        search_mode=search_mode,
+        filters=filters,
+        model_override=model_override,
+        max_iterations=max_iterations,
+        output_language=output_language,
+        step_models=step_models,
+        step_model_strict=step_model_strict,
+        user_context=user_context,
+        user_context_mode=user_context_mode,
+        user_documents=user_documents,
+        progress_callback=progress_callback,
+        cancel_check=cancel_check,
+        review_waiter=review_waiter,
+        skip_draft_review=skip_draft_review,
+        skip_refine_review=skip_refine_review,
+        skip_claim_generation=skip_claim_generation,
+        job_id=job_id,
+        depth=depth,
+    )
+    compiled = runtime["compiled"]
+    config = runtime["config"]
+    initial_state = runtime["initial_state"]
 
     try:
-        final_state = compiled.invoke(initial_state)
+        compiled.invoke(initial_state, config=config)
+        state_snapshot = compiled.get_state(config)
     except Exception as e:
         logger.error(f"Deep Research execution failed: {e}")
         return {
             "markdown": f"# {topic}\n\nDeep Research execution failed: {e}",
             "canvas_id": canvas_id or "",
-            "outline": outline,
+            "outline": runtime.get("outline") or [],
             "citations": [],
             "dashboard": {},
-            "total_time_ms": (time.perf_counter() - t0) * 1000,
+            "total_time_ms": (time.perf_counter() - float(runtime.get("started_at_perf") or time.perf_counter())) * 1000,
         }
 
-    elapsed = (time.perf_counter() - t0) * 1000
-    final_dashboard = final_state.get("dashboard", ResearchDashboard())
-    final_markdown = "\n".join(final_state.get("markdown_parts", []))
-    final_citations = final_state.get("citations", [])
-    all_chunks = final_state.get("evidence_chunks", [])
-    if final_markdown and all_chunks:
-        final_markdown, resolved_citations = _resolve_text_citations(
-            final_state,
-            final_markdown,
-            all_chunks,
-            include_unreferenced_documents=False,
-        )
-        if resolved_citations:
-            final_citations = resolved_citations
-    return {
-        "markdown": final_markdown,
-        "canvas_id": final_state.get("canvas_id", ""),
-        "outline": [s.title for s in final_dashboard.sections],
-        "citations": final_citations,
-        "dashboard": final_dashboard.to_dict(),
-        "total_time_ms": elapsed,
-    }
+    if getattr(state_snapshot, "next", ()):
+        return {
+            "status": "waiting_review",
+            "markdown": "\n".join(initial_state.get("markdown_parts", [])),
+            "canvas_id": initial_state.get("canvas_id", ""),
+            "outline": runtime.get("outline") or [],
+            "citations": initial_state.get("citations", []) or [],
+            "dashboard": (initial_state.get("dashboard").to_dict() if initial_state.get("dashboard") else {}),
+            "total_time_ms": (time.perf_counter() - float(runtime.get("started_at_perf") or time.perf_counter())) * 1000,
+        }
+
+    elapsed = (time.perf_counter() - float(runtime.get("started_at_perf") or time.perf_counter())) * 1000
+    final_state = getattr(state_snapshot, "values", {}) or {}
+    return build_deep_research_result_from_state(
+        final_state,
+        topic=str(runtime.get("topic") or topic),
+        elapsed_ms=elapsed,
+        fallback_outline=runtime.get("outline") or [],
+    )
 
 
 # ────────────────────────────────────────────────

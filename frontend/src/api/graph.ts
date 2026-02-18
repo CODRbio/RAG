@@ -46,6 +46,7 @@ export interface ChunkDetail {
   content_type?: string;
   chunk_type?: string;
   related_entities?: string[];
+  bbox?: number[];
 }
 
 export async function getGraphStats(): Promise<GraphStats> {

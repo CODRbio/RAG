@@ -31,6 +31,7 @@ class EvidenceChunk:
     page_num: Optional[int] = None
     section_title: Optional[str] = None
     evidence_type: Optional[str] = None  # finding | method | interpretation | background | summary
+    bbox: Optional[List[float]] = None  # Docling 物理坐标 [x0,y0,x1,y1]
 
     @property
     def ref_hash(self) -> str:

@@ -48,6 +48,8 @@ class Citation:
     doi: Optional[str] = None
     bibtex: Optional[str] = None
     cite_key: Optional[str] = None
+    bbox: Optional[list[float]] = None
+    page_num: Optional[int] = None
     created_at: datetime = field(default_factory=datetime.now)
 
 

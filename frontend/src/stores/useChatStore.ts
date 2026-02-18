@@ -154,6 +154,9 @@ export const useChatStore = create<ChatState>((set) => ({
           doc_id: s.doc_id,
           url: s.url,
           doi: s.doi,
+          bbox: s.bbox,
+          page_num: s.page_num,
+          type: s.url ? 'web' : 'local',
         }));
         return {
           id: `${sessionId}-${index}`,

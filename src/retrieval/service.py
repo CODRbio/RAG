@@ -165,6 +165,19 @@ def _hit_to_chunk(hit: Dict[str, Any], source_type: str, query: str) -> Evidence
         if title is None and parsed_title:
             title = parsed_title
     
+    # 提取 bbox（Docling 物理坐标列表）
+    raw_bbox = meta.get("bbox")
+    bbox = None
+    if isinstance(raw_bbox, list) and raw_bbox:
+        # 兼容两种格式：
+        # - [x0, y0, x1, y1]
+        # - [[x0, y0, x1, y1], ...]（取第一块用于前端单框高亮）
+        first = raw_bbox[0]
+        if isinstance(first, (int, float)):
+            bbox = raw_bbox
+        elif isinstance(first, list) and len(first) >= 4:
+            bbox = first
+
     return EvidenceChunk(
         chunk_id=str(chunk_id),
         doc_id=str(doc_id),
@@ -178,6 +191,7 @@ def _hit_to_chunk(hit: Dict[str, Any], source_type: str, query: str) -> Evidence
         doi=meta.get("doi"),
         page_num=meta.get("page") if isinstance(meta.get("page"), int) else None,
         section_title=meta.get("section_path"),
+        bbox=bbox,
     )
 
 

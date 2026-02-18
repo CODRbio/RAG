@@ -193,6 +193,8 @@ export function ChatInput() {
             doc_id?: string | null;
             url?: string | null;
             doi?: string | null;
+            bbox?: number[];
+            page_num?: number | null;
           }
           const meta = data as {
             session_id: string;
@@ -220,6 +222,8 @@ export function ChatInput() {
               doc_id: cite.doc_id,
               url: cite.url,
               doi: cite.doi,
+              bbox: cite.bbox,
+              page_num: cite.page_num,
               type: cite.url ? 'web' : 'local',
             }));
             setLastMessageSources(sources);

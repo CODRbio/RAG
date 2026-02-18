@@ -1,14 +1,16 @@
-import { useRef, useEffect, useState } from 'react';
+import { useRef, useEffect, useState, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
-import { MessageSquare, FileSearch, Copy, Download, ExternalLink, FileText, User, Calendar, GitCompareArrows } from 'lucide-react';
+import { MessageSquare, FileSearch, Copy, Download, ExternalLink, FileText, User, Calendar, GitCompareArrows, BookOpen } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useChatStore, useToastStore, useCompareStore } from '../../stores';
 import type { Source, DeepResearchJobInfo } from '../../types';
 import { cancelDeepResearchJob, getDeepResearchJob, listDeepResearchJobEvents } from '../../api/chat';
+import { getChunkDetail } from '../../api/graph';
 import { RetrievalDebugPanel } from './RetrievalDebugPanel';
 import { ToolTracePanel } from './ToolTracePanel';
 import { ResearchProgressPanel } from '../research/ResearchProgressPanel';
+import { PdfViewerModal } from '../ui/PdfViewerModal';
 
 export function ChatWindow() {
   const { t } = useTranslation();
@@ -29,6 +31,15 @@ export function ChatWindow() {
   const [backgroundEventLines, setBackgroundEventLines] = useState<string[]>([]);
   const lastBackgroundEventIdRef = useRef(0);
   const trackedBackgroundJobIdRef = useRef<string | null>(null);
+
+  // PDF 溯源 Modal 状态
+  const [pdfModal, setPdfModal] = useState<{
+    open: boolean;
+    pdfUrl: string;
+    pageNumber: number;
+    bbox?: number[];
+    title?: string;
+  }>({ open: false, pdfUrl: '', pageNumber: 1 });
 
   // 自动滚动到底部
   useEffect(() => {
@@ -158,6 +169,46 @@ export function ChatWindow() {
     if (authors.length === 2) return authors.join(' & ');
     return `${authors[0]} et al.`;
   };
+
+  const handleOpenPdfTrace = useCallback(async (src: Source) => {
+    if (!src.doc_id) return;
+    try {
+      // 先尝试从 source 本身获取 bbox/page，如已有则直接使用
+      let bbox = src.bbox;
+      let page = src.page_num ?? undefined;
+
+      // 若 source 上没有 bbox，通过 chunk API 补取
+      if (!bbox || bbox.length < 4) {
+        const chunkId = String(src.id);
+        const detail = await getChunkDetail({
+          chunk_id: chunkId,
+          paper_id: src.doc_id,
+        });
+        const rawBbox = detail.bbox;
+        if (Array.isArray(rawBbox) && rawBbox.length >= 4) {
+          if (typeof rawBbox[0] === 'number') {
+            bbox = rawBbox as number[];
+          } else if (Array.isArray(rawBbox[0])) {
+            bbox = rawBbox[0] as number[];
+          }
+        }
+        page = detail.page ?? undefined;
+      }
+
+      const apiBase = import.meta.env.VITE_API_BASE_URL || '/api';
+      const pdfUrl = `${apiBase}/graph/pdf/${encodeURIComponent(src.doc_id)}`;
+
+      setPdfModal({
+        open: true,
+        pdfUrl,
+        pageNumber: page || 1,
+        bbox: bbox || undefined,
+        title: src.title || src.doc_id,
+      });
+    } catch {
+      addToast('PDF 溯源失败：无法获取 chunk 信息', 'error');
+    }
+  }, [addToast]);
 
   const showBackgroundBanner = Boolean(backgroundJob) && !deepResearchActive && !researchDashboard;
 
@@ -379,8 +430,22 @@ export function ChatWindow() {
                           </span>
                         )}
                       </div>
-                      {/* 加入对比：仅当有 doc_id（本地）时可用 */}
-                      <div className="mt-2 pt-2 border-t border-slate-700/30 flex justify-end">
+                      {/* 操作栏：溯源原文 + 加入对比 */}
+                      <div className="mt-2 pt-2 border-t border-slate-700/30 flex justify-end gap-3">
+                        {/* 溯源原文：仅本地文档且有 doc_id 时可用 */}
+                        {src.type === 'local' && src.doc_id && (
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleOpenPdfTrace(src);
+                            }}
+                            className="text-xs text-amber-500 hover:text-amber-300 flex items-center gap-1 font-medium transition-colors"
+                          >
+                            <BookOpen size={10} />
+                            📄 溯源原文
+                          </button>
+                        )}
                         <button
                           type="button"
                           onClick={(e) => {
@@ -407,6 +472,16 @@ export function ChatWindow() {
         </div>
       );
       })}
+
+      {/* PDF 溯源 Modal */}
+      <PdfViewerModal
+        open={pdfModal.open}
+        onClose={() => setPdfModal((prev) => ({ ...prev, open: false }))}
+        pdfUrl={pdfModal.pdfUrl}
+        pageNumber={pdfModal.pageNumber}
+        bbox={pdfModal.bbox}
+        title={pdfModal.title}
+      />
     </div>
   );
 }

@@ -208,6 +208,9 @@ def chunk_to_citation(
     url = getattr(chunk, "url", None) or None
     doc_id = chunk.doc_id or None
 
+    bbox = getattr(chunk, "bbox", None) or None
+    page_num = getattr(chunk, "page_num", None) or None
+
     # 先创建不带 cite_key 的 Citation
     citation = Citation(
         id=chunk.chunk_id[:16] if chunk.chunk_id else "",
@@ -218,6 +221,8 @@ def chunk_to_citation(
         url=url,
         doi=doi,
         cite_key="",
+        bbox=bbox,
+        page_num=page_num,
     )
 
     # 使用生成器生成 cite_key

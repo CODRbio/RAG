@@ -30,6 +30,7 @@ class ClaimVerification:
     evidence_found: str = ""
     needs_revision: bool = False
     revision_note: str = ""
+    attribution_analysis: str = ""
 
 
 @dataclass
@@ -42,6 +43,7 @@ class VerificationResult:
     overall_confidence: str = "low"
     revision_suggestions: List[str] = field(default_factory=list)
     supplementary_queries: List[str] = field(default_factory=list)
+    conflict_notes: List[str] = field(default_factory=list)
 
 
 _EXTRACT_CLAIMS_PROMPT = """从以下文本中提取所有事实性声明（factual claims）。
@@ -69,9 +71,13 @@ _VERIFY_CLAIMS_PROMPT = """请验证以下声明是否有证据支撑。
 - 是否有充分证据支撑
 - 置信度 (high/medium/low)
 - 如果不支撑，建议的修订或补充搜索方向
+- 当发现多篇文献对同一问题结论冲突时，必须提取双方关键【实验条件变量】
+  （如采样深度、测序仪器、时间跨度、样本量、地域/人群、统计方法等），
+  并给出深度归因分析（Attribution Analysis），解释潜在差异来源，而不是只指出“有冲突”。
+- 归因分析必须写入 revision_note 或 attribution_analysis 字段；如果存在冲突，请在 conflict_notes 中列出结构化要点。
 
 返回 JSON 数组:
-[{{"claim_index": 0, "confidence": "high|medium|low", "evidence_found": "支撑证据概要", "needs_revision": false, "revision_note": "", "supplementary_query": ""}}]
+[{{"claim_index": 0, "confidence": "high|medium|low", "evidence_found": "支撑证据概要", "needs_revision": false, "revision_note": "", "attribution_analysis": "", "conflict_notes": [], "supplementary_query": ""}}]
 
 只返回 JSON 数组。"""
 
@@ -181,6 +187,29 @@ def verify_claims(
             cv.evidence_found = v.get("evidence_found", "")
             cv.needs_revision = v.get("needs_revision", False)
             cv.revision_note = v.get("revision_note", "")
+            cv.attribution_analysis = (v.get("attribution_analysis", "") or "").strip()
+
+            raw_conflicts = v.get("conflict_notes", [])
+            if isinstance(raw_conflicts, str):
+                raw_conflicts = [raw_conflicts]
+            conflict_items = [
+                str(item).strip()
+                for item in (raw_conflicts or [])
+                if str(item).strip()
+            ]
+            if cv.attribution_analysis and not conflict_items:
+                conflict_items = [cv.attribution_analysis]
+
+            if conflict_items:
+                if cv.attribution_analysis and cv.attribution_analysis not in cv.revision_note:
+                    cv.revision_note = (
+                        f"{cv.revision_note}\nAttribution Analysis: {cv.attribution_analysis}".strip()
+                    )
+                for note in conflict_items:
+                    result.conflict_notes.append(
+                        f"声明「{cv.claim_text[:50]}...」的冲突归因: {note}"
+                    )
+
             sup_query = v.get("supplementary_query", "")
             if sup_query:
                 result.supplementary_queries.append(sup_query)

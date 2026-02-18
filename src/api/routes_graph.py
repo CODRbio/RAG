@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import FileResponse
 
 from config.settings import settings
 from src.log import get_logger
@@ -37,7 +38,7 @@ def _query_chunk_in_collection(collection_name: str, chunk_id: str) -> Optional[
         rows = milvus.query(
             collection_name,
             filter=f'chunk_id == "{escaped_chunk_id}"',
-            output_fields=["chunk_id", "paper_id", "content", "raw_content", "section_path", "page", "content_type", "chunk_type"],
+            output_fields=["chunk_id", "paper_id", "content", "raw_content", "section_path", "page", "content_type", "chunk_type", "bbox"],
             limit=1,
         )
     except Exception as e:
@@ -58,6 +59,7 @@ def _query_chunk_in_collection(collection_name: str, chunk_id: str) -> Optional[
         "page": row.get("page"),
         "content_type": row.get("content_type") or "",
         "chunk_type": row.get("chunk_type") or "",
+        "bbox": row.get("bbox"),
     }
 
 
@@ -113,6 +115,7 @@ def _query_chunk_from_parsed(paper_id: str, chunk_id: str) -> Optional[Dict[str,
                     "page": page,
                     "content_type": c.content_type or "",
                     "chunk_type": ",".join(meta.get("block_types", [])) or "",
+                    "bbox": meta.get("bbox"),
                 }
     except Exception as e:
         logger.warning("query chunk from parsed failed paper=%s chunk=%s err=%s", paper_id, chunk_id, e)
@@ -298,3 +301,16 @@ def graph_chunk_detail(
             return fallback
 
     raise HTTPException(status_code=404, detail=f"chunk '{chunk_id}' 未找到")
+
+
+@router.get("/pdf/{paper_id}")
+def graph_pdf_stream(paper_id: str):
+    """返回原始 PDF 文件流，供前端 PDF 高亮溯源使用。"""
+    pdf_path = settings.path.raw_papers / f"{paper_id}.pdf"
+    if not pdf_path.exists():
+        raise HTTPException(status_code=404, detail=f"PDF '{paper_id}.pdf' 未找到")
+    return FileResponse(
+        path=str(pdf_path),
+        media_type="application/pdf",
+        filename=f"{paper_id}.pdf",
+    )

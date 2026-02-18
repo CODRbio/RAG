@@ -79,6 +79,8 @@ _CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "rag_config.json
 _DEEP_RESEARCH_EXECUTOR = ThreadPoolExecutor(max_workers=2)
 _DEEP_RESEARCH_CANCEL_EVENTS: dict[str, threading.Event] = {}
 _DEEP_RESEARCH_CANCEL_LOCK = threading.Lock()
+_DEEP_RESEARCH_SUSPENDED: dict[str, dict[str, Any]] = {}
+_DEEP_RESEARCH_SUSPENDED_LOCK = threading.Lock()
 
 
 def _dr_register_cancel_event(job_id: str) -> threading.Event:
@@ -108,6 +110,43 @@ def _dr_is_cancel_requested(job_id: str) -> bool:
 def _dr_clear_cancel_event(job_id: str) -> None:
     with _DEEP_RESEARCH_CANCEL_LOCK:
         _DEEP_RESEARCH_CANCEL_EVENTS.pop(job_id, None)
+
+
+def _dr_store_suspended_runtime(job_id: str, runtime: dict[str, Any]) -> None:
+    with _DEEP_RESEARCH_SUSPENDED_LOCK:
+        current = _DEEP_RESEARCH_SUSPENDED.get(job_id) or {}
+        merged = {**current, **runtime}
+        merged.setdefault("resume_inflight", False)
+        _DEEP_RESEARCH_SUSPENDED[job_id] = merged
+
+
+def _dr_get_suspended_runtime(job_id: str) -> dict[str, Any] | None:
+    with _DEEP_RESEARCH_SUSPENDED_LOCK:
+        runtime = _DEEP_RESEARCH_SUSPENDED.get(job_id)
+        return dict(runtime) if runtime else None
+
+
+def _dr_pop_suspended_runtime(job_id: str) -> dict[str, Any] | None:
+    with _DEEP_RESEARCH_SUSPENDED_LOCK:
+        return _DEEP_RESEARCH_SUSPENDED.pop(job_id, None)
+
+
+def _dr_mark_resume_inflight(job_id: str) -> bool:
+    with _DEEP_RESEARCH_SUSPENDED_LOCK:
+        runtime = _DEEP_RESEARCH_SUSPENDED.get(job_id)
+        if not runtime:
+            return False
+        if bool(runtime.get("resume_inflight", False)):
+            return False
+        runtime["resume_inflight"] = True
+        return True
+
+
+def _dr_set_resume_idle(job_id: str) -> None:
+    with _DEEP_RESEARCH_SUSPENDED_LOCK:
+        runtime = _DEEP_RESEARCH_SUSPENDED.get(job_id)
+        if runtime is not None:
+            runtime["resume_inflight"] = False
 
 # ── 智能查询路由：三层判断是否需要 RAG ──
 #
@@ -250,6 +289,8 @@ def _serialize_citation(c: Citation | str) -> dict:
         "doc_id": c.doc_id,
         "url": c.url,
         "doi": c.doi,
+        "bbox": getattr(c, "bbox", None),
+        "page_num": getattr(c, "page_num", None),
     }
 
 
@@ -649,6 +690,8 @@ def _citation_to_chat_citation(c: Citation) -> ChatCitation:
         doc_id=c.doc_id,
         url=c.url,
         doi=c.doi,
+        bbox=getattr(c, "bbox", None),
+        page_num=getattr(c, "page_num", None),
     )
 
 
@@ -1008,7 +1051,10 @@ def _run_deep_research_job_safe(
     optional_user_id: str | None,
 ) -> None:
     """后台执行 Deep Research 并持久化状态。"""
-    from src.collaboration.research.agent import execute_deep_research
+    from src.collaboration.research.agent import (
+        prepare_deep_research_runtime,
+        build_deep_research_result_from_state,
+    )
     from src.collaboration.research.job_store import append_event, update_job, get_pending_review
     import time as _time
 
@@ -1029,7 +1075,7 @@ def _run_deep_research_job_safe(
         update_job(job_id, status="running", message="Deep Research 任务已启动")
         append_event(job_id, "start", {"job_id": job_id, "topic": body.topic, "session_id": session_id})
 
-        result = execute_deep_research(
+        runtime = prepare_deep_research_runtime(
             topic=body.topic.strip(),
             llm_client=client,
             confirmed_outline=body.confirmed_outline,
@@ -1055,51 +1101,51 @@ def _run_deep_research_job_safe(
             job_id=job_id,
             depth=body.depth or "comprehensive",
         )
+        compiled = runtime["compiled"]
+        config = runtime["config"]
+        initial_state = runtime["initial_state"]
+        compiled.invoke(initial_state, config=config)
+        state_snapshot = compiled.get_state(config)
+        if getattr(state_snapshot, "next", ()):
+            _dr_store_suspended_runtime(
+                job_id,
+                {
+                    "compiled": compiled,
+                    "config": config,
+                    "session_id": session_id,
+                    "body": body,
+                    "started_at_perf": t0,
+                    "outline": runtime.get("outline") or [],
+                    "topic": runtime.get("topic") or body.topic.strip(),
+                },
+            )
+            update_job(
+                job_id,
+                status="waiting_review",
+                session_id=session_id,
+                current_stage="review_gate",
+                message="等待人工审核",
+            )
+            append_event(
+                job_id,
+                "waiting_review",
+                {
+                    "job_id": job_id,
+                    "session_id": session_id,
+                    "next": list(getattr(state_snapshot, "next", ()) or ()),
+                },
+            )
+            return
 
-        response_text = result.get("markdown", "")
-        citations = result.get("citations") or []
-        dashboard_data = result.get("dashboard") or {}
-        canvas_id = result.get("canvas_id", "") or ""
-        total_time_ms = float(result.get("total_time_ms", 0.0))
-
-        if canvas_id:
-            store.update_session_meta(session_id, {"canvas_id": canvas_id})
-            try:
-                from src.collaboration.canvas.canvas_manager import update_canvas
-                # Ensure Canvas panel enters Refine stage after final synthesize.
-                update_canvas(canvas_id, stage="refine")
-            except Exception:
-                logger.debug("Failed to update canvas stage to refine", exc_info=True)
-        store.update_session_stage(session_id, "refine")
-        memory = load_session_memory(session_id)
-        if memory:
-            memory.add_turn("user", f"[Deep Research Confirmed] {body.topic}")
-            memory.add_turn("assistant", response_text, citations=[_serialize_citation(c) for c in citations])
-
-        update_job(
-            job_id,
-            status="done",
-            session_id=session_id,
-            canvas_id=canvas_id,
-            current_stage="refine",
-            message="Deep Research 完成",
-            result_markdown=response_text,
-            result_citations=json.dumps([_serialize_citation(c) for c in citations], ensure_ascii=False, default=str),
-            result_dashboard=json.dumps(dashboard_data, ensure_ascii=False, default=str),
-            total_time_ms=total_time_ms,
-            finished_at=_time.time(),
+        final_state = getattr(state_snapshot, "values", {}) or {}
+        result = build_deep_research_result_from_state(
+            final_state,
+            topic=str(runtime.get("topic") or body.topic.strip()),
+            elapsed_ms=(_time.perf_counter() - t0) * 1000,
+            fallback_outline=runtime.get("outline") or [],
         )
-        append_event(
-            job_id,
-            "done",
-            {
-                "session_id": session_id,
-                "canvas_id": canvas_id,
-                "total_time_ms": total_time_ms,
-                "citations": [_serialize_citation(c) for c in citations],
-                "dashboard": dashboard_data,
-            },
-        )
+        _complete_deep_research_job(job_id=job_id, session_id=session_id, topic=body.topic, result=result)
+        _dr_pop_suspended_runtime(job_id)
     except Exception as e:
         cancelled = _dr_is_cancel_requested(job_id) or "cancelled" in str(e).lower() or "canceled" in str(e).lower()
         status = "cancelled" if cancelled else "error"
@@ -1113,7 +1159,132 @@ def _run_deep_research_job_safe(
             total_time_ms=(_time.perf_counter() - t0) * 1000,
         )
         append_event(job_id, status, {"message": msg, "error": "" if cancelled else str(e)})
+        _dr_pop_suspended_runtime(job_id)
     finally:
+        _dr_clear_cancel_event(job_id)
+
+
+def _complete_deep_research_job(*, job_id: str, session_id: str, topic: str, result: Dict[str, Any]) -> None:
+    from src.collaboration.research.job_store import append_event, update_job
+    import time as _time
+
+    store = get_session_store()
+    response_text = result.get("markdown", "")
+    citations = result.get("citations") or []
+    dashboard_data = result.get("dashboard") or {}
+    canvas_id = result.get("canvas_id", "") or ""
+    total_time_ms = float(result.get("total_time_ms", 0.0))
+
+    if canvas_id:
+        store.update_session_meta(session_id, {"canvas_id": canvas_id})
+        try:
+            from src.collaboration.canvas.canvas_manager import update_canvas
+            update_canvas(canvas_id, stage="refine")
+        except Exception:
+            _chat_logger.debug("Failed to update canvas stage to refine", exc_info=True)
+    store.update_session_stage(session_id, "refine")
+    memory = load_session_memory(session_id)
+    if memory:
+        memory.add_turn("user", f"[Deep Research Confirmed] {topic}")
+        memory.add_turn("assistant", response_text, citations=[_serialize_citation(c) for c in citations])
+
+    update_job(
+        job_id,
+        status="done",
+        session_id=session_id,
+        canvas_id=canvas_id,
+        current_stage="refine",
+        message="Deep Research 完成",
+        result_markdown=response_text,
+        result_citations=json.dumps([_serialize_citation(c) for c in citations], ensure_ascii=False, default=str),
+        result_dashboard=json.dumps(dashboard_data, ensure_ascii=False, default=str),
+        total_time_ms=total_time_ms,
+        finished_at=_time.time(),
+    )
+    append_event(
+        job_id,
+        "done",
+        {
+            "session_id": session_id,
+            "canvas_id": canvas_id,
+            "total_time_ms": total_time_ms,
+            "citations": [_serialize_citation(c) for c in citations],
+            "dashboard": dashboard_data,
+        },
+    )
+
+
+def _resume_suspended_job(job_id: str) -> None:
+    from langgraph.types import Command
+    from src.collaboration.research.agent import build_deep_research_result_from_state
+    from src.collaboration.research.job_store import append_event, get_job, update_job
+    import time as _time
+
+    runtime = _dr_get_suspended_runtime(job_id)
+    if not runtime:
+        return
+
+    compiled = runtime.get("compiled")
+    config = runtime.get("config")
+    if compiled is None or not isinstance(config, dict):
+        _dr_pop_suspended_runtime(job_id)
+        update_job(job_id, status="error", message="任务恢复失败：缺少挂起上下文")
+        return
+
+    job = get_job(job_id) or {}
+    topic = str(job.get("topic") or runtime.get("topic") or "")
+    session_id = str(runtime.get("session_id") or job.get("session_id") or "")
+    started_at_perf = float(runtime.get("started_at_perf") or _time.perf_counter())
+
+    try:
+        update_job(job_id, status="running", message="收到审核输入，恢复执行")
+        append_event(job_id, "resume_start", {"job_id": job_id})
+        compiled.invoke(Command(resume=True), config=config)
+        state_snapshot = compiled.get_state(config)
+        if getattr(state_snapshot, "next", ()):
+            update_job(
+                job_id,
+                status="waiting_review",
+                session_id=session_id,
+                current_stage="review_gate",
+                message="等待人工审核",
+            )
+            append_event(
+                job_id,
+                "waiting_review",
+                {
+                    "job_id": job_id,
+                    "session_id": session_id,
+                    "next": list(getattr(state_snapshot, "next", ()) or ()),
+                },
+            )
+            return
+
+        final_state = getattr(state_snapshot, "values", {}) or {}
+        result = build_deep_research_result_from_state(
+            final_state,
+            topic=topic or "",
+            elapsed_ms=(_time.perf_counter() - started_at_perf) * 1000,
+            fallback_outline=runtime.get("outline") or [],
+        )
+        _complete_deep_research_job(job_id=job_id, session_id=session_id, topic=topic or "", result=result)
+        _dr_pop_suspended_runtime(job_id)
+    except Exception as e:
+        cancelled = _dr_is_cancel_requested(job_id) or "cancelled" in str(e).lower() or "canceled" in str(e).lower()
+        status = "cancelled" if cancelled else "error"
+        msg = "任务已取消" if cancelled else f"任务恢复失败: {e}"
+        update_job(
+            job_id,
+            status=status,
+            message=msg,
+            error_message="" if cancelled else str(e),
+            finished_at=_time.time(),
+            total_time_ms=(_time.perf_counter() - started_at_perf) * 1000,
+        )
+        append_event(job_id, status, {"message": msg, "error": "" if cancelled else str(e)})
+        _dr_pop_suspended_runtime(job_id)
+    finally:
+        _dr_set_resume_idle(job_id)
         _dr_clear_cancel_event(job_id)
 
 
@@ -1202,7 +1373,7 @@ def confirm_deep_research_endpoint(
             from src.collaboration.canvas.canvas_manager import update_canvas
             update_canvas(result.get("canvas_id", ""), stage="refine")
         except Exception:
-            logger.debug("Failed to update canvas stage to refine (stream confirm)", exc_info=True)
+            _chat_logger.debug("Failed to update canvas stage to refine (stream confirm)", exc_info=True)
     store.update_session_stage(session_id, "refine")
     memory = load_session_memory(session_id)
     if memory:
@@ -1316,7 +1487,23 @@ def review_deep_research_section(job_id: str, body: dict) -> dict:
         raise HTTPException(status_code=400, detail="action must be approve|revise")
     result = submit_review(job_id, section_id, action=action, feedback=feedback)
     append_event(job_id, "section_review", {"section_id": section_id, "action": action, "feedback": feedback})
-    return {"ok": True, **result}
+    resume_submitted = False
+    runtime = _dr_get_suspended_runtime(job_id)
+    if runtime:
+        compiled = runtime.get("compiled")
+        config = runtime.get("config")
+        try:
+            state_snapshot = compiled.get_state(config) if compiled is not None and isinstance(config, dict) else None
+        except Exception:
+            state_snapshot = None
+        if state_snapshot is not None and getattr(state_snapshot, "next", ()):
+            if _dr_mark_resume_inflight(job_id):
+                try:
+                    _DEEP_RESEARCH_EXECUTOR.submit(_resume_suspended_job, job_id)
+                    resume_submitted = True
+                except Exception:
+                    _dr_set_resume_idle(job_id)
+    return {"ok": True, "resume_submitted": resume_submitted, **result}
 
 
 @router.get("/deep-research/jobs/{job_id}/reviews")
@@ -1420,6 +1607,8 @@ def get_session(session_id: str) -> SessionInfo:
                 doc_id=c.get("doc_id"),
                 url=c.get("url"),
                 doi=c.get("doi"),
+                bbox=c.get("bbox"),
+                page_num=c.get("page_num"),
             )
             for c in (t.citations or [])
         ]

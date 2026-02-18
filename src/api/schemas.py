@@ -112,6 +112,8 @@ class ChatCitation(BaseModel):
     doc_id: Optional[str] = None
     url: Optional[str] = None
     doi: Optional[str] = None
+    bbox: Optional[List[float]] = Field(None, description="Docling bbox 坐标 [x0,y0,x1,y1]")
+    page_num: Optional[int] = Field(None, description="证据所在页码")
 
 
 class ChatResponse(BaseModel):

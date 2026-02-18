@@ -45,6 +45,8 @@ export interface Source {
   snippet?: string;
   path?: string;
   type?: 'local' | 'web';
+  bbox?: number[];
+  page_num?: number | null;
 }
 
 export interface Message {
@@ -116,6 +118,8 @@ export interface ChatCitation {
   doc_id?: string | null;
   url?: string | null;
   doi?: string | null;
+  bbox?: number[];
+  page_num?: number | null;
 }
 
 export interface ChatResponse {
