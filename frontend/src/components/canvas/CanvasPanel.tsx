@@ -10,7 +10,7 @@ import {
   Telescope,
 } from 'lucide-react';
 import { useCanvasStore, useChatStore, useUIStore, useToastStore } from '../../stores';
-import { createCanvas } from '../../api/canvas';
+import { createCanvas, exportCanvasDocx, getCanvasCitations } from '../../api/canvas';
 import { StageStepper } from './StageStepper';
 import { ExploreStage } from './ExploreStage';
 import { OutlineStage } from './OutlineStage';
@@ -38,24 +38,58 @@ export function CanvasPanel({ onStartResize }: CanvasPanelProps) {
   const addToast = useToastStore((s) => s.addToast);
   const [isCreating, setIsCreating] = useState(false);
 
-  const handleExport = (format: 'md' | 'pdf') => {
-    if (!canvasContent) {
+  const downloadBlob = (blob: Blob, filename: string) => {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const handleExport = async (format: 'md' | 'pdf' | 'docx' | 'ris') => {
+    if (format === 'md') {
+      if (!canvasContent) {
+        addToast(t('canvas.emptyCannotExport'), 'error');
+        return;
+      }
+      const blob = new Blob([canvasContent], { type: 'text/markdown' });
+      downloadBlob(blob, 'research_draft.md');
+      addToast(t('canvas.exportedMd'), 'success');
+      return;
+    }
+
+    if (format === 'pdf') {
+      addToast(t('canvas.pdfInDev'), 'info');
+      return;
+    }
+
+    if (!canvas?.id) {
       addToast(t('canvas.emptyCannotExport'), 'error');
       return;
     }
-    if (format === 'md') {
-      const blob = new Blob([canvasContent], { type: 'text/markdown' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = 'research_draft.md';
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-      addToast(t('canvas.exportedMd'), 'success');
-    } else {
-      addToast(t('canvas.pdfInDev'), 'info');
+
+    try {
+      if (format === 'docx') {
+        const blob = await exportCanvasDocx(canvas.id);
+        downloadBlob(blob, 'research_draft.docx');
+        addToast(t('canvas.exportedDocx'), 'success');
+        return;
+      }
+
+      const ris = await getCanvasCitations(canvas.id, 'ris');
+      if (!ris.content.trim()) {
+        addToast(t('canvas.noCitationsToExport'), 'error');
+        return;
+      }
+      const blob = new Blob([ris.content], { type: 'application/x-research-info-systems' });
+      downloadBlob(blob, 'references.ris');
+      addToast(t('canvas.exportedRis'), 'success');
+    } catch (err) {
+      console.error('[CanvasPanel] Export failed:', err);
+      addToast(t('canvas.exportFailed'), 'error');
     }
   };
 
@@ -147,16 +181,30 @@ export function CanvasPanel({ onStartResize }: CanvasPanelProps) {
         </div>
         <div className="flex items-center gap-1 shrink-0">
           <button
-            onClick={() => handleExport('md')}
+            onClick={() => void handleExport('md')}
             className="p-1.5 hover:bg-slate-800 rounded text-slate-400 hover:text-sky-400 transition-colors"
-            title="Export Markdown"
+            title={t('canvas.exportMd')}
           >
             <FileDown size={14} />
           </button>
           <button
-            onClick={() => handleExport('pdf')}
+            onClick={() => void handleExport('docx')}
             className="p-1.5 hover:bg-slate-800 rounded text-slate-400 hover:text-sky-400 transition-colors"
-            title="Export PDF"
+            title={t('canvas.exportWord')}
+          >
+            <FileType size={14} />
+          </button>
+          <button
+            onClick={() => void handleExport('ris')}
+            className="p-1.5 hover:bg-slate-800 rounded text-slate-400 hover:text-sky-400 transition-colors"
+            title={t('canvas.exportRis')}
+          >
+            <FileDown size={14} />
+          </button>
+          <button
+            onClick={() => void handleExport('pdf')}
+            className="p-1.5 hover:bg-slate-800 rounded text-slate-400 hover:text-sky-400 transition-colors"
+            title={t('canvas.exportPdf')}
           >
             <FileType size={14} />
           </button>

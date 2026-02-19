@@ -56,13 +56,29 @@ export async function exportCanvas(
   return res.data;
 }
 
-export type CitationFormat = 'bibtex' | 'text' | 'both';
+export async function exportCanvasDocx(canvasId: string): Promise<Blob> {
+  const res = await client.post<Blob>(
+    '/export',
+    {
+      canvas_id: canvasId,
+      format: 'docx',
+    },
+    {
+      responseType: 'blob',
+    }
+  );
+  return res.data;
+}
+
+export type CitationFormat = 'bibtex' | 'text' | 'ris' | 'both';
 
 // 根据 format 参数返回不同结构
 export type CitationsResult<T extends CitationFormat> = T extends 'bibtex'
   ? { format: 'bibtex'; content: string }
   : T extends 'text'
     ? { format: 'text'; content: string }
+    : T extends 'ris'
+      ? { format: 'ris'; content: string }
     : { format: 'both'; bibtex: string; reference_list: string; citations: Citation[] };
 
 /**

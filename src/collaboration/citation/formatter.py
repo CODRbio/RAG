@@ -77,6 +77,56 @@ def format_reference_list(
     return "\n\n".join(lines) if lines else ""
 
 
+def _normalize_doi(doi: Optional[str]) -> str:
+    value = (doi or "").strip()
+    if not value:
+        return ""
+    lower = value.lower()
+    if lower.startswith("https://doi.org/"):
+        return value[16:].strip()
+    if lower.startswith("http://doi.org/"):
+        return value[15:].strip()
+    if lower.startswith("doi:"):
+        return value[4:].strip()
+    return value
+
+
+def format_ris(citations: List[Citation]) -> str:
+    """
+    输出 RIS 引文格式。
+
+    字段覆盖：
+    - TY (固定 GEN)
+    - TI
+    - AU (可多行)
+    - PY
+    - DO
+    - UR
+    - ER
+    """
+    records: list[str] = []
+    for c in citations:
+        lines: list[str] = ["TY  - GEN"]
+        title = (c.title or "").strip()
+        if title:
+            lines.append(f"TI  - {title}")
+        for author in (c.authors or []):
+            a = str(author or "").strip()
+            if a:
+                lines.append(f"AU  - {a}")
+        if c.year:
+            lines.append(f"PY  - {c.year}")
+        doi = _normalize_doi(c.doi)
+        if doi:
+            lines.append(f"DO  - {doi}")
+        url = (c.url or "").strip()
+        if url:
+            lines.append(f"UR  - {url}")
+        lines.append("ER  -")
+        records.append("\n".join(lines))
+    return "\n\n".join(records) + ("\n" if records else "")
+
+
 def format_inline_citation(cite_key: str, style: Literal["bracket", "parenthetical"] = "bracket") -> str:
     """
     格式化行内引用标记。

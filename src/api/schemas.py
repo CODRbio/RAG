@@ -252,7 +252,7 @@ class CanvasAIEditResponse(BaseModel):
 class ExportRequest(BaseModel):
     session_id: Optional[str] = Field(None, description="会话 ID")
     canvas_id: Optional[str] = Field(None, description="画布 ID")
-    format: str = Field("markdown", description="导出格式: markdown")
+    format: str = Field("markdown", description="导出格式: markdown | docx")
     cite_key_format: Optional[str] = Field(
         None,
         description="引用键格式: numeric | hash | author_date（默认从配置读取）"

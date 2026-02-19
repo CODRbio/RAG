@@ -46,7 +46,7 @@ from src.collaboration.canvas.canvas_manager import (
     upsert_outline,
 )
 from src.collaboration.canvas.models import DraftBlock, OutlineSection
-from src.collaboration.citation.formatter import format_bibtex, format_reference_list
+from src.collaboration.citation.formatter import format_bibtex, format_reference_list, format_ris
 from src.collaboration.memory.session_memory import get_session_store
 
 router = APIRouter(prefix="/canvas", tags=["canvas"])
@@ -465,7 +465,7 @@ def canvas_delete_citation(canvas_id: str, cite_key: str) -> dict:
 @router.get("/{canvas_id}/citations")
 def canvas_citations(
     canvas_id: str,
-    format: str = Query("both", description="bibtex | text | both"),
+    format: str = Query("both", description="bibtex | text | ris | both"),
 ) -> dict:
     c = get_canvas(canvas_id)
     if c is None:
@@ -475,6 +475,8 @@ def canvas_citations(
         return {"format": "bibtex", "content": format_bibtex(citations)}
     if format == "text":
         return {"format": "text", "content": format_reference_list(citations)}
+    if format == "ris":
+        return {"format": "ris", "content": format_ris(citations)}
     return {
         "format": "both",
         "bibtex": format_bibtex(citations),

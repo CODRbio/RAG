@@ -201,6 +201,8 @@
   "canvas": {
     "researchCanvas": "Research Canvas",
     "exportMd": "Export Markdown",
+    "exportWord": "导出 Word",
+    "exportRis": "导出 RIS",
     "exportPdf": "Export PDF",
     "emptyTitle": "研究画布",
     "emptyDesc": "在这里规划研究、整理文献、撰写综述。\nChat 中的发现会自动积累到画布中。",
@@ -210,6 +212,10 @@
     "createFailed": "创建画布失败",
     "emptyCannotExport": "画布为空，无法导出",
     "exportedMd": "文档已导出为 Markdown",
+    "exportedDocx": "文档已导出为 Word",
+    "exportedRis": "引文已导出为 RIS",
+    "noCitationsToExport": "当前没有可导出的引文",
+    "exportFailed": "导出失败，请重试",
     "pdfInDev": "PDF 导出功能开发中"
   },
   "settings": {

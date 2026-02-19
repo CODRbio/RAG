@@ -201,6 +201,8 @@
   "canvas": {
     "researchCanvas": "Research Canvas",
     "exportMd": "Export Markdown",
+    "exportWord": "Export Word",
+    "exportRis": "Export RIS",
     "exportPdf": "Export PDF",
     "emptyTitle": "Research Canvas",
     "emptyDesc": "Plan research, organize literature, and write reviews here.\nFindings from Chat will automatically accumulate in the canvas.",
@@ -210,6 +212,10 @@
     "createFailed": "Failed to create canvas",
     "emptyCannotExport": "Canvas is empty, cannot export",
     "exportedMd": "Document exported as Markdown",
+    "exportedDocx": "Document exported as Word",
+    "exportedRis": "Citations exported as RIS",
+    "noCitationsToExport": "No citations available to export",
+    "exportFailed": "Export failed, please retry",
     "pdfInDev": "PDF export in development"
   },
   "settings": {
