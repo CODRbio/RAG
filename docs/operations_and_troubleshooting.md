@@ -4,6 +4,8 @@
 
 发布与迁移全流程请参考：`release_migration_ubuntu.md`。
 
+更新时间：2026-02-19
+
 ## 一、启动与运行
 
 ### 本地全栈
@@ -95,30 +97,36 @@ sudo journalctl -u deepsea-rag-api -f
 sudo journalctl -u deepsea-rag-frontend -f
 ```
 
-补充说明：
-
-- 如果 `conda` 在 systemd 环境不可见，设置 `Environment=CONDA_EXE=/your/path/to/conda`（例如 `/opt/anaconda3/bin/conda`）。
-- 这种写法适合把 Node/npm 放在 conda 环境里管理，迁移时无需写死 `/usr/bin/npm` 或固定 node 路径。
+> 如果 `conda` 在 systemd 环境不可见，设置 `CONDA_EXE` 为实际路径（如 `/opt/anaconda3/bin/conda`）。
 
 ## 二、运行时检查
 
-- `GET /health`：服务可用性
-- `GET /health/detailed`：组件状态（检索、LLM、图谱等）
-- `GET /metrics`：Prometheus 指标
-- `GET /storage/stats`：存储情况
+### 基础健康
 
-### Deep Research 任务检查（新增）
+| 端点 | 说明 |
+|---|---|
+| `GET /health` | 服务可用性 |
+| `GET /health/detailed` | 组件状态（检索/LLM/图谱等） |
+| `GET /metrics` | Prometheus 指标 |
+| `GET /storage/stats` | 存储情况 |
 
-- `GET /deep-research/jobs/{job_id}`：当前状态（`pending/running/cancelling/done/error/cancelled`）
-- `GET /deep-research/jobs/{job_id}/events?after_id=...`：增量事件流（推荐排障主入口）
-- `GET /deep-research/jobs/{job_id}/reviews`：章节审核状态
-- `GET /deep-research/jobs/{job_id}/gap-supplements`：缺口补充是否被采纳（`pending/consumed`）
+### Deep Research 任务检查
 
-### Resume Queue 运维检查（新增）
+| 端点 | 说明 |
+|---|---|
+| `GET /deep-research/jobs/{job_id}` | 任务状态（pending/running/cancelling/done/error/cancelled） |
+| `GET /deep-research/jobs/{job_id}/events?after_id=...` | 增量事件流（排障主入口） |
+| `GET /deep-research/jobs/{job_id}/reviews` | 章节审核状态 |
+| `GET /deep-research/jobs/{job_id}/gap-supplements` | 缺口补充状态（pending/consumed） |
+| `GET /deep-research/jobs/{job_id}/insights` | 研究洞察 |
 
-- `GET /deep-research/resume-queue`：查看 resume 队列
-- `POST /deep-research/resume-queue/cleanup`：清理历史终态记录
-- `POST /deep-research/resume-queue/{resume_id}/retry`：重试指定 resume 请求
+### Resume Queue 运维检查
+
+| 端点 | 说明 |
+|---|---|
+| `GET /deep-research/resume-queue` | 查看 resume 队列 |
+| `POST /deep-research/resume-queue/cleanup` | 清理历史终态记录 |
+| `POST /deep-research/resume-queue/{resume_id}/retry` | 重试指定请求 |
 
 建议先看：
 
@@ -126,11 +134,17 @@ sudo journalctl -u deepsea-rag-frontend -f
 - `status=error`：是否出现异常积压
 - `owner_instance`：请求是否绑定到预期实例
 
-## 三、Deep Research Resume Queue SOP（值班可执行）
+### Ingest 任务检查
+
+| 端点 | 说明 |
+|---|---|
+| `GET /ingest/jobs/{job_id}` | 入库任务状态 |
+| `GET /ingest/jobs/{job_id}/events` | 入库事件流 |
+| `POST /ingest/jobs/{job_id}/cancel` | 取消入库 |
+
+## 三、Deep Research Resume Queue SOP
 
 ### 场景 A：审核通过后任务未继续执行
-
-目标：确认是否“恢复请求未入队 / 未消费 / 消费失败”。
 
 1. 查看任务状态与事件：
    - `GET /deep-research/jobs/{job_id}`
@@ -138,95 +152,63 @@ sudo journalctl -u deepsea-rag-frontend -f
 2. 查看 resume 队列（按 job）：
    - `GET /deep-research/resume-queue?job_id={job_id}&limit=20`
 3. 按结果处理：
-   - 无队列项：前端/调用方重新提交 review（会重新 enqueue）。
-   - `pending` 长时间不变：检查 worker 是否存活、`owner_instance` 是否正确。
-   - `running` 长时间不变：优先重启服务（会触发 stale 清理），再判断是否需 retry。
-   - `error/cancelled`：走“场景 C 手动重试”。
+   - 无队列项：前端重新提交 review
+   - `pending` 长时间不变：检查 worker 是否存活
+   - `running` 长时间不变：重启服务（会触发 stale 清理），再判断是否 retry
+   - `error/cancelled`：走"场景 C 手动重试"
 
-### 场景 B：批量清理历史垃圾记录
-
-目标：删除旧终态，保留活跃任务。
-
-推荐策略：
-
-- 默认只删终态：`done/error/cancelled`
-- 保留最近 48~72 小时
-
-示例请求：
+### 场景 B：批量清理历史记录
 
 ```bash
 curl -X POST "http://127.0.0.1:9999/deep-research/resume-queue/cleanup" \
   -H "Content-Type: application/json" \
-  -d '{
-    "statuses": ["done", "error", "cancelled"],
-    "before_hours": 72
-  }'
+  -d '{"statuses": ["done", "error", "cancelled"], "before_hours": 72}'
 ```
 
-注意：
+> 不建议清理 `pending/running`，除非确认是僵尸数据。
 
-- 不建议清理 `pending/running`，除非确认是僵尸数据并已完成人工评估。
+### 场景 C：手动重试
 
-### 场景 C：手动重试某条 resume 请求
-
-适用前提：
-
-- 队列项当前为终态（`done/error/cancelled`）
-- 同一 `job_id` 没有活跃项（`pending/running`）
-
-操作步骤：
-
-1. 查询候选项：
-   - `GET /deep-research/resume-queue?job_id={job_id}&status=error`
-2. 对目标 `resume_id` 重试：
+前提：队列项当前为终态，同一 `job_id` 没有活跃项。
 
 ```bash
 curl -X POST "http://127.0.0.1:9999/deep-research/resume-queue/{resume_id}/retry" \
   -H "Content-Type: application/json" \
-  -d '{
-    "message": "manual retry by oncall"
-  }'
+  -d '{"message": "manual retry by oncall"}'
 ```
 
-3. 观察结果：
-   - 队列项应变为 `pending`
-   - 随后 worker 领取后变 `running -> done/error`
-   - 同步关注：`GET /deep-research/jobs/{job_id}/events`
+### 场景 D：实例重启后恢复
 
-常见返回码：
+当前策略：
 
-- `404`：`resume_id` 不存在
-- `409`：请求已活跃，或同 job 已有活跃恢复请求（需先排空冲突）
-
-### 场景 D：实例切换 / 重启后的恢复策略
-
-当前策略（已实现）：
-
-- 服务启动会将中断态任务重置为 `error`（含 `waiting_review`）
+- 服务启动会将中断态任务重置为 `error`
 - resume_queue 中 `running` 请求会重置为 `error`
 
 值班建议：
 
-1. 重启后先执行一次队列巡检：
-   - `GET /deep-research/resume-queue?status=error&limit=100`
-2. 对确需继续的任务，按“场景 C”逐条 retry。
-3. 对无需继续的历史项，按“场景 B”批量清理。
+1. 重启后巡检：`GET /deep-research/resume-queue?status=error&limit=100`
+2. 需要继续的任务：按"场景 C"逐条 retry
+3. 无需继续的：按"场景 B"批量清理
 
-### 快速排障决策树（简版）
+### 快速排障决策树
 
-- 任务没继续：
-  - 先看 job events 有无 `section_review` / `resume_start`
-  - 再看 resume_queue：
-    - 没记录 -> 重新提交 review
-    - pending -> 看 worker/实例绑定
-    - running 卡住 -> 重启并重试
-    - error -> 直接 retry
+```text
+任务没继续？
+├── 看 job events 有无 section_review / resume_start
+└── 看 resume_queue：
+    ├── 没记录 → 重新提交 review
+    ├── pending → 看 worker/实例绑定
+    ├── running 卡住 → 重启并重试
+    └── error → 直接 retry
+```
 
 ## 四、日志与产物
 
-- 运行日志：`logs/`（按模块拆分）
-- LLM 原始响应：`logs/llm_raw/`
-- 评测/任务产物：`artifacts/`
+| 路径 | 内容 |
+|---|---|
+| `logs/` | 运行日志（按模块拆分） |
+| `logs/llm_raw/` | LLM 原始响应（JSONL，含请求/响应/耗时/token） |
+| `artifacts/` | 评测/任务产物 |
 
 ## 五、常见问题与处理
 
@@ -246,7 +228,7 @@ curl -X POST "http://127.0.0.1:9999/deep-research/resume-queue/{resume_id}/retry
 2. 检查目标 collection 是否存在（`GET /ingest/collections`）
 3. 用 `scripts/04_test_search.py` 单独验证检索链路
 
-### 3) LLM 调用失败/401
+### 3) LLM 调用失败 / 401
 
 排查：
 
@@ -254,7 +236,7 @@ curl -X POST "http://127.0.0.1:9999/deep-research/resume-queue/{resume_id}/retry
 - 检查 `GET /llm/providers` 返回
 - 确认 `rag_config.local.json` 是否覆盖了错误值
 
-### 4) Google/Scholar 不稳定
+### 4) Google / Scholar 不稳定
 
 建议：
 
@@ -262,7 +244,7 @@ curl -X POST "http://127.0.0.1:9999/deep-research/resume-queue/{resume_id}/retry
 - 安装并检查 Playwright：`playwright install chromium`
 - 必要时切换 headless 策略或代理
 
-### 5) ingest 任务卡住
+### 5) Ingest 任务卡住
 
 排查：
 
@@ -274,28 +256,34 @@ curl -X POST "http://127.0.0.1:9999/deep-research/resume-queue/{resume_id}/retry
 
 排查顺序：
 
-1. 检查审核记录是否覆盖全部章节：
-   - `GET /deep-research/jobs/{job_id}/reviews`
-2. 检查事件是否出现：
-   - `progress(type=all_reviews_approved)`
+1. 检查审核记录是否覆盖全部章节：`GET /deep-research/jobs/{job_id}/reviews`
+2. 检查事件是否出现 `progress(type=all_reviews_approved)`
    - 若没有，通常是章节名不一致或仍有 `pending_sections`
-3. 检查是否出现：
-   - `progress(type=review_gate_timeout)` / `progress(type=review_gate_early_stop)`
-   - 表示审核门超时/早停自动放行
-4. 任务结束后确认 `job.status=done` 且 Canvas stage 已切换 `refine`
+3. 检查是否出现 `review_gate_timeout` / `review_gate_early_stop`
+4. 确认 `job.status=done` 且 Canvas stage 已切换 `refine`
 
 ### 7) 最终整合后引用异常
 
 系统已内置 citation guard：
 
 - 正常：`progress(type=global_refine_done)`
-- 保护回退：`progress(type=citation_guard_fallback)`（自动回退到安全版本）
+- 保护回退：`progress(type=citation_guard_fallback)`
 
 若频繁触发 `citation_guard_fallback`：
 
 - 降低 `synthesize` 步骤模型温度/改用更稳模型
-- 缩短单次整合输入规模（减少超长上下文）
-- 检查原始草稿中的引用 key 规范性（避免非常规格式）
+- 缩短单次整合输入规模
+- 检查原始草稿中的引用 key 规范性
+
+### 8) 成本预警
+
+系统内置成本监控机制：
+
+- `cost_monitor_tick`：每 N 步上报
+- `cost_monitor_warn`：达到预警阈值
+- `cost_monitor_force_summary`：强制进入摘要模式
+
+处理建议：降低 `depth` 或缩小研究范围。
 
 ## 六、存储维护
 
@@ -313,9 +301,11 @@ python scripts/19_cleanup_storage.py --vacuum
 
 ## 七、数据安全建议
 
-- 生产环境关闭默认管理员密码
+- 生产环境关闭默认管理员密码（`auth.secret_key` 必须替换）
 - 定期备份：
   - `data/parsed/`
   - `src/data/sessions.db`
+  - `src/data/deep_research_jobs.db`
   - 关键配置文件（脱敏后）
 - 变更前先导出核心画布内容（`POST /export`）
+- 敏感配置不要提交到 Git（已在 `.gitignore` 中配置）

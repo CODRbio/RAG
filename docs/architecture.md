@@ -5,40 +5,153 @@
 ## 一、总体分层
 
 ```text
-Frontend (React + Zustand)
-  -> API Layer (FastAPI routes_*.py)
-     -> Collaboration Layer (workflow/canvas/memory/research)
-     -> Agent Layer (llm_manager + tools + react_loop)
-     -> Retrieval Layer (hybrid + web + graph + rerank)
-     -> Persistence/Infra (Milvus + SQLite + files + observability)
+Frontend (React + Zustand + i18n)
+  → API Layer (FastAPI routes_*.py)
+    → Collaboration Layer (workflow / canvas / memory / research / intent / citation / export)
+    → Agent Layer (llm_manager + tools + react_loop)
+    → Retrieval Layer (hybrid + web + graph + rerank)
+    → Persistence / Infra (Milvus + SQLite + files + observability)
 ```
 
 ## 二、后端模块映射（`src/`）
 
-- `api/`：HTTP 接口层，统一在 `server.py` 注册路由
-- `auth/`：token 鉴权与密码处理
-- `collaboration/`：多轮协作核心（canvas、memory、intent、workflow、research）
-- `llm/`：统一 LLM 与 tool-calling 适配
-- `retrieval/`：本地检索、网络检索、融合与去重
-- `indexing/`：向量化与 Milvus 读写
-- `parser/`：PDF 解析、声明提取
-- `graph/`：HippoRAG 图检索
-- `mcp/`：MCP Server，对外暴露工具/资源
-- `observability/`：metrics、tracing、中间件
-- `evaluation/`：评测执行与指标计算
+### 接口层
+
+| 模块 | 职责 |
+|---|---|
+| `api/server.py` | FastAPI 应用入口，路由注册，生命周期管理 |
+| `api/routes_chat.py` | 聊天、意图检测、Deep Research 全部接口 |
+| `api/routes_canvas.py` | 画布 CRUD、大纲、草稿、快照、AI 编辑、引用管理 |
+| `api/routes_ingest.py` | 在线入库（上传/Collections/任务管理） |
+| `api/routes_compare.py` | 多文档对比 |
+| `api/routes_graph.py` | 图谱统计、实体、邻居、chunk 详情 |
+| `api/routes_export.py` | 导出（Markdown） |
+| `api/routes_auto.py` | 自动补全（一键综述） |
+| `api/routes_auth.py` | 认证与用户管理 |
+| `api/routes_project.py` | 项目管理（存档/删除） |
+| `api/routes_models.py` | 模型状态与同步 |
+| `api/schemas.py` | Pydantic 请求/响应模型 |
+
+### LLM / Agent 层
+
+| 模块 | 职责 |
+|---|---|
+| `llm/llm_manager.py` | 统一 LLM 客户端管理（多 provider、日志、指标、结构化输出、tool-calling） |
+| `llm/tools.py` | 工具定义与路由 |
+| `llm/react_loop.py` | ReAct Agent 循环 |
+| `generation/llm_client.py` | 兼容层（旧 `call_llm()` 接口） |
+| `generation/evidence_synthesizer.py` | 证据综合（时间线排序、来源分组、强度分级、交叉验证） |
+| `generation/context_packer.py` | 上下文打包 |
+
+### 协作层
+
+| 模块 | 职责 |
+|---|---|
+| `collaboration/canvas/` | 画布管理（canvas_manager + canvas_store + models） |
+| `collaboration/memory/session_memory.py` | 会话级记忆（历史、引用、滚动摘要） |
+| `collaboration/memory/working_memory.py` | 画布级工作记忆 |
+| `collaboration/memory/persistent_store.py` | 持久用户偏好 |
+| `collaboration/intent/parser.py` | 意图解析（Chat vs Deep Research） |
+| `collaboration/intent/commands.py` | 命令处理 |
+| `collaboration/research/agent.py` | Deep Research LangGraph Agent（核心） |
+| `collaboration/research/verifier.py` | 声明验证 |
+| `collaboration/research/job_store.py` | 后台任务与事件存储 |
+| `collaboration/research/dashboard.py` | 研究进度仪表盘 |
+| `collaboration/research/trajectory.py` | 研究轨迹追踪 |
+| `collaboration/workflow/` | 状态机（states + transitions + graph） |
+| `collaboration/citation/manager.py` | 引用解析（ref_hash → cite_key） |
+| `collaboration/citation/formatter.py` | 引用格式化 |
+| `collaboration/export/formatter.py` | 导出格式化 |
+| `collaboration/auto_complete.py` | 一键综述服务 |
+
+### 检索层
+
+| 模块 | 职责 |
+|---|---|
+| `retrieval/hybrid_retriever.py` | 混合检索（dense + sparse + graph + RRF 融合） |
+| `retrieval/service.py` | 检索服务编排 |
+| `retrieval/unified_web_search.py` | 统一网络检索聚合器 |
+| `retrieval/web_search.py` | Tavily 搜索 |
+| `retrieval/web_content_fetcher.py` | 网页内容提取 |
+| `retrieval/google_search.py` | Google / Scholar 搜索 |
+| `retrieval/ncbi_search.py` | NCBI 文献搜索 |
+| `retrieval/semantic_scholar.py` | Semantic Scholar API |
+| `retrieval/colbert_reranker.py` | ColBERT 重排 |
+| `retrieval/query_optimizer.py` | 规则查询优化 |
+| `retrieval/smart_query_optimizer.py` | LLM 查询优化 |
+| `retrieval/evidence.py` | 证据数据结构（EvidenceChunk / EvidencePack） |
+| `retrieval/dedup.py` | 去重与多样化 |
+
+### 数据处理层
+
+| 模块 | 职责 |
+|---|---|
+| `parser/pdf_parser.py` | PDF 解析（Docling，含表格/图片/公式提取与 LLM 增强） |
+| `parser/claim_extractor.py` | 声明提取 |
+| `chunking/chunker.py` | 结构化切块（section-aware，表格行切块，句级 overlap） |
+| `indexing/embedder.py` | 文本向量化（BGE-M3 dense + sparse，BGE-Reranker） |
+| `indexing/milvus_ops.py` | Milvus 向量数据库操作（schema v1/v2，hybrid search） |
+| `indexing/paper_store.py` | 论文元数据持久化（SQLite） |
+| `indexing/paper_metadata_store.py` | 扩展元数据存储 |
+| `indexing/ingest_job_store.py` | 入库任务追踪 |
+| `graph/hippo_rag.py` | HippoRAG 知识图谱（实体/关系提取 + PPR 检索） |
+| `graphs/ingestion_graph.py` | LangGraph 入库流水线 |
+
+### 基础设施层
+
+| 模块 | 职责 |
+|---|---|
+| `auth/session.py` | 会话管理 |
+| `auth/password.py` | 密码哈希（bcrypt） |
+| `observability/metrics.py` | Prometheus 指标（LLM 调用计数/延迟/token 用量） |
+| `observability/tracing.py` | OpenTelemetry 分布式追踪 |
+| `observability/middleware.py` | FastAPI 可观测中间件 |
+| `observability/setup.py` | 可观测性初始化 |
+| `mcp/server.py` | MCP Server（对外暴露工具与资源） |
+| `evaluation/runner.py` | 评测执行器 |
+| `evaluation/metrics.py` | 评测指标 |
+| `evaluation/dataset.py` | 评测数据集 |
+| `utils/cache.py` | TTL 缓存 |
+| `utils/limiter.py` | 并发限流 |
+| `utils/storage_cleaner.py` | 存储清理 |
+| `utils/prompt_manager.py` | 提示词模板管理 |
+| `utils/task_runner.py` | 后台任务运行器 |
+| `utils/model_sync.py` | 模型同步 |
+| `log/log_manager.py` | 统一日志管理 |
+| `prompts/` | LLM 提示词模板文件（研究/写作/验证/翻译等） |
 
 ## 三、前端结构（`frontend/src/`）
 
-- `pages/`：`ChatPage`、`IngestPage`、`LoginPage`、`AdminPage`
-- `components/`：
-  - `chat/`（聊天窗口、输入、工具轨迹）
-  - `canvas/`（画布）
-  - `compare/`（多文档对比）
-  - `graph/`（图谱可视化）
-  - `workflow/`（研究流程相关交互）
-  - `layout/`（头部、侧栏）
-- `stores/`：Zustand 状态管理（chat/config/canvas/auth/projects/compare 等）
-- `api/`：前端请求封装（按后端路由分模块）
+### 页面层
+
+- `pages/ChatPage.tsx`：主聊天界面
+- `pages/IngestPage.tsx`：文档入库
+- `pages/LoginPage.tsx`：登录认证
+- `pages/AdminPage.tsx`：管理后台
+
+### 组件层
+
+| 目录 | 内容 |
+|---|---|
+| `components/chat/` | ChatWindow、ChatInput、ToolTracePanel、RetrievalDebugPanel |
+| `components/canvas/` | CanvasPanel、ExploreStage、OutlineStage、DraftingStage、RefineStage、StageStepper、FloatingToolbar |
+| `components/compare/` | CompareView |
+| `components/graph/` | GraphExplorer |
+| `components/workflow/` | DeepResearchDialog、DeepResearchSettingsPopover、WorkflowStepper、CommandPalette、IntentModeSelector、IntentConfirmPopover |
+| `components/research/` | ResearchProgressPanel |
+| `components/settings/` | SettingsModal |
+| `components/layout/` | Header、Sidebar |
+| `components/ui/` | Modal、Toast、PdfViewerModal |
+
+### 状态管理
+
+`stores/`：Zustand 状态管理（useChatStore、useCanvasStore、useConfigStore、useAuthStore、useProjectsStore、useCompareStore、useUIStore、useToastStore）
+
+### 其他
+
+- `api/`：后端接口封装（chat、canvas、compare、graph、ingest、models、auth、projects、auto、health）
+- `types/`：TypeScript 类型定义
+- `i18n/`：国际化（en.json、zh.json）
 
 ## 四、核心数据流
 
@@ -46,97 +159,101 @@ Frontend (React + Zustand)
 
 ```text
 raw PDF
- -> scripts/02_parse_papers.py
- -> src/parser/pdf_parser.py
- -> scripts/03_index_papers.py
- -> src/chunking/chunker.py + src/indexing/embedder.py
- -> src/indexing/milvus_ops.py
- -> (optional) scripts/03b_build_graph.py
+ → scripts/02_parse_papers.py
+ → src/parser/pdf_parser.py（Docling + LLM 增强）
+ → scripts/03_index_papers.py
+ → src/chunking/chunker.py（section-aware 切块）
+ → src/indexing/embedder.py（BGE-M3 dense + sparse）
+ → src/indexing/milvus_ops.py（写入 Milvus）
+ → (optional) scripts/03b_build_graph.py
+ → src/graph/hippo_rag.py（构建知识图谱）
 ```
 
-### 2) 在线聊天检索流
+### 2) 在线入库流
+
+```text
+POST /ingest/upload
+ → routes_ingest.py
+ → PDF 解析 + 切块 + 向量化 + 写入 Milvus
+ → 任务状态追踪（job_store）
+ → SSE 事件流上报进度
+```
+
+### 3) 在线聊天检索流
 
 ```text
 POST /chat or /chat/stream
- -> routes_chat.py
- -> (route decision: chat/rag)
- -> build_search_query_from_context()
-    - reference gate: 无代词/指代时仅使用当前问题
-    - context resolve: 仅在存在指代时使用 rolling_summary 解析主语
-    - post-validation: 生成 query 必须与当前问题保留关键词重叠，否则回退原问题
- -> RetrievalService.search()
- -> HybridRetriever + UnifiedWebSearcher + HippoRAG
- -> Evidence/context packing
- -> LLMManager client.chat()
- -> response / SSE events
+ → routes_chat.py
+ → (route decision: chat / rag)
+ → build_search_query_from_context()
+    - reference gate: 无指代时仅使用当前问题
+    - context resolve: 存在指代时用 rolling_summary 解析主语
+    - post-validation: 关键词重叠校验，否则回退原问题
+ → RetrievalService.search()
+    → HybridRetriever（dense + sparse + RRF）
+    → UnifiedWebSearcher（Tavily + Google + Scholar + NCBI + Semantic Scholar）
+    → HippoRAG（图检索，条件触发）
+ → Evidence 综合 + context packing
+ → LLMManager client.chat()
+ → response / SSE events
 ```
 
-### 3) Agent ReAct 流
+### 4) Agent ReAct 流
 
 ```text
 react_loop(messages, tools)
- -> llm_manager.chat(tools=...)
- -> parse_tool_calls(...)
- -> execute_tool_call(...)
- -> append tool result message
- -> next iteration / final_text
+ → llm_manager.chat(tools=...)
+ → parse_tool_calls(...)
+ → execute_tool_call(...)（检索/画布/图谱/对比等工具）
+ → append tool result message
+ → next iteration / final_text
 ```
 
-### 4) Deep Research 流（LangGraph + 后台任务）
+### 5) Deep Research 流（LangGraph + 后台任务）
 
 ```text
 Phase 1: /deep-research/start
-  Scope -> Plan -> 返回 brief + outline（前端可确认/编辑）
+  Scope → Plan → 返回 brief + outline（前端可确认/编辑）
 
 Phase 2: /deep-research/submit（推荐）
-  提交后台任务 -> 返回 job_id
+  提交后台任务 → 返回 job_id
   前端轮询 /deep-research/jobs/{job_id} 与 /events
   任务在后端持续运行（不依赖前端连接）
-  用户可通过 /deep-research/jobs/{job_id}/cancel 显式停止
+
+  研究循环（per section）：
+    Research → Evaluate → (gap? → Research) → Write → Verify
+    - Recall + Precision 双类查询
+    - 分层 search_top_k
+    - 3 级验证分流
+    - 收益曲线早停
+
+  Drafting 审核门：
+    - 用户审核各章节（approve / revise）
+    - 支持缺口补充（material / direct_info）
+    - 审核门指数退避 + 早停
+
+  最终整合：
+    Synthesize → Abstract → Limitations → Open Gaps → Global Refine → Citation Guard
 
 兼容模式: /deep-research/confirm（SSE 直连）
-  Research -> Evaluate -> Write -> Verify -> Synthesize
 ```
 
-### Deep Research 前端交互（最新）
+### Deep Research 前端交互
 
-- 配置前置化：
-  - 在输入区 Deep Research 按钮旁提供 `⚙` 设置弹窗（持久化到 `useConfigStore + localStorage`）。
-  - 配置项：`depth`、`outputLanguage`、`stepModels`、`stepModelStrict`。
-- 启动链路：
-  - 触发 Deep Research 时，澄清问题优先使用 `scope` 步骤模型。
-  - 对话框中保留“本次运行覆盖”能力（高级折叠区），默认加载 `⚙` 的持久化配置。
-- Drafting 审核区：
-  - 支持“通过此章 / 需要修改 / 重新确认”。
-  - 支持“一键全部通过并触发整合”。
-  - 支持章节级 `gap supplement`（材料线索或直接观点）弹窗提交。
-- 运行期监测：
-  - 对话框 `running` 阶段内置 `Research Monitor`，实时显示 graph steps、成本状态、章节 coverage 曲线与效率评分（高/中/低）。
-  - 对低效率章节给出提示：优先补充证据/约束提示词，再决定是否追加预算。
-  - 支持一键生成“章节优化提示词模板”（可复制到 Intervention 作为下一轮输入）。
-
-在 `use_agent=true` 的场景下，研究流程可递归补检索并对声明执行验证。
-Deep Research 的检索策略为“按大纲聚焦 + gaps-first”：
-
-- 章节查询先覆盖当前 section 的 gaps，再补 section 级查询
-- `plan/research/write` 节点统一 `use_query_optimizer=False`
-- 避免通用优化器对已聚焦 query 进行二次稀释
-
-新增的“人工介入”链路：
-
-- 用户可在确认阶段补充文本观点（`user_context`）
-- 可选 `user_context_mode`：
-  - `supporting`（普通补充）
-  - `direct_injection`（强提示直接注入）
-- 用户可上传 `pdf/md/txt` 作为临时材料：
-  - `POST /deep-research/context-files` 提取文本
-  - 文本进入 `user_documents`（仅本次任务）
-  - 在 query 生成与写作阶段做“临时材料召回 + 注入”
-  - 不写入 Milvus 持久库
+- **配置前置化**：输入区 `⚙` 设置弹窗，持久化到 `useConfigStore + localStorage`
+  - 配置项：`depth`、`outputLanguage`、`stepModels`、`stepModelStrict`
+- **启动链路**：澄清问题优先使用 `scope` 步骤模型
+- **Drafting 审核区**：
+  - 通过 / 修改 / 重新确认 / 一键全部通过并触发整合
+  - 章节级缺口补充弹窗
+- **运行期监测**：
+  - Research Monitor（graph steps、成本状态、coverage 曲线、效率评分）
+  - 低效率提示与章节优化提示词模板
+- **人工介入**：
+  - `user_context`（supporting / direct_injection）
+  - 临时材料上传（pdf/md/txt → 不写入持久库）
 
 ### Research Depth 双级别
-
-Deep Research 支持两种研究深度，通过 `depth` 参数选择：
 
 | | lite | comprehensive |
 |---|---|---|
@@ -146,83 +263,57 @@ Deep Research 支持两种研究深度，通过 `depth` 参数选择：
 | 每章研究轮次 | max 3 | max 5 |
 | 覆盖度阈值 | 0.60 | 0.80 |
 | 查询策略 | 2 recall + 2 precision + gaps | 4 recall + 4 precision + gaps |
-| search_top_k（首轮/补缺/写作） | 18 / 10 / 10 | 30 / 15 / 12 |
+| search_top_k（首轮/补缺/写作） | 18 / 10 / 8 | 30 / 15 / 10 |
 | 写作二次取证 `verification_k` | 12 | 16 |
 | 验证（轻/中/重） | 20% / 40% / 45% | 15% / 30% / 35% |
 | 审核门（指数退避 + 早停） | 80 轮 / 8 次无变化 | 200 轮 / 12 次无变化 |
 | LangGraph 递归上限 | 200 | 500 |
 | 成本预警 / 强制摘要步数 | 120 / 180 | 300 / 420 |
 
-所有阈值均定义在 `src/collaboration/research/agent.py` 的 `DEPTH_PRESETS` 常量中，
-也可通过 `config/rag_config.json` → `deep_research.depth_presets` 覆盖。
+阈值定义在 `src/collaboration/research/agent.py` 的 `DEPTH_PRESETS`，可通过 `config/rag_config.json` → `deep_research.depth_presets` 覆盖。
 
-**查询策略：Recall + Precision 双类查询**
+### 循环防护机制
 
-每轮研究节点通过 LLM 生成两类查询（替代原来的单一查询列表）：
-- **Recall queries**：短（3-6 关键词）、广、包含同义词/缩写/不同命名体系 → 保证"不漏角度"
-- **Precision queries**：长（6-12 关键词）、带方法/时间/数据类型/对象约束 → 保证"证据准确"
-
-**分层 search_top_k**
-
-| 阶段 | 目的 | lite | comprehensive |
-|------|------|------|--------------|
-| 首轮研究 | 广撒网，多视角 | 18 | 30 |
-| 补缺/复核 | 定点补证据 | 10 | 15 |
-| 写作前检索 | 精选最可引用的 | 10 | 12 |
-| 写作二次取证 | 关键数据点/引用复核 | 12 | 16 |
-
-**3 级验证处理**（替代原来的单阈值回滚）：
-- **轻微**（< light_threshold）：仅标记到 Insights Ledger，不中断流程
-- **中等**（light..severe 区间）：记录 gaps，但**不**回滚到研究阶段（避免无限循环）
-- **严重**（> severe_threshold）：回到 research 全面补证据
-
-**信息不足处理策略**（Insufficient Information Policy）：
-- **评估失败保守回退**：`evaluate_node` 出错时不再默认“信息充足”，而是低覆盖度+显式 gaps，继续补搜
-- **零结果自适应补搜**：`research_node` 当 chunks 过少时自动执行更宽模式/更宽 query 的 fallback 检索
-- **证据稀缺标记**：章节级 `evidence_scarce=true` 会贯穿到写作与最终综合阶段
-- **写作降级保护**：证据严重不足时输出“受限摘要+缺口列表”，而非强写长段，减少幻觉风险
-- **最终限制强化**：`synthesize_node` 会把证据稀缺章节显式写入“Limitations and Future Directions”
-
-**循环防护机制**（防止图执行陷入无限循环）：
-- **动态迭代预算**：`max_iterations = max_iterations_per_section × num_sections`，按章节数线性伸缩
-- **每章研究轮次上限**：`max_section_research_rounds` 防止单章节消耗全部预算
-- **Self-Correction**：当第 3 轮及以后且 coverage 达到阈值时，自动衰减 `search_top_k_gap` 并减半 query 数量
-- **收益曲线早停**：若最近两轮 coverage 增益都低于阈值且已接近目标覆盖，提前进入写作
-- **审核门指数退避 + 早停**：sleep 从 2s 指数增长到上限；连续 N 轮无变化自动放行
-- **3 级验证分流**：只有"严重"级才触发回滚，避免"永远研究、写不出来"
-- **LangGraph 递归限制**：编译时显式设置 `recursion_limit`，替代默认的 10000
-- **成本步数监控**：达到 `cost_warn_steps` 发出人工介入提示；达到 `cost_force_summary_steps` 触发强制摘要模式
-- **成本心跳上报**：每 `cost_tick_interval` 步发出 `cost_monitor_tick`，便于前端实时监测收益/成本曲线
+- **动态迭代预算**：`max_iterations = max_iterations_per_section × num_sections`
+- **每章研究轮次上限**：`max_section_research_rounds`
+- **Self-Correction**：第 3 轮及以后，coverage 达标时自动衰减 `search_top_k_gap`
+- **收益曲线早停**：最近两轮 coverage 增益低且接近目标时提前进入写作
+- **审核门指数退避 + 早停**：sleep 从 2s 指数增长；连续 N 轮无变化自动放行
+- **3 级验证分流**：只有"严重"级才触发回滚
+- **LangGraph 递归限制**：编译时显式设置 `recursion_limit`
+- **成本步数监控**：达到 `cost_warn_steps` 提示人工介入；达到 `cost_force_summary_steps` 强制摘要
+- **成本心跳上报**：每 `cost_tick_interval` 步发出 `cost_monitor_tick`
 
 ### 最终整合链路（Synthesize + Global Refine）
 
-当前最终阶段不是简单拼接，而是多步整合：
-
 1. 生成 `Abstract`
 2. 基于 insights + evidence-scarce sections 生成 `Limitations and Future Directions`
-3. 聚合所有 `open gaps`（insights.gap + dashboard.coverage_gaps + section.gaps），生成
-   `Open Gaps and Future Research Agenda`
-4. 执行全篇连贯性重写（global coherence refine）：
-   - 优化跨章节衔接、术语一致性、冗余消除
-   - 保持标题层级与事实语义
-5. 引用保护（citation guard）：
-   - 若检测到引用/证据标签显著丢失（如 `[xxx]` / `[evidence limited]`），自动回退到整合前版本
+3. 聚合 open gaps 生成 `Open Gaps and Future Research Agenda`
+4. 全篇连贯性重写（跨章节衔接、术语一致性、冗余消除）
+5. 引用保护（citation guard）：检测到引用/证据标签丢失时自动回退
 6. 写回最终结果并切换 Canvas 到 `refine` 阶段
 
 ## 五、存储与状态
 
-- Milvus：向量索引与 chunk 检索
-- SQLite：会话、画布、用户与项目状态
-- SQLite：Deep Research 后台任务与事件（`src/data/deep_research_jobs.db`）
-- 会话中维护滚动摘要（`rolling_summary`/`summary_at_turn`）用于跨轮主语解析
-- 文件系统：`data/raw_papers`、`data/parsed`、`artifacts`、`logs`
+| 存储 | 用途 |
+|---|---|
+| Milvus | 向量索引与 chunk 检索 |
+| SQLite (`src/data/sessions.db`) | 会话、画布、用户与项目状态 |
+| SQLite (`src/data/deep_research_jobs.db`) | Deep Research 后台任务与事件 |
+| 文件系统 | `data/raw_papers`、`data/parsed`、`artifacts`、`logs` |
+| NetworkX (in-memory + JSON) | HippoRAG 知识图谱 |
+| 会话记忆 | `rolling_summary` / `summary_at_turn` 用于跨轮主语解析 |
 
 ## 六、可观测性
 
-- `/metrics`：Prometheus 指标导出
-- `/health`：基础健康检查
-- `/health/detailed`：组件级健康状态
-- OTel：通过环境变量启用 tracing
+| 端点 | 功能 |
+|---|---|
+| `GET /metrics` | Prometheus 指标导出 |
+| `GET /health` | 基础健康检查 |
+| `GET /health/detailed` | 组件级健康状态（检索/LLM/图谱等） |
+| `GET /storage/stats` | 存储统计 |
+| OTel | 通过环境变量启用 tracing |
+| LangSmith | 可选集成（LangGraph 执行追踪） |
 
 ## 七、设计约束
 
@@ -230,3 +321,5 @@ Deep Research 支持两种研究深度，通过 `depth` 参数选择：
 - 新工具必须在 `src/llm/tools.py` 与 `src/mcp/server.py` 同步注册
 - 配置新增字段必须同步 `config/rag_config.json` 与 `config/rag_config.example.json`
 - 敏感配置放 `config/rag_config.local.json` 或环境变量
+- 依赖方向：上层调用下层，避免反向耦合
+- 新 API 路由统一放 `src/api/routes_*.py`，在 `server.py` 注册

@@ -2,6 +2,8 @@
 
 本文档用于生产发布与跨机器迁移，重点覆盖：系统依赖、Python/前端依赖、配置基线、数据迁移、启动托管与验收。
 
+更新时间：2026-02-19
+
 ## 1. 适用范围
 
 - 目标系统：Ubuntu 22.04/24.04
@@ -112,12 +114,13 @@ bash scripts/00_healthcheck_docker.sh
 - `data/raw_papers/`
 - `data/parsed/`
 - `src/data/sessions.db`
+- `src/data/deep_research_jobs.db`
 - `artifacts/`（可选）
 
 示例（源机执行）：
 
 ```bash
-tar -czf deepsea-rag-data.tgz data/raw_papers data/parsed src/data/sessions.db artifacts
+tar -czf deepsea-rag-data.tgz data/raw_papers data/parsed src/data/sessions.db src/data/deep_research_jobs.db artifacts
 ```
 
 目标机解压：
@@ -306,9 +309,12 @@ sudo certbot --nginx -d your.domain.com
 - `GET /health` 返回 `ok`
 - `GET /health/detailed` 无关键组件失败
 - `GET /metrics` 可访问
+- `GET /llm/providers` 列表正常
 - `POST /chat` 可返回
 - `POST /chat/stream` 可流式返回
 - `GET /compare/papers` 正常
+- `GET /ingest/collections` 正常
+- Deep Research 可启动并返回 job_id
 - 前端页面可打开并调用后端
 - Nginx `nginx -t` 通过且证书自动续期可用（若启用 HTTPS）
 
@@ -319,6 +325,7 @@ sudo certbot --nginx -d your.domain.com
   - `config/rag_config*.json`
   - `data/parsed/`
   - `src/data/sessions.db`
+  - `src/data/deep_research_jobs.db`
 - 回滚时：
   1. 停服务（systemd）
   2. 切回旧代码/旧镜像
