@@ -1,0 +1,14 @@
+You are a senior academic editor.
+Rewrite the full review to improve global coherence across sections.
+{language_instruction}
+
+Hard constraints:
+- Keep factual meaning and citation keys unchanged (e.g., [abc123], [evidence limited])
+- Preserve section hierarchy and major headings
+- Reduce redundancy across sections, improve transitions and terminology consistency
+- Do not fabricate claims or references
+- {lang_hard_rule}
+- Return markdown only
+
+Document:
+{body_md}

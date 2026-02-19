@@ -16,8 +16,10 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field, model_validator
 
 from src.log import get_logger
+from src.utils.prompt_manager import PromptManager
 
 logger = get_logger(__name__)
+_pm = PromptManager()
 
 
 # ============================================================
@@ -89,41 +91,6 @@ class VerificationResult:
     conflict_notes: List[str] = field(default_factory=list)
 
 
-_EXTRACT_CLAIMS_PROMPT = """从以下文本中提取所有事实性声明（factual claims）。
-
-只提取可验证的事实性陈述，忽略观点性表述和过渡句。
-
-文本:
-{text}
-
-返回 JSON 对象，格式:
-{{"claims": [{{"claim": "声明文本", "has_citation": true/false, "citation_keys": ["key1"]}}]}}
-
-只返回 JSON 对象。"""
-
-
-_VERIFY_CLAIMS_PROMPT = """请验证以下声明是否有证据支撑。
-
-声明列表:
-{claims}
-
-可用的参考资料:
-{evidence}
-
-对每个声明判断：
-- 是否有充分证据支撑
-- 置信度 (high/medium/low)
-- 如果不支撑，建议的修订或补充搜索方向
-- 当发现多篇文献对同一问题结论冲突时，必须提取双方关键【实验条件变量】
-  （如采样深度、测序仪器、时间跨度、样本量、地域/人群、统计方法等），
-  并给出深度归因分析（Attribution Analysis），解释潜在差异来源，而不是只指出“有冲突”。
-- 归因分析必须写入 revision_note 或 attribution_analysis 字段；如果存在冲突，请在 conflict_notes 中列出结构化要点。
-
-返回 JSON 对象:
-{{"verifications": [{{"claim_index": 0, "confidence": "high|medium|low", "evidence_found": "支撑证据概要", "needs_revision": false, "revision_note": "", "attribution_analysis": "", "conflict_notes": [], "supplementary_query": ""}}]}}
-
-只返回 JSON 对象。"""
-
 
 def extract_claims(
     text: str,
@@ -131,7 +98,7 @@ def extract_claims(
     model: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """从文本中提取事实性声明"""
-    prompt = _EXTRACT_CLAIMS_PROMPT.format(text=text[:4000])
+    prompt = _pm.render("extract_claims.txt", text=text[:4000])
     try:
         resp = llm_client.chat(
             messages=[
@@ -201,7 +168,7 @@ def verify_claims(
     )
 
     # Step 3: 用 LLM 验证
-    prompt = _VERIFY_CLAIMS_PROMPT.format(claims=claims_text, evidence=citation_text[:3000])
+    prompt = _pm.render("verify_claims.txt", claims=claims_text, evidence=citation_text[:3000])
     try:
         resp = llm_client.chat(
             messages=[

@@ -1,0 +1,15 @@
+You are a scientific review planning expert. Create a structured research brief.
+
+Topic: {topic}
+User clarifications:
+{clarification_block}
+
+Return strict JSON:
+{{
+  "scope": "One-sentence scope",
+  "success_criteria": ["criterion 1", "criterion 2", "criterion 3"],
+  "key_questions": ["question 1", "question 2", "question 3"],
+  "exclusions": ["out-of-scope topics"],
+  "time_range": "publication time range (for example: 2020-2025)",
+  "source_priority": ["peer-reviewed papers", "reviews", "datasets"]
+}}

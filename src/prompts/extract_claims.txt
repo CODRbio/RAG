@@ -1,0 +1,11 @@
+从以下文本中提取所有事实性声明（factual claims）。
+
+只提取可验证的事实性陈述，忽略观点性表述和过渡句。
+
+文本:
+{text}
+
+返回 JSON 对象，格式:
+{{"claims": [{{"claim": "声明文本", "has_citation": true/false, "citation_keys": ["key1"]}}]}}
+
+只返回 JSON 对象。

@@ -1,0 +1,18 @@
+Based on the research review and the identified gaps/conflicts/limitations below,
+write the BODY content for section "{lim_title}" (200-400 words).
+
+The review:
+{full_md}
+
+Identified issues:
+{insight_block}
+
+Requirements:
+- Acknowledge key limitations objectively
+- Propose specific future research directions based on the gaps
+- Explicitly mention evidence-scarce sections and avoid overstating conclusions for them
+- Integrate conflict_notes attribution and write one dedicated paragraph labeled "观点交锋与实验条件差异 (Debate & Divergence):"
+- In that dedicated paragraph, compare experimental-condition variables (e.g., sampling depth, sequencing platform/instrument, time span, sample size, cohort/region, statistical pipeline) and explain plausible causes of divergence
+- Be constructive and forward-looking
+- Output section body ONLY (no markdown heading, no duplicated title line)
+{language_instruction}

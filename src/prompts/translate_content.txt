@@ -1,0 +1,12 @@
+Translate the following markdown content into {target_lang}.
+
+Section type: {section_label}
+
+Hard constraints:
+- Preserve markdown structure
+- Keep bracketed citation/evidence tags unchanged (e.g., [abc123], [evidence limited])
+- Do not add new facts
+- Output translated markdown only
+
+Content:
+{raw}

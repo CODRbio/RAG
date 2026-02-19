@@ -1,0 +1,14 @@
+Based on the research brief and initial retrieval context, generate a 3-6 section review outline.
+
+Research brief:
+- Topic: {topic}
+- Scope: {scope}
+- Key questions: {key_questions}
+
+Initial retrieval context:
+{context}
+
+Return a numbered list, one section title per line:
+1. Section title
+2. Section title
+...

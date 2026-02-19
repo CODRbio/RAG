@@ -1,0 +1,14 @@
+Evaluate information sufficiency for this section.
+
+Section: {section_title}
+Research topic: {topic}
+Collected sources: {source_count}
+Findings so far:
+{findings}
+
+Return JSON:
+{{
+  "coverage_score": 0.0-1.0,
+  "gaps": ["missing information points"],
+  "sufficient": true/false
+}}

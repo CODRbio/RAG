@@ -1,0 +1,6 @@
+Based on the following evidence for section "{section_title}", extract 3-5 core claims (Claims).
+Each claim MUST retain the [ref_hash] citation markers from the evidence.
+Output format: numbered list, one claim per line. Do not add extra commentary.
+
+Evidence:
+{evidence}

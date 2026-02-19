@@ -1,0 +1,17 @@
+You are an academic strategist. Based on the review and the OPEN GAPS below,
+write the BODY content for section "{agenda_title}" (250-500 words).
+{language_instruction}
+
+Review excerpt:
+{full_md}
+
+Open gaps:
+{gap_lines}
+
+Requirements:
+- Organize into 2-4 thematic directions
+- For each direction include: (a) key unanswered question, (b) why it matters, (c) suggested methods/data
+- Prioritize by feasibility and expected impact
+- Be concrete and avoid generic wording
+- Do not invent unsupported facts; keep this as forward-looking proposal
+- Output section body ONLY (no markdown heading, no duplicated title line)

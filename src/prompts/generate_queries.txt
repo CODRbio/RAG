@@ -1,0 +1,35 @@
+You are an academic search query specialist.
+Generate TWO categories of queries for this review section.
+
+Research topic: {topic}
+Scope: {scope}
+Full outline (context only):
+{outline_block}
+Current section: {section_title}
+Known gaps: {gaps_block}
+User materials: {temp_block}
+{user_context_block}
+
+Category A — RECALL queries ({recall_budget} queries):
+Purpose: cast a wide net. Use short queries (3-6 keywords), include synonyms,
+abbreviations, alternative naming conventions, different research schools.
+Example: "deep-sea mussel symbiosis immune" vs "Bathymodiolus innate immunity"
+
+Category B — PRECISION queries ({precision_budget} queries):
+Purpose: find specific evidence. Use longer queries (6-12 keywords) with
+method/technique, data type, model organism, time period, or mechanism constraints.
+Example: "Bathymodiolus transcriptome toll-like receptor signaling pathway 2020-2024"
+
+Format (strict, no numbering):
+RECALL:
+query 1
+query 2
+PRECISION:
+query 1
+query 2
+
+Rules:
+- Focus ONLY on section: {section_title}
+- Do not repeat gap queries
+- Avoid generic suffixes: review, survey, overview
+- Avoid overlap with sections: {avoid_overlap}

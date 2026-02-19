@@ -33,8 +33,10 @@ from src.collaboration.research.trajectory import (
     compress_trajectory,
 )
 from src.log import get_logger
+from src.utils.prompt_manager import PromptManager
 
 logger = get_logger(__name__)
+_pm = PromptManager()
 _CONFIG_PATH = Path(__file__).resolve().parents[3] / "config" / "rag_config.json"
 
 
@@ -617,41 +619,19 @@ def _generate_section_queries(
         f"[{s['name']}] {s['text'][:350]}" for s in temp_snippets
     ) if temp_snippets else "(none)"
 
-    prompt = f"""You are an academic search query specialist.
-Generate TWO categories of queries for this review section.
-
-Research topic: {topic}
-Scope: {dashboard.brief.scope}
-Full outline (context only):
-{outline_block}
-Current section: {section.title}
-Known gaps: {gaps_block}
-User materials: {temp_block}
-{_build_user_context_block(state, max_chars=1200)}
-
-Category A — RECALL queries ({recall_budget} queries):
-Purpose: cast a wide net. Use short queries (3-6 keywords), include synonyms,
-abbreviations, alternative naming conventions, different research schools.
-Example: "deep-sea mussel symbiosis immune" vs "Bathymodiolus innate immunity"
-
-Category B — PRECISION queries ({precision_budget} queries):
-Purpose: find specific evidence. Use longer queries (6-12 keywords) with
-method/technique, data type, model organism, time period, or mechanism constraints.
-Example: "Bathymodiolus transcriptome toll-like receptor signaling pathway 2020-2024"
-
-Format (strict, no numbering):
-RECALL:
-query 1
-query 2
-PRECISION:
-query 1
-query 2
-
-Rules:
-- Focus ONLY on section: {section.title}
-- Do not repeat gap queries
-- Avoid generic suffixes: review, survey, overview
-- Avoid overlap with sections: {avoid_overlap}"""
+    prompt = _pm.render(
+        "generate_queries.txt",
+        topic=topic,
+        scope=dashboard.brief.scope,
+        outline_block=outline_block,
+        section_title=section.title,
+        gaps_block=gaps_block,
+        temp_block=temp_block,
+        user_context_block=_build_user_context_block(state, max_chars=1200),
+        recall_budget=recall_budget,
+        precision_budget=precision_budget,
+        avoid_overlap=avoid_overlap,
+    )
 
     recall_queries: List[str] = []
     precision_queries: List[str] = []
@@ -855,21 +835,11 @@ def scoping_node(state: DeepResearchState) -> DeepResearchState:
     clarification_lines = [f"- {k}: {v}" for k, v in clarification.items() if v]
     clarification_block = "\n".join(clarification_lines) if clarification_lines else "(none)"
 
-    prompt = f"""You are a scientific review planning expert. Create a structured research brief.
-
-Topic: {topic}
-User clarifications:
-{clarification_block}
-
-Return strict JSON:
-{{
-  "scope": "One-sentence scope",
-  "success_criteria": ["criterion 1", "criterion 2", "criterion 3"],
-  "key_questions": ["question 1", "question 2", "question 3"],
-  "exclusions": ["out-of-scope topics"],
-  "time_range": "publication time range (for example: 2020-2025)",
-  "source_priority": ["peer-reviewed papers", "reviews", "datasets"]
-}}"""
+    prompt = _pm.render(
+        "scope_research.txt",
+        topic=topic,
+        clarification_block=clarification_block,
+    )
 
     try:
         resp = client.chat(
@@ -945,20 +915,13 @@ def plan_node(state: DeepResearchState) -> DeepResearchState:
     dashboard.total_sources += len(pack.chunks)
 
     # Generate outline
-    prompt = f"""Based on the research brief and initial retrieval context, generate a 3-6 section review outline.
-
-Research brief:
-- Topic: {dashboard.brief.topic}
-- Scope: {dashboard.brief.scope}
-- Key questions: {', '.join(dashboard.brief.key_questions)}
-
-Initial retrieval context:
-{context[:3000]}
-
-Return a numbered list, one section title per line:
-1. Section title
-2. Section title
-..."""
+    prompt = _pm.render(
+        "plan_outline.txt",
+        topic=dashboard.brief.topic,
+        scope=dashboard.brief.scope,
+        key_questions=", ".join(dashboard.brief.key_questions),
+        context=context[:3000],
+    )
 
     try:
         resp = client.chat(
@@ -1294,20 +1257,13 @@ def evaluate_node(state: DeepResearchState) -> DeepResearchState:
     branch = trajectory.get_branch(branch_id)
     findings = "\n".join(branch.key_findings[-10:]) if branch else ""
 
-    prompt = f"""Evaluate information sufficiency for this section.
-
-Section: {section.title}
-Research topic: {dashboard.brief.topic}
-Collected sources: {section.source_count}
-Findings so far:
-{findings if findings else "(no key findings yet)"}
-
-Return JSON:
-{{
-  "coverage_score": 0.0-1.0,
-  "gaps": ["missing information points"],
-  "sufficient": true/false
-}}"""
+    prompt = _pm.render(
+        "evaluate_sufficiency.txt",
+        section_title=section.title,
+        topic=dashboard.brief.topic,
+        source_count=section.source_count,
+        findings=findings if findings else "(no key findings yet)",
+    )
 
     try:
         resp = client.chat(
@@ -1411,11 +1367,11 @@ def generate_claims_node(state: DeepResearchState) -> DeepResearchState:
     evidence_str = pack.to_context_string(max_chunks=write_top_k)
 
     client, model_override = _resolve_step_client_and_model(state, "write")
-    prompt = f"""Based on the following evidence for section "{section.title}", extract 3-5 core claims (Claims).
-Each claim MUST retain the [ref_hash] citation markers from the evidence.
-Output format: numbered list, one claim per line. Do not add extra commentary."""
-
-    user_content = f"{prompt}\n\nEvidence:\n{evidence_str[:4000]}"
+    user_content = _pm.render(
+        "generate_claims.txt",
+        section_title=section.title,
+        evidence=evidence_str[:4000],
+    )
     try:
         resp = client.chat(
             messages=[
@@ -1566,30 +1522,20 @@ def write_node(state: DeepResearchState) -> DeepResearchState:
             "(e.g., 'A single study [ref_hash] suggests...' or 'Preliminary evidence from [ref_hash] indicates...').\n"
             "- Actively look for converging evidence from different authors/studies to strengthen conclusions.\n"
         )
-        prompt = f"""Write the section "{section.title}" for the review using the evidence below.
-
-Requirements:
-- Use academic writing style and coherent logic
-- Mark citations with [ref_hash] as shown in evidence snippets
-- Length: around 400-600 words
-- Keep consistency with other sections
-- Cross-check key data points against the verification evidence block before finalizing claims
-{_language_instruction(state)}
-{_build_user_context_block(state, max_chars=1800)}
-{triangulation_block}
-{caution_block}
-{quantitative_block}
-{claims_block}
-
-Available evidence:
-{evidence_str[:4000]}
-
-Verification evidence for data points/citations (secondary check, high priority):
-{verification_evidence_str[:3500]}
-
-Relevant temporary materials from user:
-{temp_context if temp_context else "(none)"}
-{supplement_block}"""
+        prompt = _pm.render(
+            "write_section.txt",
+            section_title=section.title,
+            language_instruction=_language_instruction(state),
+            user_context_block=_build_user_context_block(state, max_chars=1800),
+            triangulation_block=triangulation_block,
+            caution_block=caution_block,
+            quantitative_block=quantitative_block,
+            claims_block=claims_block,
+            evidence=evidence_str[:4000],
+            verification_evidence=verification_evidence_str[:3500],
+            temp_context=temp_context if temp_context else "(none)",
+            supplement_block=supplement_block,
+        )
 
         try:
             messages = [
@@ -2082,18 +2028,12 @@ def synthesize_node(state: DeepResearchState) -> DeepResearchState:
         if not should_translate:
             return raw
 
-        prompt = f"""Translate the following markdown content into {target_lang}.
-
-Section type: {section_label}
-
-Hard constraints:
-- Preserve markdown structure
-- Keep bracketed citation/evidence tags unchanged (e.g., [abc123], [evidence limited])
-- Do not add new facts
-- Output translated markdown only
-
-Content:
-{raw}"""
+        prompt = _pm.render(
+            "translate_content.txt",
+            target_lang=target_lang,
+            section_label=section_label,
+            raw=raw,
+        )
         try:
             resp_lang = client.chat(
                 messages=[
@@ -2151,10 +2091,11 @@ Content:
 
     # 生成摘要
     full_md = "\n".join(state.get("markdown_parts", []))
-    prompt = f"""Generate a 150-250 word abstract for the review below.
-{_language_instruction(state)}
-
-{full_md[:5000]}"""
+    prompt = _pm.render(
+        "generate_abstract.txt",
+        language_instruction=_language_instruction(state),
+        full_md=full_md[:5000],
+    )
 
     try:
         resp = client.chat(
@@ -2195,24 +2136,13 @@ Content:
         insight_block = "\n\n".join(insight_block_parts)
 
         lim_title = "不足与未来方向" if is_zh else "Limitations and Future Directions"
-        lim_prompt = f"""Based on the research review and the identified gaps/conflicts/limitations below,
-write the BODY content for section "{lim_title}" (200-400 words).
-
-The review:
-{full_md[:3000]}
-
-Identified issues:
-{insight_block[:2500]}
-
-Requirements:
-- Acknowledge key limitations objectively
-- Propose specific future research directions based on the gaps
-- Explicitly mention evidence-scarce sections and avoid overstating conclusions for them
-- Integrate conflict_notes attribution and write one dedicated paragraph labeled "观点交锋与实验条件差异 (Debate & Divergence):"
-- In that dedicated paragraph, compare experimental-condition variables (e.g., sampling depth, sequencing platform/instrument, time span, sample size, cohort/region, statistical pipeline) and explain plausible causes of divergence
-- Be constructive and forward-looking
-- Output section body ONLY (no markdown heading, no duplicated title line)
-{_language_instruction(state)}"""
+        lim_prompt = _pm.render(
+            "limitations_section.txt",
+            lim_title=lim_title,
+            full_md=full_md[:3000],
+            insight_block=insight_block[:2500],
+            language_instruction=_language_instruction(state),
+        )
 
         try:
             resp_lim = client.chat(
@@ -2240,23 +2170,13 @@ Requirements:
     if aggregated_open_gaps:
         gap_lines = "\n".join(f"- {g}" for g in aggregated_open_gaps[:30])
         agenda_title = "开放问题与未来研究议程" if is_zh else "Open Gaps and Future Research Agenda"
-        agenda_prompt = f"""You are an academic strategist. Based on the review and the OPEN GAPS below,
-write the BODY content for section "{agenda_title}" (250-500 words).
-{_language_instruction(state)}
-
-Review excerpt:
-{full_md[:3500]}
-
-Open gaps:
-{gap_lines}
-
-Requirements:
-- Organize into 2-4 thematic directions
-- For each direction include: (a) key unanswered question, (b) why it matters, (c) suggested methods/data
-- Prioritize by feasibility and expected impact
-- Be concrete and avoid generic wording
-- Do not invent unsupported facts; keep this as forward-looking proposal
-- Output section body ONLY (no markdown heading, no duplicated title line)"""
+        agenda_prompt = _pm.render(
+            "open_gaps_agenda.txt",
+            agenda_title=agenda_title,
+            language_instruction=_language_instruction(state),
+            full_md=full_md[:3500],
+            gap_lines=gap_lines,
+        )
         try:
             resp_agenda = client.chat(
                 messages=[
@@ -2329,20 +2249,12 @@ Requirements:
             lang_hard_rule = "Output must remain Chinese (中文). Keep citation tags unchanged."
         elif (state.get("output_language") or "auto").lower() == "en":
             lang_hard_rule = "Output must remain English. Keep citation tags unchanged."
-        coherence_prompt = f"""You are a senior academic editor.
-Rewrite the full review to improve global coherence across sections.
-{_language_instruction(state)}
-
-Hard constraints:
-- Keep factual meaning and citation keys unchanged (e.g., [abc123], [evidence limited])
-- Preserve section hierarchy and major headings
-- Reduce redundancy across sections, improve transitions and terminology consistency
-- Do not fabricate claims or references
-- {lang_hard_rule if lang_hard_rule else "Respect the document's dominant language."}
-- Return markdown only
-
-Document:
-{body_md}"""
+        coherence_prompt = _pm.render(
+            "coherence_refine.txt",
+            language_instruction=_language_instruction(state),
+            lang_hard_rule=lang_hard_rule if lang_hard_rule else "Respect the document's dominant language.",
+            body_md=body_md,
+        )
         try:
             resp_coherence = client.chat(
                 messages=[
