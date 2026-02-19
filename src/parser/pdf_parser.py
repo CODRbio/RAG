@@ -192,6 +192,7 @@ class EnrichedDoc:
     parse_meta: ParseMeta = field(default_factory=lambda: ParseMeta(parser_version="1.0.0"))
     enrichment_meta: Optional[EnrichmentMeta] = None
     claims: list[dict] = field(default_factory=list)  # ClaimExtractor 提取的核心声明
+    doc_metadata: Optional[dict] = None  # DOI / title / authors / year
 
 
 # ============================================================
@@ -1557,7 +1558,85 @@ def _deserialize_enriched(raw: dict) -> EnrichedDoc:
         parse_meta=parse_meta,
         enrichment_meta=None,
         claims=raw.get("claims", []),
+        doc_metadata=raw.get("doc_metadata"),
     )
+
+
+_DOI_RE = re.compile(
+    r"(?:doi[:\s]*|(?:https?://)?(?:dx\.)?doi\.org/)"
+    r"?(10\.\d{4,9}/[^\s,;)\]\"'<>]+[^\s,;)\]\"'<>.:])",
+    re.IGNORECASE,
+)
+
+_SKIP_HEADING_LABELS = {
+    "original article", "research article", "review", "letter",
+    "communication", "open", "open access", "article", "brief report",
+    "research paper", "full paper", "short communication",
+    "abstract", "abstract:", "data note", "introduction",
+    "keywords", "highlights", "graphical abstract", "contents",
+}
+
+
+def extract_doc_metadata(blocks: list[ContentBlock], scan_blocks: int = 30) -> dict:
+    """
+    从 content_flow 前 N 个 block 提取论文级元数据（DOI + 标题）。
+    在 PDFProcessor.process() 完成解析后调用。
+    """
+    doi = None
+    title = None
+
+    for block in blocks[:scan_blocks]:
+        text = block.text
+        if not text or not isinstance(text, str):
+            continue
+        m = _DOI_RE.search(text)
+        if m:
+            doi = m.group(1).rstrip(".:")
+            break
+
+    # Pass 1: heading blocks
+    for block in blocks[:15]:
+        bt = block.block_type.value if isinstance(block.block_type, Enum) else str(block.block_type or "")
+        bt = bt.lower()
+        text = (block.text or "").strip()
+        if bt != "heading" or not text:
+            continue
+        if text.lower() in _SKIP_HEADING_LABELS:
+            continue
+        if 10 <= len(text) <= 300:
+            title = text
+            break
+
+    # Pass 2: fallback to text blocks on page 0
+    if not title:
+        for block in blocks[:15]:
+            bt = block.block_type.value if isinstance(block.block_type, Enum) else str(block.block_type or "")
+            bt = bt.lower()
+            if bt not in ("text", ""):
+                continue
+            text = (block.text or "").strip()
+            page = getattr(block, "page_index", 0) or 0
+            if page != 0 or not text or not (15 <= len(text) <= 300):
+                continue
+            tl = text.lower()
+            if tl in _SKIP_HEADING_LABELS:
+                continue
+            if tl.startswith(("http", "www.", "\u00a9", "copyright")):
+                continue
+            if re.search(r"\d{4}\s*(international|society|elsevier|springer|wiley|nature)", tl):
+                continue
+            digit_ratio = sum(c.isdigit() for c in text) / max(len(text), 1)
+            if digit_ratio > 0.08:
+                continue
+            title = text
+            break
+
+    result: dict = {}
+    if doi:
+        result["doi"] = doi
+    if title:
+        result["title"] = title
+    return result or None
 
 
 class PDFProcessor:
@@ -1610,6 +1689,12 @@ class PDFProcessor:
             enricher = LLMEnricher(self.config, self.llm_manager)
             blocks, enrichment_meta = enricher.enrich_all(blocks, str(out), progress_callback=progress_callback)
 
+        # 6. Extract doc-level metadata (DOI, title)
+        doc_meta = extract_doc_metadata(blocks)
+        if doc_meta:
+            logger.info("doc_metadata for %s: doi=%s title=%s",
+                        doc_id, doc_meta.get("doi", "-"), (doc_meta.get("title") or "-")[:60])
+
         doc = EnrichedDoc(
             doc_id=doc_id,
             source=source,
@@ -1618,6 +1703,7 @@ class PDFProcessor:
             hierarchy=hierarchy,
             parse_meta=parse_meta,
             enrichment_meta=enrichment_meta,
+            doc_metadata=doc_meta,
         )
 
         # 6. Claim extraction（需要 LLM）

@@ -20,5 +20,8 @@
   },
   "semantic_scholar": {
     "api_key": "ai4scholar-xxx"
+  },
+  "ncbi": {
+    "api_key": ""
   }
 }

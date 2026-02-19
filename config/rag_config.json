@@ -240,6 +240,14 @@
     "max_results": 5,
     "timeout_seconds": 30
   },
+  "ncbi": {
+    "enabled": true,
+    "api_key": "",
+    "max_results": 5,
+    "timeout_seconds": 20,
+    "cache_ttl_seconds": 3600,
+    "cache_maxsize": 256
+  },
   "content_fetcher": {
     "enabled": false,
     "only_academic": false,

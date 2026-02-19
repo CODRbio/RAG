@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from config.settings import settings
 from src.retrieval.evidence import EvidenceChunk, EvidencePack
+from src.retrieval.dedup import cross_source_dedup
 from src.retrieval.hybrid_retriever import HybridRetriever, RetrievalConfig, _rerank_candidates
 from src.retrieval.unified_web_search import unified_web_searcher
 
@@ -268,6 +269,16 @@ class RetrievalService:
                 _model_override,
             )
             use_content_fetcher = (filters or {}).get("use_content_fetcher")
+
+            # 为 Lazy Fetching 预判构建 LLM 客户端（仅智能模式 use_content_fetcher=None）
+            _llm_client = None
+            if use_content_fetcher is None:
+                try:
+                    from src.llm.llm_manager import get_manager
+                    _llm_client = get_manager().get_client(_llm_provider or "deepseek")
+                except Exception as _e:
+                    logger.debug("Lazy Fetching LLM 客户端初始化失败，降级全量抓取: %s", _e)
+
             t_web = time.perf_counter()
             results = unified_web_searcher.search_sync(
                 query,
@@ -280,6 +291,7 @@ class RetrievalService:
                 llm_provider=_llm_provider,
                 model_override=_model_override,
                 use_content_fetcher=use_content_fetcher,
+                llm_client=_llm_client,
             )
             web_ms = (time.perf_counter() - t_web) * 1000
             # 收集 web provider 诊断
@@ -329,6 +341,13 @@ class RetrievalService:
             total_candidates += len(local_hits) * 2 + len(web_hits)
             if not sources_used and all_chunks:
                 sources_used.append("dense")
+            # ── 跨源去重：拦截 web 中与本地重叠的文献 ──
+            if web_hits and all_chunks:
+                web_before = len(web_hits)
+                web_hits = cross_source_dedup(all_chunks, web_hits)
+                dedup_removed = web_before - len(web_hits)
+                if dedup_removed > 0:
+                    diag["cross_source_dedup"] = {"removed": dedup_removed, "remaining": len(web_hits)}
             # Web 结果 rerank（多语言 ColBERT 支持中英文）
             if web_hits:
                 try:
@@ -375,6 +394,16 @@ class RetrievalService:
                     _n_queries = query_optimizer_max_queries or 3
                     _auto_per_provider = max(5, math.ceil(_final * 3.5 / (_n_providers * _n_queries)))
                     _use_content_fetcher = (filters or {}).get("use_content_fetcher")
+
+                    # 为 Lazy Fetching 预判构建 LLM 客户端（仅智能模式 use_content_fetcher=None）
+                    _llm_client = None
+                    if _use_content_fetcher is None:
+                        try:
+                            from src.llm.llm_manager import get_manager
+                            _llm_client = get_manager().get_client(_llm_provider or "deepseek")
+                        except Exception as _e:
+                            logger.debug("Lazy Fetching LLM 客户端初始化失败，降级全量抓取: %s", _e)
+
                     web_hits = unified_web_searcher.search_sync(
                         query,
                         providers=web_providers,
@@ -386,6 +415,7 @@ class RetrievalService:
                         llm_provider=_llm_provider,
                         model_override=_model_override,
                         use_content_fetcher=_use_content_fetcher,
+                        llm_client=_llm_client,
                     )
                     total_candidates += len(web_hits)
                     sources_used.append("web")

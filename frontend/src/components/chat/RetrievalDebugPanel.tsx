@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { ChevronDown, ChevronRight, Database, Globe, Clock, BarChart3, Search } from 'lucide-react';
+import { ChevronDown, ChevronRight, Database, Globe, Clock, BarChart3, Search, ShieldCheck } from 'lucide-react';
 import type { EvidenceSummary } from '../../types';
 
 interface Props {
@@ -36,6 +36,11 @@ export function RetrievalDebugPanel({ summary }: Props) {
           {summary.sources_used.length > 0 && (
             <span className="text-gray-400">
               · {summary.sources_used.join('+')}
+            </span>
+          )}
+          {diag?.cross_source_dedup && diag.cross_source_dedup.removed > 0 && (
+            <span className="text-orange-500 flex items-center gap-0.5">
+              · <ShieldCheck size={10} /> 去重 {diag.cross_source_dedup.removed}
             </span>
           )}
         </div>
@@ -102,6 +107,16 @@ export function RetrievalDebugPanel({ summary }: Props) {
                   </span>
                 ) : null}
               </div>
+            </div>
+          )}
+
+          {/* Cross-source dedup */}
+          {diag?.cross_source_dedup && diag.cross_source_dedup.removed > 0 && (
+            <div className="flex items-center gap-2 px-2 py-1.5 rounded bg-orange-50 border border-orange-200 text-orange-700">
+              <ShieldCheck size={12} />
+              <span>
+                已通过本地指纹拦截 <strong>{diag.cross_source_dedup.removed}</strong> 条重复网络结果，保留 {diag.cross_source_dedup.remaining} 条增量信息
+              </span>
             </div>
           )}
 

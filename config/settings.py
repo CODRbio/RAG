@@ -164,6 +164,17 @@ class SemanticScholarConfig:
 
 
 @dataclass
+class NCBIConfig:
+    """NCBI PubMed E-Utilities 配置（免费 API，api_key 可选但可提升速率上限）"""
+    enabled: bool = True
+    api_key: str = ""
+    max_results: int = 5
+    timeout_seconds: int = 20
+    cache_ttl_seconds: int = 3600
+    cache_maxsize: int = 256
+
+
+@dataclass
 class ContentFetcherConfig:
     """WebContentFetcher 全文抓取配置"""
     enabled: bool = False
@@ -363,6 +374,10 @@ def _semantic_scholar_from_config() -> Dict[str, Any]:
     return (_RAW_CONFIG.get("semantic_scholar") or {})
 
 
+def _ncbi_from_config() -> Dict[str, Any]:
+    return (_RAW_CONFIG.get("ncbi") or {})
+
+
 def _content_fetcher_from_config() -> Dict[str, Any]:
     return (_RAW_CONFIG.get("content_fetcher") or {})
 
@@ -516,6 +531,15 @@ class Settings:
             base_url=(ss.get("base_url") or "https://ai4scholar.net/graph/v1").strip(),
             max_results=min(int(ss.get("max_results", 5)), 20),
             timeout_seconds=int(ss.get("timeout_seconds", 30)),
+        )
+        nc = _ncbi_from_config()
+        self.ncbi = NCBIConfig(
+            enabled=bool(nc.get("enabled", True)),
+            api_key=(nc.get("api_key") or "").strip(),
+            max_results=min(int(nc.get("max_results", 5)), 50),
+            timeout_seconds=int(nc.get("timeout_seconds", 20)),
+            cache_ttl_seconds=int(nc.get("cache_ttl_seconds", 3600)),
+            cache_maxsize=int(nc.get("cache_maxsize", 256)),
         )
         cf = _content_fetcher_from_config()
         self.content_fetcher = ContentFetcherConfig(

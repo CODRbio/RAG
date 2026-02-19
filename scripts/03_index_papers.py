@@ -74,6 +74,9 @@ def main():
 
         doc_id = doc.get("doc_id", json_path.parent.name)
         content_flow = doc.get("content_flow", [])
+        doc_metadata = doc.get("doc_metadata") or {}
+        doi = doc_metadata.get("doi") or ""
+        doc_title = doc_metadata.get("title") or ""
 
         chunks = chunk_blocks(content_flow, doc_id=doc_id, config=chunk_cfg)
         logger.info(f"chunks: {len(chunks)}")
@@ -87,7 +90,7 @@ def main():
             page_range = meta.get("page_range", [0, 0])
             page = page_range[0] if isinstance(page_range, (list, tuple)) else meta.get("page", 0)
 
-            all_data.append({
+            row = {
                 "paper_id": doc_id,
                 "chunk_id": c.chunk_id,
                 "content": text,
@@ -98,7 +101,12 @@ def main():
                 "section_path": str(meta.get("section_path", ""))[:512],
                 "page": int(page) if isinstance(page, (int, float)) else 0,
                 "_text_for_embed": text,
-            })
+            }
+            if doi:
+                row["doi"] = doi
+            if doc_title:
+                row["doc_title"] = doc_title
+            all_data.append(row)
 
         artifact["total_chunks"] += len(chunks)
 

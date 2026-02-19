@@ -210,6 +210,16 @@
     "max_results": 5,
     "timeout_seconds": 30
   },
+  "ncbi": {
+    "_comment": "NCBI PubMed E-Utilities（免费，api_key 可选——填写后速率从 3 req/s 提升至 10 req/s）",
+    "_api_key_note": "在 https://www.ncbi.nlm.nih.gov/account/ 注册后可在账号设置中申请 API Key",
+    "enabled": true,
+    "api_key": "",
+    "max_results": 5,
+    "timeout_seconds": 20,
+    "cache_ttl_seconds": 3600,
+    "cache_maxsize": 256
+  },
   "citation": {
     "key_format": "author_date",
     "hash_length": 12,

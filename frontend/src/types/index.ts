@@ -67,6 +67,7 @@ export interface RetrievalDiagnostics {
   stages?: Record<string, RetrievalStageDiag>;
   web_providers?: Record<string, RetrievalStageDiag>;
   content_fetcher?: { enriched: number; total: number };
+  cross_source_dedup?: { removed: number; remaining: number };
   cache_hit?: boolean;
 }
 

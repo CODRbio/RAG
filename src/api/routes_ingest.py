@@ -512,6 +512,7 @@ def _run_ingest_job(job_id: str, cfg: dict) -> None:
             figure_success = int(enrich_meta.get("figure_success", 0) or 0)
             content_flow = doc.get("content_flow", [])
             doc_claims = doc.get("claims") or []
+            doc_metadata = doc.get("doc_metadata") or {}
             chunks = chunk_blocks(content_flow, doc_id=doc_id, config=chunk_cfg, claims=doc_claims)
         except Exception as e:
             errors.append({"file": file_name, "stage": "chunk", "error": str(e)})
@@ -537,7 +538,10 @@ def _run_ingest_job(job_id: str, cfg: dict) -> None:
         })
 
         try:
-            rows = _build_rows(chunks, doc_id, collection_name)
+            rows = _build_rows(chunks, doc_id, collection_name, doc_metadata=doc_metadata)
+            # 写入 DOI/Title 到 SQLite 持久化存储（供跨源去重使用）
+            if doc_metadata.get("doi") or doc_metadata.get("title"):
+                _update_paper_metadata(doc_id, doc_metadata)
             texts = [r.pop("_text_for_embed") for r in rows]
             batch_size = 32
             total_batches = (len(texts) + batch_size - 1) // batch_size
@@ -796,6 +800,20 @@ def _truncate(content: str, max_len: int = 65000) -> str:
     return content[:max_len] if len(content) > max_len else content
 
 
+def _update_paper_metadata(doc_id: str, doc_metadata: dict) -> None:
+    """写入论文 DOI/Title 到 SQLite 持久化存储（供跨源去重使用）"""
+    try:
+        from src.indexing.paper_metadata_store import paper_meta_store
+        paper_meta_store.upsert(
+            paper_id=doc_id,
+            doi=doc_metadata.get("doi"),
+            title=doc_metadata.get("title"),
+            source="ingestion",
+        )
+    except Exception as e:
+        logger.warning("Failed to update paper_metadata store: %s", e)
+
+
 def _get_field_max_lengths(collection_name: str) -> dict:
     """查询集合 schema 获取各 VARCHAR 字段的 max_length"""
     defaults = {
@@ -815,7 +833,8 @@ def _get_field_max_lengths(collection_name: str) -> dict:
     return defaults
 
 
-def _build_rows(chunks, doc_id: str, collection_name: str = "") -> list:
+def _build_rows(chunks, doc_id: str, collection_name: str = "",
+                 doc_metadata: dict | None = None) -> list:
     """将 chunks 转为 Milvus upsert 行格式，截断上限动态匹配集合 schema"""
     limits = _get_field_max_lengths(collection_name) if collection_name else {}
     l_paper = limits.get("paper_id", 250)
@@ -824,17 +843,20 @@ def _build_rows(chunks, doc_id: str, collection_name: str = "") -> list:
     l_cktype = limits.get("chunk_type", 30)
     l_sp = limits.get("section_path", 500)
 
+    dm = doc_metadata or {}
+    doi = dm.get("doi") or ""
+    doc_title = dm.get("title") or ""
+
     rows = []
     for c in chunks:
         text = _truncate(c.text)
         meta = c.meta or {}
         page_range = meta.get("page_range", [0, 0])
         page = page_range[0] if isinstance(page_range, (list, tuple)) else meta.get("page", 0)
-        # section_path 可能是 list，拼成可读路径
         sp_raw = meta.get("section_path", "")
         if isinstance(sp_raw, (list, tuple)):
             sp_raw = " > ".join(str(s) for s in sp_raw)
-        rows.append({
+        row = {
             "paper_id": str(doc_id)[:l_paper],
             "chunk_id": str(c.chunk_id)[:l_chunk],
             "content": text,
@@ -845,7 +867,12 @@ def _build_rows(chunks, doc_id: str, collection_name: str = "") -> list:
             "section_path": str(sp_raw)[:l_sp],
             "page": int(page) if isinstance(page, (int, float)) else 0,
             "_text_for_embed": text,
-        })
+        }
+        if doi:
+            row["doi"] = doi
+        if doc_title:
+            row["doc_title"] = doc_title
+        rows.append(row)
     return rows
 
 

@@ -33,6 +33,8 @@ enriched = fetcher.enrich_results_sync(results, query="deep sea microbiome")
 
 import asyncio
 import concurrent.futures
+import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
@@ -484,6 +486,87 @@ class WebContentFetcher:
         return text
 
     # --------------------------------------------------------
+    # LLM 预判：哪些 URL 需要抓取全文
+    # --------------------------------------------------------
+
+    async def evaluate_snippets_need_fetch(
+        self,
+        query: str,
+        results: List[Dict[str, Any]],
+        llm_client: Any,
+    ) -> List[str]:
+        """
+        使用 LLM 预判搜索摘要是否足够，返回需要抓取全文的 URL 列表。
+
+        只评估来源为 scholar/google 的条目（这两种来源摘要最容易被截断）。
+        LLM 返回 JSON: {"urls_to_fetch": ["url1", "url2"]}
+
+        若 LLM 调用失败，降级为返回所有候选 URL（等同全量抓取）。
+
+        Args:
+            query:      原始用户查询
+            results:    UnifiedWebSearcher 返回的结果列表
+            llm_client: LLMManager 客户端实例
+
+        Returns:
+            需要抓取全文的 URL 集合（list）
+        """
+        # 只评估 scholar / google 来源且有合法 URL 的条目
+        candidates = []
+        for hit in results:
+            metadata = hit.get("metadata") or {}
+            source = metadata.get("source", "")
+            url = (metadata.get("url") or "").strip()
+            snippet = (hit.get("content") or "").strip()
+            if url and source in ("scholar", "google") and snippet:
+                candidates.append({"url": url, "snippet": snippet})
+
+        if not candidates:
+            return []
+
+        items_text = "\n".join(
+            f"{i + 1}. URL: {c['url']}\n   摘要: {c['snippet'][:400]}"
+            for i, c in enumerate(candidates)
+        )
+        prompt = (
+            f'用户问题："{query}"\n\n'
+            f"以下是搜索结果的摘要片段：\n{items_text}\n\n"
+            "请判断这些摘要是否已包含回答问题所需的具体数据。\n"
+            "如果某条摘要信息残缺（例如有省略号、核心数值/结论被截断），"
+            "则需要抓取原文。如果现有摘要已足够，无需抓取。\n"
+            '只返回 JSON，格式：{"urls_to_fetch": ["url1", "url2"]}。'
+            "如果全部摘要已足够，返回 {\"urls_to_fetch\": []}。"
+        )
+
+        try:
+            resp = llm_client.chat(
+                messages=[
+                    {"role": "system", "content": "你是文献质量评估助手，只输出纯 JSON，不加任何解释。"},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=512,
+            )
+            text = resp.get("final_text", "")
+            match = re.search(r'\{[^{}]*"urls_to_fetch"[^{}]*\}', text, re.DOTALL)
+            if match:
+                data = json.loads(match.group())
+                urls = data.get("urls_to_fetch", [])
+                if not isinstance(urls, list):
+                    raise ValueError("urls_to_fetch is not a list")
+                allowed = {c["url"] for c in candidates}
+                urls = [u for u in urls if isinstance(u, str) and u in allowed]
+                logger.info(
+                    f"LLM 预判：{len(urls)}/{len(candidates)} 条需抓取全文"
+                    + (f" (query={query!r})" if query else "")
+                )
+                return urls
+            logger.warning("LLM 预判响应缺少有效 JSON，降级为全量抓取")
+            return [c["url"] for c in candidates]
+        except Exception as e:
+            logger.warning(f"LLM 预判失败，降级为全量抓取: {e}")
+            return [c["url"] for c in candidates]
+
+    # --------------------------------------------------------
     # 批量增强搜索结果
     # --------------------------------------------------------
 
@@ -491,24 +574,58 @@ class WebContentFetcher:
         self,
         results: List[Dict[str, Any]],
         query: Optional[str] = None,
+        llm_client: Optional[Any] = None,
+        use_content_fetcher: Optional[bool] = None,
     ) -> List[Dict[str, Any]]:
         """
         异步批量抓取搜索结果的全文内容。
 
-        对每个合格的 URL 调用 fetch_content，成功则：
+        抓取策略由 use_content_fetcher 和 llm_client 共同决定：
+
+        - use_content_fetcher=True  （硬强制）：跳过 LLM 预判，对所有合格 URL 全量抓取。
+        - use_content_fetcher=None  （智能模式）且提供 llm_client：
+            先调用 evaluate_snippets_need_fetch 获取需要抓取的 URL 子集，
+            仅对这些 URL 执行 fetch_content；其余合格 URL 标记
+            metadata.content_type = "snippet_sufficient"。
+        - use_content_fetcher=None  且无 llm_client：全量抓取（兼容旧行为）。
+
+        成功抓取后：
         - 原始 content 保存到 metadata.original_snippet
         - 全文替换 hit["content"]
         - 标记 metadata.content_type = "full_text"
 
         Args:
-            results: UnifiedWebSearcher 返回的搜索结果列表
-            query: 原始查询（用于日志）
+            results:              UnifiedWebSearcher 返回的搜索结果列表
+            query:                原始查询（用于日志与 LLM prompt）
+            llm_client:           LLMManager 客户端，不为 None 时启用智能预判
+            use_content_fetcher:  True=强制全量, None=智能/配置, False 由调用层拦截
 
         Returns:
             增强后的结果列表（原地修改）
         """
         if not results:
             return results
+
+        # 智能模式 + LLM 可用：先预判，再选择性抓取
+        urls_to_fetch: Optional[set] = None  # None 表示"全量抓取"
+        if use_content_fetcher is None and llm_client is not None:
+            fetching_urls = await self.evaluate_snippets_need_fetch(
+                query or "", results, llm_client
+            )
+            urls_to_fetch = set(fetching_urls)
+
+            # 对不需要抓取的合格 URL 打上 snippet_sufficient 标记
+            for hit in results:
+                metadata = hit.get("metadata") or {}
+                url = (metadata.get("url") or "").strip()
+                if (
+                    url
+                    and url not in urls_to_fetch
+                    and is_qualifying_url(url, only_academic=self.only_academic)
+                    and metadata.get("content_type") not in ("full_text",)
+                ):
+                    metadata["content_type"] = "snippet_sufficient"
+                    hit["metadata"] = metadata
 
         sem = asyncio.Semaphore(self.max_concurrent)
 
@@ -523,6 +640,10 @@ class WebContentFetcher:
             if metadata.get("content_type") == "full_text":
                 return
 
+            # 智能模式：跳过未被 LLM 选中的 URL
+            if urls_to_fetch is not None and url not in urls_to_fetch:
+                return
+
             async with sem:
                 try:
                     full_text = await self.fetch_content(url)
@@ -531,11 +652,9 @@ class WebContentFetcher:
                     return
 
                 if full_text:
-                    # 保留原始片段
                     original = (hit.get("content") or "").strip()
                     if original:
                         metadata["original_snippet"] = original
-                    # 替换为全文
                     hit["content"] = full_text
                     metadata["content_type"] = "full_text"
                     hit["metadata"] = metadata
@@ -547,8 +666,13 @@ class WebContentFetcher:
             1 for h in results
             if (h.get("metadata") or {}).get("content_type") == "full_text"
         )
+        sufficient_count = sum(
+            1 for h in results
+            if (h.get("metadata") or {}).get("content_type") == "snippet_sufficient"
+        )
         logger.info(
-            f"全文抓取: {enriched_count}/{len(results)} 条成功"
+            f"全文抓取: {enriched_count} 条全文 / {sufficient_count} 条摘要已足够 / "
+            f"{len(results)} 条总计"
             + (f" (query={query!r})" if query else "")
         )
 
@@ -558,6 +682,8 @@ class WebContentFetcher:
         self,
         results: List[Dict[str, Any]],
         query: Optional[str] = None,
+        llm_client: Optional[Any] = None,
+        use_content_fetcher: Optional[bool] = None,
     ) -> List[Dict[str, Any]]:
         """
         同步版本的 enrich_results，兼容 RetrievalService。
@@ -565,18 +691,19 @@ class WebContentFetcher:
         if not results or not self.enabled:
             return results
 
+        coro = self.enrich_results(
+            results,
+            query=query,
+            llm_client=llm_client,
+            use_content_fetcher=use_content_fetcher,
+        )
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
                 with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(
-                        asyncio.run,
-                        self.enrich_results(results, query=query),
-                    )
+                    future = executor.submit(asyncio.run, coro)
                     return future.result()
             else:
-                return loop.run_until_complete(
-                    self.enrich_results(results, query=query)
-                )
+                return loop.run_until_complete(coro)
         except RuntimeError:
-            return asyncio.run(self.enrich_results(results, query=query))
+            return asyncio.run(coro)

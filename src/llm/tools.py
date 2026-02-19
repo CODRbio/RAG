@@ -373,6 +373,22 @@ _RUN_CODE_SCHEMA = {
     "required": ["code"],
 }
 
+_SEARCH_NCBI_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "query": {
+            "type": "string",
+            "description": "PubMed 生物医学搜索查询（英文关键词效果最佳）",
+        },
+        "limit": {
+            "type": "integer",
+            "description": "返回结果数量",
+            "default": 5,
+        },
+    },
+    "required": ["query"],
+}
+
 
 # ── Handler 实现 ──
 
@@ -473,6 +489,47 @@ def _handle_compare(paper_ids: List[str], aspects: Optional[List[str]] = None, *
         return f"论文对比失败: {e}"
 
 
+def _handle_search_ncbi(query: str, limit: int = 5, **_) -> str:
+    """调用 NCBI PubMed E-Utilities，返回生物医学文献摘要信息。"""
+    try:
+        import asyncio
+        from src.retrieval.ncbi_search import get_ncbi_searcher
+
+        searcher = get_ncbi_searcher()
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    future = pool.submit(asyncio.run, searcher.search(query, limit=limit))
+                    results = future.result(timeout=30)
+            else:
+                results = loop.run_until_complete(searcher.search(query, limit=limit))
+        except RuntimeError:
+            results = asyncio.run(searcher.search(query, limit=limit))
+
+        if not results:
+            return "PubMed 未找到相关文献。"
+
+        lines = []
+        for r in results[:limit]:
+            meta = r.get("metadata", {})
+            title = meta.get("title", r.get("content", ""))
+            year = meta.get("year", "")
+            doi = meta.get("doi", "")
+            authors = meta.get("authors", [])
+            authors_str = ", ".join(authors[:3]) + ("..." if len(authors) > 3 else "")
+            url = meta.get("url", "")
+            lines.append(
+                f"- **{title}** ({year})\n"
+                f"  Authors: {authors_str}\n"
+                f"  DOI: {doi or '—'}  URL: {url}"
+            )
+        return "\n".join(lines)
+    except Exception as e:
+        return f"NCBI 搜索失败: {e}"
+
+
 def _handle_run_code(code: str, **_) -> str:
     """以子进程方式执行 Python 代码。"""
     # TODO(Security): 生产环境强烈建议将 subprocess 替换为安全的隔离沙盒 API (如 E2B)。
@@ -558,5 +615,14 @@ CORE_TOOLS: List[ToolDef] = [
         description="执行简单的 Python 代码进行数据计算、统计验证或格式转换。",
         parameters=_RUN_CODE_SCHEMA,
         handler=_handle_run_code,
+    ),
+    ToolDef(
+        name="search_ncbi",
+        description=(
+            "搜索 NCBI PubMed 生物医学文献库，专攻生物学、医学、基因组学、海洋生态等领域。"
+            "返回标题、作者、年份、DOI，适合精确的生物医学文献检索。"
+        ),
+        parameters=_SEARCH_NCBI_SCHEMA,
+        handler=_handle_search_ncbi,
     ),
 ]
