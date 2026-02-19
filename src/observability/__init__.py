@@ -16,6 +16,6 @@ Observability 模块：OpenTelemetry tracing + Prometheus metrics。
 
 from src.observability.setup import setup_observability
 from src.observability.metrics import metrics
-from src.observability.tracing import tracer
+from src.observability.tracing import tracer, traceable, langsmith_enabled
 
-__all__ = ["setup_observability", "metrics", "tracer"]
+__all__ = ["setup_observability", "metrics", "tracer", "traceable", "langsmith_enabled"]

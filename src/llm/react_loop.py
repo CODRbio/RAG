@@ -22,6 +22,7 @@ from src.llm.tools import (
     tools_to_prompt,
 )
 from src.log import get_logger
+from src.observability.tracing import traceable
 
 logger = get_logger(__name__)
 
@@ -37,6 +38,7 @@ class ReactResult:
     raw_response: Optional[Dict[str, Any]] = None
 
 
+@traceable(run_type="agent", name="react_loop")
 def react_loop(
     messages: List[Dict[str, Any]],
     tools: List[ToolDef],

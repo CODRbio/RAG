@@ -28,6 +28,8 @@ try:
 except Exception:
     _obs_metrics = None  # type: ignore
     _obs_tracer = None  # type: ignore
+
+from src.observability.tracing import traceable
 from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
@@ -634,6 +636,7 @@ class HTTPChatClient(BaseChatClient):
         self.log_store = log_store
         self._semaphore = semaphore
 
+    @traceable(run_type="llm", name="llm.chat")
     def chat(
         self,
         messages: List[Dict[str, Any]],

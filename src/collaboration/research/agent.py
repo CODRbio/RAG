@@ -2999,6 +2999,19 @@ def execute_deep_research(
     config = runtime["config"]
     initial_state = runtime["initial_state"]
 
+    # 将 job_id 注入 LangGraph RunnableConfig 的 tags/metadata，供 LangSmith 追踪使用
+    if job_id:
+        existing_tags = list(config.get("tags") or [])
+        if f"job:{job_id}" not in existing_tags:
+            existing_tags.append(f"job:{job_id}")
+        existing_metadata = dict(config.get("metadata") or {})
+        existing_metadata.update({"job_id": job_id, "topic": topic})
+        config = {
+            **config,
+            "tags": existing_tags,
+            "metadata": existing_metadata,
+        }
+
     try:
         compiled.invoke(initial_state, config=config)
         state_snapshot = compiled.get_state(config)
