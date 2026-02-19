@@ -55,6 +55,7 @@ const defaultWebSources: WebSource[] = [
   { id: 'google', name: 'Google Search', enabled: false, topK: 5, threshold: 0.4 },
   { id: 'scholar', name: 'Google Scholar', enabled: false, topK: 3, threshold: 0.6 },
   { id: 'semantic', name: 'Semantic Scholar', enabled: false, topK: 3, threshold: 0.7 },
+  { id: 'ncbi', name: 'NCBI PubMed', enabled: false, topK: 5, threshold: 0.6 },
 ];
 
 const normalizeOptionalYear = (value: unknown): number | null => {
@@ -219,10 +220,15 @@ export const useConfigStore = create<ConfigState>()(
           webSearchConfig: {
             ...currentState.webSearchConfig,
             ...(persisted.webSearchConfig || {}),
-            // 确保新字段有默认值
             queryOptimizer: persisted.webSearchConfig?.queryOptimizer ?? true,
             maxQueriesPerProvider: persisted.webSearchConfig?.maxQueriesPerProvider ?? 3,
             enableContentFetcher: persisted.webSearchConfig?.enableContentFetcher ?? false,
+            sources: (() => {
+              const saved = persisted.webSearchConfig?.sources || [];
+              const savedIds = new Set(saved.map((s) => s.id));
+              const missing = defaultWebSources.filter((d) => !savedIds.has(d.id));
+              return [...saved, ...missing];
+            })(),
           },
           deepResearchDefaults: {
             ...currentState.deepResearchDefaults,
@@ -239,3 +245,19 @@ export const useConfigStore = create<ConfigState>()(
     }
   )
 );
+
+// After hydration, ensure any newly added default sources are present.
+// This covers cases where the merge callback didn't fire (e.g. HMR).
+useConfigStore.persist.onFinishHydration?.(() => {
+  const { webSearchConfig } = useConfigStore.getState();
+  const existingIds = new Set(webSearchConfig.sources.map((s) => s.id));
+  const missing = defaultWebSources.filter((d) => !existingIds.has(d.id));
+  if (missing.length > 0) {
+    useConfigStore.setState({
+      webSearchConfig: {
+        ...webSearchConfig,
+        sources: [...webSearchConfig.sources, ...missing],
+      },
+    });
+  }
+});

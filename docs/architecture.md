@@ -140,11 +140,19 @@ Frontend (React + Zustand + i18n)
 | `components/canvas/` | CanvasPanel、ExploreStage、OutlineStage、DraftingStage、RefineStage、StageStepper、FloatingToolbar |
 | `components/compare/` | CompareView |
 | `components/graph/` | GraphExplorer |
-| `components/workflow/` | DeepResearchDialog、DeepResearchSettingsPopover、WorkflowStepper、CommandPalette、IntentModeSelector、IntentConfirmPopover |
+| `components/workflow/` | DeepResearchDialog（壳层编排）、deep-research 子模块（Hook + 阶段组件）、DeepResearchSettingsPopover、WorkflowStepper、CommandPalette、IntentModeSelector、IntentConfirmPopover |
 | `components/research/` | ResearchProgressPanel |
 | `components/settings/` | SettingsModal |
 | `components/layout/` | Header、Sidebar |
 | `components/ui/` | Modal、Toast、PdfViewerModal |
+
+> Deep Research 前端已按阶段拆分：
+>
+> - `components/workflow/DeepResearchDialog.tsx`：弹窗壳层、阶段切换、Footer 操作。
+> - `components/workflow/deep-research/useDeepResearchTask.ts`：API 交互、SSE 流消费、副作用、任务恢复。
+> - `components/workflow/deep-research/ClarifyPhase.tsx`：澄清阶段 UI。
+> - `components/workflow/deep-research/ConfirmPhase.tsx`：大纲确认/拖拽/介入参数 UI。
+> - `components/workflow/deep-research/ProgressMonitor.tsx`：运行态监控与日志 UI。
 
 ### 状态管理
 
@@ -221,7 +229,7 @@ Phase 1: /deep-research/start
 
 Phase 2: /deep-research/submit（推荐）
   提交后台任务 → 返回 job_id
-  前端轮询 /deep-research/jobs/{job_id} 与 /events
+  前端订阅 /deep-research/jobs/{job_id}/stream（SSE，支持 after_id 断点续传）
   任务在后端持续运行（不依赖前端连接）
 
   研究循环（per section）：

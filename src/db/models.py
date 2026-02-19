@@ -575,7 +575,7 @@ class RevokedToken(SQLModel, table=True):
     )
 
     # SHA-256 hex digest of the raw JWT string — avoids storing the full token.
-    token_hash: str = Field(primary_key=True, sa_column=Column(Text, nullable=False))
+    token_hash: str = Field(sa_column=Column(Text, primary_key=True, nullable=False))
     # ISO-8601 timestamp copied from the JWT `exp` claim; used for cleanup.
     expires_at: str = Field(sa_column=Column(Text, nullable=False))
     revoked_at: str = Field(default_factory=_now_iso, sa_column=Column(Text, nullable=False))

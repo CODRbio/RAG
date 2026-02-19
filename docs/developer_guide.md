@@ -155,6 +155,12 @@ result = call_llm(
 - SSE 事件处理组件（聊天与研究相关）
 - `frontend/src/i18n/locales/*.json` 翻译文件
 
+Deep Research 前端在 `frontend/src/components/workflow/deep-research/` 下采用拆分结构，涉及研究弹窗相关改动时，优先按以下边界修改：
+
+- `DeepResearchDialog.tsx`：壳层编排与按钮行为
+- `useDeepResearchTask.ts`：请求、SSE 流消费、副作用与任务恢复
+- `ClarifyPhase.tsx` / `ConfirmPhase.tsx` / `ProgressMonitor.tsx`：分阶段 UI
+
 ## 9. 测试与回归
 
 ### 最小回归集

@@ -82,7 +82,13 @@ src/
 │   ├── graph/            #   图谱可视化
 │   │   └── GraphExplorer.tsx
 │   ├── workflow/         #   Deep Research 工作流
-│   │   ├── DeepResearchDialog.tsx
+│   │   ├── DeepResearchDialog.tsx            # 对话框壳层（阶段编排 + footer 操作）
+│   │   ├── deep-research/                    # Deep Research 子模块（2026-02 拆分）
+│   │   │   ├── useDeepResearchTask.ts        # API 交互、SSE 流消费、副作用、任务恢复
+│   │   │   ├── ClarifyPhase.tsx              # 阶段 1：澄清问题
+│   │   │   ├── ConfirmPhase.tsx              # 阶段 2：确认大纲（含 DnD）
+│   │   │   ├── ProgressMonitor.tsx           # 阶段 3：运行监控与日志
+│   │   │   └── types.ts                      # 共享类型与常量
 │   │   ├── DeepResearchSettingsPopover.tsx
 │   │   ├── WorkflowStepper.tsx
 │   │   ├── CommandPalette.tsx
@@ -147,9 +153,39 @@ src/
 
 - 启动前设置：`DeepResearchSettingsPopover`（持久化到 localStorage）
 - 意图检测：`IntentModeSelector` + `IntentConfirmPopover`
-- 研究对话框：`DeepResearchDialog`（澄清 → 大纲确认 → 执行 → 审核）
+- 研究对话框：`DeepResearchDialog`（澄清 → 大纲确认 → 执行）
 - 进度面板：`ResearchProgressPanel`（coverage 曲线、成本状态、效率评分）
-- 后台任务轮询：`GET /deep-research/jobs/{id}/events`
+- 后台任务进度：`GET /deep-research/jobs/{id}/stream`（SSE 实时事件流）
+- 兼容排障接口：`GET /deep-research/jobs/{id}/events?after_id=...`
+
+#### DeepResearchDialog 拆分说明（2026-02）
+
+为改善可读性与可维护性，`DeepResearchDialog` 已从单文件大组件拆分为「壳层 + 阶段组件 + 任务 Hook」结构：
+
+- `DeepResearchDialog`：保留弹窗壳层、阶段切换、Footer 操作按钮与 UI 级状态编排。
+- `ClarifyPhase`：只负责澄清阶段表单展示与交互。
+- `ConfirmPhase`：负责大纲确认、拖拽排序、研究深度与介入参数配置。
+- `ProgressMonitor`：负责运行态监控面板、效率洞察和进度日志渲染。
+- `useDeepResearchTask`：集中处理 API 调用、SSE 事件消费、副作用、任务恢复、结果回填。
+
+拆分后的核心收益：
+
+- 阶段 UI 与业务副作用解耦，定位问题更快。
+- 运行态 SSE 消费与事件处理逻辑集中，减少散落在渲染层的 effect。
+- 后续扩展某一阶段（如 Confirm 的交互）时，不会影响其他阶段代码。
+
+典型数据流：
+
+1. `DeepResearchDialog` 收集各阶段输入参数。
+2. 调用 `useDeepResearchTask.generatePlan / confirmAndRun` 发起请求。
+3. Hook 订阅 SSE 任务事件并更新 `researchMonitor` 与 `progressLogs`。
+4. `ProgressMonitor` 仅消费状态并渲染视图。
+
+开发建议（本模块）：
+
+- 新增 Deep Research 阶段 UI 时，优先放入 `deep-research/` 子目录。
+- API 与 SSE 流逻辑优先放在 `useDeepResearchTask`，避免回流到阶段组件。
+- 跨阶段共享结构统一放在 `deep-research/types.ts`。
 
 ### 画布协作
 

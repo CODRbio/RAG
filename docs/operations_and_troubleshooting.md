@@ -115,6 +115,7 @@ sudo journalctl -u deepsea-rag-frontend -f
 | 端点 | 说明 |
 |---|---|
 | `GET /deep-research/jobs/{job_id}` | 任务状态（pending/running/cancelling/done/error/cancelled） |
+| `GET /deep-research/jobs/{job_id}/stream?after_id=...` | SSE 实时进度流（推荐） |
 | `GET /deep-research/jobs/{job_id}/events?after_id=...` | 增量事件流（排障主入口） |
 | `GET /deep-research/jobs/{job_id}/reviews` | 章节审核状态 |
 | `GET /deep-research/jobs/{job_id}/gap-supplements` | 缺口补充状态（pending/consumed） |
@@ -148,6 +149,7 @@ sudo journalctl -u deepsea-rag-frontend -f
 
 1. 查看任务状态与事件：
    - `GET /deep-research/jobs/{job_id}`
+   - `GET /deep-research/jobs/{job_id}/stream?after_id=0`
    - `GET /deep-research/jobs/{job_id}/events`
 2. 查看 resume 队列（按 job）：
    - `GET /deep-research/resume-queue?job_id={job_id}&limit=20`

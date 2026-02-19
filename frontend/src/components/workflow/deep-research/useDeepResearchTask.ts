@@ -5,7 +5,7 @@ import {
   deepResearchStart,
   deepResearchSubmit,
   getDeepResearchJob,
-  listDeepResearchJobEvents,
+  streamDeepResearchEvents,
   cancelDeepResearchJob,
 } from '../../../api/chat';
 import { exportCanvas, getCanvas } from '../../../api/canvas';
@@ -77,7 +77,6 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
   const {
     showDeepResearchDialog,
     setShowDeepResearchDialog,
-    deepResearchTopic,
     setDeepResearchTopic,
     setClarificationQuestions,
     sessionId,
@@ -115,17 +114,15 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
   const [initialStats, setInitialStats] = useState<InitialStats | null>(null);
   const [optimizationPromptDraft, setOptimizationPromptDraft] = useState('');
 
-  const pollTimerRef = useRef<number | null>(null);
-  const isPollingRef = useRef(false);
+  const abortControllerRef = useRef<AbortController | null>(null);
   const lastEventIdRef = useRef(0);
   const canvasRefreshCounterRef = useRef(0);
 
-  const stopPolling = () => {
-    if (pollTimerRef.current !== null) {
-      window.clearInterval(pollTimerRef.current);
-      pollTimerRef.current = null;
+  const stopStreaming = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
     }
-    isPollingRef.current = false;
   };
 
   const mapCitationsToSources = (citations: ChatCitation[]): Source[] => (
@@ -343,7 +340,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
         addToast('Deep Research 失败，请重试', 'error');
       }
     } finally {
-      stopPolling();
+      stopStreaming();
       localStorage.removeItem(DEEP_RESEARCH_JOB_KEY);
       setActiveJobId(null);
       setIsStopping(false);
@@ -353,50 +350,8 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
     }
   };
 
-  const pollJobOnce = async (jobId: string) => {
-    if (isPollingRef.current) return;
-    isPollingRef.current = true;
-    try {
-      const events = await listDeepResearchJobEvents(jobId, lastEventIdRef.current, 200);
-      if (events.length > 0) {
-        const maxId = events[events.length - 1].event_id;
-        lastEventIdRef.current = Math.max(lastEventIdRef.current, maxId);
-        appendProgressEvents(events);
-      }
-      const job = await getDeepResearchJob(jobId);
-      if (job.result_dashboard && Object.keys(job.result_dashboard).length > 0) {
-        setResearchDashboard(job.result_dashboard as unknown as ResearchDashboardData);
-      }
-      if (job.message) {
-        setProgressLogs((prev) => (prev[prev.length - 1] === `[status] ${job.message}` ? prev : [...prev, `[status] ${job.message}`].slice(-300)));
-      }
-      canvasRefreshCounterRef.current += 1;
-      const runningCanvasId = job.canvas_id || canvasId;
-      if (runningCanvasId && canvasRefreshCounterRef.current % 3 === 0) {
-        getCanvas(runningCanvasId)
-          .then((canvasData) => {
-            if (!canvasData) return;
-            setCanvas(canvasData);
-            if ((job.status === 'running' || job.status === 'cancelling') && (canvasData.stage === 'drafting' || canvasData.stage === 'refine')) {
-              setCanvasOpen(true);
-            }
-          })
-          .catch((err) => {
-            console.debug('[DeepResearch] periodic canvas refresh failed:', err);
-          });
-      }
-      if (job.status === 'done' || job.status === 'cancelled' || job.status === 'error') {
-        await finalizeRunningJob(jobId);
-      }
-    } catch (err) {
-      console.error('[DeepResearch] poll failed:', err);
-    } finally {
-      isPollingRef.current = false;
-    }
-  };
-
-  const startPollingJob = (jobId: string, resetEvents: boolean) => {
-    stopPolling();
+  const startStreamingJob = (jobId: string, resetEvents: boolean) => {
+    stopStreaming();
     if (resetEvents) {
       lastEventIdRef.current = 0;
       canvasRefreshCounterRef.current = 0;
@@ -406,10 +361,92 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
     }
     setActiveJobId(jobId);
     localStorage.setItem(DEEP_RESEARCH_JOB_KEY, jobId);
-    pollJobOnce(jobId);
-    pollTimerRef.current = window.setInterval(() => {
-      pollJobOnce(jobId);
-    }, 2000);
+
+    const ac = new AbortController();
+    abortControllerRef.current = ac;
+
+    (async () => {
+      let retryDelay = 1000;
+      while (!ac.signal.aborted) {
+        try {
+          for await (const { event, data } of streamDeepResearchEvents(jobId, ac.signal, lastEventIdRef.current)) {
+            if (ac.signal.aborted) break;
+
+            if (event === 'heartbeat' || event === 'job_status') {
+              // Update research dashboard if available
+              const dashboard = data.result_dashboard as Record<string, unknown> | undefined;
+              if (dashboard && Object.keys(dashboard).length > 0) {
+                setResearchDashboard(dashboard as unknown as ResearchDashboardData);
+              }
+              // Update status message log
+              const message = typeof data.message === 'string' ? data.message : '';
+              if (message) {
+                setProgressLogs((prev) =>
+                  prev[prev.length - 1] === `[status] ${message}`
+                    ? prev
+                    : [...prev, `[status] ${message}`].slice(-300),
+                );
+              }
+              if (event === 'heartbeat') {
+                // Periodic canvas refresh on every other heartbeat (~10s cadence)
+                canvasRefreshCounterRef.current += 1;
+                if (canvasRefreshCounterRef.current % 2 === 0) {
+                  const runningCanvasId =
+                    (typeof data.canvas_id === 'string' ? data.canvas_id : '') ||
+                    useChatStore.getState().canvasId ||
+                    '';
+                  const status = typeof data.status === 'string' ? data.status : '';
+                  if (runningCanvasId) {
+                    getCanvas(runningCanvasId)
+                      .then((canvasData) => {
+                        if (!canvasData) return;
+                        setCanvas(canvasData);
+                        if (
+                          (status === 'running' || status === 'cancelling') &&
+                          (canvasData.stage === 'drafting' || canvasData.stage === 'refine')
+                        ) {
+                          setCanvasOpen(true);
+                        }
+                      })
+                      .catch((err) => {
+                        console.debug('[DeepResearch] periodic canvas refresh failed:', err);
+                      });
+                  }
+                }
+              }
+              if (event === 'job_status') {
+                const status = typeof data.status === 'string' ? data.status : '';
+                if (status === 'done' || status === 'cancelled' || status === 'error') {
+                  await finalizeRunningJob(jobId);
+                  return;
+                }
+              }
+            } else {
+              // Regular DB-backed job event — track event_id for reconnect, then process
+              const eid = typeof data._event_id === 'number' ? data._event_id : null;
+              if (eid !== null) {
+                lastEventIdRef.current = Math.max(lastEventIdRef.current, eid);
+              }
+              appendProgressEvents([
+                {
+                  event_id: eid ?? lastEventIdRef.current,
+                  event,
+                  created_at: typeof data.created_at === 'number' ? data.created_at : Date.now() / 1000,
+                  data,
+                },
+              ]);
+            }
+          }
+          // Stream ended normally (server closed after job_status or job not found)
+          break;
+        } catch (err) {
+          if (ac.signal.aborted) break;
+          console.error('[DeepResearch] SSE stream error, retrying in', retryDelay, 'ms:', err);
+          await new Promise<void>((resolve) => setTimeout(resolve, retryDelay));
+          retryDelay = Math.min(retryDelay * 2, 10000);
+        }
+      }
+    })();
   };
 
   // Restore job state when dialog opens
@@ -441,7 +478,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
         setPhase('running');
         setIsStreaming(true);
         setDeepResearchActive(true);
-        startPollingJob(savedJobId, false);
+        startStreamingJob(savedJobId, false);
         addToast('已恢复 Deep Research 后台任务状态', 'info');
       } catch (err) {
         console.debug('[DeepResearch] skip stale saved job:', err);
@@ -455,9 +492,9 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showDeepResearchDialog, activeJobId, sessionId]);
 
-  // Cleanup polling on unmount
+  // Cleanup SSE stream on unmount
   useEffect(() => () => {
-    stopPolling();
+    stopStreaming();
   }, []);
 
   const buildCommonRequestParams = () => {
@@ -696,7 +733,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
         archiveJobId(previousActiveJobId);
       }
       setWorkflowStep('drafting');
-      startPollingJob(submitResp.job_id, true);
+      startStreamingJob(submitResp.job_id, true);
       setShowDeepResearchDialog(false);
       submitted = true;
       addToast('已转为后台执行，可安全关闭当前前端页面', 'info');
@@ -704,7 +741,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       console.error('[DeepResearch] Error:', error);
       addToast('Deep Research 失败，请重试', 'error');
       appendToLastMessage('\n\n[错误] Deep Research 请求失败。');
-      stopPolling();
+      stopStreaming();
       localStorage.removeItem(DEEP_RESEARCH_JOB_KEY);
       setActiveJobId(null);
       setDeepResearchActive(false);

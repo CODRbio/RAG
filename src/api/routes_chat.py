@@ -1366,6 +1366,84 @@ def get_deep_research_job_events(job_id: str, after_id: int = 0, limit: int = 20
     }
 
 
+def _dr_sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _dr_job_status_payload(job: dict) -> dict:
+    """Extract status fields from a job dict for SSE heartbeat / job_status events."""
+    dashboard = job.get("result_dashboard")
+    if isinstance(dashboard, str):
+        try:
+            dashboard = json.loads(dashboard)
+        except Exception:
+            dashboard = {}
+    return {
+        "job_id": job.get("job_id", ""),
+        "status": job.get("status", ""),
+        "current_stage": job.get("current_stage", ""),
+        "message": job.get("message", ""),
+        "canvas_id": job.get("canvas_id", ""),
+        "result_dashboard": dashboard or {},
+    }
+
+
+@router.get("/deep-research/jobs/{job_id}/stream")
+def stream_deep_research_events(job_id: str, after_id: int = 0) -> StreamingResponse:
+    """SSE stream for Deep Research job progress.
+
+    Replaces the polling pattern of GET /events + GET /jobs/{id}.
+    Emits all job events in real-time, plus periodic heartbeat events carrying
+    the current job status, and a final job_status event when the job reaches
+    a terminal state (done / error / cancelled).
+    """
+    import time as _time
+    from src.collaboration.research.job_store import get_job, list_events
+
+    if not get_job(job_id):
+        raise HTTPException(status_code=404, detail="job 不存在")
+
+    def _ev_payload(ev: dict) -> dict:
+        """Merge event_id into the data payload so the frontend can track resume position."""
+        data = dict(ev["data"]) if isinstance(ev["data"], dict) else {"_raw": ev["data"]}
+        data["_event_id"] = int(ev["event_id"])
+        return data
+
+    def event_stream():
+        cursor = max(0, int(after_id))
+        idle_ticks = 0
+        while True:
+            events = list_events(job_id, after_id=cursor, limit=500)
+            if events:
+                idle_ticks = 0
+                for ev in events:
+                    cursor = max(cursor, int(ev["event_id"]))
+                    yield _dr_sse(ev["event"], _ev_payload(ev))
+                continue
+
+            job = get_job(job_id)
+            if not job:
+                yield _dr_sse("error", {"message": "job 不存在"})
+                break
+
+            status = str(job.get("status") or "")
+            if status in {"done", "error", "cancelled"}:
+                # Flush any final events that arrived before the status flip
+                final_events = list_events(job_id, after_id=cursor, limit=500)
+                for ev in final_events:
+                    cursor = max(cursor, int(ev["event_id"]))
+                    yield _dr_sse(ev["event"], _ev_payload(ev))
+                yield _dr_sse("job_status", _dr_job_status_payload(job))
+                break
+
+            idle_ticks += 1
+            if idle_ticks % 5 == 0:
+                yield _dr_sse("heartbeat", _dr_job_status_payload(job))
+            _time.sleep(1)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
 @router.post("/deep-research/jobs/{job_id}/cancel")
 def cancel_deep_research_job(job_id: str) -> dict:
     from src.collaboration.research.job_store import get_job, update_job, append_event

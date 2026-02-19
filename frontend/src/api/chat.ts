@@ -17,6 +17,8 @@ import type {
   ResearchInsight,
 } from '../types';
 
+const BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api';
+
 export async function chat(data: ChatRequest): Promise<ChatResponse> {
   const res = await client.post<ChatResponse>('/chat', data);
   return res.data;
@@ -85,6 +87,61 @@ export async function listDeepResearchJobEvents(
     { params: { after_id: afterId, limit } },
   );
   return res.data.events || [];
+}
+
+/**
+ * SSE stream for Deep Research job progress.
+ *
+ * Replaces the setInterval polling of /events + /jobs/{id}.
+ * Yields all job progress events in real-time. The backend also emits
+ * periodic `heartbeat` events (with job status) and a final `job_status`
+ * event when the job reaches a terminal state.
+ */
+export async function* streamDeepResearchEvents(
+  jobId: string,
+  signal?: AbortSignal,
+  afterId = 0,
+): AsyncGenerator<{ event: string; data: Record<string, unknown> }> {
+  const token = localStorage.getItem('token');
+  const url = `${BASE_URL}/deep-research/jobs/${encodeURIComponent(jobId)}/stream?after_id=${afterId}`;
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: {
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    signal,
+  });
+  if (!response.ok) {
+    const errBody = await response.text().catch(() => '');
+    throw new Error(`HTTP ${response.status}: ${response.statusText} - ${errBody}`);
+  }
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error('No response body');
+
+  const decoder = new TextDecoder();
+  let buffer = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+
+    let currentEvent = '';
+    for (const line of lines) {
+      if (line.startsWith('event: ')) {
+        currentEvent = line.slice(7).trim();
+      } else if (line.startsWith('data: ')) {
+        const dataStr = line.slice(6);
+        try {
+          const data = JSON.parse(dataStr) as Record<string, unknown>;
+          yield { event: currentEvent, data };
+        } catch {
+          yield { event: currentEvent, data: { raw: dataStr } };
+        }
+      }
+    }
+  }
 }
 
 export async function cancelDeepResearchJob(jobId: string): Promise<{ ok: boolean; job_id: string; status: string }> {

@@ -222,7 +222,7 @@ sudo journalctl -u deepsea-rag-api -f
 当前版本 Deep Research 默认采用"后台任务模式"：
 
 - 点击"开始研究"后，任务在后端持续执行，前端页面关闭/刷新不会自动中断
-- 前端通过任务接口自动刷新状态；可在主界面查看进度
+- 前端通过 `/deep-research/jobs/{job_id}/stream`（SSE）实时接收状态；可在主界面查看进度
 - 只有点击"停止任务"或调用取消接口时才会终止任务
 
 ### 启动前设置（前端 `⚙` 弹窗）
@@ -255,6 +255,7 @@ sudo journalctl -u deepsea-rag-api -f
 
 - `POST /deep-research/submit`：提交后台任务，返回 `job_id`
 - `GET /deep-research/jobs/{job_id}`：查询任务状态
+- `GET /deep-research/jobs/{job_id}/stream`：SSE 实时进度流（推荐）
 - `GET /deep-research/jobs/{job_id}/events`：增量拉取进度事件
 - `POST /deep-research/jobs/{job_id}/cancel`：停止任务
 - `POST /deep-research/jobs/{job_id}/review`：提交章节审核

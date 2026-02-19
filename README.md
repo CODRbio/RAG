@@ -88,7 +88,7 @@ bash scripts/start.sh
 | 功能域 | 接口 |
 |---|---|
 | 聊天 | `POST /chat`、`POST /chat/stream` |
-| Deep Research | `/deep-research/start\|submit\|jobs/*\|review\|gap-supplement\|insights` |
+| Deep Research | `/deep-research/start\|submit\|jobs/*\|jobs/*/stream\|review\|gap-supplement\|insights` |
 | 画布 | `/canvas/*`（CRUD + 大纲 + 草稿 + 快照 + AI 编辑 + 引用管理） |
 | 导出 | `POST /export` |
 | 对比 | `POST /compare`、`GET /compare/candidates`、`GET /compare/papers` |
@@ -105,6 +105,7 @@ bash scripts/start.sh
 
 - **启动前 `⚙` 设置**：深度（lite / comprehensive）、输出语言、分步骤模型、strict step model
 - **后台任务模式**：提交后前端可关闭/刷新，任务在后端持续运行
+- **进度实时流**：前端通过 `/deep-research/jobs/{job_id}/stream`（SSE）低延迟接收进度与状态心跳
 - **Drafting 人工审核**：通过 / 修改 / 重新确认 + 一键"全部通过并触发整合"
 - **章节缺口补充**：支持"材料线索"与"直接观点"
 - **人工介入**：上传临时材料（pdf/md/txt）或文本补充，仅用于本次任务
@@ -160,6 +161,9 @@ bash scripts/start.sh
 ├── frontend/                 # React 前端
 │   ├── src/pages/            #   ChatPage / IngestPage / LoginPage / AdminPage
 │   ├── src/components/       #   chat / canvas / compare / graph / workflow / research / settings / layout / ui
+│   │   └── workflow/deep-research/
+│   │       #   Deep Research 拆分模块：
+│   │       #   useDeepResearchTask + ClarifyPhase + ConfirmPhase + ProgressMonitor + types
 │   ├── src/stores/           #   Zustand 状态管理
 │   ├── src/api/              #   后端接口封装
 │   ├── src/types/            #   TypeScript 类型

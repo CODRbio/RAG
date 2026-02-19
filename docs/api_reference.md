@@ -74,6 +74,7 @@
 | `POST` | `/deep-research/submit` | Phase-2 后台提交，返回 `job_id`（推荐） |
 | `GET` | `/deep-research/jobs` | 列出后台任务（支持 `limit`、`status` 筛选） |
 | `GET` | `/deep-research/jobs/{job_id}` | 查询单个任务状态与结果 |
+| `GET` | `/deep-research/jobs/{job_id}/stream` | SSE 进度流（推荐，支持 `after_id` 断点续传） |
 | `GET` | `/deep-research/jobs/{job_id}/events` | 增量事件流（支持 `after_id`） |
 | `POST` | `/deep-research/jobs/{job_id}/cancel` | 停止任务（前端关闭不会自动终止） |
 | `POST` | `/deep-research/jobs/{job_id}/review` | 提交章节审核（approve / revise） |
@@ -169,7 +170,7 @@
 
 ### Deep Research 事件类型
 
-`GET /deep-research/jobs/{job_id}/events` 返回的事件：
+`GET /deep-research/jobs/{job_id}/events` 返回的事件（`/stream` 也会推送同类事件）：
 
 | 事件 | 说明 |
 |---|---|
@@ -182,6 +183,15 @@
 | `done` | 任务完成 |
 | `cancelled` | 任务取消完成 |
 | `error` | 任务失败 |
+
+`GET /deep-research/jobs/{job_id}/stream` 额外事件：
+
+| 事件 | 说明 |
+|---|---|
+| `heartbeat` | 空闲心跳，附带任务 `status/message/current_stage/canvas_id/result_dashboard` |
+| `job_status` | 终态快照（`done/error/cancelled`）后关闭连接 |
+
+> `/stream` 推送的业务事件数据中包含 `_event_id`，用于前端重连时更新 `after_id` 游标。
 
 **`progress` 子类型（`type` 字段）：**
 
