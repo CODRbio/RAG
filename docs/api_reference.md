@@ -68,6 +68,12 @@
   - 支持重复提交（“重新确认”会覆盖上一条同章节记录）。
 - `GET /deep-research/jobs/{job_id}/reviews`
   - 查看当前任务所有章节审核记录。
+- `GET /deep-research/resume-queue`
+  - 查看 resume 队列（支持按状态/实例/job 过滤）。
+- `POST /deep-research/resume-queue/cleanup`
+  - 清理 resume 队列（默认清理终态记录）。
+- `POST /deep-research/resume-queue/{resume_id}/retry`
+  - 手动重试某条 resume 请求（仅终态可重试）。
 - `POST /deep-research/jobs/{job_id}/gap-supplement`
   - 提交章节级缺口补充（观点或材料线索）。
 - `GET /deep-research/jobs/{job_id}/gap-supplements`
@@ -169,6 +175,67 @@
   - `gap_text: string`
   - `supplement_type: "material" | "direct_info"`
   - `content: object`（推荐 `{"text": "...用户补充..."}`）
+
+### Resume Queue 运维（查看 / 清理 / 重试）
+
+用于后台任务的“审核后恢复（resume）”运维排障。
+
+#### `GET /deep-research/resume-queue`
+
+- Query 参数：
+  - `limit`（默认 `50`，最大 `500`）
+  - `status`（可选：`pending|running|done|error|cancelled`）
+  - `owner_instance`（可选：实例标识）
+  - `job_id`（可选）
+- 返回：
+  - `items`：队列项列表
+  - `count`：条数
+
+示例：
+
+```http
+GET /deep-research/resume-queue?status=error&limit=20
+```
+
+#### `POST /deep-research/resume-queue/cleanup`
+
+- 请求体：
+  - `statuses?: string[]`（不传时默认 `["done","error","cancelled"]`）
+  - `before_hours?: number | null`（默认 `72`；`null` 表示不按时间过滤）
+  - `owner_instance?: string`
+  - `job_id?: string`
+- 返回：
+  - `deleted`：删除条数
+
+示例：
+
+```json
+{
+  "statuses": ["done", "error", "cancelled"],
+  "before_hours": 48
+}
+```
+
+#### `POST /deep-research/resume-queue/{resume_id}/retry`
+
+- 请求体（可选）：
+  - `owner_instance?: string`（不传则使用当前 worker 实例）
+  - `message?: string`
+- 返回：
+  - `item`：更新后的队列项（状态变为 `pending`）
+
+示例：
+
+```json
+{
+  "message": "manual retry after review fix"
+}
+```
+
+常见状态码：
+
+- `404`：`resume_id` 不存在
+- `409`：该请求已在 `pending/running`，或同一 `job_id` 已有活跃 resume 请求
 
 ### Research Depth Presets
 

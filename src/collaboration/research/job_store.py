@@ -84,6 +84,38 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS deep_research_resume_queue (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id          TEXT NOT NULL,
+            owner_instance  TEXT NOT NULL DEFAULT '',
+            source          TEXT NOT NULL DEFAULT 'review',
+            status          TEXT NOT NULL DEFAULT 'pending',
+            message         TEXT NOT NULL DEFAULT '',
+            created_at      REAL NOT NULL,
+            updated_at      REAL NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_dr_resume_queue_status_created
+        ON deep_research_resume_queue(status, created_at)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_dr_resume_queue_owner_status
+        ON deep_research_resume_queue(owner_instance, status, created_at)
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_dr_resume_queue_job_status_unique
+        ON deep_research_resume_queue(job_id, status)
+        """
+    )
     # ── Gap Supplements (section-scoped user supplements for information gaps) ──
     conn.execute(
         """
@@ -328,6 +360,255 @@ def list_reviews(job_id: str) -> List[Dict[str, Any]]:
             (job_id,),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def enqueue_resume_request(
+    job_id: str,
+    owner_instance: str,
+    source: str = "review",
+    message: str = "",
+) -> Dict[str, Any]:
+    """
+    Enqueue one resume request for a job.
+    Idempotent when an existing pending/running row already exists.
+    """
+    now = time.time()
+    with _db() as conn:
+        existing = conn.execute(
+            """
+            SELECT id, job_id, owner_instance, source, status, message, created_at, updated_at
+            FROM deep_research_resume_queue
+            WHERE job_id = ? AND status IN ('pending', 'running')
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (job_id,),
+        ).fetchone()
+        if existing:
+            row = dict(existing)
+            if row.get("owner_instance") != owner_instance:
+                conn.execute(
+                    """
+                    UPDATE deep_research_resume_queue
+                    SET owner_instance = ?, source = ?, message = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (owner_instance, source, message, now, row["id"]),
+                )
+                conn.commit()
+                row["owner_instance"] = owner_instance
+                row["source"] = source
+                row["message"] = message
+                row["updated_at"] = now
+            return row
+
+        cur = conn.execute(
+            """
+            INSERT INTO deep_research_resume_queue
+                (job_id, owner_instance, source, status, message, created_at, updated_at)
+            VALUES (?, ?, ?, 'pending', ?, ?, ?)
+            """,
+            (job_id, owner_instance, source, message, now, now),
+        )
+        conn.commit()
+        rid = int(cur.lastrowid or 0)
+        row = conn.execute(
+            """
+            SELECT id, job_id, owner_instance, source, status, message, created_at, updated_at
+            FROM deep_research_resume_queue
+            WHERE id = ?
+            """,
+            (rid,),
+        ).fetchone()
+    return dict(row) if row else {}
+
+
+def claim_resume_requests(owner_instance: str, limit: int = 10) -> List[Dict[str, Any]]:
+    """Atomically claim pending resume requests for this instance."""
+    limit = max(1, min(int(limit), 100))
+    now = time.time()
+    claimed: List[Dict[str, Any]] = []
+    with _db() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, job_id, owner_instance, source, status, message, created_at, updated_at
+            FROM deep_research_resume_queue
+            WHERE status = 'pending' AND owner_instance = ?
+            ORDER BY created_at ASC
+            LIMIT ?
+            """,
+            (owner_instance, limit),
+        ).fetchall()
+        for row in rows:
+            rid = int(row["id"])
+            cur = conn.execute(
+                """
+                UPDATE deep_research_resume_queue
+                SET status = 'running', updated_at = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (now, rid),
+            )
+            if cur.rowcount <= 0:
+                continue
+            updated = conn.execute(
+                """
+                SELECT id, job_id, owner_instance, source, status, message, created_at, updated_at
+                FROM deep_research_resume_queue
+                WHERE id = ?
+                """,
+                (rid,),
+            ).fetchone()
+            if updated:
+                claimed.append(dict(updated))
+        conn.commit()
+    return claimed
+
+
+def complete_resume_request(resume_id: int, status: str, message: str = "") -> None:
+    """Mark a running resume request as done/error/cancelled."""
+    if status not in {"done", "error", "cancelled"}:
+        status = "error"
+    now = time.time()
+    with _db() as conn:
+        conn.execute(
+            """
+            UPDATE deep_research_resume_queue
+            SET status = ?, message = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (status, message, now, int(resume_id)),
+        )
+        conn.commit()
+
+
+def list_resume_requests(
+    limit: int = 50,
+    status: Optional[str] = None,
+    owner_instance: Optional[str] = None,
+    job_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """List resume queue rows with optional filters."""
+    limit = max(1, min(int(limit), 500))
+    sql = """
+        SELECT id, job_id, owner_instance, source, status, message, created_at, updated_at
+        FROM deep_research_resume_queue
+        WHERE 1 = 1
+    """
+    params: List[Any] = []
+    if status:
+        sql += " AND status = ?"
+        params.append(status)
+    if owner_instance:
+        sql += " AND owner_instance = ?"
+        params.append(owner_instance)
+    if job_id:
+        sql += " AND job_id = ?"
+        params.append(job_id)
+    sql += " ORDER BY created_at DESC LIMIT ?"
+    params.append(limit)
+    with _db() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def cleanup_resume_requests(
+    *,
+    statuses: Optional[List[str]] = None,
+    before_ts: Optional[float] = None,
+    owner_instance: Optional[str] = None,
+    job_id: Optional[str] = None,
+) -> int:
+    """
+    Delete resume queue rows by filters, defaulting to terminal statuses only.
+    Returns deleted row count.
+    """
+    effective_statuses = statuses or ["done", "error", "cancelled"]
+    allowed = {"pending", "running", "done", "error", "cancelled"}
+    effective_statuses = [s for s in effective_statuses if s in allowed]
+    if not effective_statuses:
+        return 0
+
+    placeholders = ", ".join(["?"] * len(effective_statuses))
+    sql = f"DELETE FROM deep_research_resume_queue WHERE status IN ({placeholders})"
+    params: List[Any] = list(effective_statuses)
+    if before_ts is not None:
+        sql += " AND updated_at <= ?"
+        params.append(float(before_ts))
+    if owner_instance:
+        sql += " AND owner_instance = ?"
+        params.append(owner_instance)
+    if job_id:
+        sql += " AND job_id = ?"
+        params.append(job_id)
+
+    with _db() as conn:
+        cur = conn.execute(sql, params)
+        conn.commit()
+        return int(cur.rowcount or 0)
+
+
+def retry_resume_request(
+    *,
+    resume_id: int,
+    owner_instance: str,
+    message: str = "manual retry",
+) -> Optional[Dict[str, Any]]:
+    """
+    Retry a terminal resume request by setting it back to pending.
+    Raises ValueError when retry is unsafe/conflicting.
+    """
+    now = time.time()
+    with _db() as conn:
+        row = conn.execute(
+            """
+            SELECT id, job_id, owner_instance, source, status, message, created_at, updated_at
+            FROM deep_research_resume_queue
+            WHERE id = ?
+            """,
+            (int(resume_id),),
+        ).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        status = str(item.get("status") or "")
+        if status in {"pending", "running"}:
+            raise ValueError("resume request is already active")
+
+        conflict = conn.execute(
+            """
+            SELECT id
+            FROM deep_research_resume_queue
+            WHERE job_id = ? AND status IN ('pending', 'running') AND id != ?
+            LIMIT 1
+            """,
+            (item["job_id"], int(resume_id)),
+        ).fetchone()
+        if conflict:
+            raise ValueError("job already has active resume request")
+
+        conn.execute(
+            """
+            UPDATE deep_research_resume_queue
+            SET owner_instance = ?,
+                source = 'manual_retry',
+                status = 'pending',
+                message = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (owner_instance, message, now, int(resume_id)),
+        )
+        conn.commit()
+        updated = conn.execute(
+            """
+            SELECT id, job_id, owner_instance, source, status, message, created_at, updated_at
+            FROM deep_research_resume_queue
+            WHERE id = ?
+            """,
+            (int(resume_id),),
+        ).fetchone()
+    return dict(updated) if updated else None
 
 
 # ────────────────────────────────────────────────

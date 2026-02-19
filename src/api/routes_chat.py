@@ -8,8 +8,6 @@ import threading
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List
-from concurrent.futures import ThreadPoolExecutor
-
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from fastapi.responses import StreamingResponse
 
@@ -76,20 +74,10 @@ from src.collaboration.auto_complete import AutoCompleteService
 router = APIRouter(tags=["chat"])
 
 _CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "rag_config.json"
-_DEEP_RESEARCH_EXECUTOR = ThreadPoolExecutor(max_workers=2)
 _DEEP_RESEARCH_CANCEL_EVENTS: dict[str, threading.Event] = {}
 _DEEP_RESEARCH_CANCEL_LOCK = threading.Lock()
 _DEEP_RESEARCH_SUSPENDED: dict[str, dict[str, Any]] = {}
 _DEEP_RESEARCH_SUSPENDED_LOCK = threading.Lock()
-
-
-def _dr_register_cancel_event(job_id: str) -> threading.Event:
-    with _DEEP_RESEARCH_CANCEL_LOCK:
-        ev = _DEEP_RESEARCH_CANCEL_EVENTS.get(job_id)
-        if ev is None:
-            ev = threading.Event()
-            _DEEP_RESEARCH_CANCEL_EVENTS[job_id] = ev
-        return ev
 
 
 def _dr_request_cancel(job_id: str) -> None:
@@ -1307,6 +1295,7 @@ def submit_deep_research_endpoint(
     session_id = body.session_id or store.create_session(canvas_id=body.canvas_id or "")
     payload = body.model_dump()
     payload["session_id"] = session_id
+    payload["_worker_user_id"] = optional_user_id
     job = create_job(
         topic=body.topic.strip(),
         session_id=session_id,
@@ -1314,13 +1303,6 @@ def submit_deep_research_endpoint(
         request_payload=payload,
     )
     job_id = str(job.get("job_id") or "")
-    _dr_register_cancel_event(job_id)
-    _DEEP_RESEARCH_EXECUTOR.submit(
-        _run_deep_research_job_safe,
-        job_id=job_id,
-        body=body,
-        optional_user_id=optional_user_id,
-    )
     return DeepResearchSubmitResponse(
         ok=True,
         job_id=job_id,
@@ -1461,6 +1443,11 @@ def cancel_deep_research_job(job_id: str) -> dict:
     current_status = str(job.get("status") or "")
     if current_status in {"done", "error", "cancelled"}:
         return {"ok": True, "job_id": job_id, "status": current_status}
+    if current_status == "pending":
+        import time as _t
+        update_job(job_id, status="cancelled", message="任务已取消（未启动）", finished_at=_t.time())
+        append_event(job_id, "cancelled", {"job_id": job_id, "message": "任务已取消（未启动）"})
+        return {"ok": True, "job_id": job_id, "status": "cancelled"}
     _dr_request_cancel(job_id)
     update_job(job_id, status="cancelling", message="收到停止请求，正在终止任务...")
     append_event(job_id, "cancel_requested", {"job_id": job_id, "message": "已请求停止"})
@@ -1506,7 +1493,14 @@ def review_deep_research_section(job_id: str, body: dict) -> dict:
         if state_snapshot is not None and getattr(state_snapshot, "next", ()):
             if _dr_mark_resume_inflight(job_id):
                 try:
-                    _DEEP_RESEARCH_EXECUTOR.submit(_resume_suspended_job, job_id)
+                    from src.collaboration.research.job_store import enqueue_resume_request
+                    from src.utils.task_runner import get_worker_instance_id
+                    enqueue_resume_request(
+                        job_id=job_id,
+                        owner_instance=get_worker_instance_id(),
+                        source="review",
+                        message="收到人工审核结果，等待恢复执行",
+                    )
                     resume_submitted = True
                 except Exception:
                     _dr_set_resume_idle(job_id)
@@ -1521,6 +1515,77 @@ def list_deep_research_reviews(job_id: str) -> dict:
     if not job:
         raise HTTPException(status_code=404, detail="job 不存在")
     return {"job_id": job_id, "reviews": list_reviews(job_id)}
+
+
+@router.get("/deep-research/resume-queue")
+def list_deep_research_resume_queue(
+    limit: int = 50,
+    status: str | None = None,
+    owner_instance: str | None = None,
+    job_id: str | None = None,
+) -> dict:
+    from src.collaboration.research.job_store import list_resume_requests
+
+    rows = list_resume_requests(
+        limit=limit,
+        status=status,
+        owner_instance=owner_instance,
+        job_id=job_id,
+    )
+    return {"items": rows, "count": len(rows)}
+
+
+@router.post("/deep-research/resume-queue/cleanup")
+def cleanup_deep_research_resume_queue(body: dict) -> dict:
+    from src.collaboration.research.job_store import cleanup_resume_requests
+    import time as _time
+
+    statuses = body.get("statuses")
+    if statuses is not None and not isinstance(statuses, list):
+        raise HTTPException(status_code=400, detail="statuses 必须是字符串数组")
+    before_hours = body.get("before_hours", 72)
+    before_ts = None
+    if before_hours is not None:
+        try:
+            hours = float(before_hours)
+            if hours < 0:
+                raise ValueError("hours < 0")
+            before_ts = _time.time() - hours * 3600
+        except Exception:
+            raise HTTPException(status_code=400, detail="before_hours 必须是非负数字或 null")
+    deleted = cleanup_resume_requests(
+        statuses=[str(s) for s in (statuses or [])] if statuses else None,
+        before_ts=before_ts,
+        owner_instance=str(body.get("owner_instance") or "") or None,
+        job_id=str(body.get("job_id") or "") or None,
+    )
+    return {"ok": True, "deleted": deleted}
+
+
+@router.post("/deep-research/resume-queue/{resume_id}/retry")
+def retry_deep_research_resume_request(resume_id: int, body: dict | None = None) -> dict:
+    from src.collaboration.research.job_store import retry_resume_request, append_event
+    from src.utils.task_runner import get_worker_instance_id
+
+    payload = body or {}
+    owner_instance = str(payload.get("owner_instance") or get_worker_instance_id())
+    message = str(payload.get("message") or "手动重试恢复请求")
+    try:
+        row = retry_resume_request(
+            resume_id=resume_id,
+            owner_instance=owner_instance,
+            message=message,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    if not row:
+        raise HTTPException(status_code=404, detail="resume request 不存在")
+    append_event(
+        str(row.get("job_id") or ""),
+        "resume_retry_requested",
+        {"resume_id": resume_id, "owner_instance": owner_instance, "message": message},
+    )
+    return {"ok": True, "item": row}
 
 
 # ── Gap Supplement Endpoints ──

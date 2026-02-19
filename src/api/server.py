@@ -2,6 +2,7 @@
 FastAPI 应用入口 - 多轮对话 API
 """
 
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -20,6 +21,7 @@ from src.api.routes_graph import router as graph_router
 from src.api.routes_compare import router as compare_router
 from src.log import get_logger
 from src.utils.storage_cleaner import run_cleanup, get_storage_stats
+from src.utils.task_runner import cleanup_stale_jobs, run_background_worker
 from src.observability import setup_observability
 
 logger = get_logger(__name__)
@@ -27,7 +29,12 @@ logger = get_logger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """应用生命周期：启动时执行存储清理"""
+    """应用生命周期：清理残留任务 → 存储清理 → 启动后台 Worker"""
+
+    # 1. 将上次进程中断时残留的 running/cancelling 任务重置为 error
+    cleanup_stale_jobs()
+
+    # 2. 常规存储清理
     if settings.storage.cleanup_on_startup:
         try:
             result = run_cleanup(
@@ -39,7 +46,18 @@ async def lifespan(app: FastAPI):
             logger.info(f"[startup] storage cleanup done: {result}, current={stats}")
         except Exception as e:
             logger.warning(f"[startup] storage cleanup failed: {e}")
+
+    # 3. 启动后台任务轮询 Worker
+    worker_task = asyncio.create_task(run_background_worker())
+
     yield
+
+    # Shutdown: 取消 Worker
+    worker_task.cancel()
+    try:
+        await worker_task
+    except asyncio.CancelledError:
+        pass
 
 
 app = FastAPI(

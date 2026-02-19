@@ -23,18 +23,8 @@ from src.log import get_logger
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/ingest", tags=["ingest"])
-_INGEST_EXECUTOR = ThreadPoolExecutor(max_workers=2)
 _INGEST_CANCEL_EVENTS: dict[str, threading.Event] = {}
 _INGEST_CANCEL_LOCK = threading.Lock()
-
-
-def _register_cancel_event(job_id: str) -> threading.Event:
-    with _INGEST_CANCEL_LOCK:
-        ev = _INGEST_CANCEL_EVENTS.get(job_id)
-        if ev is None:
-            ev = threading.Event()
-            _INGEST_CANCEL_EVENTS[job_id] = ev
-        return ev
 
 
 def _request_cancel(job_id: str) -> None:
@@ -698,19 +688,12 @@ def _run_ingest_job_safe(job_id: str, cfg: dict) -> None:
 
 @router.post("/process")
 def process_files(body: dict) -> JSONResponse:
-    """创建入库任务并立即返回 job_id（任务在后台持续执行）。"""
+    """创建入库任务并立即返回 job_id（Worker 将自动领取并执行）。"""
     from src.indexing.ingest_job_store import create_job
 
     cfg = _normalize_process_body(body)
-    payload = {
-        "file_paths": cfg["file_paths"],
-        "enrich_tables": cfg["enrich_tables"],
-        "enrich_figures": cfg["enrich_figures"],
-    }
-    job = create_job(cfg["collection_name"], payload, total_files=len(cfg["file_paths"]))
+    job = create_job(cfg["collection_name"], cfg, total_files=len(cfg["file_paths"]))
     job_id = job.get("job_id")
-    _register_cancel_event(job_id)
-    _INGEST_EXECUTOR.submit(_run_ingest_job_safe, job_id, cfg)
     return JSONResponse({"ok": True, "job_id": job_id})
 
 
@@ -741,6 +724,12 @@ def cancel_ingest_job(job_id: str) -> dict:
     current_status = str(job.get("status") or "")
     if current_status in {"done", "error", "cancelled"}:
         return {"ok": True, "job_id": job_id, "status": current_status}
+
+    if current_status == "pending":
+        update_job(job_id, status="cancelled", message="任务已取消（未启动）", finished_at=time.time())
+        _emit_job_event(job_id, "cancelled", {"job_id": job_id, "message": "任务已取消（未启动）"})
+        _emit_job_event(job_id, "done", {"cancelled": True, "total_files": 0, "total_chunks": 0, "total_upserted": 0, "errors": []})
+        return {"ok": True, "job_id": job_id, "status": "cancelled"}
 
     _request_cancel(job_id)
     update_job(job_id, message="收到取消请求，正在停止任务...")

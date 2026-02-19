@@ -114,13 +114,121 @@ sudo journalctl -u deepsea-rag-frontend -f
 - `GET /deep-research/jobs/{job_id}/reviews`：章节审核状态
 - `GET /deep-research/jobs/{job_id}/gap-supplements`：缺口补充是否被采纳（`pending/consumed`）
 
-## 三、日志与产物
+### Resume Queue 运维检查（新增）
+
+- `GET /deep-research/resume-queue`：查看 resume 队列
+- `POST /deep-research/resume-queue/cleanup`：清理历史终态记录
+- `POST /deep-research/resume-queue/{resume_id}/retry`：重试指定 resume 请求
+
+建议先看：
+
+- `status=running`：是否存在长时间未更新的恢复请求
+- `status=error`：是否出现异常积压
+- `owner_instance`：请求是否绑定到预期实例
+
+## 三、Deep Research Resume Queue SOP（值班可执行）
+
+### 场景 A：审核通过后任务未继续执行
+
+目标：确认是否“恢复请求未入队 / 未消费 / 消费失败”。
+
+1. 查看任务状态与事件：
+   - `GET /deep-research/jobs/{job_id}`
+   - `GET /deep-research/jobs/{job_id}/events`
+2. 查看 resume 队列（按 job）：
+   - `GET /deep-research/resume-queue?job_id={job_id}&limit=20`
+3. 按结果处理：
+   - 无队列项：前端/调用方重新提交 review（会重新 enqueue）。
+   - `pending` 长时间不变：检查 worker 是否存活、`owner_instance` 是否正确。
+   - `running` 长时间不变：优先重启服务（会触发 stale 清理），再判断是否需 retry。
+   - `error/cancelled`：走“场景 C 手动重试”。
+
+### 场景 B：批量清理历史垃圾记录
+
+目标：删除旧终态，保留活跃任务。
+
+推荐策略：
+
+- 默认只删终态：`done/error/cancelled`
+- 保留最近 48~72 小时
+
+示例请求：
+
+```bash
+curl -X POST "http://127.0.0.1:9999/deep-research/resume-queue/cleanup" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "statuses": ["done", "error", "cancelled"],
+    "before_hours": 72
+  }'
+```
+
+注意：
+
+- 不建议清理 `pending/running`，除非确认是僵尸数据并已完成人工评估。
+
+### 场景 C：手动重试某条 resume 请求
+
+适用前提：
+
+- 队列项当前为终态（`done/error/cancelled`）
+- 同一 `job_id` 没有活跃项（`pending/running`）
+
+操作步骤：
+
+1. 查询候选项：
+   - `GET /deep-research/resume-queue?job_id={job_id}&status=error`
+2. 对目标 `resume_id` 重试：
+
+```bash
+curl -X POST "http://127.0.0.1:9999/deep-research/resume-queue/{resume_id}/retry" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "message": "manual retry by oncall"
+  }'
+```
+
+3. 观察结果：
+   - 队列项应变为 `pending`
+   - 随后 worker 领取后变 `running -> done/error`
+   - 同步关注：`GET /deep-research/jobs/{job_id}/events`
+
+常见返回码：
+
+- `404`：`resume_id` 不存在
+- `409`：请求已活跃，或同 job 已有活跃恢复请求（需先排空冲突）
+
+### 场景 D：实例切换 / 重启后的恢复策略
+
+当前策略（已实现）：
+
+- 服务启动会将中断态任务重置为 `error`（含 `waiting_review`）
+- resume_queue 中 `running` 请求会重置为 `error`
+
+值班建议：
+
+1. 重启后先执行一次队列巡检：
+   - `GET /deep-research/resume-queue?status=error&limit=100`
+2. 对确需继续的任务，按“场景 C”逐条 retry。
+3. 对无需继续的历史项，按“场景 B”批量清理。
+
+### 快速排障决策树（简版）
+
+- 任务没继续：
+  - 先看 job events 有无 `section_review` / `resume_start`
+  - 再看 resume_queue：
+    - 没记录 -> 重新提交 review
+    - pending -> 看 worker/实例绑定
+    - running 卡住 -> 重启并重试
+    - error -> 直接 retry
+
+## 四、日志与产物
 
 - 运行日志：`logs/`（按模块拆分）
 - LLM 原始响应：`logs/llm_raw/`
 - 评测/任务产物：`artifacts/`
 
-## 四、常见问题与处理
+## 五、常见问题与处理
 
 ### 1) Milvus 连接失败
 
@@ -189,7 +297,7 @@ sudo journalctl -u deepsea-rag-frontend -f
 - 缩短单次整合输入规模（减少超长上下文）
 - 检查原始草稿中的引用 key 规范性（避免非常规格式）
 
-## 五、存储维护
+## 六、存储维护
 
 自动清理配置：
 
@@ -203,7 +311,7 @@ sudo journalctl -u deepsea-rag-frontend -f
 python scripts/19_cleanup_storage.py --vacuum
 ```
 
-## 六、数据安全建议
+## 七、数据安全建议
 
 - 生产环境关闭默认管理员密码
 - 定期备份：
