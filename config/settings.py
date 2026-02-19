@@ -386,6 +386,10 @@ def _performance_from_config() -> Dict[str, Any]:
     return (_RAW_CONFIG.get("performance") or {})
 
 
+def _graph_from_config() -> Dict[str, Any]:
+    return (_RAW_CONFIG.get("graph") or {})
+
+
 def _storage_from_config() -> Dict[str, Any]:
     return (_RAW_CONFIG.get("storage") or {})
 
@@ -448,6 +452,19 @@ class StorageSettings:
     max_size_gb: float = 5.0        # 总大小上限（GB），默认 5GB
     cleanup_on_startup: bool = True # 启动时是否自动清理
     cleanup_batch_size: int = 100   # 每批清理记录数
+
+
+@dataclass
+class GraphEntityExtractionSettings:
+    """知识图谱实体抽取配置"""
+    strategy: str = "gliner"
+    fallback: str = "rule"
+    ontology_path: str = "config/ontology.json"
+    gliner_model: str = "urchade/gliner_base"
+    gliner_threshold: float = 0.4
+    gliner_device: str = "cpu"
+    llm_provider: str = "deepseek"
+    llm_max_tokens: int = 1000
 
 
 @dataclass
@@ -612,6 +629,20 @@ class Settings:
             max_size_gb=float(st.get("max_size_gb", 5.0)),
             cleanup_on_startup=bool(st.get("cleanup_on_startup", True)),
             cleanup_batch_size=int(st.get("cleanup_batch_size", 100)),
+        )
+        gr = _graph_from_config()
+        ee = gr.get("entity_extraction") or {}
+        gl = ee.get("gliner") or {}
+        ll = ee.get("llm") or {}
+        self.graph_entity_extraction = GraphEntityExtractionSettings(
+            strategy=str(ee.get("strategy", "gliner")),
+            fallback=str(ee.get("fallback", "rule")),
+            ontology_path=str(ee.get("ontology_path", "config/ontology.json")),
+            gliner_model=str(gl.get("model", "urchade/gliner_base")),
+            gliner_threshold=float(gl.get("threshold", 0.4)),
+            gliner_device=str(gl.get("device", "cpu")),
+            llm_provider=str(ll.get("provider", "deepseek")),
+            llm_max_tokens=int(ll.get("max_tokens", 1000)),
         )
         au = _auth_from_config()
         self.auth = AuthSettings(

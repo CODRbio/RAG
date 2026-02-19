@@ -19,7 +19,7 @@
 |---|---|
 | `02_parse_papers.py` | 解析 PDF 生成结构化数据 |
 | `03_index_papers.py` | 切块、向量化并写入 Milvus |
-| `03b_build_graph.py` | 构建 HippoRAG 图谱 |
+| `03b_build_graph.py` | 构建 HippoRAG 图谱（实体抽取策略由 `rag_config.json → graph.entity_extraction` 控制） |
 | `06_ingest_langgraph.py` | 基于 LangGraph 的入库流程 |
 
 ## 三、服务启动
@@ -113,6 +113,6 @@ python scripts/23_sync_local_models.py
 
 - 需要浏览器自动化的脚本（Google / Scholar）先执行：`playwright install chromium`
 - 并发或网络不稳定时，优先调小配置中的 timeout / concurrency 参数
-- 清理数据前，先备份 `data/` 与 `src/data/sessions.db`
+- 清理数据前，先备份 `data/` 与 `data/rag.db`（如有 `*.db.bak` 也一并备份）
 - Deep Research 端到端测试（`23_test_deep_research_e2e.py`）耗时较长，建议在非高峰时段运行
 - 脚本编号可能不连续，属于历史遗留，不影响使用

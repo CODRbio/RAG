@@ -1,8 +1,9 @@
 """
-Background task worker: polls SQLite job queues and executes tasks via asyncio.to_thread.
+Background task worker: polls the consolidated rag.db job queues and executes
+tasks via asyncio.to_thread.
 
-Replaces in-memory ThreadPoolExecutor so that pending tasks survive process restarts.
-Worker is started once inside the FastAPI lifespan hook.
+Previously used direct sqlite3.connect() against two separate .db files.
+Now uses SQLModel sessions via the shared engine in src/db/engine.py.
 """
 
 from __future__ import annotations
@@ -10,26 +11,23 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import sqlite3
 import time
-from pathlib import Path
 from typing import Any, Dict, List
 
+from sqlmodel import Session, select
+
+from src.db.engine import get_engine
+from src.db.models import DeepResearchJob, DRResumeQueue, IngestJob
 from src.log import get_logger
 
 logger = get_logger(__name__)
 
-# ── DB paths (mirror the paths used by job_store / ingest_job_store) ──
-_DATA_DIR = Path(__file__).resolve().parents[1] / "data"
-_DR_DB = _DATA_DIR / "deep_research_jobs.db"
-_INGEST_DB = _DATA_DIR / "ingest_jobs.db"
-
-# ── Concurrency caps (same as the old ThreadPoolExecutor max_workers) ──
+# ── Concurrency caps ──────────────────────────────────────────────────────────
 _DR_MAX_CONCURRENT = 2
 _INGEST_MAX_CONCURRENT = 2
 _POLL_INTERVAL = 5  # seconds
 
-# ── worker instance id (used by db resume-queue routing) ──
+# ── Worker instance id (used by db resume-queue routing) ─────────────────────
 _WORKER_INSTANCE_ID = f"{os.getenv('HOSTNAME', 'local')}:{os.getpid()}"
 
 
@@ -37,160 +35,165 @@ def get_worker_instance_id() -> str:
     return _WORKER_INSTANCE_ID
 
 
-# ────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 # Startup cleanup
-# ────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 
 def cleanup_stale_jobs() -> None:
     """Reset running/cancelling jobs to error — they were interrupted by a process restart."""
     now = time.time()
-    if _DR_DB.exists():
-        try:
-            conn = sqlite3.connect(str(_DR_DB), timeout=10)
-            conn.execute("PRAGMA journal_mode=WAL")
-            cur = conn.execute(
-                """
-                UPDATE deep_research_jobs
-                SET status = 'error',
-                    error_message = '服务重启，任务中断',
-                    message = '服务重启，任务中断',
-                    updated_at = ?,
-                    finished_at = ?
-                WHERE status IN ('running', 'cancelling', 'waiting_review')
-                """,
-                (now, now),
-            )
-            if cur.rowcount > 0:
-                logger.warning(
-                    "[task_runner] reset %d stale deep-research job(s) to error",
-                    cur.rowcount,
+    try:
+        with Session(get_engine()) as session:
+            dr_rows = session.exec(
+                select(DeepResearchJob).where(
+                    DeepResearchJob.status.in_(["running", "cancelling", "waiting_review"])
                 )
-            conn.commit()
-            # Reset stale resume-queue entries for current process crash.
-            try:
-                conn.execute(
-                    """
-                    UPDATE deep_research_resume_queue
-                    SET status = 'error',
-                        message = '服务重启，恢复请求失效',
-                        updated_at = ?
-                    WHERE status = 'running'
-                    """,
-                    (now,),
-                )
-                conn.commit()
-            except Exception:
-                # resume queue table may not exist before first migration; ignore safely
-                pass
-            conn.close()
-        except Exception as e:
-            logger.warning("[task_runner] cleanup deep-research stale jobs failed: %s", e)
-    if _INGEST_DB.exists():
-        try:
-            conn = sqlite3.connect(str(_INGEST_DB), timeout=10)
-            conn.execute("PRAGMA journal_mode=WAL")
-            cur = conn.execute(
-                """
-                UPDATE ingest_jobs
-                SET status = 'error',
-                    error_message = '服务重启，任务中断',
-                    message = '服务重启，任务中断',
-                    updated_at = ?,
-                    finished_at = ?
-                WHERE status IN ('running', 'cancelling')
-                """,
-                (now, now),
-            )
-            if cur.rowcount > 0:
-                logger.warning(
-                    "[task_runner] reset %d stale ingest job(s) to error",
-                    cur.rowcount,
-                )
-            conn.commit()
-            conn.close()
-        except Exception as e:
-            logger.warning("[task_runner] cleanup ingest stale jobs failed: %s", e)
+            ).all()
+            count_dr = len(dr_rows)
+            for row in dr_rows:
+                row.status = "error"
+                row.error_message = "服务重启，任务中断"
+                row.message = "服务重启，任务中断"
+                row.updated_at = now
+                row.finished_at = now
+                session.add(row)
+
+            # Reset stale resume queue entries
+            rq_rows = session.exec(
+                select(DRResumeQueue).where(DRResumeQueue.status == "running")
+            ).all()
+            for rq in rq_rows:
+                rq.status = "error"
+                rq.message = "服务重启，恢复请求失效"
+                rq.updated_at = now
+                session.add(rq)
+
+            ingest_rows = session.exec(
+                select(IngestJob).where(IngestJob.status.in_(["running", "cancelling"]))
+            ).all()
+            count_ingest = len(ingest_rows)
+            for row in ingest_rows:
+                row.status = "error"
+                row.error_message = "服务重启，任务中断"
+                row.message = "服务重启，任务中断"
+                row.updated_at = now
+                row.finished_at = now
+                session.add(row)
+
+            session.commit()
+
+        if count_dr > 0:
+            logger.warning("[task_runner] reset %d stale deep-research job(s) to error", count_dr)
+        if count_ingest > 0:
+            logger.warning("[task_runner] reset %d stale ingest job(s) to error", count_ingest)
+
+    except Exception as e:
+        logger.warning("[task_runner] cleanup_stale_jobs failed: %s", e)
 
 
-# ────────────────────────────────────────────────
-# Pending-job fetch (lightweight, no schema init)
-# ────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Pending-job fetch + atomic claim
+# ──────────────────────────────────────────────────────────────────────────────
 
-def _fetch_pending(
-    db_path: Path,
-    table: str,
-    json_col: str,
-    limit: int,
-    exclude: set[str],
-) -> List[Dict[str, Any]]:
-    """Read pending rows from *table*, skipping IDs already tracked in *exclude*."""
-    if not db_path.exists() or limit <= 0:
+def _fetch_pending_dr(limit: int, exclude: set) -> List[Dict[str, Any]]:
+    """Read pending deep-research jobs, skipping already-tracked IDs."""
+    if limit <= 0:
         return []
     try:
-        conn = sqlite3.connect(str(db_path), timeout=10)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        rows = conn.execute(
-            f"""
-            SELECT job_id, {json_col} FROM {table}
-            WHERE status = 'pending'
-            ORDER BY created_at ASC
-            LIMIT ?
-            """,
-            (limit + len(exclude),),
-        ).fetchall()
-        conn.close()
-
-        result: list[Dict[str, Any]] = []
+        with Session(get_engine()) as session:
+            rows = session.exec(
+                select(DeepResearchJob)
+                .where(DeepResearchJob.status == "pending")
+                .order_by(DeepResearchJob.created_at.asc())
+                .limit(limit + len(exclude))
+            ).all()
+        result = []
         for row in rows:
-            jid = row["job_id"]
-            if jid in exclude:
+            if row.job_id in exclude:
                 continue
             try:
-                data = json.loads(row[json_col] or "{}")
+                data = json.loads(row.request_json or "{}")
             except Exception:
                 data = {}
-            result.append({"job_id": jid, "data": data})
+            result.append({"job_id": row.job_id, "data": data})
             if len(result) >= limit:
                 break
         return result
     except Exception as e:
-        logger.debug("[task_runner] fetch pending from %s failed: %s", table, e)
+        logger.debug("[task_runner] fetch pending DR failed: %s", e)
         return []
 
 
-def _claim_pending_job(db_path: Path, table: str, job_id: str) -> bool:
-    """
-    Atomically claim a pending job by switching pending -> running.
-    Returns True only when the row was still pending and got claimed.
-    """
-    if not db_path.exists():
-        return False
+def _fetch_pending_ingest(limit: int, exclude: set) -> List[Dict[str, Any]]:
+    """Read pending ingest jobs, skipping already-tracked IDs."""
+    if limit <= 0:
+        return []
+    try:
+        with Session(get_engine()) as session:
+            rows = session.exec(
+                select(IngestJob)
+                .where(IngestJob.status == "pending")
+                .order_by(IngestJob.created_at.asc())
+                .limit(limit + len(exclude))
+            ).all()
+        result = []
+        for row in rows:
+            if row.job_id in exclude:
+                continue
+            try:
+                data = json.loads(row.payload_json or "{}")
+            except Exception:
+                data = {}
+            result.append({"job_id": row.job_id, "data": data})
+            if len(result) >= limit:
+                break
+        return result
+    except Exception as e:
+        logger.debug("[task_runner] fetch pending ingest failed: %s", e)
+        return []
+
+
+def _claim_dr_job(job_id: str) -> bool:
+    """Atomically claim a pending DR job: pending → running. Returns True on success."""
     now = time.time()
     try:
-        conn = sqlite3.connect(str(db_path), timeout=10)
-        conn.execute("PRAGMA journal_mode=WAL")
-        cur = conn.execute(
-            f"""
-            UPDATE {table}
-            SET status = 'running',
-                message = 'Worker 已领取任务，准备执行',
-                updated_at = ?
-            WHERE job_id = ? AND status = 'pending'
-            """,
-            (now, job_id),
-        )
-        conn.commit()
-        conn.close()
-        return cur.rowcount > 0
+        with Session(get_engine()) as session:
+            row = session.get(DeepResearchJob, job_id)
+            if not row or row.status != "pending":
+                return False
+            row.status = "running"
+            row.message = "Worker 已领取任务，准备执行"
+            row.updated_at = now
+            session.add(row)
+            session.commit()
+        return True
     except Exception as e:
-        logger.warning("[task_runner] claim job failed table=%s job_id=%s err=%s", table, job_id, e)
+        logger.warning("[task_runner] claim DR job failed job_id=%s err=%s", job_id, e)
         return False
 
 
-# ────────────────────────────────────────────────
-# Per-job executors (each runs in a worker thread)
-# ────────────────────────────────────────────────
+def _claim_ingest_job(job_id: str) -> bool:
+    """Atomically claim a pending ingest job: pending → running. Returns True on success."""
+    now = time.time()
+    try:
+        with Session(get_engine()) as session:
+            row = session.get(IngestJob, job_id)
+            if not row or row.status != "pending":
+                return False
+            row.status = "running"
+            row.message = "Worker 已领取任务，准备执行"
+            row.updated_at = now
+            session.add(row)
+            session.commit()
+        return True
+    except Exception as e:
+        logger.warning("[task_runner] claim ingest job failed job_id=%s err=%s", job_id, e)
+        return False
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Per-job executors
+# ──────────────────────────────────────────────────────────────────────────────
 
 async def _exec_dr_job(job_id: str, request: dict) -> None:
     """Execute a deep-research job; wraps the existing sync business logic."""
@@ -258,12 +261,12 @@ async def _exec_ingest_job(job_id: str, cfg: dict) -> None:
             pass
 
 
-# ────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 # Main polling loop
-# ────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 
 async def run_background_worker() -> None:
-    """Poll SQLite for pending tasks every POLL_INTERVAL seconds and dispatch them."""
+    """Poll rag.db for pending tasks every POLL_INTERVAL seconds and dispatch them."""
     logger.info(
         "[task_runner] background worker started (instance=%s, poll=%ds, dr_max=%d, ingest_max=%d)",
         _WORKER_INSTANCE_ID,
@@ -318,16 +321,10 @@ async def run_background_worker() -> None:
             # ── Deep Research: claim pending jobs ──
             dr_available = _DR_MAX_CONCURRENT - len(dr_tasks)
             if dr_available > 0:
-                pending = _fetch_pending(
-                    _DR_DB,
-                    "deep_research_jobs",
-                    "request_json",
-                    limit=dr_available,
-                    exclude=set(dr_tasks.keys()),
-                )
+                pending = _fetch_pending_dr(limit=dr_available, exclude=set(dr_tasks.keys()))
                 for job in pending:
                     jid = job["job_id"]
-                    if not _claim_pending_job(_DR_DB, "deep_research_jobs", jid):
+                    if not _claim_dr_job(jid):
                         continue
                     logger.info("[task_runner] claimed DR job %s", jid)
                     dr_tasks[jid] = asyncio.create_task(_exec_dr_job(jid, job["data"]))
@@ -335,21 +332,13 @@ async def run_background_worker() -> None:
             # ── Ingest: claim pending jobs ──
             ingest_available = _INGEST_MAX_CONCURRENT - len(ingest_tasks)
             if ingest_available > 0:
-                pending = _fetch_pending(
-                    _INGEST_DB,
-                    "ingest_jobs",
-                    "payload_json",
-                    limit=ingest_available,
-                    exclude=set(ingest_tasks.keys()),
-                )
+                pending = _fetch_pending_ingest(limit=ingest_available, exclude=set(ingest_tasks.keys()))
                 for job in pending:
                     jid = job["job_id"]
-                    if not _claim_pending_job(_INGEST_DB, "ingest_jobs", jid):
+                    if not _claim_ingest_job(jid):
                         continue
                     logger.info("[task_runner] claimed ingest job %s", jid)
-                    ingest_tasks[jid] = asyncio.create_task(
-                        _exec_ingest_job(jid, job["data"])
-                    )
+                    ingest_tasks[jid] = asyncio.create_task(_exec_ingest_job(jid, job["data"]))
 
         except Exception as e:
             logger.error("[task_runner] poll cycle error: %s", e, exc_info=True)

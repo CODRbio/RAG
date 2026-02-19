@@ -24,7 +24,9 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field, model_validator
 
 from src.log import get_logger
+from src.utils.prompt_manager import PromptManager
 
+_pm = PromptManager()
 logger = get_logger(__name__)
 
 
@@ -121,23 +123,6 @@ def _is_key_section(heading_path: List[str], target_sections: List[str]) -> Opti
 # LLM Prompt
 # ============================================================
 
-_CLAIM_EXTRACTION_PROMPT = """You are a scientific claim extraction expert.
-
-Given the following text from a research paper, extract 3-5 **core scientific claims**.
-
-For each claim, provide:
-- **text**: The core claim statement (1-2 sentences, precise and falsifiable)
-- **evidence**: Brief summary of supporting evidence from the paper
-- **methodology**: What method/approach was used
-- **confidence**: "high" (directly supported by data), "medium" (inferred), or "low" (speculative)
-- **limitations**: Any caveats or limitations mentioned
-- **source_section**: Which section this claim comes from (abstract/results/conclusion/discussion)
-
-Return ONLY a JSON object:
-{"claims": [{"text": "...", "evidence": "...", "methodology": "...", "confidence": "high|medium|low", "limitations": "...", "source_section": "..."}]}
-
-Paper text:
-{text}"""
 
 
 # ============================================================
@@ -258,13 +243,13 @@ class ClaimExtractor:
 
     def _call_llm(self, text: str, llm_client: Any) -> Optional[List[Dict]]:
         """调用 LLM 提取 claims，使用 Pydantic 结构化输出保障解析稳定性"""
-        prompt = _CLAIM_EXTRACTION_PROMPT.replace("{text}", text)
+        prompt = _pm.render("claim_extraction.txt", text=text)
 
         for attempt in range(self.max_retries + 1):
             try:
                 resp = llm_client.chat(
                     messages=[
-                        {"role": "system", "content": "Extract scientific claims. Return ONLY valid JSON."},
+                        {"role": "system", "content": _pm.render("claim_extraction_system.txt")},
                         {"role": "user", "content": prompt},
                     ],
                     max_tokens=2000,

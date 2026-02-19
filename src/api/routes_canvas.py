@@ -48,6 +48,9 @@ from src.collaboration.canvas.canvas_manager import (
 from src.collaboration.canvas.models import DraftBlock, OutlineSection
 from src.collaboration.citation.formatter import format_bibtex, format_reference_list, format_ris
 from src.collaboration.memory.session_memory import get_session_store
+from src.utils.prompt_manager import PromptManager
+
+_pm = PromptManager()
 
 router = APIRouter(prefix="/canvas", tags=["canvas"])
 
@@ -346,31 +349,18 @@ def canvas_refine_full(canvas_id: str, body: CanvasRefineRequest) -> CanvasRefin
     manager = get_manager(str(_CONFIG_PATH))
     client = manager.get_client()
 
-    prompt = f"""You are a senior academic editor.
-Refine the full markdown document for better coherence and readability.
-
-Language:
-- {lang_hint}
-
-Hard constraints:
-- Keep all citation/evidence tags unchanged (e.g., [cite_key], [evidence limited], [123abc])
-- Keep factual meaning unchanged; do not invent claims
-- Preserve heading hierarchy and section boundaries
-- Apply user directives when compatible with evidence
-- Only edit where necessary; keep unaffected sentences unchanged
-- {locked_rule_line}
-- Output markdown only
-
-User directives:
-{directives_block}
-
-Document:
-{prompt_doc}"""
+    prompt = _pm.render(
+        "canvas_refine_document.txt",
+        lang_hint=lang_hint,
+        locked_rule_line=locked_rule_line,
+        directives_block=directives_block,
+        prompt_doc=prompt_doc,
+    )
 
     try:
         resp = client.chat(
             messages=[
-                {"role": "system", "content": "You are precise and conservative in scientific editing."},
+                {"role": "system", "content": _pm.render("canvas_refine_system.txt")},
                 {"role": "user", "content": prompt},
             ],
             max_tokens=5000,
@@ -610,31 +600,11 @@ def _restore_locked_placeholders(
 
 
 _AI_EDIT_PROMPTS = {
-    "rewrite": (
-        "请重写以下学术段落，使其更加清晰、简洁且符合学术写作规范。"
-        "保持原始含义不变，仅改善表达。"
-        "必须保留原文中的所有 [..] 引用/证据标签，禁止删除或改写标签。"
-    ),
-    "expand": (
-        "请扩展以下学术段落，添加更多细节、解释和过渡句。"
-        "保持与原文一致的学术风格和语气。"
-        "必须保留原文中的所有 [..] 引用/证据标签，禁止删除或改写标签。"
-    ),
-    "condense": (
-        "请精简以下学术段落，去除冗余表达，保留核心信息。"
-        "目标长度约为原文的 50-70%。"
-        "必须保留原文中的所有 [..] 引用/证据标签，禁止删除或改写标签。"
-    ),
-    "add_citations": (
-        "请为以下段落中的关键论断添加引用标注（使用 [cite_key] 格式）。"
-        "基于提供的参考资料匹配合适的引用。"
-    ),
-    "targeted_refine": (
-        "请仅对指定段落做定向精炼，严格按用户指令修改。"
-        "不要改动与指令无关的信息，不要扩散修改范围。"
-        "必须保留原文中的所有 [..] 引用/证据标签，禁止删除或改写标签。"
-        "输出仅包含修改后的该段落。"
-    ),
+    "rewrite": _pm.render("canvas_edit_rewrite.txt"),
+    "expand": _pm.render("canvas_edit_expand.txt"),
+    "condense": _pm.render("canvas_edit_condense.txt"),
+    "add_citations": _pm.render("canvas_edit_add_citations.txt"),
+    "targeted_refine": _pm.render("canvas_edit_targeted_refine.txt"),
 }
 
 

@@ -6,6 +6,9 @@ import re
 from typing import Any, Iterable, List, Optional, Set
 
 from .parser import ParsedIntent
+from src.utils.prompt_manager import PromptManager
+
+_pm = PromptManager()
 
 
 def get_search_query_from_intent(parsed: ParsedIntent, fallback: str) -> str:
@@ -148,36 +151,23 @@ def _generate_focused_query(
     recent_block = "\n".join(
         f"- {c.strip()}" for c in recent_user_turns if isinstance(c, str) and c.strip()
     )
-    prompt = f"""You are a search query generator.
-Generate ONE concise search query for academic literature retrieval.
-
-Conversation background (ONLY for resolving references like "it", "this", "the above"):
-{rolling_summary or "(first message in session)"}
-
-Recent user turns (optional, for disambiguation only):
-{recent_block or "(none)"}
-
-Current user question:
-{current_msg}
-
-CRITICAL RULES:
-- The query MUST target the CURRENT question, not background topics.
-- Use background only to replace unresolved references.
-- Output 3-8 precise academic keywords.
-- Avoid generic suffixes: review, survey, overview.
-- Use {"English" if output_english else "the same language as current user question"}.
-- Output ONLY the query string."""
+    language_instruction = "English" if output_english else "the same language as current user question"
+    system_content = (
+        "Output only a single English search query."
+        if output_english
+        else "Output only a single search query."
+    )
+    prompt = _pm.render(
+        "intent_search_query.txt",
+        rolling_summary=rolling_summary or "(first message in session)",
+        recent_block=recent_block or "(none)",
+        current_msg=current_msg,
+        language_instruction=language_instruction,
+    )
     try:
         resp = llm_client.chat(
             messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Output only a single English search query."
-                        if output_english
-                        else "Output only a single search query."
-                    ),
-                },
+                {"role": "system", "content": system_content},
                 {"role": "user", "content": prompt},
             ],
             max_tokens=64,

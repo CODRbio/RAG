@@ -1,0 +1,78 @@
+{
+  "version": "1.0",
+  "description": "Domain ontology for knowledge-graph entity extraction. Customise entity_types per research domain; patterns are optional regex rules used only by the 'rule' strategy.",
+  "entity_types": {
+    "LOCATION": {
+      "label": "geographic location or geological structure",
+      "description": "Geographic locations, regions, geological structures, habitats",
+      "patterns": []
+    },
+    "ORGANISM": {
+      "label": "organism, species, or biological taxon",
+      "description": "Species, organisms, biological taxa including Latin binomial names",
+      "patterns": [
+        "\\b[A-Z][a-z]{3,} [a-z]{3,}\\b"
+      ]
+    },
+    "PHENOMENON": {
+      "label": "natural phenomenon or biological process",
+      "description": "Natural phenomena, biological or chemical processes, geological events",
+      "patterns": []
+    },
+    "SUBSTANCE": {
+      "label": "chemical substance, compound, or material",
+      "description": "Chemical substances, compounds, elements, materials, minerals",
+      "patterns": [
+        "\\b(?:H2S|CH4|CO2|H2O|NaCl|O2|N2|Fe2O3|SiO2|CaCO3|NH3|NO3|SO4|PO4)\\b"
+      ]
+    },
+    "METHOD": {
+      "label": "research method, instrument, or technique",
+      "description": "Research methods, instruments, experimental techniques, analysis tools",
+      "patterns": []
+    },
+    "CONCEPT": {
+      "label": "scientific concept, theory, or model",
+      "description": "Theories, models, principles, key domain terms",
+      "patterns": []
+    }
+  },
+  "min_entity_length": 2,
+  "_profiles": {
+    "_comment": "Domain profiles below are examples. Copy the patterns into entity_types above to activate a profile.",
+    "deep_sea": {
+      "LOCATION": [
+        "马里亚纳海沟|冲绳海槽|南海|东太平洋|大西洋中脊",
+        "热液喷口|冷泉|深海平原|海山|海沟",
+        "hydrothermal vent|cold seep|deep sea|trench"
+      ],
+      "ORGANISM": [
+        "管虫|贻贝|蟹类|虾类|细菌|古菌",
+        "tube worm|mussel|crab|shrimp|bacteria|archaea"
+      ],
+      "PHENOMENON": [
+        "化能合成|光合作用|共生|甲烷渗漏|热液活动",
+        "chemosynthesis|symbiosis|methane seep"
+      ],
+      "SUBSTANCE": [
+        "硫化氢|甲烷|二氧化碳|氧气|硫化物",
+        "H2S|CH4|CO2|sulfide|methane"
+      ],
+      "METHOD": [
+        "ROV|AUV|深潜器|采样器|声呐",
+        "remotely operated vehicle|autonomous underwater vehicle"
+      ]
+    },
+    "biomedical": {
+      "ORGANISM": [
+        "\\b(?:E\\.\\s?coli|S\\.\\s?aureus|SARS-CoV-2|HIV|HBV)\\b"
+      ],
+      "SUBSTANCE": [
+        "\\b(?:aspirin|metformin|ibuprofen|paclitaxel|doxorubicin)\\b"
+      ],
+      "METHOD": [
+        "\\b(?:PCR|ELISA|Western blot|CRISPR|RNA-seq|flow cytometry)\\b"
+      ]
+    }
+  }
+}

@@ -1,4 +1,8 @@
 {
+  "database": {
+    "url": "sqlite:///data/rag.db",
+    "echo": false
+  },
   "llm": {
     "default": "deepseek", 
     "dry_run": false,
@@ -346,6 +350,22 @@
         "cost_warn_steps": 300,
         "cost_force_summary_steps": 420,
         "cost_tick_interval": 30
+      }
+    }
+  },
+  "graph": {
+    "entity_extraction": {
+      "strategy": "gliner",
+      "fallback": "rule",
+      "ontology_path": "config/ontology.json",
+      "gliner": {
+        "model": "urchade/gliner_base",
+        "threshold": 0.4,
+        "device": "cpu"
+      },
+      "llm": {
+        "provider": "deepseek",
+        "max_tokens": 1000
       }
     }
   },

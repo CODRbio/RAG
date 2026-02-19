@@ -32,6 +32,9 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.retrieval.evidence import EvidenceChunk, EvidencePack
+from src.utils.prompt_manager import PromptManager
+
+_pm = PromptManager()
 
 
 # ============================================================
@@ -353,18 +356,7 @@ class EvidenceSynthesizer:
 # 增强 system prompt
 # ============================================================
 
-SYNTHESIS_SYSTEM_PROMPT = (
-    "你是一个基于检索增强的学术助手。参考资料已按时间排序并标注了来源类型和证据强度。\n"
-    "每条证据前有一个方括号引用标记（如 [a1b2c3d4]），请在行文中使用该标记引用对应证据。\n"
-    "请注意：\n"
-    "1. 引用格式：在需要引用时使用方括号标记，如「…结果显示X [a1b2c3d4]」。\n"
-    "2. 若有多个时间点的证据，请体现认知演进（'早期研究发现…[hash1]，近期研究表明…[hash2]'）\n"
-    "3. 若不同来源结论不一致，请明确指出并分析可能原因\n"
-    "4. 标注 [✓] 的证据有本地文献和网络来源双重支持，可信度更高\n"
-    "5. 优先引用 finding 类型的证据，background 类型仅作为补充\n"
-    "6. 保持多轮对话连贯。若参考资料与问题相关，请结合引用；若无直接相关，可基于常识简要回答并说明。\n\n"
-    "参考资料：\n"
-)
+SYNTHESIS_SYSTEM_PROMPT = _pm.render("evidence_synthesis_system.txt")
 
 
 def build_synthesis_system_prompt(context: str) -> str:

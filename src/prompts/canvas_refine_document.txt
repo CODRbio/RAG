@@ -1,0 +1,20 @@
+You are a senior academic editor.
+Refine the full markdown document for better coherence and readability.
+
+Language:
+- {lang_hint}
+
+Hard constraints:
+- Keep all citation/evidence tags unchanged (e.g., [cite_key], [evidence limited], [123abc])
+- Keep factual meaning unchanged; do not invent claims
+- Preserve heading hierarchy and section boundaries
+- Apply user directives when compatible with evidence
+- Only edit where necessary; keep unaffected sentences unchanged
+- {locked_rule_line}
+- Output markdown only
+
+User directives:
+{directives_block}
+
+Document:
+{prompt_doc}

@@ -1,17 +1,22 @@
 """
-会话记忆 - 多轮对话滑动窗口与 SQLite 持久化
+会话记忆 - 多轮对话滑动窗口与持久化。
+底层存储已迁移至 data/rag.db (sessions / turns 表)，通过 SQLModel 访问。
 """
 
 import json
-import sqlite3
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
-from src.log import get_logger
+from sqlmodel import Session, select
 
+from src.db.engine import get_engine
+from src.db.models import ChatSession, Turn as TurnRow
+from src.log import get_logger
+from src.utils.prompt_manager import PromptManager
+
+_pm = PromptManager()
 logger = get_logger(__name__)
 
 
@@ -28,114 +33,44 @@ class ConversationTurn:
     timestamp: datetime = field(default_factory=datetime.now)
 
 
-def _default_db_path() -> Path:
-    return Path(__file__).resolve().parents[2] / "data" / "sessions.db"
-
-
-def _ensure_stage_column(conn: sqlite3.Connection) -> None:
-    """兼容旧库：若 sessions 表无 stage 列则添加。"""
-    cur = conn.execute("PRAGMA table_info(sessions)")
-    columns = [row[1] for row in cur.fetchall()]
-    if "stage" not in columns:
-        conn.execute("ALTER TABLE sessions ADD COLUMN stage TEXT NOT NULL DEFAULT 'explore'")
-
-
-def _ensure_citations_column(conn: sqlite3.Connection) -> None:
-    """兼容旧库：若 turns 表无 citations_json 列则添加。"""
-    cur = conn.execute("PRAGMA table_info(turns)")
-    columns = [row[1] for row in cur.fetchall()]
-    if "citations_json" not in columns:
-        conn.execute("ALTER TABLE turns ADD COLUMN citations_json TEXT")
-
-
-def _ensure_summary_columns(conn: sqlite3.Connection) -> None:
-    """兼容旧库：若 sessions 表无滚动总结字段则添加。"""
-    cur = conn.execute("PRAGMA table_info(sessions)")
-    columns = [row[1] for row in cur.fetchall()]
-    if "rolling_summary" not in columns:
-        conn.execute("ALTER TABLE sessions ADD COLUMN rolling_summary TEXT NOT NULL DEFAULT ''")
-    if "summary_at_turn" not in columns:
-        conn.execute("ALTER TABLE sessions ADD COLUMN summary_at_turn INTEGER NOT NULL DEFAULT 0")
-
-
 class SessionStore:
-    """SQLite 持久化：会话与轮次"""
+    """SQLModel 持久化：会话与轮次"""
 
-    def __init__(self, db_path: Optional[Path] = None):
-        self.db_path = db_path or _default_db_path()
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_schema()
-
-    def _init_schema(self) -> None:
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS sessions (
-                    session_id TEXT PRIMARY KEY,
-                    canvas_id TEXT NOT NULL DEFAULT '',
-                    stage TEXT NOT NULL DEFAULT 'explore',
-                    rolling_summary TEXT NOT NULL DEFAULT '',
-                    summary_at_turn INTEGER NOT NULL DEFAULT 0,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                )
-                """
-            )
-            _ensure_stage_column(conn)
-            _ensure_summary_columns(conn)
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS turns (
-                    session_id TEXT NOT NULL,
-                    turn_index INTEGER NOT NULL,
-                    role TEXT NOT NULL,
-                    content TEXT NOT NULL,
-                    intent TEXT,
-                    evidence_pack_id TEXT,
-                    canvas_patch TEXT,
-                    citations_json TEXT,
-                    timestamp TEXT NOT NULL,
-                    PRIMARY KEY (session_id, turn_index)
-                )
-                """
-            )
-            _ensure_citations_column(conn)
-            conn.commit()
+    def __init__(self, db_path=None):
+        # db_path ignored — we use the shared engine
+        pass
 
     def create_session(self, canvas_id: str = "", stage: str = "explore") -> str:
         session_id = str(uuid.uuid4())
         now = datetime.now().isoformat()
-        with sqlite3.connect(self.db_path) as conn:
-            _ensure_stage_column(conn)
-            _ensure_summary_columns(conn)
-            conn.execute(
-                """
-                INSERT INTO sessions (
-                    session_id, canvas_id, stage, rolling_summary, summary_at_turn, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (session_id, canvas_id, stage, "", 0, now, now),
+        with Session(get_engine()) as session:
+            row = ChatSession(
+                session_id=session_id,
+                canvas_id=canvas_id,
+                stage=stage,
+                rolling_summary="",
+                summary_at_turn=0,
+                created_at=now,
+                updated_at=now,
             )
-            conn.commit()
+            session.add(row)
+            session.commit()
         return session_id
 
     def get_session_meta(self, session_id: str) -> Optional[Dict[str, Any]]:
-        with sqlite3.connect(self.db_path) as conn:
-            _ensure_stage_column(conn)
-            _ensure_summary_columns(conn)
-            conn.row_factory = sqlite3.Row
-            row = conn.execute(
-                """
-                SELECT session_id, canvas_id, stage, rolling_summary, summary_at_turn, created_at, updated_at
-                FROM sessions WHERE session_id = ?
-                """,
-                (session_id,),
-            ).fetchone()
+        with Session(get_engine()) as session:
+            row = session.get(ChatSession, session_id)
         if row is None:
             return None
-        meta = dict(row)
-        if meta.get("stage") is None:
-            meta["stage"] = "explore"
+        meta = {
+            "session_id": row.session_id,
+            "canvas_id": row.canvas_id or "",
+            "stage": row.stage or "explore",
+            "rolling_summary": row.rolling_summary or "",
+            "summary_at_turn": row.summary_at_turn or 0,
+            "created_at": row.created_at,
+            "updated_at": row.updated_at,
+        }
         return meta
 
     def get_session_stage(self, session_id: str) -> str:
@@ -145,38 +80,29 @@ class SessionStore:
         return meta.get("stage") or "explore"
 
     def update_session_stage(self, session_id: str, stage: str) -> None:
-        with sqlite3.connect(self.db_path) as conn:
-            _ensure_stage_column(conn)
-            conn.execute(
-                "UPDATE sessions SET stage = ?, updated_at = ? WHERE session_id = ?",
-                (stage, datetime.now().isoformat(), session_id),
-            )
-            conn.commit()
+        with Session(get_engine()) as session:
+            row = session.get(ChatSession, session_id)
+            if row:
+                row.stage = stage
+                row.updated_at = datetime.now().isoformat()
+                session.add(row)
+                session.commit()
 
     def update_session_meta(self, session_id: str, meta: Dict[str, Any]) -> None:
         """更新会话元数据，如 canvas_id"""
-        updates = []
-        values: List[Any] = []
-        if isinstance(meta.get("canvas_id"), str):
-            updates.append("canvas_id = ?")
-            values.append(meta["canvas_id"])
-        if isinstance(meta.get("rolling_summary"), str):
-            updates.append("rolling_summary = ?")
-            values.append(meta["rolling_summary"])
-        summary_at_turn = meta.get("summary_at_turn")
-        if isinstance(summary_at_turn, int):
-            updates.append("summary_at_turn = ?")
-            values.append(summary_at_turn)
-        if not updates:
-            return
-        updates.append("updated_at = ?")
-        values.append(datetime.now().isoformat())
-        values.append(session_id)
-        sql = f"UPDATE sessions SET {', '.join(updates)} WHERE session_id = ?"
-        with sqlite3.connect(self.db_path) as conn:
-            _ensure_summary_columns(conn)
-            conn.execute(sql, tuple(values))
-            conn.commit()
+        with Session(get_engine()) as session:
+            row = session.get(ChatSession, session_id)
+            if not row:
+                return
+            if isinstance(meta.get("canvas_id"), str):
+                row.canvas_id = meta["canvas_id"]
+            if isinstance(meta.get("rolling_summary"), str):
+                row.rolling_summary = meta["rolling_summary"]
+            if isinstance(meta.get("summary_at_turn"), int):
+                row.summary_at_turn = meta["summary_at_turn"]
+            row.updated_at = datetime.now().isoformat()
+            session.add(row)
+            session.commit()
 
     def get_turns(
         self,
@@ -184,39 +110,37 @@ class SessionStore:
         limit: Optional[int] = None,
         order_desc: bool = False,
     ) -> List[ConversationTurn]:
-        with sqlite3.connect(self.db_path) as conn:
-            _ensure_citations_column(conn)
-            conn.row_factory = sqlite3.Row
-            order = "DESC" if order_desc else "ASC"
-            sql = (
-                "SELECT role, content, intent, evidence_pack_id, canvas_patch, citations_json, timestamp "
-                "FROM turns WHERE session_id = ? ORDER BY turn_index "
-                + order
+        with Session(get_engine()) as session:
+            stmt = (
+                select(TurnRow)
+                .where(TurnRow.session_id == session_id)
+                .order_by(TurnRow.turn_index.desc() if order_desc else TurnRow.turn_index.asc())
             )
             if limit is not None:
-                sql += f" LIMIT {int(limit)}"
-            rows = conn.execute(sql, (session_id,)).fetchall()
+                stmt = stmt.limit(int(limit))
+            rows = session.exec(stmt).all()
+
         turns = []
         for r in rows:
             patch = None
-            if r["canvas_patch"]:
+            if r.canvas_patch:
                 try:
-                    patch = json.loads(r["canvas_patch"])
+                    patch = json.loads(r.canvas_patch)
                 except Exception:
                     pass
             citations = []
-            if r["citations_json"]:
+            if r.citations_json:
                 try:
-                    citations = json.loads(r["citations_json"])
+                    citations = json.loads(r.citations_json)
                 except Exception:
                     pass
-            ts = datetime.fromisoformat(r["timestamp"]) if r["timestamp"] else datetime.now()
+            ts = datetime.fromisoformat(r.timestamp) if r.timestamp else datetime.now()
             turns.append(
                 ConversationTurn(
-                    role=r["role"],
-                    content=r["content"] or "",
-                    intent=r["intent"],
-                    evidence_pack_id=r["evidence_pack_id"],
+                    role=r.role,
+                    content=r.content or "",
+                    intent=r.intent,
+                    evidence_pack_id=r.evidence_pack_id,
                     canvas_patch=patch,
                     citations=citations,
                     timestamp=ts,
@@ -239,60 +163,67 @@ class SessionStore:
         meta = self.get_session_meta(session_id)
         if meta is None:
             raise ValueError(f"Session not found: {session_id}")
-        with sqlite3.connect(self.db_path) as conn:
-            _ensure_citations_column(conn)
-            cur = conn.execute(
-                "SELECT COALESCE(MAX(turn_index), -1) + 1 FROM turns WHERE session_id = ?",
-                (session_id,),
+        with Session(get_engine()) as session:
+            # Get next turn index atomically
+            existing = session.exec(
+                select(TurnRow)
+                .where(TurnRow.session_id == session_id)
+                .order_by(TurnRow.turn_index.desc())
+                .limit(1)
+            ).first()
+            idx = (existing.turn_index + 1) if existing else 0
+
+            turn = TurnRow(
+                session_id=session_id,
+                turn_index=idx,
+                role=role,
+                content=content,
+                intent=intent,
+                evidence_pack_id=evidence_pack_id,
+                canvas_patch=json.dumps(canvas_patch, ensure_ascii=False) if canvas_patch else None,
+                citations_json=json.dumps(citations, ensure_ascii=False) if citations else None,
+                timestamp=datetime.now().isoformat(),
             )
-            idx = cur.fetchone()[0]
-            conn.execute(
-                """INSERT INTO turns (session_id, turn_index, role, content, intent, evidence_pack_id, canvas_patch, citations_json, timestamp)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    session_id,
-                    idx,
-                    role,
-                    content,
-                    intent,
-                    evidence_pack_id,
-                    json.dumps(canvas_patch, ensure_ascii=False) if canvas_patch else None,
-                    json.dumps(citations, ensure_ascii=False) if citations else None,
-                    datetime.now().isoformat(),
-                ),
-            )
-            conn.execute(
-                "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
-                (datetime.now().isoformat(), session_id),
-            )
-            conn.commit()
+            session.add(turn)
+
+            # Update session's updated_at
+            chat_session = session.get(ChatSession, session_id)
+            if chat_session:
+                chat_session.updated_at = datetime.now().isoformat()
+                session.add(chat_session)
+
+            session.commit()
 
     def delete_session(self, session_id: str) -> bool:
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("DELETE FROM turns WHERE session_id = ?", (session_id,))
-            cur = conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
-            conn.commit()
-        return cur.rowcount > 0
+        with Session(get_engine()) as session:
+            row = session.get(ChatSession, session_id)
+            if not row:
+                return False
+            session.delete(row)  # cascade deletes turns
+            session.commit()
+        return True
 
     def list_all_sessions(self, limit: int = 100) -> List[Dict[str, Any]]:
         """列出所有会话，按更新时间倒序"""
-        with sqlite3.connect(self.db_path) as conn:
-            _ensure_stage_column(conn)
-            _ensure_summary_columns(conn)
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                """
-                SELECT session_id, canvas_id, stage, rolling_summary, summary_at_turn, created_at, updated_at
-                FROM sessions ORDER BY updated_at DESC LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
+        with Session(get_engine()) as session:
+            stmt = (
+                select(ChatSession)
+                .order_by(ChatSession.updated_at.desc())
+                .limit(limit)
+            )
+            rows = session.exec(stmt).all()
+
         sessions = []
         for row in rows:
-            meta = dict(row)
-            if meta.get("stage") is None:
-                meta["stage"] = "explore"
-            # 获取第一轮对话作为标题
+            meta = {
+                "session_id": row.session_id,
+                "canvas_id": row.canvas_id or "",
+                "stage": row.stage or "explore",
+                "rolling_summary": row.rolling_summary or "",
+                "summary_at_turn": row.summary_at_turn or 0,
+                "created_at": row.created_at,
+                "updated_at": row.updated_at,
+            }
             turns = self.get_turns(meta["session_id"], limit=1)
             meta["title"] = turns[0].content[:50] + "..." if turns and turns[0].content else "未命名对话"
             meta["turn_count"] = self._count_turns(meta["session_id"])
@@ -301,18 +232,21 @@ class SessionStore:
 
     def _count_turns(self, session_id: str) -> int:
         """统计会话的轮次数"""
-        with sqlite3.connect(self.db_path) as conn:
-            cur = conn.execute("SELECT COUNT(*) FROM turns WHERE session_id = ?", (session_id,))
-            return cur.fetchone()[0]
+        with Session(get_engine()) as session:
+            from sqlmodel import func
+            result = session.exec(
+                select(func.count()).select_from(TurnRow).where(TurnRow.session_id == session_id)
+            ).one()
+            return result
 
 
 _store: Optional[SessionStore] = None
 
 
-def get_session_store(db_path: Optional[Path] = None) -> SessionStore:
+def get_session_store(db_path=None) -> SessionStore:
     global _store
     if _store is None:
-        _store = SessionStore(db_path=db_path)
+        _store = SessionStore()
     return _store
 
 
@@ -341,7 +275,7 @@ class SessionMemory:
             citations=kwargs.get("citations"),
         )
         if len(self.turns) > self.max_turns:
-            self.turns = self.turns[-self.max_turns :]
+            self.turns = self.turns[-self.max_turns:]
 
     def get_context_window(self, n: int = 10) -> List[ConversationTurn]:
         return self.turns[-n:]
@@ -360,20 +294,15 @@ class SessionMemory:
             f"{'User' if t.role == 'user' else 'Assistant'}: {(t.content or '')[:200]}"
             for t in recent_turns
         )
-        prompt = f"""Summarize the following conversation segment in 2-3 sentences.
-Focus on the main topic, key concepts discussed, and the user's current direction.
-
-Previous summary:
-{self.rolling_summary or "(start of conversation)"}
-
-New conversation segment:
-{turns_text}
-
-Output only the updated summary."""
+        prompt = _pm.render(
+            "session_memory_summarize.txt",
+            previous_summary=self.rolling_summary or "(start of conversation)",
+            turns_text=turns_text,
+        )
         try:
             resp = llm_client.chat(
                 messages=[
-                    {"role": "system", "content": "Output a concise conversation summary."},
+                    {"role": "system", "content": _pm.render("session_memory_summarize_system.txt")},
                     {"role": "user", "content": prompt},
                 ],
                 max_tokens=200,

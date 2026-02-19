@@ -18,6 +18,9 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.log import get_logger
+from src.utils.prompt_manager import PromptManager
+
+_pm = PromptManager()
 from src.retrieval.query_optimizer import optimize_query
 
 logger = get_logger(__name__)
@@ -253,72 +256,27 @@ class SmartQueryOptimizer:
 
         # ── 代价感知路由模式 ─────────────────────────────────────────────────
         if auto_route:
-            routing_rules = """**Cost-aware routing rules (STRICT):**
-Select ONLY 1-2 most appropriate engines from the candidate list. Do NOT use all engines.
-- **ncbi**: MUST select for biomedical / medicine / genetics / genomics / marine biology / marine ecology queries. Skip other academic engines when ncbi is selected.
-- **scholar**: Select for general academic / scientific / interdisciplinary topics that are NOT purely biomedical.
-- **semantic**: Select ONLY for highly specialized academic topics requiring deep literature depth AND when API budget allows (e.g. novel algorithms, niche technical terms). Do NOT select for common topics.
-- **tavily**: Select for general/conceptual knowledge, current events, news, non-academic questions.
-- **google**: Select for broad overviews, everyday concepts, general knowledge questions."""
-
-            prompt = f"""You are a cost-aware search router and query optimizer.
-Given the user query and a candidate list of search engines, first SELECT 1-2 best engines, then generate optimized queries for ONLY those selected engines.
-Output ONLY a valid JSON object, no markdown.
-
-**User query:** {query}
-
-**Candidate engines:** {provider_list}
-
-{routing_rules}
-
-**Per-engine query style:**
-- **ncbi**: Medical Subject Headings (MeSH) style keywords, 3-6 words, English preferred. Example: "cold seep methane bacteria", "coral reef bleaching gene expression".
-- **scholar**: Short academic keyword phrases, 3-6 words. Avoid "review/survey/overview". Example: "deep sea cold seep biodiversity".
-- **semantic**: Precise academic terms, no natural language. Example: "cold seep chemosynthesis ecosystem".
-- **tavily**: Natural language questions. Example: "What causes coral reef bleaching?".
-- **google**: Concise keywords. Example: "coral reef bleaching causes".
-{bilingual_instruction}
-
-**Output format:**
-- Include ONLY the selected engines as JSON keys (omit all others).
-- Each value: array of 1-{max_per} query strings (or zh/en object for Chinese input).
-
-Example (biomedical query, English): {{"ncbi": ["cold seep methane oxidizing bacteria", "anaerobic methane oxidation archaea"]}}
-Example (general academic, English): {{"scholar": ["deep learning image segmentation", "convolutional neural network segmentation"]}}
-Example (everyday query, English): {{"tavily": ["What is machine learning and how does it work?"]}}
-"""
+            prompt = _pm.render(
+                "optimizer_auto_route.txt",
+                query=query,
+                provider_list=provider_list,
+                bilingual_instruction=bilingual_instruction,
+                max_per=max_per,
+            )
         # ── 普通优化模式（尊重前端选择）────────────────────────────────────────
         else:
-            prompt = f"""You are a search query optimizer. Given a user query and a list of search engines, generate 1-{max_per} optimized search queries **per engine**. Output ONLY a valid JSON object, no markdown.
-
-**User query:** {query}
-
-**Search engines to optimize for:** {provider_list}
-
-**Rules per engine:**
-- **ncbi**: Medical/biological keyword phrases (3-6 words), English preferred. MeSH-style. Example: "cold seep microbial diversity", "marine invertebrate chemosynthesis".
-- **scholar**: Academic keywords, short keyword phrases (3-6 words). Avoid generic suffixes like "review/survey/overview". Example: "deep sea cold seep biodiversity", "cold seep chemosynthesis mechanism".
-- **semantic**: Precise academic terms, no natural language. Example: "cold seep chemosynthesis", "cold seep ecosystem diversity".
-- **google**: General keywords, concise. Avoid generic suffixes like "overview/review". Example: "deep sea cold seep characteristics", "cold seep definition".
-- **tavily**: Natural language questions or full sentences. Example: "What are deep sea cold seeps and where do they occur?"
-{bilingual_instruction}
-
-**Output format:**
-- If input is Chinese: each engine value is an object with keys **zh** and **en**, each an array of exactly {max_per} queries.
-- Otherwise: each engine value is an array of 1-{max_per} query strings.
-Only include keys for engines that are in the list above; omit others.
-
-Example (Chinese input, providers include scholar and tavily):
-{{"scholar": {{"zh": ["深海冷泉 生物多样性", "冷泉 生态", "冷泉 形成 机制"], "en": ["deep sea cold seep biodiversity", "cold seep ecology", "cold seep formation mechanism"]}}, "tavily": {{"zh": ["深海冷泉是什么？", "深海冷泉的生态作用是什么？", "深海冷泉如何形成？"], "en": ["What is a deep sea cold seep?", "What is the ecological role of cold seeps?", "How do cold seeps form?"]}}}}
-
-Example (English input, providers include scholar and tavily):
-{{"scholar": ["cold seep biodiversity", "deep sea cold seep ecosystem"], "tavily": ["What is a deep sea cold seep?"]}}
-"""
+            prompt = _pm.render(
+                "optimizer_normal.txt",
+                query=query,
+                provider_list=provider_list,
+                bilingual_instruction=bilingual_instruction,
+                max_per=max_per,
+            )
 
         try:
             resp = client.chat(
                 messages=[
-                    {"role": "system", "content": "You output only valid JSON. No markdown, no explanation."},
+                    {"role": "system", "content": _pm.render("optimizer_system.txt")},
                     {"role": "user", "content": prompt},
                 ],
                 model=model_override or None,
@@ -420,80 +378,18 @@ Example (English input, providers include scholar and tavily):
             )
 
         provider_list = ", ".join(candidate_providers)
-        prompt = f"""You are a cost-aware search router and query optimizer.
-Given the user query and available search engines, output a JSON routing plan.
-Output ONLY valid JSON. No markdown, no explanation.
-
-**User query:** {query}
-**Available engines:** {provider_list}
-
----
-**STEP 1 — Freshness detection:**
-If the query asks about "latest", "recent", "new", "current", "2025", "2026", trending topics,
-or is clearly about a recent/breaking event → set "is_fresh": true AND put "tavily" in primary
-(tavily has the freshest web index). Otherwise "is_fresh": false.
-
-**STEP 2 — Domain routing (select PRIMARY 1-2 engines):**
-- **ncbi**: MUST select for biomedical / medicine / genetics / genomics /
-            marine biology / marine ecology / pharmacology queries.
-- **tavily**: MUST select when is_fresh=true (fastest for breaking news & recent events).
-              Also select for general factual questions, how-to, news.
-- **scholar**: Select for general academic / scientific / interdisciplinary topics
-               that are NOT purely biomedical and NOT time-sensitive.
-- **semantic**: Select ONLY for highly specialized academic topics needing deep literature
-                (niche algorithms, specific technical terms). Expensive — avoid for broad queries.
-- **google**: Select for broad overviews, everyday concepts, general knowledge.
-
-**STEP 3 — Select FALLBACK (1 engine, different domain from primary):**
-Choose 1 backup engine. Rules:
-- After ncbi → fallback to scholar (broader academic coverage)
-- After tavily → fallback to scholar or google (more structured results)
-- After scholar → fallback to tavily (fresh coverage) or ncbi (if bio-adjacent)
-- After semantic → fallback to scholar
-- Do NOT repeat a primary engine in fallback.
-
-**STEP 4 — Generate queries:**
-Generate 1-{max_per} optimized queries for each selected engine (primary + fallback).
-Query styles:
-- ncbi: MeSH-style medical keywords, 3-6 words, English preferred.
-- scholar: Short academic keyword phrases, 3-6 words. No "review/survey/overview".
-- semantic: Precise technical terms only, no natural language.
-- tavily: Natural language question or full sentence. Prefer recency framing if is_fresh.
-- google: Concise general keywords.{bilingual_note}
-
----
-**Output JSON format:**
-{{
-  "is_fresh": <bool>,
-  "primary": {{
-    "<engine>": ["query1", "query2"]
-  }},
-  "fallback": {{
-    "<engine>": ["query1"]
-  }}
-}}
-
-Rules:
-- primary can have 1-2 engines, fallback must have exactly 1 engine.
-- Only include engines from the available list.
-- For Chinese input: each engine value is {{"zh": [...], "en": [...]}} instead of an array.
-- Do NOT include engines not in the available list.
-
-Examples:
-Query="latest breakthroughs in LLM 2026", engines=[tavily, scholar, ncbi]:
-{{"is_fresh": true, "primary": {{"tavily": ["latest LLM breakthroughs 2026"]}}, "fallback": {{"scholar": ["large language model recent advances"]}}}}
-
-Query="deep sea cold seep microbiology", engines=[ncbi, scholar, tavily, google]:
-{{"is_fresh": false, "primary": {{"ncbi": ["cold seep microbial community methane oxidation"]}}, "fallback": {{"scholar": ["cold seep microbiology chemosynthesis"]}}}}
-
-Query="如何治疗新冠肺炎", engines=[ncbi, tavily, scholar]:
-{{"is_fresh": false, "primary": {{"ncbi": {{"zh": ["新冠肺炎 治疗方案"], "en": ["COVID-19 treatment clinical outcomes"]}}}}, "fallback": {{"scholar": {{"zh": ["新冠 临床治疗"], "en": ["SARS-CoV-2 treatment efficacy"]}}}}}}
-"""
+        prompt = _pm.render(
+            "optimizer_routing_plan.txt",
+            query=query,
+            provider_list=provider_list,
+            max_per=max_per,
+            bilingual_note=bilingual_note,
+        )
 
         try:
             resp = client.chat(
                 messages=[
-                    {"role": "system", "content": "You output only valid JSON. No markdown."},
+                    {"role": "system", "content": _pm.render("optimizer_routing_plan_system.txt")},
                     {"role": "user", "content": prompt},
                 ],
                 model=model_override or None,

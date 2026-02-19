@@ -20,6 +20,9 @@ from src.collaboration.canvas.models import DraftBlock, OutlineSection, SurveyCa
 from src.collaboration.citation.manager import resolve_response_citations, sync_evidence_to_canvas
 from src.collaboration.citation.formatter import format_reference_list
 from src.retrieval.service import RetrievalService, get_retrieval_service
+from src.utils.prompt_manager import PromptManager
+
+_pm = PromptManager()
 
 
 @dataclass
@@ -239,20 +242,16 @@ class AutoCompleteService:
             if lines:
                 answers_block = "\n用户补充信息：\n" + "\n".join(lines) + "\n"
 
-        prompt = f"""根据以下参考资料，为综述主题「{topic}」生成大纲结构。
-{answers_block}
-要求：
-1. 列出 3-6 个主要章节，每行一个
-2. 格式示例：1. 引言  2. 研究背景  3. 核心内容  4. 展望
-3. 只输出章节列表，不要其他文字
-
-参考资料：
-{context[:3000] if len(context) > 3000 else context}
-"""
+        prompt = _pm.render(
+            "auto_complete_outline.txt",
+            topic=topic,
+            answers_block=answers_block,
+            context=context[:3000] if len(context) > 3000 else context,
+        )
         try:
             resp = self.llm.chat(
                 [
-                    {"role": "system", "content": "你是学术写作助手，只返回大纲列表。"},
+                    {"role": "system", "content": _pm.render("auto_complete_outline_system.txt")},
                     {"role": "user", "content": prompt},
                 ],
                 max_tokens=512,
@@ -276,16 +275,15 @@ class AutoCompleteService:
 
     def _generate_abstract(self, topic: str, context: str) -> str:
         """LLM 生成摘要"""
-        prompt = f"""根据以下参考资料，为综述主题「{topic}」撰写 150-250 字的摘要。
-只输出摘要内容，不要其他文字。
-
-参考资料：
-{context[:2500] if len(context) > 2500 else context}
-"""
+        prompt = _pm.render(
+            "auto_complete_abstract.txt",
+            topic=topic,
+            context=context[:2500] if len(context) > 2500 else context,
+        )
         try:
             resp = self.llm.chat(
                 [
-                    {"role": "system", "content": "你是学术写作助手。"},
+                    {"role": "system", "content": _pm.render("auto_complete_abstract_system.txt")},
                     {"role": "user", "content": prompt},
                 ],
                 max_tokens=400,
@@ -301,20 +299,17 @@ class AutoCompleteService:
         context: str,
     ) -> str:
         """LLM 生成章节内容"""
-        prompt = f"""根据以下参考资料，撰写综述「{topic}」中「{section_title}」章节的内容。
-要求：
-1. 字数约 {self.max_words_per_section} 字
-2. 使用学术语言，逻辑清晰
-3. 引用时使用方括号标记；若参考资料中有 [ref_hash] 请直接引用该标记（后续会自动替换为正式 cite_key）
-4. 只输出章节正文，不要标题
-
-参考资料：
-{context}
-"""
+        prompt = _pm.render(
+            "auto_complete_section.txt",
+            topic=topic,
+            section_title=section_title,
+            max_words=self.max_words_per_section,
+            context=context,
+        )
         try:
             resp = self.llm.chat(
                 [
-                    {"role": "system", "content": "你是学术写作助手，基于参考资料撰写综述章节。"},
+                    {"role": "system", "content": _pm.render("auto_complete_section_system.txt")},
                     {"role": "user", "content": prompt},
                 ],
                 max_tokens=1200,

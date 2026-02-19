@@ -1,76 +1,21 @@
 """
 Paper 元数据持久化：记录每个集合中入库的文件信息，支持文件级查询和删除。
-存储位置：src/data/papers.db
+底层存储已迁移至 data/rag.db (papers 表)，通过 SQLModel 访问。
 """
 
-import sqlite3
 import time
-from pathlib import Path
 from typing import List, Optional
 
+from sqlmodel import Session, select, and_
+
+from src.db.engine import get_engine
+from src.db.models import Paper
 from src.log import get_logger
 
 logger = get_logger(__name__)
 
-_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "papers.db"
 
-
-def _db():
-    _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(_DB_PATH))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    _init_schema(conn)
-    return conn
-
-
-def _init_schema(conn: sqlite3.Connection):
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS papers (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            collection    TEXT    NOT NULL,
-            paper_id      TEXT    NOT NULL,
-            filename      TEXT    NOT NULL DEFAULT '',
-            file_path     TEXT    NOT NULL DEFAULT '',
-            file_size     INTEGER NOT NULL DEFAULT 0,
-            chunk_count   INTEGER NOT NULL DEFAULT 0,
-            row_count     INTEGER NOT NULL DEFAULT 0,
-            enrich_tables_enabled INTEGER NOT NULL DEFAULT 0,
-            enrich_figures_enabled INTEGER NOT NULL DEFAULT 0,
-            table_count   INTEGER NOT NULL DEFAULT 0,
-            figure_count  INTEGER NOT NULL DEFAULT 0,
-            table_success INTEGER NOT NULL DEFAULT 0,
-            figure_success INTEGER NOT NULL DEFAULT 0,
-            status        TEXT    NOT NULL DEFAULT 'done',
-            error_message TEXT    DEFAULT '',
-            created_at    REAL    NOT NULL,
-            UNIQUE(collection, paper_id)
-        )
-    """)
-    conn.execute("""
-        CREATE INDEX IF NOT EXISTS idx_papers_collection
-        ON papers (collection)
-    """)
-    try:
-        conn.execute("ALTER TABLE papers ADD COLUMN content_hash TEXT")
-    except sqlite3.OperationalError:
-        pass  # column already exists
-    for col_sql in [
-        "ALTER TABLE papers ADD COLUMN enrich_tables_enabled INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE papers ADD COLUMN enrich_figures_enabled INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE papers ADD COLUMN table_count INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE papers ADD COLUMN figure_count INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE papers ADD COLUMN table_success INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE papers ADD COLUMN figure_success INTEGER NOT NULL DEFAULT 0",
-    ]:
-        try:
-            conn.execute(col_sql)
-        except sqlite3.OperationalError:
-            pass
-    conn.commit()
-
-
-# ── 写入 ──
+# ── 写入 ──────────────────────────────────────────────────────────────────────
 
 def upsert_paper(
     collection: str,
@@ -89,93 +34,141 @@ def upsert_paper(
     status: str = "done",
     error_message: str = "",
     content_hash: str = "",
-):
-    """插入或更新 paper 记录"""
+) -> None:
+    """插入或更新 paper 记录。"""
     now = time.time()
-    with _db() as conn:
-        conn.execute("""
-            INSERT INTO papers (collection, paper_id, filename, file_path, file_size,
-                                chunk_count, row_count,
-                                enrich_tables_enabled, enrich_figures_enabled,
-                                table_count, figure_count, table_success, figure_success,
-                                status, error_message, created_at, content_hash)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(collection, paper_id) DO UPDATE SET
-                filename      = excluded.filename,
-                file_path     = excluded.file_path,
-                file_size     = CASE WHEN excluded.file_size > 0 THEN excluded.file_size ELSE file_size END,
-                chunk_count   = CASE WHEN excluded.chunk_count > 0 THEN excluded.chunk_count ELSE chunk_count END,
-                row_count     = CASE WHEN excluded.row_count > 0 THEN excluded.row_count ELSE row_count END,
-                enrich_tables_enabled = excluded.enrich_tables_enabled,
-                enrich_figures_enabled = excluded.enrich_figures_enabled,
-                table_count   = excluded.table_count,
-                figure_count  = excluded.figure_count,
-                table_success = excluded.table_success,
-                figure_success = excluded.figure_success,
-                status        = excluded.status,
-                error_message = excluded.error_message,
-                created_at    = CASE WHEN status = 'done' THEN created_at ELSE excluded.created_at END,
-                content_hash  = excluded.content_hash
-        """, (
-            collection, paper_id, filename, file_path, file_size,
-            chunk_count, row_count,
-            int(bool(enrich_tables_enabled)), int(bool(enrich_figures_enabled)),
-            int(table_count), int(figure_count), int(table_success), int(figure_success),
-            status, error_message, now, content_hash or None
-        ))
-        conn.commit()
+    with Session(get_engine()) as session:
+        stmt = select(Paper).where(
+            and_(Paper.collection == collection, Paper.paper_id == paper_id)
+        )
+        row = session.exec(stmt).first()
+        if row is None:
+            row = Paper(
+                collection=collection,
+                paper_id=paper_id,
+                filename=filename,
+                file_path=file_path,
+                file_size=file_size,
+                chunk_count=chunk_count,
+                row_count=row_count,
+                enrich_tables_enabled=int(bool(enrich_tables_enabled)),
+                enrich_figures_enabled=int(bool(enrich_figures_enabled)),
+                table_count=int(table_count),
+                figure_count=int(figure_count),
+                table_success=int(table_success),
+                figure_success=int(figure_success),
+                status=status,
+                error_message=error_message,
+                content_hash=content_hash or None,
+                created_at=now,
+            )
+            session.add(row)
+        else:
+            row.filename = filename
+            row.file_path = file_path
+            if file_size > 0:
+                row.file_size = file_size
+            if chunk_count > 0:
+                row.chunk_count = chunk_count
+            if row_count > 0:
+                row.row_count = row_count
+            row.enrich_tables_enabled = int(bool(enrich_tables_enabled))
+            row.enrich_figures_enabled = int(bool(enrich_figures_enabled))
+            row.table_count = int(table_count)
+            row.figure_count = int(figure_count)
+            row.table_success = int(table_success)
+            row.figure_success = int(figure_success)
+            row.status = status
+            row.error_message = error_message
+            row.content_hash = content_hash or None
+            session.add(row)
+        session.commit()
 
 
-# ── 查询 ──
+# ── 查询 ──────────────────────────────────────────────────────────────────────
 
 def list_papers(collection: str) -> List[dict]:
-    """列出指定集合中的所有 paper"""
-    with _db() as conn:
-        rows = conn.execute("""
-            SELECT paper_id, filename, file_size, chunk_count, row_count,
-                   enrich_tables_enabled, enrich_figures_enabled,
-                   table_count, figure_count, table_success, figure_success,
-                   status, error_message, created_at, content_hash
-            FROM papers
-            WHERE collection = ?
-            ORDER BY created_at DESC
-        """, (collection,)).fetchall()
-        return [dict(r) for r in rows]
+    """列出指定集合中的所有 paper。"""
+    with Session(get_engine()) as session:
+        stmt = (
+            select(Paper)
+            .where(Paper.collection == collection)
+            .order_by(Paper.created_at.desc())
+        )
+        rows = session.exec(stmt).all()
+    return [
+        {
+            "paper_id": r.paper_id,
+            "filename": r.filename,
+            "file_size": r.file_size,
+            "chunk_count": r.chunk_count,
+            "row_count": r.row_count,
+            "enrich_tables_enabled": r.enrich_tables_enabled,
+            "enrich_figures_enabled": r.enrich_figures_enabled,
+            "table_count": r.table_count,
+            "figure_count": r.figure_count,
+            "table_success": r.table_success,
+            "figure_success": r.figure_success,
+            "status": r.status,
+            "error_message": r.error_message,
+            "created_at": r.created_at,
+            "content_hash": r.content_hash,
+        }
+        for r in rows
+    ]
 
 
 def get_paper(collection: str, paper_id: str) -> Optional[dict]:
-    """获取单个 paper 信息"""
-    with _db() as conn:
-        row = conn.execute("""
-            SELECT paper_id, filename, file_size, chunk_count, row_count,
-                   enrich_tables_enabled, enrich_figures_enabled,
-                   table_count, figure_count, table_success, figure_success,
-                   status, error_message, created_at, content_hash
-            FROM papers
-            WHERE collection = ? AND paper_id = ?
-        """, (collection, paper_id)).fetchone()
-        return dict(row) if row else None
+    """获取单个 paper 信息。"""
+    with Session(get_engine()) as session:
+        stmt = select(Paper).where(
+            and_(Paper.collection == collection, Paper.paper_id == paper_id)
+        )
+        row = session.exec(stmt).first()
+    if not row:
+        return None
+    return {
+        "paper_id": row.paper_id,
+        "filename": row.filename,
+        "file_size": row.file_size,
+        "chunk_count": row.chunk_count,
+        "row_count": row.row_count,
+        "enrich_tables_enabled": row.enrich_tables_enabled,
+        "enrich_figures_enabled": row.enrich_figures_enabled,
+        "table_count": row.table_count,
+        "figure_count": row.figure_count,
+        "table_success": row.table_success,
+        "figure_success": row.figure_success,
+        "status": row.status,
+        "error_message": row.error_message,
+        "created_at": row.created_at,
+        "content_hash": row.content_hash,
+    }
 
 
-# ── 删除 ──
+# ── 删除 ──────────────────────────────────────────────────────────────────────
 
 def delete_paper(collection: str, paper_id: str) -> bool:
-    """删除 paper 记录"""
-    with _db() as conn:
-        cur = conn.execute(
-            "DELETE FROM papers WHERE collection = ? AND paper_id = ?",
-            (collection, paper_id),
+    """删除 paper 记录。"""
+    with Session(get_engine()) as session:
+        stmt = select(Paper).where(
+            and_(Paper.collection == collection, Paper.paper_id == paper_id)
         )
-        conn.commit()
-        return cur.rowcount > 0
+        row = session.exec(stmt).first()
+        if not row:
+            return False
+        session.delete(row)
+        session.commit()
+    return True
 
 
 def delete_collection_papers(collection: str) -> int:
-    """删除整个集合的所有 paper 记录"""
-    with _db() as conn:
-        cur = conn.execute(
-            "DELETE FROM papers WHERE collection = ?",
-            (collection,),
-        )
-        conn.commit()
-        return cur.rowcount
+    """删除整个集合的所有 paper 记录。"""
+    with Session(get_engine()) as session:
+        stmt = select(Paper).where(Paper.collection == collection)
+        rows = session.exec(stmt).all()
+        count = len(rows)
+        for row in rows:
+            session.delete(row)
+        session.commit()
+    return count

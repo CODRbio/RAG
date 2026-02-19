@@ -32,23 +32,20 @@ def delete_canvas(canvas_id: str) -> bool:
 
 def list_canvases(user_id: str = "", limit: int = 50) -> List[SurveyCanvas]:
     """列出所有画布（可选按用户过滤）。"""
-    import sqlite3
+    from sqlmodel import Session, select
+    from src.db.engine import get_engine
+    from src.db.models import Canvas as CanvasRow
+
     store = get_canvas_store()
-    with sqlite3.connect(store.db_path) as conn:
-        conn.row_factory = sqlite3.Row
+    with Session(get_engine()) as session:
+        stmt = select(CanvasRow.id).order_by(CanvasRow.updated_at.desc()).limit(limit)
         if user_id:
-            rows = conn.execute(
-                "SELECT id FROM canvases WHERE user_id = ? ORDER BY updated_at DESC LIMIT ?",
-                (user_id, limit),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT id FROM canvases ORDER BY updated_at DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
+            stmt = select(CanvasRow.id).where(CanvasRow.user_id == user_id).order_by(CanvasRow.updated_at.desc()).limit(limit)
+        ids = session.exec(stmt).all()
+
     canvases = []
-    for r in rows:
-        canvas = store.get(r["id"])
+    for cid in ids:
+        canvas = store.get(cid)
         if canvas:
             canvases.append(canvas)
     return canvases

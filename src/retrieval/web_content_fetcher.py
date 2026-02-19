@@ -43,6 +43,9 @@ from pydantic import BaseModel, Field
 
 from src.log import get_logger
 from src.utils.cache import TTLCache, _make_key, get_cache
+from src.utils.prompt_manager import PromptManager
+
+_pm = PromptManager()
 
 logger = get_logger(__name__)
 
@@ -534,20 +537,12 @@ class WebContentFetcher:
             f"{i + 1}. URL: {c['url']}\n   摘要: {c['snippet'][:400]}"
             for i, c in enumerate(candidates)
         )
-        prompt = (
-            f'用户问题："{query}"\n\n'
-            f"以下是搜索结果的摘要片段：\n{items_text}\n\n"
-            "请判断这些摘要是否已包含回答问题所需的具体数据。\n"
-            "如果某条摘要信息残缺（例如有省略号、核心数值/结论被截断），"
-            "则需要抓取原文。如果现有摘要已足够，无需抓取。\n"
-            '只返回 JSON，格式：{"urls_to_fetch": ["url1", "url2"]}。'
-            "如果全部摘要已足够，返回 {\"urls_to_fetch\": []}。"
-        )
+        prompt = _pm.render("web_content_fetch_decide.txt", query=query, items_text=items_text)
 
         try:
             resp = llm_client.chat(
                 messages=[
-                    {"role": "system", "content": "你是文献质量评估助手，只输出纯 JSON，不加任何解释。"},
+                    {"role": "system", "content": _pm.render("web_content_fetch_decide_system.txt")},
                     {"role": "user", "content": prompt},
                 ],
                 max_tokens=512,

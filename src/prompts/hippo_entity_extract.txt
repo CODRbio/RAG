@@ -1,0 +1,10 @@
+Extract named entities from the following academic text. Return a JSON array only.
+
+Text:
+{text}
+
+Entity types to extract:
+{entity_types}
+
+Return format (JSON array, no other text):
+[{{"name": "entity name", "type": "TYPE_CODE"}}]

@@ -29,7 +29,39 @@ logger = get_logger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """应用生命周期：清理残留任务 → 存储清理 → 启动后台 Worker"""
+    """应用生命周期：DB初始化 → 历史迁移 → 清理残留任务 → 存储清理 → 启动后台 Worker"""
+
+    # 0. 确保 rag.db 表结构存在，自动迁移旧 .db 文件（仅首次启动时执行）
+    from src.db.engine import init_db
+    from src.db.migrate_legacy import migrate_if_needed
+    try:
+        init_db()
+    except Exception as e:
+        logger.warning("[startup] init_db failed (may be OK if alembic already ran): %s", e)
+    try:
+        migrate_if_needed()
+    except Exception as e:
+        logger.warning("[startup] migrate_if_needed failed: %s", e)
+
+    # 0a. JWT secret key safety check
+    _DEFAULT_SECRET = "change-me-in-local"
+    if settings.auth.secret_key == _DEFAULT_SECRET:
+        logger.warning(
+            "[startup] SECURITY WARNING: auth.secret_key is still set to the default value '%s'. "
+            "All JWT tokens can be trivially forged. "
+            "Set a strong random value in config/rag_config.local.json → auth.secret_key "
+            "before deploying to production.",
+            _DEFAULT_SECRET,
+        )
+
+    # 0b. Purge expired JWT revocation records to keep the table compact
+    try:
+        from src.auth.session import purge_expired_revocations
+        purged = purge_expired_revocations()
+        if purged:
+            logger.info("[startup] purged %d expired token revocation record(s)", purged)
+    except Exception as e:
+        logger.warning("[startup] purge_expired_revocations failed: %s", e)
 
     # 1. 将上次进程中断时残留的 running/cancelling 任务重置为 error
     cleanup_stale_jobs()

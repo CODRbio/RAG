@@ -1,4 +1,7 @@
 {
+  "database": {
+    "url": "sqlite:///data/rag.db"
+  },
   "llm": {
     "providers": {
       "openai": { "api_key": "sk-xxx" },

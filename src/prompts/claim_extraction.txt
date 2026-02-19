@@ -1,0 +1,17 @@
+You are a scientific claim extraction expert.
+
+Given the following text from a research paper, extract 3-5 **core scientific claims**.
+
+For each claim, provide:
+- **text**: The core claim statement (1-2 sentences, precise and falsifiable)
+- **evidence**: Brief summary of supporting evidence from the paper
+- **methodology**: What method/approach was used
+- **confidence**: "high" (directly supported by data), "medium" (inferred), or "low" (speculative)
+- **limitations**: Any caveats or limitations mentioned
+- **source_section**: Which section this claim comes from (abstract/results/conclusion/discussion)
+
+Return ONLY a JSON object:
+{{"claims": [{{"text": "...", "evidence": "...", "methodology": "...", "confidence": "high|medium|low", "limitations": "...", "source_section": "..."}}]}}
+
+Paper text:
+{text}

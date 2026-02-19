@@ -16,6 +16,7 @@ except ImportError:
 
 from src.chunking.chunker import ChunkConfig, chunk_blocks
 from src.graph.hippo_rag import HippoRAG
+from src.graph.entity_extractor import ExtractorConfig
 
 
 def _truncate(content: str, max_len: int = 65000) -> str:
@@ -182,8 +183,19 @@ def _build_hippo_graph(state: IngestionState, *, config: RunnableConfig) -> dict
         overlap_sentences=chunk_config.get("overlap_sentences", 2),
         table_rows_per_chunk=chunk_config.get("table_rows_per_chunk", 10),
     )
-    hippo = HippoRAG()
-    hippo.build_from_parsed_docs(parsed_dir, use_llm=False, chunk_config=ccfg)
+    ext_cfg_raw = cfg.get("entity_extraction") or {}
+    ext_cfg = ExtractorConfig(
+        strategy=ext_cfg_raw.get("strategy", "gliner"),
+        fallback=ext_cfg_raw.get("fallback", "rule"),
+        ontology_path=ext_cfg_raw.get("ontology_path", "config/ontology.json"),
+        gliner_model=ext_cfg_raw.get("gliner_model", "urchade/gliner_base"),
+        gliner_threshold=float(ext_cfg_raw.get("gliner_threshold", 0.4)),
+        gliner_device=ext_cfg_raw.get("gliner_device", "cpu"),
+        llm_provider=ext_cfg_raw.get("llm_provider", "deepseek"),
+        llm_max_tokens=int(ext_cfg_raw.get("llm_max_tokens", 1000)),
+    )
+    hippo = HippoRAG(extractor_config=ext_cfg)
+    hippo.build_from_parsed_docs(parsed_dir, chunk_config=ccfg)
     graph_output_path.parent.mkdir(parents=True, exist_ok=True)
     hippo.save(graph_output_path)
     return {}

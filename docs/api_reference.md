@@ -31,6 +31,8 @@
 
 - 需要鉴权的接口使用 Header：`Authorization: Bearer <token>`
 - 普通用户与管理员权限由路由层依赖项判断
+- 登录返回的 `token` 为 JWT（`HS256`），默认有效期由 `auth.token_expire_hours` 控制
+- token 为无状态设计，支持多进程/多副本；被撤销 token 会通过 `revoked_tokens` 表进行拦截
 
 ## 项目管理（`/projects`）
 

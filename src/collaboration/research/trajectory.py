@@ -15,6 +15,9 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from src.log import get_logger
+from src.utils.prompt_manager import PromptManager
+
+_pm = PromptManager()
 
 logger = get_logger(__name__)
 
@@ -132,26 +135,6 @@ class ResearchTrajectory:
 # RE-TRAC 压缩
 # ────────────────────────────────────────────────
 
-_COMPRESS_PROMPT = """你是一个研究轨迹压缩助手。请将以下详细的研究轨迹压缩为一段高质量摘要。
-
-**保留**:
-- 战略性发现（关键结论、重要数据点）
-- 未探索的分支和待回答的问题
-- 关键来源的引用信息
-- 研究方向的判断和决策
-
-**丢弃**:
-- 重复的搜索结果和中间推理步骤
-- 冗余的背景描述
-- 已被后续发现否定的信息
-
-研究轨迹:
-{trajectory}
-
-请输出压缩后的摘要（控制在 500-800 字以内），格式为：
-1. **核心发现**: 已确认的关键事实
-2. **未决问题**: 仍需探索的方向
-3. **来源概要**: 已使用的重要来源"""
 
 
 def compress_trajectory(
@@ -178,12 +161,12 @@ def compress_trajectory(
 
     trajectory_text = "\n".join(detail_parts)
 
-    prompt = _COMPRESS_PROMPT.format(trajectory=trajectory_text)
+    prompt = _pm.render("trajectory_compress.txt", trajectory=trajectory_text)
 
     try:
         resp = llm_client.chat(
             messages=[
-                {"role": "system", "content": "你是研究轨迹压缩专家。"},
+                {"role": "system", "content": _pm.render("trajectory_compress_system.txt")},
                 {"role": "user", "content": prompt},
             ],
             model=model,

@@ -1,0 +1,4 @@
+You produced invalid JSON. Fix it ONLY.
+Schema: {schema}
+Your output: {raw_output}
+Return ONLY valid JSON.

@@ -24,6 +24,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from src.utils.prompt_manager import PromptManager
+
+_pm = PromptManager()
 logger = logging.getLogger(__name__)
 
 
@@ -919,22 +922,6 @@ class FigureExtractor:
 # LLMEnricher
 # ============================================================
 
-TABLE_SUMMARY_PROMPT = """Role: Senior Data Analyst
-Task: Generate a semantic summary for the table.
-
-Context:
-- Section: {heading_path}
-- Title: {table_title}
-- Markdown: {table_markdown}
-- Computed Stats (trusted): {computed_stats}
-
-Requirements:
-- ONE paragraph, NO bullets
-- Reference ≥2 column headers by name
-- ALL numbers must come from table or computed_stats
-- If uncertain, say "not explicitly stated"
-- Output ONLY the summary text, no JSON."""
-
 FIGURE_JSON_SCHEMA = """{
   "figure_type": "line_plot|bar_chart|diagram|photo|map|multi-panel figure|...",
   "description": "1-2 sentences for overall summary",
@@ -942,29 +929,6 @@ FIGURE_JSON_SCHEMA = """{
   "evidence": ["panel/legend/axis cues supporting findings", "..."],
   "qa_pairs": []
 }"""
-
-FIGURE_INTERPRET_PROMPT = """Role: Scientific Visualization Expert
-Task: Provide a concise overall summary and key evidence.
-
-Context:
-- Section: {heading_path}
-- Caption: {caption}
-
-Requirements:
-- Output must be concise: 1-2 sentences overall summary.
-- Provide up to 3 key findings with direct evidence from panels/legend/axes.
-- If numeric values are not clearly readable, say "not readable" and do not guess.
-- Reference panel labels (a/b/c/d) or legend cues when present.
-
-Output JSON only:
-{{
-  "figure_type": "line_plot|bar_chart|diagram|photo|map|multi-panel figure|...",
-  "description": "1-2 sentences overall summary",
-  "key_findings": ["finding1", "finding2", "finding3"],
-  "evidence": ["where in the figure this comes from (panel/legend/axis)", "..."],
-  "qa_pairs": []
-}}
-Return ONLY valid JSON."""
 
 
 class LLMEnricher:
@@ -999,17 +963,12 @@ class LLMEnricher:
     def _repair_json(self, raw_output: str, schema: str) -> Optional[dict]:
         if not raw_output:
             return None
-        prompt = (
-            "You produced invalid JSON. Fix it ONLY.\n"
-            f"Schema: {schema}\n"
-            f"Your output: {raw_output}\n"
-            "Return ONLY valid JSON."
-        )
+        prompt = _pm.render("pdf_json_repair.txt", schema=schema, raw_output=raw_output)
         try:
             client = self._get_text_client(fresh=True)
             resp = client.chat(
                 messages=[
-                    {"role": "system", "content": "Return ONLY valid JSON."},
+                    {"role": "system", "content": _pm.render("pdf_json_repair_system.txt")},
                     {"role": "user", "content": prompt},
                 ],
                 max_tokens=self.config.llm_json_repair_max_tokens,
@@ -1227,7 +1186,8 @@ class LLMEnricher:
         td = block.table_data
         if not td.computed_stats:
             td.computed_stats = compute_table_stats(td.structured)
-        prompt = TABLE_SUMMARY_PROMPT.format(
+        prompt = _pm.render(
+            "pdf_table_summary.txt",
             heading_path=" > ".join(block.heading_path) if block.heading_path else "(root)",
             table_title=td.title or "(no title)",
             table_markdown=td.markdown[:3000] if td.markdown else "",
@@ -1348,7 +1308,8 @@ class LLMEnricher:
         with open(img_full, "rb") as f:
             b64 = base64.standard_b64encode(f.read()).decode("utf-8")
 
-        prompt = FIGURE_INTERPRET_PROMPT.format(
+        prompt = _pm.render(
+            "pdf_figure_interpret.txt",
             heading_path=" > ".join(block.heading_path) if block.heading_path else "(root)",
             caption=fd.caption or "(no caption)",
         )

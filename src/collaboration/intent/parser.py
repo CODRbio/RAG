@@ -12,6 +12,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, Iterable, Optional
 
+from src.utils.prompt_manager import PromptManager
+
+_pm = PromptManager()
+
 # ---------------------------------------------------------------------------
 # 意图类型（简化为 3 种）
 # ---------------------------------------------------------------------------
@@ -135,28 +139,16 @@ class IntentParser:
         history: Optional[Iterable[Any]] = None,
     ) -> ParsedIntent:
         history_block = _format_history(history)
-        prompt = f"""判断用户意图属于以下哪一类。当前工作阶段: {current_stage}
-
-对话上下文:
-{history_block or "（无）"}
-
-用户输入: "{user_input}"
-
-只有两种意图：
-- chat: 普通对话、提问、搜索、写作、编辑、闲聊 —— 绝大多数情况都是 chat
-- deep_research: 用户明确要求生成一篇完整的多章节综述/报告（如"帮我写一篇完整综述"、"自动完成一篇关于XXX的报告"）
-
-判断原则：
-1. 如果用户只是提问、搜索文献、写某个段落、编辑文本、闲聊 → chat
-2. 只有用户明确表达要"完整综述"、"全文生成"、"一键综述"时 → deep_research
-3. 不确定时默认 chat
-
-请只返回一行 JSON，不要其他文字:
-{{"intent": "chat 或 deep_research", "confidence": 0.0-1.0, "params": {{}}}}"""
+        prompt = _pm.render(
+            "intent_classify.txt",
+            current_stage=current_stage,
+            history_block=history_block or "（无）",
+            user_input=user_input,
+        )
         try:
             resp = self.llm.chat(
                 [
-                    {"role": "system", "content": "你是一个意图分析助手，只返回 JSON。"},
+                    {"role": "system", "content": _pm.render("intent_classify_system.txt")},
                     {"role": "user", "content": prompt},
                 ],
                 max_tokens=128,

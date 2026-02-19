@@ -8,6 +8,7 @@
 |---|---|
 | 新成员 / 首次部署 | `../README.md` → `../install.md` → `scripts_guide.md` |
 | 后端开发 | `developer_guide.md` → `architecture.md` → `api_reference.md` |
+| Prompt 工程 / 提示词调优 | `developer_guide.md`（新增提示词模板）→ `architecture.md`（Prompt 资产流） |
 | 前端开发 | `../frontend/README.md` → `api_reference.md` |
 | 运维 / 排障 | `configuration.md` → `operations_and_troubleshooting.md` |
 | 质量保障 | `testing_and_evaluation.md` → `dependency_matrix.md` |
@@ -44,5 +45,8 @@
   - 新配置 → `configuration.md`
   - 新脚本 → `scripts_guide.md`
   - 新模块/重要设计变更 → `architecture.md` + `developer_guide.md`
+- 涉及提示词改造（`src/prompts/` 或 `PromptManager`）时，至少更新：
+  - `developer_guide.md`（开发约定）
+  - `architecture.md`（架构约束或数据流）
 - 与用户直接相关的变更（启动方式、主要能力）同步更新根目录 `README.md`。
 - 依赖版本变更时更新 `dependency_matrix.md`。

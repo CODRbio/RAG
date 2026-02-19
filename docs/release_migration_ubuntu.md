@@ -113,15 +113,17 @@ bash scripts/00_healthcheck_docker.sh
 
 - `data/raw_papers/`
 - `data/parsed/`
-- `src/data/sessions.db`
-- `src/data/deep_research_jobs.db`
+- `data/rag.db`
+- `data/*.db.bak`（如存在，作为历史迁移备份）
 - `artifacts/`（可选）
 
 示例（源机执行）：
 
 ```bash
-tar -czf deepsea-rag-data.tgz data/raw_papers data/parsed src/data/sessions.db src/data/deep_research_jobs.db artifacts
+tar -czf deepsea-rag-data.tgz data/raw_papers data/parsed data/rag.db artifacts
 ```
+
+> 说明：当前版本已统一为单库 `data/rag.db`（SQLModel + Alembic 管理）。若从旧版本迁移，系统启动时会自动尝试将历史多库数据合并到 `rag.db`，并将旧库重命名为 `*.db.bak`。
 
 目标机解压：
 
@@ -324,8 +326,8 @@ sudo certbot --nginx -d your.domain.com
 - 新版本发布前备份：
   - `config/rag_config*.json`
   - `data/parsed/`
-  - `src/data/sessions.db`
-  - `src/data/deep_research_jobs.db`
+  - `data/rag.db`
+  - `data/*.db.bak`（如存在）
 - 回滚时：
   1. 停服务（systemd）
   2. 切回旧代码/旧镜像

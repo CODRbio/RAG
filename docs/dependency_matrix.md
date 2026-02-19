@@ -17,6 +17,8 @@
 | FastAPI | `>=0.100.0,<1.0.0` | Web 框架 |
 | Uvicorn | `>=0.22.0` | ASGI 服务器 |
 | Pydantic | `>=2.0.0,<3.0.0` | 数据验证 |
+| SQLModel | `>=0.0.22` | ORM（统一业务数据库访问） |
+| Alembic | `>=1.14.0` | 数据库 schema 迁移 |
 | LangGraph | `>=0.2.0` | Agent 图编排 |
 | MCP SDK | `>=1.26.0` | MCP 协议 |
 

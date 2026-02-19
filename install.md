@@ -79,6 +79,7 @@ cp .env.example .env
 
 # 编辑 .env，设置 Milvus 地址、设备类型等
 # 编辑 config/rag_config.local.json，填入各 LLM provider 的 API Key
+# 如需覆盖数据库连接，可设置 RAG_DATABASE_URL（默认 sqlite:///data/rag.db）
 ```
 
 密钥注入优先级：

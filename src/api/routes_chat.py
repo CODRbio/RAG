@@ -13,6 +13,9 @@ from fastapi.responses import StreamingResponse
 
 from config.settings import settings
 from src.api.routes_auth import get_optional_user_id
+from src.utils.prompt_manager import PromptManager
+
+_pm = PromptManager()
 
 # ── Observability ──
 try:
@@ -156,30 +159,7 @@ _FORCE_RAG_RE = re.compile(
 )
 
 # ── 第二层：LLM 分类 prompt ──
-_ROUTE_SYSTEM = "你是一个查询路由分类器。只回答一个词：rag 或 chat。"
-
-_ROUTE_PROMPT = """判断用户消息是否需要检索外部知识库。
-
-## chat（不检索，LLM 直接回答）：
-- 社交寒暄：问候、感谢、告别、确认（你好、谢谢、明白了）
-- 情绪闲聊：哈哈、嗯嗯
-- 用户明确要求用 LLM 自身知识："基于你的训练/知识""你觉得""不用查资料""用你自己的话"
-- 纯编程/数学/逻辑推理（不需要领域知识库）
-- 对上一轮回答的追问，且上下文已包含足够信息（如"详细说说第三点"）
-
-## rag（需要检索知识库）：
-- 涉及特定领域的事实、数据、数值
-- 要求基于文献/材料做分析、对比、验证
-- 涉及学术概念或专业术语
-- 不确定时一律 rag
-
-## 最近对话
-{history}
-
-## 当前消息
-{message}
-
-只回答 rag 或 chat"""
+_ROUTE_SYSTEM = _pm.render("chat_route_system.txt")
 
 # ── 第三层解析：严格正则校验 LLM 输出 ──
 _ROUTE_ANSWER_RE = re.compile(r'^(chat|rag)\b', re.IGNORECASE)
@@ -214,7 +194,7 @@ def _classify_query(message: str, history_turns: list, llm_client) -> bool:
         ctx_lines.append(f"{role_label}: {text}")
     history_block = "\n".join(ctx_lines) if ctx_lines else "（首轮对话）"
 
-    prompt = _ROUTE_PROMPT.format(history=history_block, message=msg)
+    prompt = _pm.render("chat_route_classify.txt", history=history_block, message=msg)
 
     try:
         resp = llm_client.chat(
@@ -249,13 +229,7 @@ def _classify_query(message: str, history_turns: list, llm_client) -> bool:
 
 
 def _build_system_with_context(context: str) -> str:
-    return (
-        "你是一个基于检索增强的学术助手。请基于以下检索到的参考资料回答用户问题，"
-        "保持多轮对话连贯。每条证据前有方括号引用标记（如 [a1b2c3d4]），"
-        "请在行文中使用该标记引用对应证据。若无直接相关，可基于常识简要回答并说明。\n\n"
-        "参考资料：\n"
-        f"{context or '（本轮暂无检索结果）'}"
-    )
+    return _pm.render("chat_rag_system.txt", context=context or "（本轮暂无检索结果）")
 
 
 def _chunk_text(text: str, chunk_size: int = 20):
@@ -544,11 +518,7 @@ def _run_chat(
     next_stage = wf["next_stage"]
     stage_prompt = wf.get("system_prompt") or ""
     if not query_needs_rag:
-        system_content = (
-            "你是一个友好的学术助手。当前用户的问题不需要检索外部知识库。\n"
-            "请基于你自身的训练知识回答，保持专业、准确、简洁。\n"
-            "如果问题超出你的知识范围，坦诚说明并建议用户让你检索知识库获取更准确的信息。"
-        )
+        system_content = _pm.render("chat_direct_system.txt")
         prompt_mode = "chat_direct"
     elif stage_prompt:
         system_content = stage_prompt
@@ -593,13 +563,7 @@ def _run_chat(
 
     # Agent + 预检索结果：指示优先使用已有资料
     if use_agent and do_retrieval and context_str:
-        agent_hint = (
-            "\n\n【重要：检索结果已就绪】\n"
-            "我已为你检索了相关参考资料（见上文）。请优先基于这些资料回答用户问题。\n"
-            "只有当现有资料明显不足以回答时，才使用 search_local 或 search_web 工具补充检索。\n"
-            "避免重复搜索已有资料中已覆盖的内容。"
-        )
-        messages[0]["content"] = messages[0]["content"] + agent_hint
+        messages[0]["content"] = messages[0]["content"] + _pm.render("chat_agent_hint.txt")
 
     gen_mode = "agent" if use_agent else "direct"
     _chat_logger.info(
@@ -844,53 +808,16 @@ def clarify_for_deep_research(
                 lines.append(f"{role_label}: {text}")
             history_block = "\n".join(lines)
 
-    prompt = f"""用户想要进行深度研究。请先生成澄清问题：
-- 至少 1 个问题（即使主题较明确，也要有 1 个关键确认问题）；
-- 如果主题不明确或歧义较大，生成更多问题（最多 6 个）；
-- 问题按优先级排序。
-然后输出一个结构化研究简报。
-
-用户的主题描述: "{body.message}"
-
-对话历史上下文:
-{history_block or "（无）"}
-
-请生成问题帮助明确（优先级从高到低）：
-1. 研究主题的精确范围
-2. 重点关注的方向（如理论/应用/方法论）
-3. 目标受众和写作风格（学术论文/科普/报告）
-4. 篇幅和深度要求
-5. 特别需要关注的子主题或排除的内容
-6. 文献语言偏好
-
-约束：
-- questions 数量必须在 1 到 6 之间
-- 问题应尽量具体、可回答，避免重复
-
-返回 JSON 格式:
-{{
-  "suggested_topic": "建议的综述主题（一句话）",
-  "suggested_outline": ["章节1", "章节2", ...],
-  "research_brief": {{
-    "scope": "研究范围描述",
-    "success_criteria": ["完成标准1", "完成标准2"],
-    "key_questions": ["核心问题1", "核心问题2"],
-    "exclusions": ["排除内容"],
-    "time_range": "文献时间范围",
-    "source_priority": ["peer-reviewed papers", "reviews"]
-  }},
-  "questions": [
-    {{"id": "q1", "text": "问题文本", "type": "text", "default": "建议答案"}},
-    {{"id": "q2", "text": "问题文本", "type": "choice", "options": ["选项A", "选项B"], "default": "选项A"}}
-  ]
-}}
-
-只返回 JSON，不要其他文字。"""
+    prompt = _pm.render(
+        "chat_deep_research_clarify.txt",
+        message=body.message,
+        history_block=history_block or "（无）",
+    )
 
     try:
         resp = client.chat(
             [
-                {"role": "system", "content": "你是一个学术研究规划助手，只返回 JSON。"},
+                {"role": "system", "content": _pm.render("chat_deep_research_system.txt")},
                 {"role": "user", "content": prompt},
             ],
             model=body.model_override or None,

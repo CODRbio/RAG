@@ -1,4 +1,8 @@
 {
+  "database": {
+    "url": "sqlite:///data/rag.db",
+    "echo": false
+  },
   "llm": {
     "default": "claude",
     "dry_run": false,

@@ -34,6 +34,23 @@ class PromptManager:
                     cls._instance = inst
         return cls._instance
 
+    def load(self, template_name: str) -> str:
+        """Return the raw template text without any format substitution.
+
+        Useful when the caller will perform its own ``str.format`` later
+        (e.g. ``StageConfig.system_prompt_template`` filled at runtime).
+
+        Args:
+            template_name: File name relative to ``src/prompts/``.
+
+        Returns:
+            Raw template string (may contain ``{placeholder}`` tokens).
+        """
+        if template_name not in self._cache:
+            path = _PROMPTS_DIR / template_name
+            self._cache[template_name] = path.read_text(encoding="utf-8")
+        return self._cache[template_name]
+
     def render(self, template_name: str, **kwargs: object) -> str:
         """Render a prompt template by name.
 
@@ -44,10 +61,7 @@ class PromptManager:
         Returns:
             Rendered prompt string.
         """
-        if template_name not in self._cache:
-            path = _PROMPTS_DIR / template_name
-            self._cache[template_name] = path.read_text(encoding="utf-8")
-        return self._cache[template_name].format(**kwargs)
+        return self.load(template_name).format(**kwargs)
 
     def invalidate(self, template_name: str | None = None) -> None:
         """Clear one or all cached templates (useful in tests or hot-reload scenarios)."""

@@ -17,7 +17,7 @@
 
 | 层 | 技术 |
 |---|---|
-| 后端框架 | FastAPI + Pydantic + SQLite + Milvus + NetworkX |
+| 后端框架 | FastAPI + Pydantic + SQLModel/Alembic + SQLite(`data/rag.db`) + Milvus + NetworkX |
 | 检索引擎 | Dense/Sparse + RRF + BGE-M3/ColBERT + HippoRAG + Web Search 聚合 |
 | LLM 调度 | 统一 `LLMManager`（OpenAI / DeepSeek / Gemini / Claude / Kimi / Sonar） |
 | Agent 框架 | ReAct 循环 + 统一 Tool 抽象 + LangGraph Deep Research |
@@ -52,6 +52,7 @@ bash scripts/verify_dependencies.sh
 
 - 敏感字段（API Key）建议放在 `config/rag_config.local.json`
 - 或使用环境变量覆盖：`RAG_LLM__{PROVIDER}__API_KEY`
+- 数据库默认使用 `database.url = sqlite:///data/rag.db`（可用 `RAG_DATABASE_URL` 覆盖）
 
 ### 3) 启动基础服务（Milvus 等）
 
@@ -132,6 +133,7 @@ bash scripts/start.sh
 ├── src/                      # 后端源码
 │   ├── api/                  #   FastAPI 路由层
 │   ├── llm/                  #   LLMManager + tools + react_loop
+│   ├── db/                   #   SQLModel 模型 / 连接引擎 / 历史库迁移
 │   ├── retrieval/            #   混合检索 + web 聚合 + 重排
 │   ├── collaboration/        #   协作核心
 │   │   ├── canvas/           #     画布管理
@@ -200,6 +202,24 @@ text = resp["final_text"]
 ```
 
 禁止直接在业务代码里实例化各家 SDK 客户端或硬编码密钥。
+
+## Prompt 管理约定（必须遵守）
+
+- 所有业务 prompt 模板统一放在 `src/prompts/`
+- 业务代码通过 `src/utils/prompt_manager.py` 读取，不在 Python 逻辑中硬编码多行提示词
+- 常规模板使用 `PromptManager.render(template, **kwargs)`，延迟格式化场景使用 `PromptManager.load(template)`
+
+示例：
+
+```python
+from src.utils.prompt_manager import PromptManager
+
+_pm = PromptManager()
+system_prompt = _pm.render("chat_route_system.txt")
+user_prompt = _pm.render("chat_route_classify.txt", history=history, message=message)
+```
+
+对于包含 JSON 示例的模板，字面量花括号需使用 `{{` / `}}`，以兼容 `str.format`。
 
 ## License
 

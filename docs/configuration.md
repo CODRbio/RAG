@@ -20,6 +20,18 @@
 
 ## 二、关键配置块（`rag_config.json`）
 
+### `database`
+
+统一数据库配置（当前默认 SQLite，后续可平滑切换 PostgreSQL）。
+
+- `url`：数据库连接字符串（默认 `sqlite:///data/rag.db`）
+- `echo`：是否输出 SQL 调试日志
+
+说明：
+
+- 当前后端使用 **SQLModel + Alembic** 管理 schema 与迁移
+- 启动时会确保 `data/rag.db` 可用，并尝试自动迁移历史多库数据（若存在）
+
 ### `llm`
 
 LLM 统一调度配置。
@@ -114,9 +126,15 @@ API 服务配置。
 
 认证配置。
 
-- `secret_key`：JWT 密钥（生产环境必须替换）
-- `token_expire_hours`：Token 过期时间（默认 24h）
+- `secret_key`：JWT 签名密钥（生产环境必须替换；默认值仅用于开发环境）
+- `token_expire_hours`：JWT 过期时间（默认 24h）
 - 初始化管理员账户字段（`default_admin_*`）
+
+说明：
+
+- 登录后签发的是无状态 JWT（`HS256`），服务端不再依赖进程内 token 字典，支持多 worker / 多副本部署。
+- 被显式撤销的 token 会写入数据库表 `revoked_tokens`（保存 token 的 SHA-256 哈希），用于后续校验拦截。
+- 服务启动时会自动清理过期的撤销记录，避免 `revoked_tokens` 持续膨胀。
 
 ### `logging`
 
@@ -158,6 +176,71 @@ Deep Research 配置。
   - 图上限：`recursion_limit`
   - 成本监控：`cost_warn_steps`、`cost_force_summary_steps`、`cost_tick_interval`
 
+### `graph`
+
+知识图谱实体抽取配置，控制 HippoRAG 构图时所使用的 NER 策略。
+
+```json
+"graph": {
+  "entity_extraction": {
+    "strategy": "gliner",
+    "fallback": "rule",
+    "ontology_path": "config/ontology.json",
+    "gliner": {
+      "model": "urchade/gliner_base",
+      "threshold": 0.4,
+      "device": "cpu"
+    },
+    "llm": {
+      "provider": "deepseek",
+      "max_tokens": 1000
+    }
+  }
+}
+```
+
+- `strategy`：主策略，可选值：
+  - `gliner`（默认）：本地轻量 Zero-Shot NER，CPU 友好，~50 MB 模型，无需手写规则
+  - `rule`：基于 `config/ontology.json` 中的正则规则，无需外部模型
+  - `llm`：调用项目 LLM Provider 按文本抽取，精度最高但速度最慢
+- `fallback`：主策略**抛出异常**时自动降级到的备用策略（不因空结果触发，避免噪声）
+- `ontology_path`：领域本体配置路径，相对于项目根目录；切换领域只需替换此文件
+- `gliner.model`：GLiNER 模型名（HuggingFace Hub ID 或本地路径）
+- `gliner.threshold`：实体置信度阈值，越低召回越多，建议 0.3–0.5
+- `gliner.device`：推理设备，`cpu` / `cuda` / `mps`
+- `llm.provider`：使用 LLM 策略时的 provider（需在 `llm.providers` 中已配置）
+- `llm.max_tokens`：LLM 单次抽取最大 token 数
+
+#### 领域本体 `config/ontology.json`
+
+定义实体类型与（可选）规则模式。切换领域只需编辑此文件，无需改动代码：
+
+```json
+{
+  "entity_types": {
+    "ORGANISM": {
+      "label": "organism, species, or biological taxon",
+      "description": "Species, organisms, biological taxa including Latin binomial names",
+      "patterns": ["\\b[A-Z][a-z]{3,} [a-z]{3,}\\b"]
+    },
+    "SUBSTANCE": { ... },
+    ...
+  },
+  "min_entity_length": 2,
+  "_profiles": {
+    "deep_sea": { ... },
+    "biomedical": { ... }
+  }
+}
+```
+
+- `entity_types`：实体类型字典，key 为类型名称（全大写）
+  - `label`：GLiNER 使用的自然语言描述（影响 Zero-Shot 性能，应具体）
+  - `description`：LLM prompt 中展示的说明
+  - `patterns`：`rule` 策略使用的正则列表（`gliner`/`llm` 策略会忽略此字段）
+- `min_entity_length`：最短实体字符数，过短的匹配将被过滤
+- `_profiles`：参考用领域 Profile，不会自动激活；若需启用，将对应 patterns 复制到 `entity_types` 对应类型的 `patterns` 字段中
+
 ### `auto_complete`
 
 一键综述配置。
@@ -187,6 +270,7 @@ Deep Research 配置。
 ### 服务配置
 
 - `API_HOST`、`API_PORT`：API 监听地址
+- `RAG_DATABASE_URL`：覆盖数据库连接串（高于配置文件，适合 CI/生产）
 - `MILVUS_HOST`、`MILVUS_PORT`：Milvus 地址
 - `RAG_ENV`：运行环境（dev / prod）
 - `COMPUTE_DEVICE`：计算设备（mps / cuda / cpu）
@@ -221,6 +305,10 @@ Deep Research 配置。
 
 ```json
 {
+  "database": {
+    "url": "sqlite:///data/rag.db",
+    "echo": false
+  },
   "llm": {
     "default": "deepseek",
     "providers": {

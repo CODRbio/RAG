@@ -75,6 +75,7 @@ def main():
         "table_rows_per_chunk": settings.chunk.table_rows_per_chunk,
     }
 
+    ee_cfg = settings.graph_entity_extraction
     configurable = {
         "thread_id": run_id,
         "processor": processor,
@@ -89,6 +90,16 @@ def main():
         "run_id": run_id,
         "graph_output_path": str(graph_path),
         "max_docs": args.max_docs,
+        "entity_extraction": {
+            "strategy": ee_cfg.strategy,
+            "fallback": ee_cfg.fallback,
+            "ontology_path": ee_cfg.ontology_path,
+            "gliner_model": ee_cfg.gliner_model,
+            "gliner_threshold": ee_cfg.gliner_threshold,
+            "gliner_device": ee_cfg.gliner_device,
+            "llm_provider": ee_cfg.llm_provider,
+            "llm_max_tokens": ee_cfg.llm_max_tokens,
+        },
     }
 
     initial_state = {

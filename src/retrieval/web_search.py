@@ -17,6 +17,9 @@ from pydantic import BaseModel, Field, model_validator
 from config.settings import settings
 from src.log import get_logger
 from src.utils.cache import TTLCache, _make_key, get_cache
+from src.utils.prompt_manager import PromptManager
+
+_pm = PromptManager()
 
 logger = get_logger(__name__)
 
@@ -156,25 +159,10 @@ class TavilySearcher:
             client = manager.get_client(provider)
             from datetime import datetime
             year = datetime.now().strftime("%Y")
-            prompt = f"""
-Act as a search query optimizer for the Tavily API. 
-Generate 3-5 distinct search queries based on the user's input: "{user_query}"
-
-**Optimization Rules:**
-1.  **Refine vs. Convert:**
-    - If the input is a **question**, refine it to be more specific or technical (e.g., add "benefits," "comparison," or "technical specs").
-    - If the input is **keywords**, convert them into a natural language question to capture intent.
-2.  **Global Knowledge:** If the input is not in English, you MUST provide at least 2 queries in English to access a broader index.
-3.  **Search Angles:** - Query 1: A deep-dive "How" or "Why" question.
-    - Query 2: A specific keyword string (3-6 words) focused on technical terms or entities.
-    - Query 3: A trend-focused query including the year {year} (if relevant).
-4.  **Format:** Output ONLY a raw JSON array of strings. No Markdown, no code blocks.
-
-Example Output: ["How does X affect Y in {year}?", "X technical architecture overview", "latest developments in X"]
-            """
+            prompt = _pm.render("web_search_optimize.txt", user_query=user_query, year=year)
             resp = client.chat(
                 messages=[
-                    {"role": "system", "content": "You are a search query generator. Output ONLY a valid JSON array of query strings."},
+                    {"role": "system", "content": _pm.render("web_search_optimize_system.txt")},
                     {"role": "user", "content": prompt},
                 ],
                 max_tokens=600,

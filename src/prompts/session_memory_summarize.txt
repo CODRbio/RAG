@@ -1,0 +1,10 @@
+Summarize the following conversation segment in 2-3 sentences.
+Focus on the main topic, key concepts discussed, and the user's current direction.
+
+Previous summary:
+{previous_summary}
+
+New conversation segment:
+{turns_text}
+
+Output only the updated summary.

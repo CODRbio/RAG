@@ -13,6 +13,9 @@ from pydantic import BaseModel, Field
 from config.settings import settings
 from src.collaboration.memory.session_memory import get_session_store
 from src.log import get_logger
+from src.utils.prompt_manager import PromptManager
+
+_pm = PromptManager()
 
 logger = get_logger(__name__)
 
@@ -138,28 +141,6 @@ def _extract_sections_text(data: Dict[str, Any], max_chars: int = 3000) -> str:
     return "\n\n".join(parts) if parts else ""
 
 
-_COMPARE_PROMPT = """You are a scientific literature comparison expert.
-
-Compare the following {n} papers across these aspects: {aspects}
-
-For each paper, I provide an ID and key text excerpts.
-
-{paper_blocks}
-
-Return a JSON object with TWO fields:
-1. "matrix": an object where keys are aspect names, and values are objects mapping paper_id to a brief description (1-2 sentences) for that aspect.
-2. "narrative": a 3-5 sentence comparative analysis summarizing key similarities and differences.
-
-Return ONLY valid JSON:
-```json
-{{
-  "matrix": {{
-    "objective": {{"paper1": "...", "paper2": "..."}},
-    ...
-  }},
-  "narrative": "..."
-}}
-```"""
 
 
 @router.post("", response_model=CompareResponse)
@@ -184,7 +165,8 @@ def compare_papers(body: CompareRequest) -> CompareResponse:
         paper_blocks.append(f"--- Paper: {pid} ---\n{text}")
 
     aspects_str = ", ".join(body.aspects)
-    prompt = _COMPARE_PROMPT.format(
+    prompt = _pm.render(
+        "compare_papers.txt",
         n=len(body.paper_ids),
         aspects=aspects_str,
         paper_blocks="\n\n".join(paper_blocks),
@@ -198,7 +180,7 @@ def compare_papers(body: CompareRequest) -> CompareResponse:
     try:
         resp = client.chat(
             messages=[
-                {"role": "system", "content": "You are a scientific comparison expert. Return ONLY valid JSON."},
+                {"role": "system", "content": _pm.render("compare_system.txt")},
                 {"role": "user", "content": prompt},
             ],
             model=body.model_override or None,

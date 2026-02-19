@@ -304,8 +304,26 @@ python scripts/19_cleanup_storage.py --vacuum
 - 生产环境关闭默认管理员密码（`auth.secret_key` 必须替换）
 - 定期备份：
   - `data/parsed/`
-  - `src/data/sessions.db`
-  - `src/data/deep_research_jobs.db`
+  - `data/rag.db`
+  - `data/*.db.bak`（如存在历史迁移备份）
   - 关键配置文件（脱敏后）
 - 变更前先导出核心画布内容（`POST /export`）
 - 敏感配置不要提交到 Git（已在 `.gitignore` 中配置）
+
+## 八、认证（JWT）运维说明
+
+- 当前认证 token 为无状态 JWT（`HS256`），支持多 worker / 多副本部署。
+- 被撤销 token 仅保存哈希到 `revoked_tokens` 表；服务启动会自动清理过期撤销记录。
+- 首次升级后请确保执行数据库迁移（Alembic），以创建 `revoked_tokens` 表：
+
+```bash
+alembic upgrade head
+```
+
+常见问题：
+
+- 如果启动日志出现 `auth.secret_key is still set to the default value`，请立即在 `config/rag_config.local.json` 中替换为强随机字符串并重启服务。
+- 如果登录后快速出现 `Invalid or missing token`，优先检查：
+  - 前端是否发送了 `Authorization: Bearer <token>`
+  - 服务端与客户端是否存在明显时间偏差（JWT 过期判断依赖系统时间）
+  - 数据库迁移是否已执行（缺少 `revoked_tokens` 表可能导致撤销/校验异常日志）

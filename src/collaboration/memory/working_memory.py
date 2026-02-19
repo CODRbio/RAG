@@ -1,62 +1,35 @@
 """
-Working Memory：与 Canvas 绑定的状态摘要，由 LLM 生成并 SQLite 缓存。
+Working Memory：与 Canvas 绑定的状态摘要，由 LLM 生成并持久化。
+底层存储已迁移至 data/rag.db (working_memory 表)，通过 SQLModel 访问。
 """
 
 import json
-import sqlite3
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Dict, Optional
 
+from sqlmodel import Session, select
+
 from src.collaboration.canvas.models import SurveyCanvas
-from src.collaboration.canvas.canvas_manager import get_canvas
-from src.llm.llm_manager import get_manager
+from src.db.engine import get_engine
+from src.db.models import WorkingMemory as WorkingMemoryRow
+from src.utils.prompt_manager import PromptManager
 
-
-def _db_path() -> Path:
-    return Path(__file__).resolve().parents[2] / "data" / "working_memory.db"
-
-
-def _init_schema(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS working_memory (
-            canvas_id TEXT PRIMARY KEY,
-            summary TEXT NOT NULL DEFAULT '',
-            meta_json TEXT NOT NULL DEFAULT '{}',
-            updated_at TEXT NOT NULL
-        )
-        """
-    )
-    conn.commit()
+_pm = PromptManager()
 
 
 def get_working_memory(canvas_id: str) -> Optional[Dict[str, Any]]:
     """返回缓存的 working memory，无则返回 None。"""
     if not canvas_id:
         return None
-    path = _db_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(path) as conn:
-        _init_schema(conn)
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            "SELECT canvas_id, summary, meta_json, updated_at FROM working_memory WHERE canvas_id = ?",
-            (canvas_id,),
-        ).fetchone()
+    with Session(get_engine()) as session:
+        row = session.get(WorkingMemoryRow, canvas_id)
     if row is None:
         return None
-    meta = {}
-    if row["meta_json"]:
-        try:
-            meta = json.loads(row["meta_json"])
-        except Exception:
-            pass
     return {
-        "canvas_id": row["canvas_id"],
-        "summary": row["summary"] or "",
-        "meta": meta,
-        "updated_at": row["updated_at"],
+        "canvas_id": row.canvas_id,
+        "summary": row.summary or "",
+        "meta": row.get_meta(),
+        "updated_at": row.updated_at,
     }
 
 
@@ -64,19 +37,24 @@ def update_working_memory(canvas_id: str, summary: str, meta: Optional[Dict[str,
     """写入或更新 working memory 缓存。"""
     if not canvas_id:
         return
-    path = _db_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
     now = datetime.now().isoformat()
     meta_json = json.dumps(meta or {}, ensure_ascii=False)
-    with sqlite3.connect(path) as conn:
-        _init_schema(conn)
-        conn.execute(
-            """INSERT INTO working_memory (canvas_id, summary, meta_json, updated_at)
-               VALUES (?, ?, ?, ?)
-               ON CONFLICT(canvas_id) DO UPDATE SET summary = ?, meta_json = ?, updated_at = ?""",
-            (canvas_id, summary, meta_json, now, summary, meta_json, now),
-        )
-        conn.commit()
+    with Session(get_engine()) as session:
+        row = session.get(WorkingMemoryRow, canvas_id)
+        if row is None:
+            row = WorkingMemoryRow(
+                canvas_id=canvas_id,
+                summary=summary,
+                meta_json=meta_json,
+                updated_at=now,
+            )
+            session.add(row)
+        else:
+            row.summary = summary
+            row.meta_json = meta_json
+            row.updated_at = now
+            session.add(row)
+        session.commit()
 
 
 def _canvas_to_context_string(canvas: SurveyCanvas) -> str:
@@ -103,26 +81,25 @@ def _canvas_to_context_string(canvas: SurveyCanvas) -> str:
     return "\n".join(parts)
 
 
-def generate_working_memory_summary(canvas_id: str, config_path: Optional[Path] = None) -> str:
+def generate_working_memory_summary(canvas_id: str, config_path=None) -> str:
     """
     根据 Canvas 用 LLM 生成摘要并写入缓存，返回 summary 文本。
     若 canvas 不存在则返回空字符串。
     """
+    from src.collaboration.canvas.canvas_manager import get_canvas
+    from src.llm.llm_manager import get_manager
+
     canvas = get_canvas(canvas_id)
     if canvas is None:
         return ""
     context = _canvas_to_context_string(canvas)
-    prompt = f"""你是一个学术写作助手。请根据以下综述画布状态，用 2-4 句话概括当前进度与下一步建议。只输出概括内容，不要其他解释。
-
-画布状态：
-{context}
-"""
+    prompt = _pm.render("working_memory_progress.txt", context=context)
     try:
         manager = get_manager(str(config_path) if config_path else None)
         client = manager.get_client()
         resp = client.chat(
             [
-                {"role": "system", "content": "你只输出简短概括，不要 markdown 或标题。"},
+                {"role": "system", "content": _pm.render("working_memory_progress_system.txt")},
                 {"role": "user", "content": prompt},
             ],
             max_tokens=256,
@@ -135,14 +112,13 @@ def generate_working_memory_summary(canvas_id: str, config_path: Optional[Path] 
         "outline_count": len(canvas.outline),
         "draft_count": len(canvas.drafts),
     }
-    # Include open research insights in meta for cross-session reuse
     if canvas.research_insights:
         meta["research_insights"] = canvas.research_insights[:20]
     update_working_memory(canvas_id, summary, meta)
     return summary
 
 
-def get_or_generate_working_memory(canvas_id: str, config_path: Optional[Path] = None) -> Optional[Dict[str, Any]]:
+def get_or_generate_working_memory(canvas_id: str, config_path=None) -> Optional[Dict[str, Any]]:
     """
     若已有缓存则返回，否则生成并缓存后返回。
     """

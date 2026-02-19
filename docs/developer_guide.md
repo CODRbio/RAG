@@ -25,7 +25,7 @@ src/
 ├── chunking/         #            结构化切块
 ├── indexing/         #            向量化与 Milvus 读写
 ├── generation/       # 生成层：证据综合 / 上下文打包 / LLM 兼容层
-├── graph/            # 图谱：HippoRAG
+├── graph/            # 图谱：HippoRAG + EntityExtractor（实体抽取解耦，领域本体驱动）
 ├── graphs/           # 流水线：LangGraph 入库图
 ├── auth/             # 认证：session / password
 ├── observability/    # 可观测：metrics / tracing / middleware
@@ -133,8 +133,8 @@ result = call_llm(
 |---|---|
 | `data/raw_papers/` | 原始 PDF 文档 |
 | `data/parsed/` | 解析后结构化数据 |
-| `src/data/sessions.db` | 会话数据库 |
-| `src/data/deep_research_jobs.db` | Deep Research 任务数据库 |
+| `data/rag.db` | 统一业务数据库（21 张表） |
+| `alembic/` + `alembic.ini` | 数据库 migration 管理 |
 | `logs/` | 运行日志 |
 | `logs/llm_raw/` | LLM 原始响应日志（JSONL） |
 | `artifacts/` | 评测/任务产物 |
@@ -202,11 +202,92 @@ cd frontend && npm run build && cd ..
 4. 前端加 API 封装与页面入口
 5. 更新文档与测试
 
+### 切换实体抽取领域（扩展本体）
+
+知识图谱的实体类型和抽取规则完全由 `config/ontology.json` 驱动，**不需要改任何 Python 代码**。
+
+**方式一：修改 `ontology.json` 直接生效**
+
+```json
+{
+  "entity_types": {
+    "GENE": {
+      "label": "gene, protein, or molecular target",
+      "description": "Genes, proteins, receptors, enzymes and molecular targets",
+      "patterns": []
+    },
+    "DRUG": {
+      "label": "drug, compound, or small molecule",
+      "description": "Pharmaceutical compounds, small molecules, biologics",
+      "patterns": ["\\b(?:aspirin|metformin|ibuprofen)\\b"]
+    }
+  },
+  "min_entity_length": 2
+}
+```
+
+`gliner` 策略只读 `label` 字段（自然语言越具体效果越好）；`rule` 策略只读 `patterns`；`llm` 策略读 `description`。
+
+**方式二：切换 `_profiles` 预设**
+
+`ontology.json` 的 `_profiles` 块内预置了 `deep_sea`、`biomedical` 两个参考配置，将其中的 patterns 复制到对应 `entity_types` 的 `patterns` 字段即可激活。
+
+**方式三：修改 `rag_config.json` 切换策略**
+
+```json
+"graph": {
+  "entity_extraction": {
+    "strategy": "gliner",
+    "fallback": "rule",
+    "gliner": { "threshold": 0.35 }
+  }
+}
+```
+
+策略选择建议：
+- **通用 / 多领域**：`gliner`（首选，零样本，无需规则）
+- **资源受限 / 离线**：`rule`（配合 `_profiles` 手写关键词）
+- **高精度 / 已有 LLM 配额**：`llm`
+
+**注意**：修改 ontology 后需重新运行 `scripts/03b_build_graph.py` 重建图谱；已存在的 `data/hippo_graph.json` 不会自动更新。
+
 ### 新增提示词模板
 
-1. 在 `src/prompts/` 新增 `.txt` 模板文件
-2. 通过 `src/utils/prompt_manager.py` 加载
-3. 在业务代码中引用
+目标：提示词工程与业务逻辑彻底解耦，业务代码中不再内嵌大段 prompt 字符串。
+
+1. 在 `src/prompts/` 新增 `.txt` 模板文件（推荐模块前缀命名，如 `chat_route_classify.txt`）
+2. 在业务模块引入 `PromptManager`，并使用单例：
+
+```python
+from src.utils.prompt_manager import PromptManager
+
+_pm = PromptManager()
+```
+
+3. 使用 `render()` 渲染模板（常规场景）：
+
+```python
+prompt = _pm.render(
+    "chat_route_classify.txt",
+    history=history_block,
+    message=message,
+)
+```
+
+4. 使用 `load()` 读取原始模板（需要延迟格式化时）：
+
+```python
+system_prompt_template = _pm.load("workflow_explore_system.txt")
+# 后续在运行时再 format(...)
+```
+
+5. 禁止在业务代码中直接硬编码多行 prompt（尤其是 `"""..."""` 的系统/用户提示）
+
+补充约定：
+
+- JSON 示例中的字面量花括号必须写成 `{{` / `}}`，以兼容 `str.format`
+- 系统提示与用户提示建议拆分为两个模板（如 `*_system.txt` / `*.txt`）
+- 模板变更需要同步更新文档（至少 `developer_guide.md` 或 `architecture.md`）
 
 ## 11. 文档维护职责
 

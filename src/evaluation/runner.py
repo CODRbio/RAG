@@ -18,6 +18,9 @@ from src.evaluation.metrics import (
 )
 from src.retrieval.evidence import EvidencePack
 from src.retrieval.service import RetrievalService
+from src.utils.prompt_manager import PromptManager
+
+_pm = PromptManager()
 
 
 def evaluate_dataset(
@@ -142,22 +145,10 @@ def _generate_answer(
     cite_keys: List[str],
     model_override: Optional[str] = None,
 ) -> str:
-    system_prompt = (
-        "你是严谨的科研助手，只能基于提供的证据回答。"
-        "回答中需要在句末使用引用标记，例如 [Smith2023]。"
-        "若证据不足，请直接说明无法确定。"
-    )
     keys_str = ", ".join(cite_keys[:30])
-    user_prompt = (
-        "以下是证据列表（每条以引用标记开头）：\n\n"
-        f"{context}\n\n"
-        f"可用引用标记: {keys_str}\n\n"
-        f"问题: {query}\n\n"
-        "请给出简洁回答，并在相关句子末尾标注引用。"
-    )
     messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
+        {"role": "system", "content": _pm.render("evaluation_system.txt")},
+        {"role": "user", "content": _pm.render("evaluation_user.txt", context=context, keys_str=keys_str, query=query)},
     ]
     resp = llm_client.chat(messages, model=model_override, max_tokens=800)
     return (resp.get("final_text") or "").strip()

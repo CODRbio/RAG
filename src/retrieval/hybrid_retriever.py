@@ -26,6 +26,7 @@ from config.settings import settings
 from src.indexing.milvus_ops import milvus
 from src.indexing.embedder import embedder
 from src.graph.hippo_rag import HippoRAG, get_hippo_rag
+from src.graph.entity_extractor import ExtractorConfig
 from src.log import get_logger
 from src.utils.cache import TTLCache, _make_key, get_cache
 
@@ -161,13 +162,29 @@ class HybridRetriever:
             if perf else None
         )
 
+    def _build_extractor_config(self) -> ExtractorConfig:
+        cfg = settings.graph_entity_extraction
+        return ExtractorConfig(
+            strategy=cfg.strategy,
+            fallback=cfg.fallback,
+            ontology_path=cfg.ontology_path,
+            gliner_model=cfg.gliner_model,
+            gliner_threshold=cfg.gliner_threshold,
+            gliner_device=cfg.gliner_device,
+            llm_provider=cfg.llm_provider,
+            llm_max_tokens=cfg.llm_max_tokens,
+        )
+
     def _ensure_graph(self):
         """确保图谱已加载"""
         if self.hippo is None:
             if self._graph_path.exists():
-                self.hippo = get_hippo_rag(self._graph_path)
+                self.hippo = get_hippo_rag(
+                    self._graph_path,
+                    extractor_config=self._build_extractor_config(),
+                )
             else:
-                self.logger.warning(f"图谱文件不存在: {self._graph_path}")
+                self.logger.warning("图谱文件不存在: %s", self._graph_path)
                 self.logger.warning("请先运行: python scripts/03b_build_graph.py")
 
     def retrieve_vector(

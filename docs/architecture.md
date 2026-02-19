@@ -10,7 +10,7 @@ Frontend (React + Zustand + i18n)
     → Collaboration Layer (workflow / canvas / memory / research / intent / citation / export)
     → Agent Layer (llm_manager + tools + react_loop)
     → Retrieval Layer (hybrid + web + graph + rerank)
-    → Persistence / Infra (Milvus + SQLite + files + observability)
+  → Persistence / Infra (Milvus + SQLModel/Alembic + SQLite(rag.db) + files + observability)
 ```
 
 ## 二、后端模块映射（`src/`）
@@ -91,17 +91,19 @@ Frontend (React + Zustand + i18n)
 | `chunking/chunker.py` | 结构化切块（section-aware，表格行切块，句级 overlap） |
 | `indexing/embedder.py` | 文本向量化（BGE-M3 dense + sparse，BGE-Reranker） |
 | `indexing/milvus_ops.py` | Milvus 向量数据库操作（schema v1/v2，hybrid search） |
-| `indexing/paper_store.py` | 论文元数据持久化（SQLite） |
+| `indexing/paper_store.py` | 论文元数据持久化（SQLModel / `data/rag.db`） |
 | `indexing/paper_metadata_store.py` | 扩展元数据存储 |
 | `indexing/ingest_job_store.py` | 入库任务追踪 |
-| `graph/hippo_rag.py` | HippoRAG 知识图谱（实体/关系提取 + PPR 检索） |
+| `graph/entity_extractor.py` | 通用实体抽取器（GLiNER zero-shot / 规则 / LLM 三种后端，领域本体由 `config/ontology.json` 驱动） |
+| `graph/hippo_rag.py` | HippoRAG 知识图谱（委托 EntityExtractor 抽取实体 + Personalized PageRank 检索 + 图谱持久化） |
 | `graphs/ingestion_graph.py` | LangGraph 入库流水线 |
+| `pipelines/ingestion_graph.py` | 兼容性桥接（转发至 `graphs/ingestion_graph`，保留旧导入路径） |
 
 ### 基础设施层
 
 | 模块 | 职责 |
 |---|---|
-| `auth/session.py` | 会话管理 |
+| `auth/session.py` | JWT 签发/校验与撤销校验（无状态认证） |
 | `auth/password.py` | 密码哈希（bcrypt） |
 | `observability/metrics.py` | Prometheus 指标（LLM 调用计数/延迟/token 用量） |
 | `observability/tracing.py` | OpenTelemetry 分布式追踪 |
@@ -118,7 +120,7 @@ Frontend (React + Zustand + i18n)
 | `utils/task_runner.py` | 后台任务运行器 |
 | `utils/model_sync.py` | 模型同步 |
 | `log/log_manager.py` | 统一日志管理 |
-| `prompts/` | LLM 提示词模板文件（研究/写作/验证/翻译等） |
+| `prompts/` | LLM 提示词模板文件（API/检索/解析/协作/评测等），与业务代码解耦 |
 
 ## 三、前端结构（`frontend/src/`）
 
@@ -166,7 +168,8 @@ raw PDF
  → src/indexing/embedder.py（BGE-M3 dense + sparse）
  → src/indexing/milvus_ops.py（写入 Milvus）
  → (optional) scripts/03b_build_graph.py
- → src/graph/hippo_rag.py（构建知识图谱）
+ → src/graph/entity_extractor.py（读取 config/ontology.json，GLiNER / 规则 / LLM 抽取实体）
+ → src/graph/hippo_rag.py（构建知识图谱 + Personalized PageRank 索引）
 ```
 
 ### 2) 在线入库流
@@ -298,8 +301,8 @@ Phase 2: /deep-research/submit（推荐）
 | 存储 | 用途 |
 |---|---|
 | Milvus | 向量索引与 chunk 检索 |
-| SQLite (`src/data/sessions.db`) | 会话、画布、用户与项目状态 |
-| SQLite (`src/data/deep_research_jobs.db`) | Deep Research 后台任务与事件 |
+| SQLite (`data/rag.db`) | 统一业务数据库（会话、画布、用户、项目、任务、元数据等 21 张表） |
+| SQLModel + Alembic | ORM 与版本化 schema 迁移（支持后续平滑切换 PostgreSQL） |
 | 文件系统 | `data/raw_papers`、`data/parsed`、`artifacts`、`logs` |
 | NetworkX (in-memory + JSON) | HippoRAG 知识图谱 |
 | 会话记忆 | `rolling_summary` / `summary_at_turn` 用于跨轮主语解析 |
@@ -318,8 +321,27 @@ Phase 2: /deep-research/submit（推荐）
 ## 七、设计约束
 
 - LLM 调用必须通过 `src/llm/llm_manager.py`
+- Prompt 必须通过 `src/utils/prompt_manager.py` 从 `src/prompts/*.txt` 加载，避免业务代码硬编码多行提示词
+- 实体类型定义必须放 `config/ontology.json`，禁止在 `entity_extractor.py` 或 `hippo_rag.py` 中硬编码领域正则或实体列表
+- 常规场景使用 `PromptManager.render()`；需要延迟格式化时使用 `PromptManager.load()`
 - 新工具必须在 `src/llm/tools.py` 与 `src/mcp/server.py` 同步注册
 - 配置新增字段必须同步 `config/rag_config.json` 与 `config/rag_config.example.json`
 - 敏感配置放 `config/rag_config.local.json` 或环境变量
 - 依赖方向：上层调用下层，避免反向耦合
 - 新 API 路由统一放 `src/api/routes_*.py`，在 `server.py` 注册
+
+## 八、Prompt 资产流
+
+```text
+src/prompts/*.txt
+  → src/utils/prompt_manager.py
+    → render(template, **kwargs)    # 直接渲染
+    → load(template)                # 读取原始模板，后续再 format
+      → 业务模块（routes_* / retrieval / parser / collaboration / evaluation / graph）
+```
+
+这一路径保证：
+
+- 模板可独立于 Python 逻辑快速调优
+- 多模块共享统一提示词资产与缓存机制
+- 变更审查时可清晰区分“业务逻辑改动”与“提示词改动”

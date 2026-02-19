@@ -1,0 +1,15 @@
+Role: Senior Data Analyst
+Task: Generate a semantic summary for the table.
+
+Context:
+- Section: {heading_path}
+- Title: {table_title}
+- Markdown: {table_markdown}
+- Computed Stats (trusted): {computed_stats}
+
+Requirements:
+- ONE paragraph, NO bullets
+- Reference ≥2 column headers by name
+- ALL numbers must come from table or computed_stats
+- If uncertain, say "not explicitly stated"
+- Output ONLY the summary text, no JSON.

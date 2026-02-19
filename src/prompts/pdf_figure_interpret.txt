@@ -1,0 +1,22 @@
+Role: Scientific Visualization Expert
+Task: Provide a concise overall summary and key evidence.
+
+Context:
+- Section: {heading_path}
+- Caption: {caption}
+
+Requirements:
+- Output must be concise: 1-2 sentences overall summary.
+- Provide up to 3 key findings with direct evidence from panels/legend/axes.
+- If numeric values are not clearly readable, say "not readable" and do not guess.
+- Reference panel labels (a/b/c/d) or legend cues when present.
+
+Output JSON only:
+{{
+  "figure_type": "line_plot|bar_chart|diagram|photo|map|multi-panel figure|...",
+  "description": "1-2 sentences overall summary",
+  "key_findings": ["finding1", "finding2", "finding3"],
+  "evidence": ["where in the figure this comes from (panel/legend/axis)", "..."],
+  "qa_pairs": []
+}}
+Return ONLY valid JSON.
