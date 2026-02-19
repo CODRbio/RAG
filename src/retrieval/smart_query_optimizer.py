@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from pydantic import BaseModel, ConfigDict, Field
+
 from src.log import get_logger
 from src.retrieval.query_optimizer import optimize_query
 
@@ -96,22 +98,18 @@ def _default_smart_config() -> Dict[str, Any]:
     }
 
 
-def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
-    """从 LLM 输出中提取 JSON 对象"""
-    text = (text or "").strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-    match = re.search(r"\{[\s\S]*\}", text)
-    if match:
-        try:
-            return json.loads(match.group())
-        except json.JSONDecodeError:
-            pass
-    return None
+# ── Pydantic Response Models (结构化输出) ────────────────────────────────────
+
+class _DynamicQueryResponse(BaseModel):
+    """查询优化响应：引擎名作为动态 key，接受任意额外字段。"""
+    model_config = ConfigDict(extra="allow")
+
+
+class _RoutingPlanLLMResponse(BaseModel):
+    """路由计划 LLM 响应结构。"""
+    is_fresh: bool = False
+    primary: Dict[str, Any] = Field(default_factory=dict)
+    fallback: Dict[str, Any] = Field(default_factory=dict)
 
 
 def _is_chinese(text: str) -> bool:
@@ -325,9 +323,14 @@ Example (English input, providers include scholar and tavily):
                 ],
                 model=model_override or None,
                 max_tokens=800,
+                response_model=_DynamicQueryResponse,
             )
-            text = (resp.get("final_text") or "").strip()
-            data = _extract_json_object(text)
+            parsed_resp: Optional[_DynamicQueryResponse] = resp.get("parsed_object")
+            if parsed_resp is None:
+                raw_text = (resp.get("final_text") or "").strip()
+                if raw_text:
+                    parsed_resp = _DynamicQueryResponse.model_validate_json(raw_text)
+            data: Optional[Dict[str, Any]] = parsed_resp.model_dump() if parsed_resp is not None else None
             if not data or not isinstance(data, dict):
                 return self._fallback_optimize(query, providers)
 
@@ -495,9 +498,14 @@ Query="如何治疗新冠肺炎", engines=[ncbi, tavily, scholar]:
                 ],
                 model=model_override or None,
                 max_tokens=700,
+                response_model=_RoutingPlanLLMResponse,
             )
-            text = (resp.get("final_text") or "").strip()
-            data = _extract_json_object(text)
+            parsed_plan: Optional[_RoutingPlanLLMResponse] = resp.get("parsed_object")
+            if parsed_plan is None:
+                raw_text = (resp.get("final_text") or "").strip()
+                if raw_text:
+                    parsed_plan = _RoutingPlanLLMResponse.model_validate_json(raw_text)
+            data: Optional[Dict[str, Any]] = parsed_plan.model_dump() if parsed_plan is not None else None
             if not data or not isinstance(data, dict):
                 return self._fallback_routing_plan(query, candidate_providers, is_fresh)
 

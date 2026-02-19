@@ -16,15 +16,40 @@ claims = extractor.extract(enriched_doc, llm_client)
 
 from __future__ import annotations
 
-import json
 import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from pydantic import BaseModel, Field, model_validator
+
 from src.log import get_logger
 
 logger = get_logger(__name__)
+
+
+# ============================================================
+# Pydantic Response Models (结构化输出)
+# ============================================================
+
+class _ClaimItem(BaseModel):
+    text: str = ""
+    evidence: str = ""
+    methodology: str = ""
+    confidence: str = "medium"
+    limitations: str = ""
+    source_section: str = ""
+
+
+class _ClaimListResponse(BaseModel):
+    claims: List[_ClaimItem] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_legacy_array(cls, data: Any) -> Any:
+        if isinstance(data, list):
+            return {"claims": data}
+        return data
 
 
 # ============================================================
@@ -108,19 +133,8 @@ For each claim, provide:
 - **limitations**: Any caveats or limitations mentioned
 - **source_section**: Which section this claim comes from (abstract/results/conclusion/discussion)
 
-Return ONLY a JSON array:
-```json
-[
-  {
-    "text": "...",
-    "evidence": "...",
-    "methodology": "...",
-    "confidence": "high|medium|low",
-    "limitations": "...",
-    "source_section": "..."
-  }
-]
-```
+Return ONLY a JSON object:
+{"claims": [{"text": "...", "evidence": "...", "methodology": "...", "confidence": "high|medium|low", "limitations": "...", "source_section": "..."}]}
 
 Paper text:
 {text}"""
@@ -243,56 +257,29 @@ class ClaimExtractor:
         return "\n\n".join(parts)
 
     def _call_llm(self, text: str, llm_client: Any) -> Optional[List[Dict]]:
-        """调用 LLM 提取 claims"""
+        """调用 LLM 提取 claims，使用 Pydantic 结构化输出保障解析稳定性"""
         prompt = _CLAIM_EXTRACTION_PROMPT.replace("{text}", text)
 
         for attempt in range(self.max_retries + 1):
             try:
                 resp = llm_client.chat(
                     messages=[
-                        {"role": "system", "content": "Extract scientific claims. Return ONLY valid JSON array."},
+                        {"role": "system", "content": "Extract scientific claims. Return ONLY valid JSON."},
                         {"role": "user", "content": prompt},
                     ],
                     max_tokens=2000,
+                    response_model=_ClaimListResponse,
                 )
-                raw = (resp.get("final_text") or "").strip()
-                return self._parse_response(raw)
+                parsed: Optional[_ClaimListResponse] = resp.get("parsed_object")
+                if parsed is None:
+                    raw = (resp.get("final_text") or "").strip()
+                    if raw:
+                        parsed = _ClaimListResponse.model_validate_json(raw)
+                if parsed is not None:
+                    return [item.model_dump() for item in parsed.claims]
             except Exception as e:
                 logger.warning(f"Claim extraction LLM call failed (attempt {attempt + 1}): {e}")
                 if attempt == self.max_retries:
                     return None
 
-        return None
-
-    def _parse_response(self, raw: str) -> Optional[List[Dict]]:
-        """解析 LLM 返回的 JSON 数组"""
-        if not raw:
-            return None
-
-        # 尝试提取 JSON 块
-        json_match = re.search(r"\[[\s\S]*\]", raw)
-        if json_match:
-            raw = json_match.group(0)
-
-        try:
-            data = json.loads(raw)
-            if isinstance(data, list):
-                return data
-        except json.JSONDecodeError:
-            pass
-
-        # 逐行修复
-        try:
-            # 移除 markdown 代码块标记
-            cleaned = re.sub(r"```(?:json)?\s*", "", raw).strip()
-            cleaned = re.sub(r"```\s*$", "", cleaned).strip()
-            json_match = re.search(r"\[[\s\S]*\]", cleaned)
-            if json_match:
-                data = json.loads(json_match.group(0))
-                if isinstance(data, list):
-                    return data
-        except (json.JSONDecodeError, AttributeError):
-            pass
-
-        logger.warning("Failed to parse claim extraction response")
         return None

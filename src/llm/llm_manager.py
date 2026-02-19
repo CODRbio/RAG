@@ -13,11 +13,14 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import json
 import threading
 import time
 import hashlib
+
+_log = logging.getLogger(__name__)
 
 # ── Observability ──
 try:
@@ -518,6 +521,7 @@ class BaseChatClient(ABC):
         messages: List[Dict[str, Any]],
         model: Optional[str] = None,
         return_reasoning: bool = False,
+        response_model: Optional[Any] = None,
         **overrides
     ) -> Dict[str, Any]:
         """
@@ -527,6 +531,9 @@ class BaseChatClient(ABC):
             messages: OpenAI 格式消息列表 [{"role": "user", "content": "..."}]
             model: 可选的模型名或别名，覆盖默认
             return_reasoning: 是否在返回中包含 reasoning_text（默认 False）
+            response_model: 可选 Pydantic BaseModel 类；设置后自动启用 JSON 模式，
+                            并将解析结果存入返回字典的 ``parsed_object`` 字段。
+                            解析失败时自动追加错误信息并重试一次。
             **overrides: 覆盖 provider 默认参数
             
         Returns:
@@ -535,6 +542,7 @@ class BaseChatClient(ABC):
                 "model": str,
                 "final_text": str,
                 "reasoning_text": str | None,  # 仅当 return_reasoning=True 或始终返回
+                "parsed_object": BaseModel | None,  # 仅当 response_model 不为 None
                 "raw": dict,
                 "params": dict,
                 "meta": {"usage": dict, "latency_ms": int, "refusal": bool}
@@ -558,6 +566,7 @@ class DryRunChatClient(BaseChatClient):
         messages: List[Dict[str, Any]],
         model: Optional[str] = None,
         return_reasoning: bool = False,
+        response_model: Optional[Any] = None,
         **overrides
     ) -> Dict[str, Any]:
         resolved_model = self._resolve_model(model)
@@ -568,6 +577,7 @@ class DryRunChatClient(BaseChatClient):
             "model": resolved_model,
             "final_text": f"[DRY_RUN] provider={self.config.name}, model={resolved_model}",
             "reasoning_text": None,
+            "parsed_object": None,
             "raw": {
                 "dry_run": True,
                 "note": "This is a dry-run response. No actual API call was made.",
@@ -630,6 +640,7 @@ class HTTPChatClient(BaseChatClient):
         model: Optional[str] = None,
         return_reasoning: bool = False,
         tools: Optional[List] = None,
+        response_model: Optional[Any] = None,
         **overrides
     ) -> Dict[str, Any]:
         resolved_model = self._resolve_model(model)
@@ -643,6 +654,10 @@ class HTTPChatClient(BaseChatClient):
                 timeout_override = None
         merged_params = deep_merge(self.config.params, overrides)
         is_anthropic = self.config.is_anthropic()
+
+        # 结构化输出：为 OpenAI-compat 协议注入 JSON 模式
+        if response_model is not None and not is_anthropic:
+            merged_params.setdefault("response_format", {"type": "json_object"})
 
         # 构建请求 payload
         if is_anthropic:
@@ -734,6 +749,45 @@ class HTTPChatClient(BaseChatClient):
                 result["tool_calls"] = parse_tool_calls(raw, is_anthropic)
             else:
                 result["tool_calls"] = []
+
+        # ── Structured Output: Pydantic 解析 + 自动重试一次 ──
+        if response_model is not None:
+            final_text = result.get("final_text") or ""
+            try:
+                result["parsed_object"] = response_model.model_validate_json(final_text)
+            except Exception as val_err:
+                retry_msgs = list(messages) + [
+                    {"role": "assistant", "content": final_text},
+                    {"role": "user", "content": (
+                        f"Your previous response could not be parsed as JSON. "
+                        f"Validation error: {val_err}. "
+                        "Please return ONLY valid JSON matching the required schema, with no markdown."
+                    )},
+                ]
+                retry_payload = (
+                    self._build_anthropic_payload(retry_msgs, resolved_model, merged_params, tools=tools)
+                    if is_anthropic
+                    else self._build_openai_payload(retry_msgs, resolved_model, merged_params, tools=tools)
+                )
+                try:
+                    if self._semaphore:
+                        with self._semaphore:
+                            retry_raw = self.provider.request(retry_payload, timeout=timeout_override)
+                    else:
+                        retry_raw = self.provider.request(retry_payload, timeout=timeout_override)
+                    retry_norm = normalize_response(self.config.name, retry_raw, is_anthropic)
+                    retry_text = retry_norm.get("final_text") or ""
+                    result["final_text"] = retry_text
+                    result["reasoning_text"] = retry_norm.get("reasoning_text")
+                    result["raw"] = retry_raw
+                    result["meta"]["usage"] = retry_norm.get("usage")
+                    result["meta"]["refusal"] = retry_norm.get("refusal")
+                    result["meta"]["latency_ms"] = int((time.time() - start_time) * 1000)
+                    result["parsed_object"] = response_model.model_validate_json(retry_text)
+                    _log.debug("Structured output validation succeeded on retry")
+                except Exception as retry_err:
+                    _log.warning("Structured output retry failed: %s", retry_err)
+                    result["parsed_object"] = None
 
         return result
 

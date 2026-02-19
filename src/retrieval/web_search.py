@@ -7,17 +7,29 @@ Tavily 网络搜索模块
 
 import asyncio
 import json
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
+
+from pydantic import BaseModel, Field, model_validator
 
 from config.settings import settings
 from src.log import get_logger
 from src.utils.cache import TTLCache, _make_key, get_cache
 
 logger = get_logger(__name__)
+
+
+class _QueryExpansionResponse(BaseModel):
+    queries: List[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_legacy_array(cls, data: Any) -> Any:
+        if isinstance(data, list):
+            return {"queries": data}
+        return data
 
 
 def _get_web_search_config() -> Dict[str, Any]:
@@ -166,9 +178,14 @@ Example Output: ["How does X affect Y in {year}?", "X technical architecture ove
                     {"role": "user", "content": prompt},
                 ],
                 max_tokens=600,
+                response_model=_QueryExpansionResponse,
             )
-            text = (resp.get("final_text") or "").strip()
-            queries = self._extract_json_array(text)
+            parsed: Optional[_QueryExpansionResponse] = resp.get("parsed_object")
+            if parsed is None:
+                raw_text = (resp.get("final_text") or "").strip()
+                if raw_text:
+                    parsed = _QueryExpansionResponse.model_validate_json(raw_text)
+            queries = [str(q).strip() for q in (parsed.queries if parsed else []) if str(q).strip()]
             if queries:
                 return queries[: self._config.get("max_queries", 4)]
         except Exception:
@@ -179,26 +196,6 @@ Example Output: ["How does X affect Y in {year}?", "X technical architecture ove
         """异步：LLM 生成多查询（在 executor 中跑同步）"""
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, self._generate_queries_sync, user_query)
-
-    def _extract_json_array(self, text: str) -> List[str]:
-        text = (text or "").strip()
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-        try:
-            result = json.loads(text)
-            if isinstance(result, list):
-                return [str(q).strip() for q in result if q and str(q).strip()]
-        except json.JSONDecodeError:
-            pass
-        match = re.search(r"\[[\s\S]*?\]", text)
-        if match:
-            try:
-                result = json.loads(match.group())
-                if isinstance(result, list):
-                    return [str(q).strip() for q in result if q and str(q).strip()]
-            except json.JSONDecodeError:
-                pass
-        return []
 
     def _search_tavily_sync(self, queries: List[str]) -> List[Dict[str, Any]]:
         """同步调用 Tavily API，返回标准化 hit 列表"""

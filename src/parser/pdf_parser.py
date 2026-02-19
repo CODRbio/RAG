@@ -22,7 +22,21 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from pydantic import BaseModel, ConfigDict, Field
+
 logger = logging.getLogger(__name__)
+
+
+class _AnyJSONObject(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+
+class _FigureEnrichmentResponse(BaseModel):
+    figure_type: str = "unknown"
+    description: str = ""
+    qa_pairs: list[dict[str, Any]] = Field(default_factory=list)
+    key_findings: list[str] = Field(default_factory=list)
+    evidence: list[str] = Field(default_factory=list)
 
 # ============================================================
 # ENUMS
@@ -1001,14 +1015,15 @@ class LLMEnricher:
                 max_tokens=self.config.llm_json_repair_max_tokens,
                 temperature=0.0,
                 timeout_seconds=self.config.llm_call_timeout_seconds,
+                response_model=_AnyJSONObject,
             )
-            fixed = (resp.get("final_text") or "").strip()
-            if not fixed:
-                return None
-            m = re.search(r"\{[\s\S]*\}", fixed)
-            if not m:
-                return None
-            return json.loads(m.group())
+            parsed: Optional[_AnyJSONObject] = resp.get("parsed_object")
+            if parsed is None:
+                fixed = (resp.get("final_text") or "").strip()
+                if not fixed:
+                    return None
+                parsed = _AnyJSONObject.model_validate_json(fixed)
+            return parsed.model_dump()
         except Exception:
             return None
 
@@ -1377,25 +1392,26 @@ class LLMEnricher:
                     max_tokens=self.config.llm_vision_max_tokens,
                     temperature=self.config.llm_temperature,
                     timeout_seconds=self.config.llm_call_timeout_seconds,
+                    response_model=_FigureEnrichmentResponse,
                 )
+                parsed: Optional[_FigureEnrichmentResponse] = resp.get("parsed_object")
                 text = (resp.get("final_text") or "").strip()
-                obj = None
-                if text:
-                    m = re.search(r"\{[\s\S]*\}", text)
-                    if m:
-                        try:
-                            obj = json.loads(m.group())
-                        except Exception:
-                            obj = None
-                if obj is None:
-                    obj = self._repair_json(text, FIGURE_JSON_SCHEMA)
-                if obj:
+                if parsed is None and text:
+                    try:
+                        parsed = _FigureEnrichmentResponse.model_validate_json(text)
+                    except Exception:
+                        parsed = None
+                if parsed is None:
+                    repaired = self._repair_json(text, FIGURE_JSON_SCHEMA)
+                    if repaired:
+                        parsed = _FigureEnrichmentResponse.model_validate(repaired)
+                if parsed:
                     interp = FigureInterpretation(
-                        figure_type=obj.get("figure_type", "unknown"),
-                        description=obj.get("description", ""),
-                        qa_pairs=obj.get("qa_pairs", [])[:3],
-                        key_findings=obj.get("key_findings", [])[:5],
-                        evidence=obj.get("evidence", [])[:5],
+                        figure_type=parsed.figure_type,
+                        description=parsed.description,
+                        qa_pairs=parsed.qa_pairs[:3],
+                        key_findings=parsed.key_findings[:5],
+                        evidence=parsed.evidence[:5],
                     )
                     provider_used = resp.get("provider") or provider
                     model_used = resp.get("model") or model_resolved

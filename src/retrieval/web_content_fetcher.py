@@ -39,10 +39,16 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
+from pydantic import BaseModel, Field
+
 from src.log import get_logger
 from src.utils.cache import TTLCache, _make_key, get_cache
 
 logger = get_logger(__name__)
+
+
+class _FetchDecisionResponse(BaseModel):
+    urls_to_fetch: List[str] = Field(default_factory=list)
 
 # ============================================================
 # URL 过滤常量
@@ -545,23 +551,22 @@ class WebContentFetcher:
                     {"role": "user", "content": prompt},
                 ],
                 max_tokens=512,
+                response_model=_FetchDecisionResponse,
             )
-            text = resp.get("final_text", "")
-            match = re.search(r'\{[^{}]*"urls_to_fetch"[^{}]*\}', text, re.DOTALL)
-            if match:
-                data = json.loads(match.group())
-                urls = data.get("urls_to_fetch", [])
-                if not isinstance(urls, list):
-                    raise ValueError("urls_to_fetch is not a list")
-                allowed = {c["url"] for c in candidates}
-                urls = [u for u in urls if isinstance(u, str) and u in allowed]
-                logger.info(
-                    f"LLM 预判：{len(urls)}/{len(candidates)} 条需抓取全文"
-                    + (f" (query={query!r})" if query else "")
-                )
-                return urls
-            logger.warning("LLM 预判响应缺少有效 JSON，降级为全量抓取")
-            return [c["url"] for c in candidates]
+            parsed: Optional[_FetchDecisionResponse] = resp.get("parsed_object")
+            if parsed is None:
+                raw_text = (resp.get("final_text") or "").strip()
+                if raw_text:
+                    parsed = _FetchDecisionResponse.model_validate_json(raw_text)
+
+            urls = parsed.urls_to_fetch if parsed is not None else []
+            allowed = {c["url"] for c in candidates}
+            urls = [u for u in urls if isinstance(u, str) and u in allowed]
+            logger.info(
+                f"LLM 预判：{len(urls)}/{len(candidates)} 条需抓取全文"
+                + (f" (query={query!r})" if query else "")
+            )
+            return urls
         except Exception as e:
             logger.warning(f"LLM 预判失败，降级为全量抓取: {e}")
             return [c["url"] for c in candidates]

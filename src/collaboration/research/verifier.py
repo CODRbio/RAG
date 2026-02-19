@@ -10,14 +10,57 @@ Chain of Verification (CoV) — 对已生成内容执行事实验证。
 
 from __future__ import annotations
 
-import json
-import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+
+from pydantic import BaseModel, Field, model_validator
 
 from src.log import get_logger
 
 logger = get_logger(__name__)
+
+
+# ============================================================
+# Pydantic Response Models (结构化输出)
+# ============================================================
+
+class _ExtractedClaimItem(BaseModel):
+    claim: str = ""
+    has_citation: bool = False
+    citation_keys: List[str] = Field(default_factory=list)
+
+
+class _ExtractedClaimsResponse(BaseModel):
+    claims: List[_ExtractedClaimItem] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_legacy_array(cls, data: Any) -> Any:
+        if isinstance(data, list):
+            return {"claims": data}
+        return data
+
+
+class _VerificationItem(BaseModel):
+    claim_index: int = 0
+    confidence: str = "low"
+    evidence_found: str = ""
+    needs_revision: bool = False
+    revision_note: str = ""
+    attribution_analysis: str = ""
+    conflict_notes: List[str] = Field(default_factory=list)
+    supplementary_query: str = ""
+
+
+class _VerificationsResponse(BaseModel):
+    verifications: List[_VerificationItem] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_legacy_array(cls, data: Any) -> Any:
+        if isinstance(data, list):
+            return {"verifications": data}
+        return data
 
 
 @dataclass
@@ -53,10 +96,10 @@ _EXTRACT_CLAIMS_PROMPT = """从以下文本中提取所有事实性声明（fact
 文本:
 {text}
 
-返回 JSON 数组，每项格式:
-{{"claim": "声明文本", "has_citation": true/false, "citation_keys": ["key1"]}}
+返回 JSON 对象，格式:
+{{"claims": [{{"claim": "声明文本", "has_citation": true/false, "citation_keys": ["key1"]}}]}}
 
-只返回 JSON 数组。"""
+只返回 JSON 对象。"""
 
 
 _VERIFY_CLAIMS_PROMPT = """请验证以下声明是否有证据支撑。
@@ -76,10 +119,10 @@ _VERIFY_CLAIMS_PROMPT = """请验证以下声明是否有证据支撑。
   并给出深度归因分析（Attribution Analysis），解释潜在差异来源，而不是只指出“有冲突”。
 - 归因分析必须写入 revision_note 或 attribution_analysis 字段；如果存在冲突，请在 conflict_notes 中列出结构化要点。
 
-返回 JSON 数组:
-[{{"claim_index": 0, "confidence": "high|medium|low", "evidence_found": "支撑证据概要", "needs_revision": false, "revision_note": "", "attribution_analysis": "", "conflict_notes": [], "supplementary_query": ""}}]
+返回 JSON 对象:
+{{"verifications": [{{"claim_index": 0, "confidence": "high|medium|low", "evidence_found": "支撑证据概要", "needs_revision": false, "revision_note": "", "attribution_analysis": "", "conflict_notes": [], "supplementary_query": ""}}]}}
 
-只返回 JSON 数组。"""
+只返回 JSON 对象。"""
 
 
 def extract_claims(
@@ -97,12 +140,15 @@ def extract_claims(
             ],
             model=model,
             max_tokens=2000,
+            response_model=_ExtractedClaimsResponse,
         )
-        raw = resp.get("final_text", "")
-        # 提取 JSON 数组
-        match = re.search(r"\[[\s\S]*\]", raw)
-        if match:
-            return json.loads(match.group(0))
+        parsed: Optional[_ExtractedClaimsResponse] = resp.get("parsed_object")
+        if parsed is None:
+            raw = (resp.get("final_text") or "").strip()
+            if raw:
+                parsed = _ExtractedClaimsResponse.model_validate_json(raw)
+        if parsed is not None:
+            return [item.model_dump() for item in parsed.claims]
     except Exception as e:
         logger.warning(f"Claim extraction failed: {e}")
     return []
@@ -164,10 +210,18 @@ def verify_claims(
             ],
             model=model,
             max_tokens=2000,
+            response_model=_VerificationsResponse,
         )
-        raw = resp.get("final_text", "")
-        match = re.search(r"\[[\s\S]*\]", raw)
-        verifications = json.loads(match.group(0)) if match else []
+        parsed_verif: Optional[_VerificationsResponse] = resp.get("parsed_object")
+        if parsed_verif is None:
+            raw = (resp.get("final_text") or "").strip()
+            if raw:
+                parsed_verif = _VerificationsResponse.model_validate_json(raw)
+        verifications = (
+            [item.model_dump() for item in parsed_verif.verifications]
+            if parsed_verif is not None
+            else []
+        )
     except Exception as e:
         logger.warning(f"Claim verification failed: {e}")
         verifications = []

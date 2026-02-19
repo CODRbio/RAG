@@ -19,6 +19,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, TypedDict
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import StateGraph, END
 from langgraph.types import interrupt
+from pydantic import BaseModel, Field
 
 from src.collaboration.research.dashboard import (
     ResearchBrief,
@@ -35,6 +36,21 @@ from src.log import get_logger
 
 logger = get_logger(__name__)
 _CONFIG_PATH = Path(__file__).resolve().parents[3] / "config" / "rag_config.json"
+
+
+class _ScopingResponse(BaseModel):
+    scope: str = ""
+    success_criteria: List[str] = Field(default_factory=list)
+    key_questions: List[str] = Field(default_factory=list)
+    exclusions: List[str] = Field(default_factory=list)
+    time_range: str = ""
+    source_priority: List[str] = Field(default_factory=list)
+
+
+class _CoverageEvalResponse(BaseModel):
+    coverage_score: float = 0.0
+    gaps: List[str] = Field(default_factory=list)
+    sufficient: bool = False
 
 
 # ────────────────────────────────────────────────
@@ -863,14 +879,14 @@ Return strict JSON:
             ],
             model=model_override,
             max_tokens=1000,
+            response_model=_ScopingResponse,
         )
-        raw = resp.get("final_text", "")
-        # 解析 JSON
-        match = re.search(r"\{[\s\S]*\}", raw)
-        if match:
-            data = json.loads(match.group(0))
-        else:
-            data = {}
+        parsed: Optional[_ScopingResponse] = resp.get("parsed_object")
+        if parsed is None:
+            raw = (resp.get("final_text") or "").strip()
+            if raw:
+                parsed = _ScopingResponse.model_validate_json(raw)
+        data = parsed.model_dump() if parsed is not None else {}
     except Exception as e:
         logger.warning(f"Scoping failed: {e}")
         data = {}
@@ -1301,10 +1317,14 @@ Return JSON:
             ],
             model=model_override,
             max_tokens=500,
+            response_model=_CoverageEvalResponse,
         )
-        raw = resp.get("final_text", "")
-        match = re.search(r"\{[\s\S]*\}", raw)
-        data = json.loads(match.group(0)) if match else {}
+        parsed: Optional[_CoverageEvalResponse] = resp.get("parsed_object")
+        if parsed is None:
+            raw = (resp.get("final_text") or "").strip()
+            if raw:
+                parsed = _CoverageEvalResponse.model_validate_json(raw)
+        data = parsed.model_dump() if parsed is not None else {}
     except Exception:
         data = {
             "coverage_score": 0.3,

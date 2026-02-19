@@ -4,7 +4,6 @@
 """
 
 import json
-import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -46,6 +45,11 @@ class CompareResponse(BaseModel):
         description="对比矩阵: {aspect: {paper_id: description}}",
     )
     narrative: str = Field("", description="LLM 生成的对比叙述")
+
+
+class _CompareLLMResponse(BaseModel):
+    matrix: Dict[str, Dict[str, str]] = Field(default_factory=dict)
+    narrative: str = ""
 
 
 def _load_paper_data(paper_id: str) -> Optional[Dict[str, Any]]:
@@ -199,23 +203,18 @@ def compare_papers(body: CompareRequest) -> CompareResponse:
             ],
             model=body.model_override or None,
             max_tokens=3000,
+            response_model=_CompareLLMResponse,
         )
-        raw = (resp.get("final_text") or "").strip()
+        parsed: Optional[_CompareLLMResponse] = resp.get("parsed_object")
+        if parsed is None:
+            raw = (resp.get("final_text") or "").strip()
+            if raw:
+                parsed = _CompareLLMResponse.model_validate_json(raw)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LLM 调用失败: {e}")
 
-    # 解析 JSON
-    import re
-    matrix = {}
-    narrative = ""
-    try:
-        json_match = re.search(r"\{[\s\S]*\}", raw)
-        if json_match:
-            parsed = json.loads(json_match.group(0))
-            matrix = parsed.get("matrix", {})
-            narrative = parsed.get("narrative", "")
-    except (json.JSONDecodeError, AttributeError):
-        narrative = raw  # fallback: 返回原始文本
+    matrix = parsed.matrix if parsed is not None else {}
+    narrative = parsed.narrative if parsed is not None else (resp.get("final_text") or "")
 
     return CompareResponse(
         papers=summaries,
