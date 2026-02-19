@@ -136,6 +136,8 @@ class RetrievalConfig:
     top_k: int = 10
     rerank: bool = True
     graph_weight: float = 0.3  # hybrid 模式下图检索权重
+    year_start: Optional[int] = None  # 年份窗口起始（硬过滤）
+    year_end: Optional[int] = None  # 年份窗口结束（硬过滤）
 
 
 class HybridRetriever:
@@ -174,6 +176,8 @@ class HybridRetriever:
         collection: str,
         top_k: int = 10,
         rerank: bool = True,
+        year_start: Optional[int] = None,
+        year_end: Optional[int] = None,
         diagnostics: Optional[Dict] = None,
     ) -> List[Dict]:
         """
@@ -193,7 +197,7 @@ class HybridRetriever:
         w_sparse = getattr(settings.search, "rrf_sparse_weight", 0.4)
         per_doc_cap = getattr(settings.search, "per_doc_cap", 3)
 
-        cache_key = _make_key("retrieval_vector", query, collection, top_k, rerank)
+        cache_key = _make_key("retrieval_vector", query, collection, top_k, rerank, year_start, year_end)
         if self._vector_cache:
             cached = self._vector_cache.get(cache_key)
             if cached is not None:
@@ -237,6 +241,8 @@ class HybridRetriever:
                 ranker=RRFRanker(k=settings.search.rrf_k),
                 limit=dense_recall_k,
                 output_fields=output_fields,
+                year_start=year_start,
+                year_end=year_end,
             )
 
         def _do_sparse():
@@ -246,6 +252,8 @@ class HybridRetriever:
                 ranker=RRFRanker(k=settings.search.rrf_k),
                 limit=sparse_recall_k,
                 output_fields=output_fields,
+                year_start=year_start,
+                year_end=year_end,
             )
 
         dense_res, sparse_res = None, None
@@ -372,6 +380,8 @@ class HybridRetriever:
         top_k: int = 10,
         rerank: bool = True,
         graph_weight: float = 0.3,
+        year_start: Optional[int] = None,
+        year_end: Optional[int] = None,
         diagnostics: Optional[Dict] = None,
     ) -> List[Dict]:
         """
@@ -379,11 +389,20 @@ class HybridRetriever:
         条件触发 HippoRAG：多实体 + 关系类关键词时合并图检索结果
         """
         # 1. 向量检索
-        vector_hits = self.retrieve_vector(query, collection, top_k=top_k * 2, rerank=False, diagnostics=diagnostics)
+        vector_hits = self.retrieve_vector(
+            query,
+            collection,
+            top_k=top_k * 2,
+            rerank=False,
+            year_start=year_start,
+            year_end=year_end,
+            diagnostics=diagnostics,
+        )
 
         # 2. 条件触发 HippoRAG（多实体+关系词时融合图检索）
         fused_hits = vector_hits
-        if should_use_hipporag(query):
+        year_window_enabled = year_start is not None or year_end is not None
+        if should_use_hipporag(query) and not year_window_enabled:
             self._ensure_graph()
             if self.hippo is not None:
                 fused_hits = self.hippo.retrieve_with_graph(
@@ -427,12 +446,27 @@ class HybridRetriever:
             collection = settings.collection.global_
 
         if config.mode == "vector":
-            return self.retrieve_vector(query, collection, config.top_k, config.rerank, diagnostics=diagnostics)
+            return self.retrieve_vector(
+                query,
+                collection,
+                config.top_k,
+                config.rerank,
+                config.year_start,
+                config.year_end,
+                diagnostics=diagnostics,
+            )
         elif config.mode == "graph":
             return self.retrieve_graph(query, config.top_k)
         else:  # hybrid
             return self.retrieve_hybrid(
-                query, collection, config.top_k, config.rerank, config.graph_weight, diagnostics=diagnostics,
+                query,
+                collection,
+                config.top_k,
+                config.rerank,
+                config.graph_weight,
+                config.year_start,
+                config.year_end,
+                diagnostics=diagnostics,
             )
 
 

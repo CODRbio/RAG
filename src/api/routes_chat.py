@@ -297,6 +297,10 @@ def _build_filters(body: ChatRequest) -> dict:
         filters["query_optimizer_max_queries"] = body.query_optimizer_max_queries
     if body.local_threshold is not None:
         filters["local_threshold"] = body.local_threshold
+    if body.year_start is not None:
+        filters["year_start"] = body.year_start
+    if body.year_end is not None:
+        filters["year_end"] = body.year_end
     if body.final_top_k is not None:
         filters["final_top_k"] = body.final_top_k
     if body.llm_provider:
@@ -320,6 +324,8 @@ def _build_deep_research_filters(body: Any) -> dict:
         "query_optimizer_max_queries",
         "local_top_k",
         "local_threshold",
+        "year_start",
+        "year_end",
         "final_top_k",
         "llm_provider",
         "model_override",

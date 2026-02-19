@@ -61,13 +61,24 @@ class NCBISearcher:
         session: aiohttp.ClientSession,
         query: str,
         limit: int,
+        year_start: Optional[int] = None,
+        year_end: Optional[int] = None,
     ) -> List[str]:
         """返回相关度排序的 PubMed ID 列表。"""
+        term = query
+        if year_start is not None or year_end is not None:
+            if year_start is not None and year_end is not None:
+                y0, y1 = sorted((int(year_start), int(year_end)))
+                term += f' AND ("{y0}"[Date - Publication] : "{y1}"[Date - Publication])'
+            elif year_start is not None:
+                term += f' AND ("{int(year_start)}"[Date - Publication] : "3000"[Date - Publication])'
+            elif year_end is not None:
+                term += f' AND ("1000"[Date - Publication] : "{int(year_end)}"[Date - Publication])'
         params = self._base_params()
         params.update(
             {
                 "db": "pubmed",
-                "term": query,
+                "term": term,
                 "retmax": str(limit),
                 "sort": "relevance",
             }
@@ -197,12 +208,18 @@ class NCBISearcher:
 
     # ── 公开接口 ─────────────────────────────────────────────────────────────
 
-    async def search(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
+    async def search(
+        self,
+        query: str,
+        limit: int = 5,
+        year_start: Optional[int] = None,
+        year_end: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
         """
         异步搜索 PubMed，返回最多 `limit` 条 RAG-compatible 结果。
         相同 query+limit 命中缓存时直接返回，不重复请求。
         """
-        cache_key = _make_key("ncbi", query, limit)
+        cache_key = _make_key("ncbi", query, limit, year_start, year_end)
         cached = self._cache.get(cache_key)
         if cached is not None:
             logger.debug(f"NCBI cache hit: {query!r}")
@@ -212,7 +229,13 @@ class NCBISearcher:
             timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
             connector = aiohttp.TCPConnector(limit=5)
             async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-                ids = await self._esearch(session, query, limit)
+                ids = await self._esearch(
+                    session,
+                    query,
+                    limit,
+                    year_start=year_start,
+                    year_end=year_end,
+                )
                 if not ids:
                     logger.info(f"NCBI esearch 无结果: {query!r}")
                     self._cache.set(cache_key, [])

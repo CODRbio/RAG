@@ -145,7 +145,14 @@ def get_citations(canvas_id: str, format: str = "text") -> str:
     citations = get_canvas_citations(canvas_id)
     if not citations:
         return "该画布暂无引文。"
-    style_map = {"text": "custom", "bibtex": "apa", "apa": "apa", "numeric": "numeric", "custom": "custom"}
+    style_map = {
+        "text": "custom",
+        "bibtex": "apa",
+        "apa": "apa",
+        "ieee": "ieee",
+        "numeric": "numeric",
+        "custom": "custom",
+    }
     style = style_map.get(format, "custom")
     return format_reference_list(citations, style=style)
 

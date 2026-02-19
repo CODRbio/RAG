@@ -837,7 +837,7 @@ class GoogleSearcher:
             return []
 
         limit = limit or self._config.get("max_results", 5)
-        cache_key = _make_key("google_scholar", query, limit)
+        cache_key = _make_key("google_scholar", query, limit, year_start, year_end)
         if self._cache:
             cached = self._cache.get(cache_key)
             if cached is not None:
@@ -1012,7 +1012,7 @@ class GoogleSearcher:
         all_results = []
         queries_to_search = []
         for q in queries:
-            cache_key = _make_key("google_scholar", q, limit_per_query)
+            cache_key = _make_key("google_scholar", q, limit_per_query, year_start, year_end)
             if self._cache:
                 cached = self._cache.get(cache_key)
                 if cached is not None:
@@ -1127,7 +1127,7 @@ class GoogleSearcher:
 
                     # 缓存单个查询的结果
                     if self._cache and query_results:
-                        cache_key = _make_key("google_scholar", query, limit_per_query)
+                        cache_key = _make_key("google_scholar", query, limit_per_query, year_start, year_end)
                         self._cache.set(cache_key, query_results)
 
                     all_results.extend(query_results)

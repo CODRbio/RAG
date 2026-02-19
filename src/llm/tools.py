@@ -468,7 +468,14 @@ def _handle_citations(canvas_id: str, format: str = "text", **_) -> str:
     if not citations:
         return "该画布暂无引文。"
     # 映射前端参数到有效 style
-    style_map = {"text": "custom", "bibtex": "apa", "apa": "apa", "numeric": "numeric", "custom": "custom"}
+    style_map = {
+        "text": "custom",
+        "bibtex": "apa",
+        "apa": "apa",
+        "ieee": "ieee",
+        "numeric": "numeric",
+        "custom": "custom",
+    }
     style = style_map.get(format, "custom")
     return format_reference_list(citations, style=style)
 

@@ -57,6 +57,13 @@ const defaultWebSources: WebSource[] = [
   { id: 'semantic', name: 'Semantic Scholar', enabled: false, topK: 3, threshold: 0.7 },
 ];
 
+const normalizeOptionalYear = (value: unknown): number | null => {
+  if (value === null || value === undefined || value === '') return null;
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 1900 || n > 2100) return null;
+  return n;
+};
+
 export const useConfigStore = create<ConfigState>()(
   persist(
     (set) => ({
@@ -89,6 +96,8 @@ export const useConfigStore = create<ConfigState>()(
       deepResearchDefaults: {
         depth: 'comprehensive',
         outputLanguage: 'auto',
+        yearStart: null,
+        yearEnd: null,
         stepModelStrict: false,
         skipClaimGeneration: false,
         stepModels: {
@@ -218,6 +227,8 @@ export const useConfigStore = create<ConfigState>()(
           deepResearchDefaults: {
             ...currentState.deepResearchDefaults,
             ...(persisted.deepResearchDefaults || {}),
+            yearStart: normalizeOptionalYear(persisted.deepResearchDefaults?.yearStart),
+            yearEnd: normalizeOptionalYear(persisted.deepResearchDefaults?.yearEnd),
             stepModels: {
               ...currentState.deepResearchDefaults.stepModels,
               ...(persisted.deepResearchDefaults?.stepModels || {}),

@@ -100,6 +100,8 @@ export interface ChatRequest {
   use_query_expansion?: boolean;  // 兼容字段（已弃用）
   local_top_k?: number;  // 本地检索返回的最大文档数
   local_threshold?: number;  // 本地检索的相似度阈值 (0-1)
+  year_start?: number;  // 年份窗口起始（硬过滤）
+  year_end?: number;  // 年份窗口结束（硬过滤）
   final_top_k?: number;  // 最终保留的文档数（local + web 合并重排后）
   llm_provider?: string;  // LLM 提供商: deepseek | openai | gemini | claude | kimi 等
   model_override?: string;  // 覆盖默认模型，如 claude-opus-4-6
@@ -237,6 +239,8 @@ export interface DeepResearchRequest {
   query_optimizer_max_queries?: number;
   local_top_k?: number;
   local_threshold?: number;
+  year_start?: number;
+  year_end?: number;
   final_top_k?: number;
   llm_provider?: string;
   model_override?: string;
@@ -261,6 +265,8 @@ export interface DeepResearchStartRequest {
   query_optimizer_max_queries?: number;
   local_top_k?: number;
   local_threshold?: number;
+  year_start?: number;
+  year_end?: number;
   final_top_k?: number;
   llm_provider?: string;
   model_override?: string;
@@ -296,6 +302,8 @@ export interface DeepResearchConfirmRequest {
   query_optimizer_max_queries?: number;
   local_top_k?: number;
   local_threshold?: number;
+  year_start?: number;
+  year_end?: number;
   final_top_k?: number;
   llm_provider?: string;
   model_override?: string;
@@ -542,6 +550,8 @@ export interface WebSearchConfig {
 export interface DeepResearchDefaults {
   depth: 'lite' | 'comprehensive';
   outputLanguage: 'auto' | 'en' | 'zh';
+  yearStart: number | null;
+  yearEnd: number | null;
   stepModelStrict: boolean;
   stepModels: Record<string, string>;
   skipClaimGeneration: boolean;

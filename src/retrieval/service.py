@@ -196,6 +196,26 @@ def _hit_to_chunk(hit: Dict[str, Any], source_type: str, query: str) -> Evidence
     )
 
 
+def _coerce_year(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        year = int(value)
+    except (TypeError, ValueError):
+        return None
+    if year < 1900 or year > 2100:
+        return None
+    return year
+
+
+def _normalize_year_window(filters: Optional[Dict[str, Any]]) -> tuple[Optional[int], Optional[int]]:
+    year_start = _coerce_year((filters or {}).get("year_start"))
+    year_end = _coerce_year((filters or {}).get("year_end"))
+    if year_start is not None and year_end is not None and year_start > year_end:
+        year_start, year_end = year_end, year_start
+    return year_start, year_end
+
+
 class RetrievalService:
     """
     统一检索服务。
@@ -241,14 +261,23 @@ class RetrievalService:
         # Amplify retrieval pool so that the reranker always operates on a
         # sufficiently large candidate set, regardless of the caller's top_k.
         actual_recall = max(80, k * 4)
+        year_start, year_end = _normalize_year_window(filters)
 
         # 诊断信息收集
         diag: Dict[str, Any] = {}
         if actual_recall != k:
             diag["recall_amplification"] = {"requested_k": k, "actual_recall": actual_recall}
+        if year_start is not None or year_end is not None:
+            diag["year_window"] = {"year_start": year_start, "year_end": year_end}
 
         def _do_local() -> List[Dict[str, Any]]:
-            config = RetrievalConfig(mode="hybrid", top_k=actual_recall, rerank=True)
+            config = RetrievalConfig(
+                mode="hybrid",
+                top_k=actual_recall,
+                rerank=True,
+                year_start=year_start,
+                year_end=year_end,
+            )
             return self.retriever.retrieve(query, self.collection, config, diagnostics=diag)
 
         def _do_web() -> List[Dict[str, Any]]:
@@ -298,6 +327,8 @@ class RetrievalService:
                 model_override=_model_override,
                 use_content_fetcher=use_content_fetcher,
                 llm_client=_llm_client,
+                year_start=year_start,
+                year_end=year_end,
             )
             web_ms = (time.perf_counter() - t_web) * 1000
             # 收集 web provider 诊断
@@ -368,7 +399,13 @@ class RetrievalService:
                 all_chunks.append(_hit_to_chunk(h, "web", query))
         else:
             if mode == "local":
-                config = RetrievalConfig(mode="hybrid", top_k=actual_recall, rerank=True)
+                config = RetrievalConfig(
+                    mode="hybrid",
+                    top_k=actual_recall,
+                    rerank=True,
+                    year_start=year_start,
+                    year_end=year_end,
+                )
                 hits = self.retriever.retrieve(query, self.collection, config, diagnostics=diag)
                 total_candidates += len(hits) * 2
                 for h in hits:
@@ -422,6 +459,8 @@ class RetrievalService:
                         model_override=_model_override,
                         use_content_fetcher=_use_content_fetcher,
                         llm_client=_llm_client,
+                        year_start=year_start,
+                        year_end=year_end,
                     )
                     total_candidates += len(web_hits)
                     sources_used.append("web")

@@ -3,6 +3,8 @@ Milvus 操作封装
 Mac 和服务器使用完全相同的代码
 """
 
+from typing import Optional
+
 from pymilvus import MilvusClient, DataType
 from config.settings import settings
 from src.log import get_logger
@@ -112,6 +114,15 @@ class MilvusOps:
         return self.client.search(collection_name=collection, **kwargs)
 
     def hybrid_search(self, collection: str, **kwargs):
+        year_start = kwargs.pop("year_start", None)
+        year_end = kwargs.pop("year_end", None)
+        year_expr = self.build_year_expr(year_start=year_start, year_end=year_end)
+        if year_expr:
+            existing_expr = (kwargs.get("expr") or "").strip()
+            if existing_expr:
+                kwargs["expr"] = f"({existing_expr}) and ({year_expr})"
+            else:
+                kwargs["expr"] = year_expr
         return self.client.hybrid_search(collection_name=collection, **kwargs)
 
     def query(self, collection: str, **kwargs):
@@ -120,6 +131,26 @@ class MilvusOps:
     def count(self, collection: str) -> int:
         stats = self.client.get_collection_stats(collection)
         return stats.get("row_count", 0)
+
+    @staticmethod
+    def build_year_expr(year_start: Optional[int] = None, year_end: Optional[int] = None) -> str:
+        """
+        构造 Milvus 年份过滤表达式（硬过滤）。
+
+        规则：
+        - year_start / year_end 均为空 -> ""
+        - 仅 start -> "year >= start"
+        - 仅 end -> "year <= end"
+        - 同时存在 -> "year >= start and year <= end"
+        """
+        if year_start is None and year_end is None:
+            return ""
+        clauses: list[str] = []
+        if year_start is not None:
+            clauses.append(f"year >= {int(year_start)}")
+        if year_end is not None:
+            clauses.append(f"year <= {int(year_end)}")
+        return " and ".join(clauses)
 
 
 # 全局实例

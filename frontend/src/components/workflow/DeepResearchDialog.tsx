@@ -88,7 +88,13 @@ export function DeepResearchDialog() {
     setDeepResearchActive,
   } = useChatStore();
   const setResearchDashboard = useChatStore((s) => s.setResearchDashboard);
-  const { webSearchConfig, ragConfig, selectedProvider, selectedModel, currentCollection } = useConfigStore();
+  const {
+    webSearchConfig,
+    ragConfig,
+    selectedProvider,
+    selectedModel,
+    currentCollection,
+  } = useConfigStore();
   const addToast = useToastStore((s) => s.addToast);
   const { setCanvas, setCanvasContent, setIsLoading: setCanvasLoading, setActiveStage } = useCanvasStore();
   const setCanvasOpen = useUIStore((s) => s.setCanvasOpen);
@@ -102,6 +108,8 @@ export function DeepResearchDialog() {
   const [progressLogs, setProgressLogs] = useState<string[]>([]);
   const [researchMonitor, setResearchMonitor] = useState<ResearchMonitorState>(createEmptyMonitor);
   const [outputLanguage, setOutputLanguage] = useState<'auto' | 'en' | 'zh'>('auto');
+  const [yearStart, setYearStart] = useState<number | null>(null);
+  const [yearEnd, setYearEnd] = useState<number | null>(null);
   const [showAdvancedModels, setShowAdvancedModels] = useState(false);
   const [stepModelStrict, setStepModelStrict] = useState(false);
   const [draggingOutlineIndex, setDraggingOutlineIndex] = useState<number | null>(null);
@@ -231,6 +239,8 @@ export function DeepResearchDialog() {
         const defaults = useConfigStore.getState().deepResearchDefaults;
         setDepth(defaults.depth);
         setOutputLanguage(defaults.outputLanguage);
+        setYearStart(defaults.yearStart ?? null);
+        setYearEnd(defaults.yearEnd ?? null);
         setStepModelStrict(defaults.stepModelStrict);
         setSkipClaimGeneration(defaults.skipClaimGeneration);
         setStepModels({ ...defaults.stepModels });
@@ -798,6 +808,8 @@ export function DeepResearchDialog() {
       query_optimizer_max_queries: webEnabled ? maxQueries : undefined,
       local_top_k: localEnabled ? Math.max(ragConfig.localTopK, 15) : undefined,
       local_threshold: localEnabled ? (ragConfig.localThreshold ?? undefined) : undefined,
+      year_start: yearStart ?? undefined,
+      year_end: yearEnd ?? undefined,
       final_top_k: deepFinalTopK,
       clarification_answers: hasNonEmptyAnswers ? answers : undefined,
       output_language: outputLanguage,
@@ -873,6 +885,8 @@ export function DeepResearchDialog() {
       query_optimizer_max_queries: webEnabled ? maxQueries : undefined,
       local_top_k: localEnabled ? Math.max(ragConfig.localTopK, 15) : undefined,
       local_threshold: localEnabled ? (ragConfig.localThreshold ?? undefined) : undefined,
+      year_start: yearStart ?? undefined,
+      year_end: yearEnd ?? undefined,
       final_top_k: deepFinalTopK,
       user_context: userContext.trim() || undefined,
       user_context_mode: userContext.trim() ? userContextMode : undefined,

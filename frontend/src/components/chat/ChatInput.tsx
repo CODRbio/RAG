@@ -29,7 +29,14 @@ export function ChatInput() {
     setDeepResearchTopic,
     setClarificationQuestions,
   } = useChatStore();
-  const { webSearchConfig, ragConfig, selectedProvider, selectedModel, currentCollection } = useConfigStore();
+  const {
+    webSearchConfig,
+    ragConfig,
+    selectedProvider,
+    selectedModel,
+    currentCollection,
+    deepResearchDefaults,
+  } = useConfigStore();
   const addToast = useToastStore((s) => s.addToast);
   const { setCanvas, setCanvasContent, setIsLoading: setCanvasLoading } = useCanvasStore();
   const setCanvasOpen = useUIStore((s) => s.setCanvasOpen);
@@ -170,6 +177,8 @@ export function ChatInput() {
       query_optimizer_max_queries: (searchMode !== 'none' && webEnabled) ? maxQueries : undefined,
       local_top_k: (searchMode !== 'none' && localEnabled) ? ragConfig.localTopK : undefined,
       local_threshold: (searchMode !== 'none' && localEnabled) ? (ragConfig.localThreshold ?? undefined) : undefined,
+      year_start: deepResearchDefaults.yearStart ?? undefined,
+      year_end: deepResearchDefaults.yearEnd ?? undefined,
       final_top_k: (searchMode !== 'none') ? (ragConfig.finalTopK ?? 10) : undefined,
       use_content_fetcher: (searchMode !== 'none' && webEnabled) ? (webSearchConfig.enableContentFetcher ?? false) : undefined,
       use_agent: ragConfig.enableAgent || undefined,

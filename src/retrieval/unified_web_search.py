@@ -227,6 +227,8 @@ class UnifiedWebSearcher:
         model_override: Optional[str] = None,
         use_content_fetcher: Optional[bool] = None,
         llm_client: Optional[Any] = None,
+        year_start: Optional[int] = None,
+        year_end: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """
         异步搜索多个来源并合并去重
@@ -294,6 +296,8 @@ class UnifiedWebSearcher:
                 query,
                 source_configs,
                 max_results_per_provider,
+                year_start=year_start,
+                year_end=year_end,
             )
             primary_unique_hits = _merge_and_dedup(primary_hits)
             all_hits.extend(primary_unique_hits)
@@ -310,6 +314,8 @@ class UnifiedWebSearcher:
                     query,
                     source_configs,
                     max_results_per_provider,
+                    year_start=year_start,
+                    year_end=year_end,
                 )
                 all_hits.extend(fallback_hits)
                 logger.info(f"Fallback 补充 {len(fallback_hits)} 条，合计 {len(all_hits)} 条")
@@ -334,6 +340,8 @@ class UnifiedWebSearcher:
                 query,
                 source_configs,
                 max_results_per_provider,
+                year_start=year_start,
+                year_end=year_end,
             )
 
         # 合并去重
@@ -393,10 +401,17 @@ class UnifiedWebSearcher:
         searcher,
         query: str,
         limit: int,
+        year_start: Optional[int] = None,
+        year_end: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Google Scholar 搜索"""
         try:
-            return await searcher.search_scholar(query, limit=limit)
+            return await searcher.search_scholar(
+                query,
+                limit=limit,
+                year_start=year_start,
+                year_end=year_end,
+            )
         except Exception as e:
             logger.error(f"Google Scholar 搜索失败: {e}")
             return []
@@ -419,11 +434,18 @@ class UnifiedWebSearcher:
         searcher,
         queries: List[str],
         limit_per_query: int,
+        year_start: Optional[int] = None,
+        year_end: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Google Scholar 批量搜索（串行执行）"""
         try:
             logger.info(f"Scholar 批量搜索：{len(queries)} 个查询，每个最多 {limit_per_query} 条")
-            return await searcher.search_scholar_batch(queries, limit_per_query=limit_per_query)
+            return await searcher.search_scholar_batch(
+                queries,
+                limit_per_query=limit_per_query,
+                year_start=year_start,
+                year_end=year_end,
+            )
         except Exception as e:
             logger.error(f"Google Scholar 批量搜索失败: {e}")
             return []
@@ -447,10 +469,12 @@ class UnifiedWebSearcher:
         searcher,
         query: str,
         limit: int,
+        year_start: Optional[int] = None,
+        year_end: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Semantic Scholar 搜索"""
         try:
-            return await searcher.search(query, limit=limit)
+            return await searcher.search(query, limit=limit, year_start=year_start, year_end=year_end)
         except Exception as e:
             logger.error(f"Semantic Scholar 搜索失败: {e}")
             return []
@@ -460,10 +484,12 @@ class UnifiedWebSearcher:
         searcher,
         query: str,
         limit: int,
+        year_start: Optional[int] = None,
+        year_end: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """NCBI PubMed 搜索"""
         try:
-            return await searcher.search(query, limit=limit)
+            return await searcher.search(query, limit=limit, year_start=year_start, year_end=year_end)
         except Exception as e:
             logger.error(f"NCBI 搜索失败: {e}")
             return []
@@ -475,6 +501,8 @@ class UnifiedWebSearcher:
         default_query: str,
         source_configs: Dict[str, Any],
         max_results_per_provider: int,
+        year_start: Optional[int] = None,
+        year_end: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """
         并发执行指定引擎列表，返回所有命中结果（未去重）。
@@ -526,21 +554,48 @@ class UnifiedWebSearcher:
                 if semantic and getattr(semantic, "enabled", False):
                     for q in qs:
                         tasks_with_flags.append(
-                            (self._search_semantic(semantic, q, pmax), False)
+                            (
+                                self._search_semantic(
+                                    semantic,
+                                    q,
+                                    pmax,
+                                    year_start=year_start,
+                                    year_end=year_end,
+                                ),
+                                False,
+                            )
                         )
             elif provider == "ncbi":
                 ncbi = self._get_ncbi_searcher()
                 if ncbi:
                     for q in qs:
                         tasks_with_flags.append(
-                            (self._search_ncbi(ncbi, q, pmax), False)
+                            (
+                                self._search_ncbi(
+                                    ncbi,
+                                    q,
+                                    pmax,
+                                    year_start=year_start,
+                                    year_end=year_end,
+                                ),
+                                False,
+                            )
                         )
 
         if scholar_queries:
             gsearcher = self._get_google_searcher()
             if gsearcher:
                 tasks_with_flags.append(
-                    (self._search_scholar_batch(gsearcher, scholar_queries, scholar_max), True)
+                    (
+                        self._search_scholar_batch(
+                            gsearcher,
+                            scholar_queries,
+                            scholar_max,
+                            year_start=year_start,
+                            year_end=year_end,
+                        ),
+                        True,
+                    )
                 )
 
         if google_queries:
@@ -597,6 +652,8 @@ class UnifiedWebSearcher:
         model_override: Optional[str] = None,
         use_content_fetcher: Optional[bool] = None,
         llm_client: Optional[Any] = None,
+        year_start: Optional[int] = None,
+        year_end: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """
         同步搜索（在 executor 中运行异步版本）
@@ -613,6 +670,8 @@ class UnifiedWebSearcher:
             model_override=model_override,
             use_content_fetcher=use_content_fetcher,
             llm_client=llm_client,
+            year_start=year_start,
+            year_end=year_end,
         )
         try:
             loop = asyncio.get_event_loop()

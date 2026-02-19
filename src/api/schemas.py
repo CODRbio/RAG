@@ -47,6 +47,18 @@ class ChatRequest(BaseModel):
         None,
         description="本地检索的相似度阈值 (0-1)，低于此阈值的结果会被过滤，None 表示不过滤",
     )
+    year_start: Optional[int] = Field(
+        None,
+        ge=1900,
+        le=2100,
+        description="年份窗口起始（硬过滤，含边界）",
+    )
+    year_end: Optional[int] = Field(
+        None,
+        ge=1900,
+        le=2100,
+        description="年份窗口结束（硬过滤，含边界）",
+    )
     final_top_k: Optional[int] = Field(
         None,
         description="最终保留的文档数（local + web 合并重排后），None 表示使用配置默认值",
@@ -474,6 +486,8 @@ class DeepResearchRequest(BaseModel):
     query_optimizer_max_queries: Optional[int] = Field(None, description="每个搜索引擎查询数")
     local_top_k: Optional[int] = Field(None, description="本地检索 top_k")
     local_threshold: Optional[float] = Field(None, description="本地检索阈值")
+    year_start: Optional[int] = Field(None, ge=1900, le=2100, description="年份窗口起始（硬过滤）")
+    year_end: Optional[int] = Field(None, ge=1900, le=2100, description="年份窗口结束（硬过滤）")
     final_top_k: Optional[int] = Field(None, description="最终保留文档数（合并重排后）")
     llm_provider: Optional[str] = Field(None, description="LLM 提供商")
     model_override: Optional[str] = Field(None, description="覆盖 provider 默认模型")
@@ -512,6 +526,8 @@ class DeepResearchStartRequest(BaseModel):
     query_optimizer_max_queries: Optional[int] = Field(None, description="每个搜索引擎查询数")
     local_top_k: Optional[int] = Field(None, description="本地检索 top_k")
     local_threshold: Optional[float] = Field(None, description="本地检索阈值")
+    year_start: Optional[int] = Field(None, ge=1900, le=2100, description="年份窗口起始（硬过滤）")
+    year_end: Optional[int] = Field(None, ge=1900, le=2100, description="年份窗口结束（硬过滤）")
     final_top_k: Optional[int] = Field(None, description="最终保留文档数")
     llm_provider: Optional[str] = Field(None, description="LLM 提供商")
     model_override: Optional[str] = Field(None, description="覆盖 provider 默认模型")
@@ -560,6 +576,8 @@ class DeepResearchConfirmRequest(BaseModel):
     query_optimizer_max_queries: Optional[int] = Field(None, description="每个搜索引擎查询数")
     local_top_k: Optional[int] = Field(None, description="本地检索 top_k")
     local_threshold: Optional[float] = Field(None, description="本地检索阈值")
+    year_start: Optional[int] = Field(None, ge=1900, le=2100, description="年份窗口起始（硬过滤）")
+    year_end: Optional[int] = Field(None, ge=1900, le=2100, description="年份窗口结束（硬过滤）")
     final_top_k: Optional[int] = Field(None, description="最终保留文档数")
     llm_provider: Optional[str] = Field(None, description="LLM 提供商")
     model_override: Optional[str] = Field(None, description="覆盖 provider 默认模型")
