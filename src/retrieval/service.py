@@ -238,11 +238,17 @@ class RetrievalService:
         t0 = time.perf_counter()
         timeout_s = getattr(getattr(settings, "perf_retrieval", None), "timeout_seconds", 60) or 60
 
+        # Amplify retrieval pool so that the reranker always operates on a
+        # sufficiently large candidate set, regardless of the caller's top_k.
+        actual_recall = max(80, k * 4)
+
         # 诊断信息收集
         diag: Dict[str, Any] = {}
+        if actual_recall != k:
+            diag["recall_amplification"] = {"requested_k": k, "actual_recall": actual_recall}
 
         def _do_local() -> List[Dict[str, Any]]:
-            config = RetrievalConfig(mode="hybrid", top_k=k, rerank=True)
+            config = RetrievalConfig(mode="hybrid", top_k=actual_recall, rerank=True)
             return self.retriever.retrieve(query, self.collection, config, diagnostics=diag)
 
         def _do_web() -> List[Dict[str, Any]]:
@@ -362,7 +368,7 @@ class RetrievalService:
                 all_chunks.append(_hit_to_chunk(h, "web", query))
         else:
             if mode == "local":
-                config = RetrievalConfig(mode="hybrid", top_k=k, rerank=True)
+                config = RetrievalConfig(mode="hybrid", top_k=actual_recall, rerank=True)
                 hits = self.retriever.retrieve(query, self.collection, config, diagnostics=diag)
                 total_candidates += len(hits) * 2
                 for h in hits:

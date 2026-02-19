@@ -64,6 +64,7 @@ _CONFIG_PATH = Path(__file__).resolve().parents[3] / "config" / "rag_config.json
 #   search_top_k_first          first-round broad sweep
 #   search_top_k_gap            gap-fill / re-research rounds
 #   search_top_k_write          write-node final evidence retrieval
+#   search_top_k_write_max      hard cap for adaptive write retrieval window
 #   verification_k              write-stage secondary evidence check for data-point citations
 #
 # Self-correction:
@@ -110,6 +111,7 @@ DEPTH_PRESETS: Dict[str, Dict[str, Any]] = {
         "search_top_k_first": 18,                # broad first-round sweep
         "search_top_k_gap": 10,                  # targeted gap-fill
         "search_top_k_write": 10,                # precise evidence for writing
+        "search_top_k_write_max": 40,            # hard cap for adaptive write retrieval
         "verification_k": 12,                    # secondary check context for data-point claims
         # ── Self-correction / adaptive cost control ──
         "self_correction_trigger_coverage": 0.75,
@@ -147,6 +149,7 @@ DEPTH_PRESETS: Dict[str, Dict[str, Any]] = {
         "search_top_k_first": 30,                # wide net
         "search_top_k_gap": 15,                  # focused supplement
         "search_top_k_write": 12,                # best-citation retrieval
+        "search_top_k_write_max": 60,            # hard cap for adaptive write retrieval
         "verification_k": 16,                    # stronger secondary check context
         # ── Self-correction / adaptive cost control ──
         "self_correction_trigger_coverage": 0.78,
@@ -436,6 +439,26 @@ def _build_user_context_block(state: DeepResearchState, max_chars: int = 2500) -
     if len(text) > max_chars:
         text = text[:max_chars]
     return "\n\nAdditional temporary context:\n" + text
+
+
+def _compute_effective_write_k(preset: Dict[str, Any], filters: Optional[Dict[str, Any]]) -> int:
+    """Compute adaptive write retrieval window with a safety cap."""
+    preset_write_k = int(preset.get("search_top_k_write", 12))
+    write_k_cap = int(preset.get("search_top_k_write_max", 60))
+    if write_k_cap <= 0:
+        write_k_cap = 60
+    # Keep cap sane: never below the preset floor.
+    write_k_cap = max(write_k_cap, preset_write_k)
+
+    ui_top_k = 0
+    ui_top_k_raw = (filters or {}).get("final_top_k")
+    try:
+        ui_top_k = int(ui_top_k_raw or 0)
+    except (TypeError, ValueError):
+        ui_top_k = 0
+
+    effective_write_k = max(preset_write_k, int(ui_top_k * 1.5)) if ui_top_k > 0 else preset_write_k
+    return min(effective_write_k, write_k_cap)
 
 
 def _tokenize_for_overlap(text: str) -> List[str]:
@@ -1132,15 +1155,34 @@ def research_node(state: DeepResearchState) -> DeepResearchState:
         ))
 
     # Adaptive fallback for sparse evidence:
-    # if retrieval returns too few chunks, run one wider fallback query/mode.
-    if len(all_chunks) < 3:
+    # Trigger on (a) too few chunks overall, OR (b) too few independent
+    # documents (corroboration principle — single-source evidence is fragile).
+    def _count_distinct_docs(chunks):
+        keys = set()
+        for c in chunks:
+            if getattr(c, "doi", None):
+                keys.add(f"doi:{c.doi}")
+            else:
+                keys.add(c.doc_group_key)
+        return len(keys)
+
+    distinct_docs = _count_distinct_docs(all_chunks)
+    needs_fallback = len(all_chunks) < 3 or distinct_docs < 3
+
+    if needs_fallback:
+        fallback_reason = (
+            "Sparse evidence detected"
+            if len(all_chunks) < 3
+            else f"Corroboration risk: only {distinct_docs} independent source(s)"
+        )
         _emit_progress(
             state,
             "warning",
             {
                 "section": section.title,
-                "message": "Sparse evidence detected; running adaptive fallback search.",
+                "message": f"{fallback_reason}; running adaptive fallback search.",
                 "chunks_found": len(all_chunks),
+                "distinct_docs": distinct_docs,
             },
         )
         fallback_query = f"{dashboard.brief.topic} {section.title}".strip()
@@ -1168,7 +1210,8 @@ def research_node(state: DeepResearchState) -> DeepResearchState:
         except Exception as e:
             logger.warning("Adaptive fallback search failed for section '%s': %s", section.title, e)
 
-    if len(all_chunks) < 3:
+    distinct_docs_post = _count_distinct_docs(all_chunks)
+    if len(all_chunks) < 3 or distinct_docs_post < 3:
         section.evidence_scarce = True
         _emit_progress(
             state,
@@ -1177,6 +1220,7 @@ def research_node(state: DeepResearchState) -> DeepResearchState:
                 "section": section.title,
                 "message": "Evidence remains insufficient after fallback search; section may be degraded in writing.",
                 "chunks_found": len(all_chunks),
+                "distinct_docs": distinct_docs_post,
                 "gaps": section.gaps[:3],
             },
         )
@@ -1334,9 +1378,9 @@ def generate_claims_node(state: DeepResearchState) -> DeepResearchState:
         return state
 
     preset = state.get("depth_preset") or get_depth_preset(state.get("depth", DEFAULT_DEPTH))
-    write_top_k = int(preset.get("search_top_k_write", 8))
-    svc = _get_retrieval_svc(state)
     dr_filters = dict(state.get("filters") or {})
+    write_top_k = _compute_effective_write_k(preset, dr_filters)
+    svc = _get_retrieval_svc(state)
     dr_filters["use_query_optimizer"] = False
     pack = svc.search(
         query=f"{dashboard.brief.topic} {section.title}",
@@ -1390,12 +1434,12 @@ def write_node(state: DeepResearchState) -> DeepResearchState:
         context_parts.append("\n".join(trajectory.compressed_summaries[-2:]))
     context = "\n\n".join(context_parts)
 
-    # Retrieve section context — use write-stage top_k (precise, high-relevance only)
+    # Retrieve section context — adaptive write-stage top_k
     preset = state.get("depth_preset") or get_depth_preset(state.get("depth", DEFAULT_DEPTH))
-    write_top_k = int(preset.get("search_top_k_write", 8))
+    dr_filters = dict(state.get("filters") or {})
+    write_top_k = _compute_effective_write_k(preset, dr_filters)
     verification_k = int(preset.get("verification_k", max(10, write_top_k)))
     svc = _get_retrieval_svc(state)
-    dr_filters = dict(state.get("filters") or {})
     dr_filters["use_query_optimizer"] = False
     pack = svc.search(
         query=f"{dashboard.brief.topic} {section.title}",
@@ -1494,6 +1538,14 @@ def write_node(state: DeepResearchState) -> DeepResearchState:
                 f"{state['verified_claims']}\n"
                 "Expand each claim into well-supported prose. Do not omit any claim.\n"
             )
+        triangulation_block = (
+            "\nEvidence Triangulation (MANDATORY):\n"
+            "- You MUST synthesize information across multiple independent sources for every major claim.\n"
+            "- Do NOT rely on a single paper for any major claim.\n"
+            "- If a finding is only supported by one source, explicitly qualify it "
+            "(e.g., 'A single study [ref_hash] suggests...' or 'Preliminary evidence from [ref_hash] indicates...').\n"
+            "- Actively look for converging evidence from different authors/studies to strengthen conclusions.\n"
+        )
         prompt = f"""Write the section "{section.title}" for the review using the evidence below.
 
 Requirements:
@@ -1504,6 +1556,7 @@ Requirements:
 - Cross-check key data points against the verification evidence block before finalizing claims
 {_language_instruction(state)}
 {_build_user_context_block(state, max_chars=1800)}
+{triangulation_block}
 {caution_block}
 {quantitative_block}
 {claims_block}
@@ -1524,7 +1577,9 @@ Relevant temporary materials from user:
                     "role": "system",
                     "content": (
                         "You are an expert academic review writer."
-                        " When numeric comparisons are needed, use tools to compute instead of guessing.\n"
+                        " When numeric comparisons are needed, use tools to compute instead of guessing."
+                        " You follow the principle that a single-source claim must never be presented as established fact;"
+                        " always triangulate across multiple independent references.\n"
                         f"{context[:2000]}"
                     ),
                 },
