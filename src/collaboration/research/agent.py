@@ -1587,12 +1587,11 @@ Relevant temporary materials from user:
             ]
             if has_structured_numeric_data:
                 from src.llm.react_loop import react_loop
-                from src.llm.tools import CORE_TOOLS
+                from src.llm.tools import get_tools_by_names
 
-                run_code_tools = [t for t in CORE_TOOLS if getattr(t, "name", "") == "run_code"]
                 react_result = react_loop(
                     messages=messages,
-                    tools=run_code_tools,
+                    tools=get_tools_by_names(["run_code"]),
                     llm_client=client,
                     max_iterations=4,
                     model=model_override,

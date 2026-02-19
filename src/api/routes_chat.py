@@ -59,7 +59,7 @@ from src.collaboration.memory.persistent_store import get_user_profile
 from src.collaboration.workflow import run_workflow
 from src.llm.llm_manager import get_manager
 from src.llm.react_loop import react_loop
-from src.llm.tools import CORE_TOOLS
+from src.llm.tools import CORE_TOOLS, get_routed_skills
 from src.collaboration.citation.manager import (
     _dedupe_citations,
     chunk_to_citation,
@@ -617,9 +617,15 @@ def _run_chat(
     t_llm = _time.perf_counter()
     try:
         if use_agent:
+            routed_tools = get_routed_skills(
+                message=message,
+                current_stage=current_stage or "",
+                search_mode=search_mode,
+                allowed_web_providers=body.web_providers,
+            )
             react_result = react_loop(
                 messages=messages,
-                tools=CORE_TOOLS,
+                tools=routed_tools,
                 llm_client=client,
                 max_iterations=8,
                 model=body.model_override or None,
@@ -629,8 +635,9 @@ def _run_chat(
             tool_trace = react_result.tool_trace if react_result.tool_trace else None
             llm_ms = (_time.perf_counter() - t_llm) * 1000
             _chat_logger.info(
-                "[chat] ⑧ Agent 完成 | iterations=%d | tools_called=%d | 耗时=%.0fms",
-                react_result.iterations, len(react_result.tool_trace), llm_ms,
+                "[chat] ⑧ Agent 完成 | iterations=%d | tools_called=%d | routed=%d/%d | 耗时=%.0fms",
+                react_result.iterations, len(react_result.tool_trace),
+                len(routed_tools), len(CORE_TOOLS), llm_ms,
             )
         else:
             resp = client.chat(messages, model=body.model_override or None, max_tokens=2000)

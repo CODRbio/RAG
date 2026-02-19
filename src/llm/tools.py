@@ -6,6 +6,7 @@
 
 Usage:
     from src.llm.tools import CORE_TOOLS, ToolDef, to_openai_tools, to_anthropic_tools, execute_tool_call
+    from src.llm.tools import get_routed_skills, get_tools_by_names
 """
 
 from __future__ import annotations
@@ -626,3 +627,121 @@ CORE_TOOLS: List[ToolDef] = [
         handler=_handle_search_ncbi,
     ),
 ]
+
+
+# ────────────────────────────────────────────────
+# Tool Registry & Dynamic Skill Routing
+# ────────────────────────────────────────────────
+
+_TOOL_REGISTRY: Dict[str, ToolDef] = {t.name: t for t in CORE_TOOLS}
+
+_GROUP_SEARCH_LOCAL = frozenset({"search_local"})
+_GROUP_WEB = frozenset({"search_web", "search_scholar", "search_ncbi"})
+_GROUP_ANALYSIS = frozenset({"compare_papers", "run_code"})
+_GROUP_GRAPH = frozenset({"explore_graph"})
+_GROUP_COLLAB = frozenset({"canvas", "get_citations"})
+
+_WEB_PROVIDER_TO_TOOL: Dict[str, str] = {
+    "tavily": "search_web",
+    "google": "search_web",
+    "scholar": "search_scholar",
+    "semantic": "search_scholar",
+    "ncbi": "search_ncbi",
+    "pubmed": "search_ncbi",
+}
+
+_RE_ANALYSIS = re.compile(
+    r"对比|比较|差异|统计|计算|代码|数据分析|分析数据"
+    r"|compare|contrast|diff|statistic|calculat|code|data\s*analy",
+    re.IGNORECASE,
+)
+_RE_GRAPH = re.compile(
+    r"关系|网络|图谱|关联|知识图"
+    r"|relation|network|graph|connection|linked|topology",
+    re.IGNORECASE,
+)
+_RE_COLLAB = re.compile(
+    r"画布|草稿|大纲|引用|参考文献|引文"
+    r"|canvas|draft|outline|citation|reference|bibliography",
+    re.IGNORECASE,
+)
+
+_TOOL_ORDER: Dict[str, int] = {t.name: i for i, t in enumerate(CORE_TOOLS)}
+
+
+def get_tools_by_names(names: List[str]) -> List[ToolDef]:
+    """Return ToolDef instances matching the given tool names, preserving CORE_TOOLS order."""
+    tools = [_TOOL_REGISTRY[n] for n in names if n in _TOOL_REGISTRY]
+    tools.sort(key=lambda t: _TOOL_ORDER.get(t.name, 999))
+    return tools
+
+
+def get_routed_skills(
+    message: str,
+    current_stage: str,
+    search_mode: str,
+    allowed_web_providers: Optional[List[str]] = None,
+) -> List[ToolDef]:
+    """
+    Dynamic skill routing — select only the tools relevant to the current
+    request instead of mounting all CORE_TOOLS.
+
+    This reduces prompt token cost and lowers the probability of the LLM
+    hallucinating tool calls to irrelevant tools.
+
+    Routing rules
+    ─────────────
+    1. search_local: always on when search_mode != "none"
+    2. Web group (search_web / search_scholar / search_ncbi):
+       active when search_mode allows web; narrowed by allowed_web_providers
+    3. Analysis group (compare_papers / run_code):
+       keyword-triggered by comparison / statistics / code mentions
+    4. Graph group (explore_graph):
+       keyword-triggered by relationship / graph / network mentions
+    5. Collab group (canvas / get_citations):
+       stage-triggered (drafting / refine) or keyword-triggered
+    """
+    selected: set[str] = set()
+
+    # 1. Local search — the backbone of RAG
+    if search_mode != "none":
+        selected |= _GROUP_SEARCH_LOCAL
+
+    # 2. Web tools — gated by search_mode and optionally by explicit provider list
+    if search_mode in ("web", "hybrid"):
+        if allowed_web_providers is not None:
+            for provider in allowed_web_providers:
+                tool_name = _WEB_PROVIDER_TO_TOOL.get(provider.lower().strip())
+                if tool_name and tool_name in _GROUP_WEB:
+                    selected.add(tool_name)
+        else:
+            selected |= _GROUP_WEB
+
+    # 3. Analysis group — keyword activated
+    if _RE_ANALYSIS.search(message):
+        selected |= _GROUP_ANALYSIS
+
+    # 4. Graph group — keyword activated
+    if _RE_GRAPH.search(message):
+        selected |= _GROUP_GRAPH
+
+    # 5. Collaboration group — stage or keyword activated
+    stage_lower = (current_stage or "").lower()
+    if stage_lower in ("drafting", "draft", "refine", "writing"):
+        selected |= _GROUP_COLLAB
+    elif _RE_COLLAB.search(message):
+        selected |= _GROUP_COLLAB
+
+    # Fallback: guarantee at least search_local so the agent is never toolless
+    if not selected and search_mode != "none":
+        selected.add("search_local")
+
+    tools = [_TOOL_REGISTRY[name] for name in selected if name in _TOOL_REGISTRY]
+    tools.sort(key=lambda t: _TOOL_ORDER.get(t.name, 999))
+
+    logger.info(
+        "skill_router | stage=%s mode=%s providers=%s → tools=[%s] (%d/%d)",
+        current_stage, search_mode, allowed_web_providers,
+        ", ".join(t.name for t in tools), len(tools), len(CORE_TOOLS),
+    )
+    return tools
