@@ -2,7 +2,7 @@ Write the section "{section_title}" for the review using the evidence below.
 
 Requirements:
 - Use academic writing style and coherent logic
-- Mark citations with [ref_hash] as shown in evidence snippets
+- Mark citations with [ref:xxxx] as shown in evidence snippets (e.g. [ref:a1b2c3d4])
 - Length: around 400-600 words
 - Keep consistency with other sections
 - Cross-check key data points against the verification evidence block before finalizing claims

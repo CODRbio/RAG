@@ -176,6 +176,20 @@ Deep Research 配置。
   - 图上限：`recursion_limit`
   - 成本监控：`cost_warn_steps`、`cost_force_summary_steps`、`cost_tick_interval`
 
+**全篇连贯性重写（Coherence Refine）策略**
+
+`synthesize_node` 在最终整合阶段自动选择写作策略，无需额外配置：
+
+| 情况 | 策略 | 说明 |
+|---|---|---|
+| 文档 token 充足 | Single-pass | 单次调用，`max_tokens` 由 `compute_safe_budget` 动态计算 |
+| 文档过长（输出预算 < 1024 token）| Sliding Window | 逐章润色，每章携带 Document Blueprint 全局引导 |
+
+- Token 估算工具：`src/utils/token_counter.py`（tiktoken cl100k_base，不可用时自动降级为字符估算）
+- 模型上下文窗口注册在 `MODEL_CONTEXT_WINDOWS`（`token_counter.py`），未知模型默认 64,000 token
+- 安全余量：默认保留 10%（`safety_margin=0.10`），可在源码中调整
+- Prompt 模板：单次 → `coherence_refine.txt`；分章 → `coherence_refine_window.txt`
+
 ### `graph`
 
 知识图谱实体抽取配置，控制 HippoRAG 构图时所使用的 NER 策略。

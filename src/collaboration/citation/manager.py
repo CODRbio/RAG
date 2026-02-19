@@ -278,17 +278,17 @@ def resolve_response_citations(
     include_unreferenced_documents: bool = True,
 ) -> tuple[str, List[Citation], Dict[str, str]]:
     """
-    对 LLM 回答做引文后处理：将 [ref_hash] 替换为正式 cite_key，并输出文档级引文列表。
+    对 LLM 回答做引文后处理：将 [ref:xxxx] 占位符替换为正式 cite_key，并输出文档级引文列表。
 
     流程：
-      1. 扫描 response_text 中的 [hex_hash] 模式
-      2. hash → chunk → doc_group_key，按文档去重
+      1. 扫描 response_text 中的 [ref:<8位十六进制>] 模式
+      2. ref_hash → chunk → doc_group_key，按文档去重
       3. 按首次出现顺序为每个文档生成正式 cite_key
-      4. 替换文本中所有 hash 为对应 cite_key
+      4. 替换文本中所有占位符为对应 cite_key
       5. 构建文档级 Citation 列表
 
     Args:
-        response_text: LLM 原始回答（包含 [ref_hash] 引用）
+        response_text: LLM 原始回答（包含 [ref:xxxx] 引用占位符）
         chunks:        本轮检索返回的所有 EvidenceChunk
         format:        cite_key 格式，默认读配置
 
@@ -304,19 +304,22 @@ def resolve_response_citations(
         - include_unreferenced_documents=True 时，会把未在文本中出现但存在于 chunks 的文档也纳入 citations。
     """
     from collections import OrderedDict
-    from src.retrieval.evidence import REF_HASH_LENGTH
+    from src.retrieval.evidence import REF_HASH_LENGTH, REF_PREFIX
 
-    # ── 1. 建立 hash → chunk 查找表 ──
+    # ── 1. 建立 ref_hash → chunk 查找表（key 为完整 ref_hash，如 "ref:a1b2c3d4"）──
     hash_to_chunk: Dict[str, EvidenceChunk] = {}
     for c in chunks:
         hash_to_chunk[c.ref_hash] = c
 
-    # ── 2. 扫描回答中出现的 hash ──
-    pattern = re.compile(r"\[([0-9a-fA-F]{" + str(REF_HASH_LENGTH) + r"})\]")
+    # ── 2. 扫描回答中出现的 [ref:xxxx] 占位符 ──
+    # 格式：[ref:<8位十六进制>]，命名空间前缀防止误匹配领域文本
+    pattern = re.compile(
+        r"\[" + re.escape(REF_PREFIX) + r"([0-9a-fA-F]{" + str(REF_HASH_LENGTH) + r"})\]"
+    )
     cited_hashes: List[str] = []
     seen_hashes: Set[str] = set()
     for m in pattern.finditer(response_text):
-        h = m.group(1).lower()
+        h = f"{REF_PREFIX}{m.group(1).lower()}"
         if h in hash_to_chunk and h not in seen_hashes:
             cited_hashes.append(h)
             seen_hashes.add(h)
@@ -378,20 +381,20 @@ def resolve_response_citations(
         )
         citations.append(citation)
 
-    # ── 5. 构建 ref_hash → cite_key 映射 ──
+    # ── 5. 构建 ref_hash → cite_key 映射（key 为完整 ref_hash，如 "ref:a1b2c3d4"）──
     ref_map: Dict[str, str] = {}
     for h, chunk in hash_to_chunk.items():
         key = chunk.doc_group_key
         if key in shared_doc_map:
             ref_map[h] = shared_doc_map[key]
 
-    # ── 6. 替换文本中的 hash ──
+    # ── 6. 替换文本中的 [ref:xxxx] 为正式 cite_key ──
     def _replace_hash(m: re.Match) -> str:
-        h = m.group(1).lower()
+        h = f"{REF_PREFIX}{m.group(1).lower()}"
         cite_key = ref_map.get(h)
         if cite_key:
             return f"[{cite_key}]"
-        return m.group(0)  # 未识别的 hash 保持原样
+        return m.group(0)  # 未识别的占位符保持原样
 
     resolved_text = pattern.sub(_replace_hash, response_text)
 

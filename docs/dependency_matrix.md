@@ -28,6 +28,7 @@
 |---|---|---|
 | openai | `>=1.0.0,<3.0.0` | OpenAI / DeepSeek / Kimi 等 |
 | anthropic | `>=0.18.0` | Claude |
+| tiktoken | `>=0.7.0` | Token 预算估算（cl100k_base 编码，跨 provider 近似计算，用于 coherence 阶段双路策略决策） |
 
 ### 检索与模型
 
@@ -130,7 +131,7 @@
 
 ### LLM 相关
 
-- 依赖：`openai`、`anthropic`、`mcp`
+- 依赖：`openai`、`anthropic`、`tiktoken`、`mcp`
 - 配置：`llm.default`、`llm.providers.*`
 - 环境变量：`RAG_LLM__{PROVIDER}__API_KEY`
 

@@ -1,6 +1,6 @@
 """
 Citation resolution tests:
-- ref_hash -> cite_key replacement
+- [ref:xxxx] placeholder -> cite_key replacement
 - document-level merge (multiple chunks from same doc)
 - cross-stage stable cite_key reuse
 """
@@ -101,9 +101,13 @@ def test_cross_stage_reuse_keeps_stable_numeric_keys():
     assert len(cites2) == 2
 
 
-def test_uppercase_hash_is_supported_for_replacement():
+def test_uppercase_hex_in_hash_is_supported_for_replacement():
+    """Uppercase hex digits in the [ref:XXXX] placeholder should still be resolved."""
+    from src.retrieval.evidence import REF_PREFIX
     c = _mk_chunk(chunk_id="upper-1", doc_id="doc-upper", title="Upper Hash Doc")
-    raw = f"Upper hash citation [{c.ref_hash.upper()}]."
+    # ref_hash returns "ref:xxxxxxxx"; use uppercase hex digits only (keep prefix lowercase)
+    hex_part = c.ref_hash[len(REF_PREFIX):]
+    raw = f"Upper hash citation [ref:{hex_part.upper()}]."
     resolved, _citations, _ref_map = resolve_response_citations(raw, [c], format="numeric")
     assert resolved == "Upper hash citation [1]."
 

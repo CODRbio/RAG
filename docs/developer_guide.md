@@ -251,6 +251,38 @@ cd frontend && npm run build && cd ..
 
 **注意**：修改 ontology 后需重新运行 `scripts/03b_build_graph.py` 重建图谱；已存在的 `data/hippo_graph.json` 不会自动更新。
 
+### Token 预算估算
+
+当你需要在调用 LLM 之前估算是否会超出上下文窗口，使用 `src/utils/token_counter.py`：
+
+```python
+from src.utils.token_counter import (
+    count_tokens,
+    get_context_window,
+    compute_safe_budget,
+    needs_sliding_window,
+)
+
+# 计算 prompt 占用的 token 数（使用 tiktoken cl100k_base，跨 provider 近似）
+prompt_tokens = count_tokens(system_msg) + count_tokens(user_msg)
+
+# 获取当前模型的上下文窗口大小
+context_window = get_context_window(model_name)  # model_name 为空时返回 64_000
+
+# 计算可用的安全输出 token 数（保留 10% 余量，结果夹在 [512, 8192]）
+output_budget = compute_safe_budget(prompt_tokens, context_window)
+
+# 判断是否需要滑动窗口策略（可用输出 token 低于 min_output_tokens 时返回 True）
+if needs_sliding_window(prompt_tokens, context_window, min_output_tokens=1024):
+    # 走分段处理逻辑
+    ...
+```
+
+**注意：**
+- `count_tokens` 内部延迟加载 tiktoken，首次调用会触发编码器初始化（约 20–50 ms）
+- 若 tiktoken 未安装，`count_tokens` 自动降级为字符数 × 0.4 的粗估
+- 不要在 `src/utils/__init__.py` 中直接导入 `token_counter`，应在使用处按需导入，避免触发包初始化链
+
 ### 新增提示词模板
 
 目标：提示词工程与业务逻辑彻底解耦，业务代码中不再内嵌大段 prompt 字符串。

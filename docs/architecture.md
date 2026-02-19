@@ -59,7 +59,7 @@ Frontend (React + Zustand + i18n)
 | `collaboration/research/dashboard.py` | 研究进度仪表盘 |
 | `collaboration/research/trajectory.py` | 研究轨迹追踪 |
 | `collaboration/workflow/` | 状态机（states + transitions + graph） |
-| `collaboration/citation/manager.py` | 引用解析（ref_hash → cite_key） |
+| `collaboration/citation/manager.py` | 引用解析（[ref:xxxx] → cite_key） |
 | `collaboration/citation/formatter.py` | 引用格式化 |
 | `collaboration/export/formatter.py` | 导出格式化 |
 | `collaboration/auto_complete.py` | 一键综述服务 |
@@ -117,6 +117,7 @@ Frontend (React + Zustand + i18n)
 | `utils/limiter.py` | 并发限流 |
 | `utils/storage_cleaner.py` | 存储清理 |
 | `utils/prompt_manager.py` | 提示词模板管理 |
+| `utils/token_counter.py` | Token 预算估算（tiktoken cl100k_base；含模型上下文窗口注册表与安全预算计算） |
 | `utils/task_runner.py` | 后台任务运行器 |
 | `utils/model_sync.py` | 模型同步 |
 | `log/log_manager.py` | 统一日志管理 |
@@ -292,9 +293,18 @@ Phase 2: /deep-research/submit（推荐）
 1. 生成 `Abstract`
 2. 基于 insights + evidence-scarce sections 生成 `Limitations and Future Directions`
 3. 聚合 open gaps 生成 `Open Gaps and Future Research Agenda`
-4. 全篇连贯性重写（跨章节衔接、术语一致性、冗余消除）
-5. 引用保护（citation guard）：检测到引用/证据标签丢失时自动回退
-6. 写回最终结果并切换 Canvas 到 `refine` 阶段
+4. **Token 预算估算**（`src/utils/token_counter.py`）：使用 tiktoken 精确计算拼接后文档的 token 数，与模型上下文窗口对比，决定下一步策略
+5. **全篇连贯性重写**（双路策略）：
+   - **Path A — Single-pass**：文档 token 充足时，单次调用 `coherence_refine.txt`，`max_tokens` 由安全预算动态计算（替代原硬编码 3500）
+   - **Path B — Sliding Window**：文档过长时，逐章节润色：
+     - 每个窗口携带 **Document Blueprint**（话题 + 摘要 + 全章节大纲 + 当前位置标记 `>> [CURRENT] <<`，~500–800 token，零额外 LLM 调用）
+     - 本地上下文：前章末尾 ~300 token + 后章预览 ~150 token
+     - Prompt 模板：`coherence_refine_window.txt`
+     - 每章完成后上报 `coherence_window_done` 进度事件
+6. 引用保护（citation guard）：对全文合并结果检测引用/证据标签丢失，任一路径失败均自动回退到整合前版本
+7. 写回最终结果并切换 Canvas 到 `refine` 阶段
+
+> **策略选择事件**：`coherence_strategy_selected`（含 `strategy`、`body_tokens`、`prompt_tokens`、`context_window` 字段），可在前端研究进度面板或日志中观察。
 
 ## 五、存储与状态
 
@@ -345,3 +355,16 @@ src/prompts/*.txt
 - 模板可独立于 Python 逻辑快速调优
 - 多模块共享统一提示词资产与缓存机制
 - 变更审查时可清晰区分“业务逻辑改动”与“提示词改动”
+
+### 关键模板速查（Deep Research 最终整合）
+
+| 模板文件 | 用途 | 使用场景 |
+|---|---|---|
+| `coherence_refine.txt` | 全篇连贯性重写（单次调用） | Path A：文档 token 充足 |
+| `coherence_refine_window.txt` | 单章节连贯性润色（含 Document Blueprint） | Path B：滑动窗口，每章一次调用 |
+| `generate_abstract.txt` | 生成摘要 | `synthesize_node` |
+| `limitations_section.txt` | 生成不足与未来方向 | `synthesize_node` |
+| `open_gaps_agenda.txt` | 生成开放问题与研究议程 | `synthesize_node` |
+| `write_section.txt` | 写作单个章节 | `write_node` |
+| `verify_claims.txt` | 声明验证 | `verifier.py` |
+| `generate_claims.txt` | 提取核心声明 | `generate_claims_node` |

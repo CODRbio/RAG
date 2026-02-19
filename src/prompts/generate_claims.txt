@@ -1,5 +1,5 @@
 Based on the following evidence for section "{section_title}", extract 3-5 core claims (Claims).
-Each claim MUST retain the [ref_hash] citation markers from the evidence.
+Each claim MUST retain the [ref:xxxx] citation markers from the evidence (e.g. [ref:a1b2c3d4]).
 Output format: numbered list, one claim per line. Do not add extra commentary.
 
 Evidence:

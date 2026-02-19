@@ -12,6 +12,10 @@ from typing import List, Literal, Optional
 # chunk 引用哈希的长度（SHA-256 前 N 位十六进制）
 REF_HASH_LENGTH = 8
 
+# 引用占位符命名空间前缀，避免与领域文本（内存地址、Git commit、颜色码等）冲突
+# 完整占位符格式：[ref:a1b2c3d4]
+REF_PREFIX = "ref:"
+
 
 @dataclass
 class EvidenceChunk:
@@ -36,10 +40,13 @@ class EvidenceChunk:
     @property
     def ref_hash(self) -> str:
         """
-        8 位 SHA-256 哈希，用作 LLM 上下文中的稳定引用标记。
-        后续 resolve_response_citations() 会将其替换为正式的 cite_key。
+        带命名空间前缀的 8 位 SHA-256 哈希，用作 LLM 上下文中的稳定引用标记。
+        格式为 `ref:xxxxxxxx`（如 `ref:a1b2c3d4`），在文本中以 [ref:a1b2c3d4] 呈现。
+        使用 `ref:` 前缀可防止与领域文本（内存地址、Git commit、颜色码等）产生误匹配。
+        后续 resolve_response_citations() 会将 [ref:xxxx] 替换为正式的 cite_key。
         """
-        return hashlib.sha256(self.chunk_id.encode("utf-8")).hexdigest()[:REF_HASH_LENGTH]
+        hex_part = hashlib.sha256(self.chunk_id.encode("utf-8")).hexdigest()[:REF_HASH_LENGTH]
+        return f"{REF_PREFIX}{hex_part}"
 
     @property
     def doc_group_key(self) -> str:
@@ -67,7 +74,7 @@ class EvidencePack:
         return [c for c in self.chunks if c.source_type == source_type]
 
     def to_context_string(self, max_chunks: int = 10) -> str:
-        """生成 LLM 可用的上下文字符串（使用 ref_hash 作为引用标记）"""
+        """生成 LLM 可用的上下文字符串（使用 [ref:xxxx] 作为引用标记）"""
         lines = []
         for chunk in self.chunks[:max_chunks]:
             ref = f"[{chunk.ref_hash}]"

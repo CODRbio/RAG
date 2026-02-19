@@ -558,7 +558,7 @@ def _resolve_text_citations(
     include_unreferenced_documents: bool = False,
 ) -> tuple[str, List[Any]]:
     """
-    使用共享的 doc_key->cite_key 映射做 hash 引文替换，确保跨阶段引用键稳定。
+    使用共享的 doc_key->cite_key 映射做 [ref:xxxx] 占位符替换，确保跨阶段引用键稳定。
     """
     if not text or not chunks:
         return text, []
@@ -1345,7 +1345,7 @@ def evaluate_node(state: DeepResearchState) -> DeepResearchState:
 
 
 def generate_claims_node(state: DeepResearchState) -> DeepResearchState:
-    """Extract 3-5 core claims from section evidence (with [ref_hash]) before writing."""
+    """Extract 3-5 core claims from section evidence (with [ref:xxxx] citations) before writing."""
     _ensure_not_cancelled(state)
     _tick_cost_monitor(state, "generate_claims")
     dashboard = state["dashboard"]
@@ -1375,7 +1375,7 @@ def generate_claims_node(state: DeepResearchState) -> DeepResearchState:
     try:
         resp = client.chat(
             messages=[
-                {"role": "system", "content": "You are an expert at extracting concise, citation-backed claims from evidence. Preserve every [ref_hash] in each claim."},
+                {"role": "system", "content": "You are an expert at extracting concise, citation-backed claims from evidence. Preserve every [ref:xxxx] citation marker in each claim."},
                 {"role": "user", "content": user_content},
             ],
             model=model_override,
@@ -1519,7 +1519,7 @@ def write_node(state: DeepResearchState) -> DeepResearchState:
             "- You MUST synthesize information across multiple independent sources for every major claim.\n"
             "- Do NOT rely on a single paper for any major claim.\n"
             "- If a finding is only supported by one source, explicitly qualify it "
-            "(e.g., 'A single study [ref_hash] suggests...' or 'Preliminary evidence from [ref_hash] indicates...').\n"
+            "(e.g., 'A single study [ref:xxxx] suggests...' or 'Preliminary evidence from [ref:xxxx] indicates...').\n"
             "- Actively look for converging evidence from different authors/studies to strengthen conclusions.\n"
         )
         prompt = _pm.render(
@@ -1891,6 +1891,101 @@ def review_gate_node(state: DeepResearchState) -> DeepResearchState:
     return state
 
 
+# ---------------------------------------------------------------------------
+# Coherence-refinement helpers (used by synthesize_node)
+# ---------------------------------------------------------------------------
+
+def _split_into_sections(body_md: str) -> List[Tuple[str, str]]:
+    """
+    Split a markdown document into sections by level-2 headings (## ...).
+
+    Returns a list of (heading_line, body_text) pairs, where heading_line
+    includes the leading '## ' and body_text is everything until the next ##
+    heading (or end of document).  Content before the first ## heading is
+    returned as ("", content) so it is never silently dropped.
+    """
+    if not body_md:
+        return []
+
+    sections: List[Tuple[str, str]] = []
+    current_heading = ""
+    current_lines: List[str] = []
+
+    for line in body_md.splitlines(keepends=True):
+        if line.startswith("## "):
+            # Flush previous section
+            if current_heading or current_lines:
+                sections.append((current_heading, "".join(current_lines).rstrip()))
+            current_heading = line.rstrip()
+            current_lines = []
+        else:
+            current_lines.append(line)
+
+    # Flush last section
+    if current_heading or current_lines:
+        sections.append((current_heading, "".join(current_lines).rstrip()))
+
+    return sections
+
+
+def _extract_first_sentence(text: str, max_chars: int = 120) -> str:
+    """Return the first sentence of *text*, truncated to *max_chars*."""
+    t = (text or "").strip()
+    if not t:
+        return ""
+    # Strip leading markdown emphasis / list markers
+    t = re.sub(r"^[*_>#\-]+\s*", "", t)
+    # Find end of first sentence
+    for punct in ("。", ".", "！", "！", "？", "?"):
+        idx = t.find(punct)
+        if 0 < idx <= max_chars:
+            return t[: idx + 1]
+    return t[:max_chars]
+
+
+def _build_document_blueprint(
+    topic: str,
+    abstract: str,
+    sections: List[Tuple[str, str]],
+    current_idx: int,
+) -> str:
+    """
+    Build a lightweight Document Blueprint string to prepend to every
+    sliding-window coherence prompt.
+
+    The blueprint gives the LLM global narrative awareness of the full review
+    without including the complete text of other sections.  It contains:
+
+    - Topic
+    - Abstract (first 300 chars as a condensed anchor)
+    - Section outline: heading + first sentence of each section body,
+      with a '>> [CURRENT] <<' marker on the section being refined.
+
+    Estimated size: ~400-800 tokens for a 6-8 section document.
+    Zero extra LLM calls — purely string extraction.
+    """
+    lines: List[str] = ["[DOCUMENT BLUEPRINT]", f"Topic: {topic}"]
+
+    if abstract:
+        abstract_snippet = abstract.strip()[:300].replace("\n", " ")
+        lines.append(f"Abstract: {abstract_snippet}")
+
+    lines.append("")
+    lines.append("Section Outline:")
+
+    for idx, (heading, body) in enumerate(sections):
+        num = idx + 1
+        display_heading = heading.lstrip("#").strip() if heading else f"Section {num}"
+        snippet = _extract_first_sentence(body)
+        snippet_part = f' -- "{snippet}"' if snippet else ""
+        if idx == current_idx:
+            lines.append(f'{num}. >> {display_heading} [CURRENT] <<{snippet_part}')
+        else:
+            lines.append(f"{num}. {display_heading}{snippet_part}")
+
+    return "\n".join(lines)
+
+
 def synthesize_node(state: DeepResearchState) -> DeepResearchState:
     """Phase 5: 全局综合 — 生成摘要 + 不足与展望 + 参考文献"""
     _ensure_not_cancelled(state)
@@ -2249,59 +2344,274 @@ def synthesize_node(state: DeepResearchState) -> DeepResearchState:
             lang_hard_rule = "Output must remain Chinese (中文). Keep citation tags unchanged."
         elif (state.get("output_language") or "auto").lower() == "en":
             lang_hard_rule = "Output must remain English. Keep citation tags unchanged."
-        coherence_prompt = _pm.render(
+        effective_lang_rule = lang_hard_rule or "Respect the document's dominant language."
+
+        # ── Token budget estimation ──
+        try:
+            from src.utils.token_counter import (
+                count_tokens,
+                get_context_window,
+                compute_safe_budget,
+                needs_sliding_window,
+            )
+            _token_counting_available = True
+        except Exception:
+            # Some environments may fail while importing `src.utils` package
+            # due to unrelated side-effect imports in src/utils/__init__.py.
+            # Fallback to direct module loading so token budgeting still works.
+            try:
+                import importlib.util
+
+                token_counter_path = Path(__file__).resolve().parents[2] / "utils" / "token_counter.py"
+                spec = importlib.util.spec_from_file_location("token_counter_direct", str(token_counter_path))
+                if spec is None or spec.loader is None:
+                    raise RuntimeError("failed to load token_counter module spec")
+                tc_mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(tc_mod)
+
+                count_tokens = tc_mod.count_tokens
+                get_context_window = tc_mod.get_context_window
+                compute_safe_budget = tc_mod.compute_safe_budget
+                needs_sliding_window = tc_mod.needs_sliding_window
+                _token_counting_available = True
+            except Exception:
+                _token_counting_available = False
+                logger.debug("tiktoken unavailable; falling back to char-based estimation")
+
+        def _estimate_tokens(text: str) -> int:
+            if _token_counting_available:
+                return count_tokens(text)
+            return int(len(text) * 0.4)
+
+        # Resolve model name for context-window lookup
+        _active_model = model_override or ""
+        if not _active_model:
+            try:
+                _active_model = client._default_model or ""  # type: ignore[attr-defined]
+            except Exception:
+                _active_model = ""
+
+        if _token_counting_available:
+            _context_window = get_context_window(_active_model)
+        else:
+            _context_window = 64_000  # conservative default
+
+        # Build the single-pass prompt to measure its token footprint
+        _single_pass_prompt = _pm.render(
             "coherence_refine.txt",
             language_instruction=_language_instruction(state),
-            lang_hard_rule=lang_hard_rule if lang_hard_rule else "Respect the document's dominant language.",
+            lang_hard_rule=effective_lang_rule,
             body_md=body_md,
         )
-        try:
-            resp_coherence = client.chat(
-                messages=[
-                    {"role": "system", "content": "You are an expert in scholarly synthesis and coherence editing."},
-                    {"role": "user", "content": coherence_prompt},
-                ],
-                model=model_override,
-                max_tokens=3500,
+        _sys_tokens = _estimate_tokens("You are an expert in scholarly synthesis and coherence editing.")
+        _prompt_tokens = _estimate_tokens(_single_pass_prompt) + _sys_tokens
+        _body_tokens = _estimate_tokens(body_md)
+
+        if _token_counting_available:
+            _use_sliding = needs_sliding_window(
+                _prompt_tokens, _context_window, safety_margin=0.10, min_output_tokens=1024
             )
-            refined_body = (resp_coherence.get("final_text") or "").strip()
-            if refined_body:
-                candidate_markdown = refined_body + ("\n\n" + refs_md.strip() if refs_md.strip() else "")
-                ok, guard_diag = _citation_guard_ok(assembled, candidate_markdown)
-                lang_ok = _language_consistency_ok(refined_body)
-                if ok and lang_ok:
-                    final_markdown = candidate_markdown
-                    _emit_progress(
-                        state,
-                        "global_refine_done",
-                        {
-                            "message": "已完成全文连贯性整合与跨章节一致性优化。",
-                            "open_gaps": len(aggregated_open_gaps),
-                            "citation_guard": guard_diag,
-                        },
-                    )
+        else:
+            # Fallback heuristic: slide if body > 6000 tokens (~15k chars)
+            _use_sliding = _body_tokens > 6000
+
+        _emit_progress(
+            state,
+            "coherence_strategy_selected",
+            {
+                "strategy": "sliding_window" if _use_sliding else "single_pass",
+                "body_tokens": _body_tokens,
+                "prompt_tokens": _prompt_tokens,
+                "context_window": _context_window,
+            },
+        )
+
+        # ── Helper: extract tail tokens from a text ──
+        def _tail_tokens(text: str, n_tokens: int) -> str:
+            """Return approximately the last n_tokens worth of text."""
+            approx_chars = n_tokens * 4
+            return text[-approx_chars:] if len(text) > approx_chars else text
+
+        # ── Helper: extract head tokens from a text ──
+        def _head_tokens(text: str, n_tokens: int) -> str:
+            """Return approximately the first n_tokens worth of text."""
+            approx_chars = n_tokens * 4
+            return text[:approx_chars] if len(text) > approx_chars else text
+
+        # ===================================================================
+        # PATH A — Single-pass (document fits within context window)
+        # ===================================================================
+        if not _use_sliding:
+            if _token_counting_available:
+                output_budget = compute_safe_budget(_prompt_tokens, _context_window)
+                # A rewrite should not expand the document significantly
+                output_budget = min(output_budget, _body_tokens + 500)
+            else:
+                output_budget = 3500
+
+            try:
+                resp_coherence = client.chat(
+                    messages=[
+                        {"role": "system", "content": "You are an expert in scholarly synthesis and coherence editing."},
+                        {"role": "user", "content": _single_pass_prompt},
+                    ],
+                    model=model_override,
+                    max_tokens=output_budget,
+                )
+                refined_body = (resp_coherence.get("final_text") or "").strip()
+                if refined_body:
+                    candidate_markdown = refined_body + ("\n\n" + refs_md.strip() if refs_md.strip() else "")
+                    ok, guard_diag = _citation_guard_ok(assembled, candidate_markdown)
+                    lang_ok = _language_consistency_ok(refined_body)
+                    if ok and lang_ok:
+                        final_markdown = candidate_markdown
+                        _emit_progress(
+                            state,
+                            "global_refine_done",
+                            {
+                                "message": "已完成全文连贯性整合与跨章节一致性优化。",
+                                "strategy": "single_pass",
+                                "open_gaps": len(aggregated_open_gaps),
+                                "citation_guard": guard_diag,
+                            },
+                        )
+                    else:
+                        logger.warning(
+                            "Global refine fallback (citation/lang guard): citation=%s, lang_ok=%s",
+                            guard_diag,
+                            lang_ok,
+                        )
+                        _emit_progress(
+                            state,
+                            "citation_guard_fallback",
+                            {
+                                "message": "检测到整合后语言/引用一致性风险，已回退到整合前版本。",
+                                "guard": guard_diag,
+                                "language_guard_ok": lang_ok,
+                            },
+                        )
+            except Exception as e:
+                logger.warning("Global coherence refine (single-pass) failed: %s", e)
+                _emit_progress(
+                    state,
+                    "warning",
+                    {"message": "全文连贯性整合失败，已回退到合成稿。"},
+                )
+
+        # ===================================================================
+        # PATH B — Sliding window (document too long for a single call)
+        # ===================================================================
+        else:
+            sections_list = _split_into_sections(body_md)
+            n_sections = len(sections_list)
+            topic_str = state.get("topic") or ""
+            # Abstract is inserted at parts[1]; try to extract it from the assembled text
+            _abstract_for_blueprint = abstract if abstract else ""
+
+            refined_sections: List[str] = []
+            window_errors = 0
+
+            for idx, (heading, sec_body) in enumerate(sections_list):
+                current_section_text = (heading + "\n" + sec_body).strip() if heading else sec_body.strip()
+
+                # Build global context guide (blueprint with current marker)
+                blueprint = _build_document_blueprint(
+                    topic=topic_str,
+                    abstract=_abstract_for_blueprint,
+                    sections=sections_list,
+                    current_idx=idx,
+                )
+
+                # Build local context: tail of previous section
+                if idx > 0:
+                    prev_heading, prev_body = sections_list[idx - 1]
+                    prev_full = (prev_heading + "\n" + prev_body).strip()
+                    prev_tail = _tail_tokens(prev_full, 300)
                 else:
-                    logger.warning(
-                        "Global refine fallback (citation/lang guard): citation=%s, lang_ok=%s",
-                        guard_diag,
-                        lang_ok,
+                    prev_tail = "(This is the first section — no preceding content.)"
+
+                # Build local context: head of next section
+                if idx < n_sections - 1:
+                    next_heading, next_body = sections_list[idx + 1]
+                    next_full = (next_heading + "\n" + next_body).strip()
+                    next_preview = _head_tokens(next_full, 150)
+                else:
+                    next_preview = "(This is the last section — no following content.)"
+
+                window_prompt = _pm.render(
+                    "coherence_refine_window.txt",
+                    language_instruction=_language_instruction(state),
+                    lang_hard_rule=effective_lang_rule,
+                    document_blueprint=blueprint,
+                    prev_tail=prev_tail,
+                    current_section=current_section_text,
+                    next_preview=next_preview,
+                )
+
+                # Dynamic output budget per window: allow modest expansion
+                sec_tokens = _estimate_tokens(current_section_text)
+                if _token_counting_available:
+                    win_prompt_tokens = _estimate_tokens(window_prompt) + _sys_tokens
+                    win_budget = compute_safe_budget(win_prompt_tokens, _context_window)
+                    win_budget = min(win_budget, sec_tokens + 600)
+                else:
+                    win_budget = min(3500, sec_tokens + 600)
+
+                try:
+                    resp_win = client.chat(
+                        messages=[
+                            {"role": "system", "content": "You are an expert in scholarly synthesis and coherence editing."},
+                            {"role": "user", "content": window_prompt},
+                        ],
+                        model=model_override,
+                        max_tokens=win_budget,
                     )
+                    refined_sec = (resp_win.get("final_text") or "").strip()
+                    refined_sections.append(refined_sec if refined_sec else current_section_text)
                     _emit_progress(
                         state,
-                        "citation_guard_fallback",
-                        {
-                            "message": "检测到整合后语言/引用一致性风险，已回退到整合前版本。",
-                            "guard": guard_diag,
-                            "language_guard_ok": lang_ok,
-                        },
+                        "coherence_window_done",
+                        {"window": idx + 1, "total": n_sections, "section": heading.lstrip("#").strip()},
                     )
-        except Exception as e:
-            logger.warning("Global coherence refine failed: %s", e)
-            _emit_progress(
-                state,
-                "warning",
-                {"message": "全文连贯性整合失败，已回退到合成稿。"},
-            )
+                except Exception as e:
+                    logger.warning("Coherence window %d/%d failed: %s", idx + 1, n_sections, e)
+                    refined_sections.append(current_section_text)
+                    window_errors += 1
+
+            refined_body = "\n\n".join(refined_sections)
+            candidate_markdown = refined_body + ("\n\n" + refs_md.strip() if refs_md.strip() else "")
+            ok, guard_diag = _citation_guard_ok(assembled, candidate_markdown)
+            lang_ok = _language_consistency_ok(refined_body)
+            if ok and lang_ok:
+                final_markdown = candidate_markdown
+                _emit_progress(
+                    state,
+                    "global_refine_done",
+                    {
+                        "message": "已完成滑动窗口全文连贯性整合。",
+                        "strategy": "sliding_window",
+                        "windows": n_sections,
+                        "window_errors": window_errors,
+                        "open_gaps": len(aggregated_open_gaps),
+                        "citation_guard": guard_diag,
+                    },
+                )
+            else:
+                logger.warning(
+                    "Sliding window refine fallback (citation/lang guard): citation=%s, lang_ok=%s",
+                    guard_diag,
+                    lang_ok,
+                )
+                _emit_progress(
+                    state,
+                    "citation_guard_fallback",
+                    {
+                        "message": "滑动窗口整合后检测到语言/引用一致性风险，已回退到整合前版本。",
+                        "guard": guard_diag,
+                        "language_guard_ok": lang_ok,
+                        "strategy": "sliding_window",
+                    },
+                )
 
     # ── Final citation resolution pass (whole document) ──
     all_evidence_chunks = state.get("evidence_chunks", [])

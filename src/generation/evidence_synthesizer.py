@@ -11,9 +11,9 @@
 零延迟增加、零额外 token 消耗。
 
 引用流程：
-  1. 上下文中每条证据用 chunk 的 ref_hash (8位十六进制) 作为引用标记
-  2. LLM 在回答中使用 [ref_hash] 引用
-  3. 生成后由 citation/manager.resolve_response_citations() 将 hash 替换为
+  1. 上下文中每条证据用 chunk 的 ref_hash（格式 ref:xxxxxxxx）作为引用标记，在文本中呈现为 [ref:a1b2c3d4]
+  2. LLM 在回答中使用 [ref:xxxx] 引用；`ref:` 命名空间前缀防止误匹配领域文本（内存地址、Git commit 等）
+  3. 生成后由 citation/manager.resolve_response_citations() 将 [ref:xxxx] 替换为
      正式 cite_key（numbered / author_date / hash 格式），同时输出文档级引文列表
 
 使用方法:
@@ -198,7 +198,7 @@ class EvidenceSynthesizer:
             ),
         )
 
-        # 5. 构建 context string（使用 ref_hash 作为引用标记）
+        # 5. 构建 context string（使用 [ref:xxxx] 作为引用标记）
         context = self._build_context(sorted_chunks, meta, cross_validated_docs)
 
         # 6. 回写到 pack
@@ -346,7 +346,7 @@ class EvidenceSynthesizer:
 
         tag_str = " | ".join(tags)
 
-        # 引用标记：使用稳定的 8 位哈希
+        # 引用标记：使用带命名空间前缀的稳定哈希（格式 [ref:xxxxxxxx]）
         ref = chunk.ref_hash
 
         return f"[{tag_str}] [{ref}]\n{text}"
