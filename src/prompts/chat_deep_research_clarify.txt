@@ -1,42 +1,44 @@
-用户想要进行深度研究。请先生成澄清问题：
-- 至少 1 个问题（即使主题较明确，也要有 1 个关键确认问题）；
-- 如果主题不明确或歧义较大，生成更多问题（最多 6 个）；
-- 问题按优先级排序。
-然后输出一个结构化研究简报。
+The user wants to conduct deep research. Generate clarification questions first:
+- At least 1 question (even if the topic is clear, include 1 key confirmation question);
+- If the topic is ambiguous or broad, generate more questions (up to 6);
+- Questions should be sorted by priority.
+Then output a structured research brief.
 
-用户的主题描述: "{message}"
+User's topic: "{message}"
 
-对话历史上下文:
+Conversation history:
 {history_block}
 
-请生成问题帮助明确（优先级从高到低）：
-1. 研究主题的精确范围
-2. 重点关注的方向（如理论/应用/方法论）
-3. 目标受众和写作风格（学术论文/科普/报告）
-4. 篇幅和深度要求
-5. 特别需要关注的子主题或排除的内容
-6. 文献语言偏好
+{language_instruction}
 
-约束：
-- questions 数量必须在 1 到 6 之间
-- 问题应尽量具体、可回答，避免重复
+Generate questions to clarify (priority from high to low):
+1. Precise scope of the research topic
+2. Key focus areas (e.g. theoretical mechanisms, experimental methods, or applications)
+3. Target audience and writing style (academic paper / popular science / report)
+4. Length and depth requirements
+5. Sub-topics to emphasize or exclude
+6. Literature language preference
 
-返回 JSON 格式:
+Constraints:
+- Number of questions must be between 1 and 6
+- Questions should be specific, answerable, and non-repetitive
+
+Return JSON format:
 {{
-  "suggested_topic": "建议的综述主题（一句话）",
-  "suggested_outline": ["章节1", "章节2", ...],
+  "suggested_topic": "Suggested review topic (one sentence)",
+  "suggested_outline": ["Section 1", "Section 2", ...],
   "research_brief": {{
-    "scope": "研究范围描述",
-    "success_criteria": ["完成标准1", "完成标准2"],
-    "key_questions": ["核心问题1", "核心问题2"],
-    "exclusions": ["排除内容"],
-    "time_range": "文献时间范围",
+    "scope": "Research scope description",
+    "success_criteria": ["criterion 1", "criterion 2"],
+    "key_questions": ["key question 1", "key question 2"],
+    "exclusions": ["out-of-scope content"],
+    "time_range": "literature time range",
     "source_priority": ["peer-reviewed papers", "reviews"]
   }},
   "questions": [
-    {{"id": "q1", "text": "问题文本", "type": "text", "default": "建议答案"}},
-    {{"id": "q2", "text": "问题文本", "type": "choice", "options": ["选项A", "选项B"], "default": "选项A"}}
+    {{"id": "q1", "text": "Question text", "type": "text", "default": "Suggested answer"}},
+    {{"id": "q2", "text": "Question text", "type": "choice", "options": ["Option A", "Option B"], "default": "Option A"}}
   ]
 }}
 
-只返回 JSON，不要其他文字。
+Return ONLY JSON, no other text.

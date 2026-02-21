@@ -45,6 +45,7 @@ export interface Source {
   snippet?: string;
   path?: string;
   type?: 'local' | 'web';
+  provider?: string;  // local | tavily | google | scholar | semantic | ncbi
   bbox?: number[];
   page_num?: number | null;
 }
@@ -55,6 +56,11 @@ export interface Message {
   content: string;
   sources?: Source[];
   timestamp?: string;
+  providerStats?: {
+    chunk_level: Record<string, number>;
+    citation_level: Record<string, number>;
+  };
+  agentDebug?: AgentDebugData | null;
 }
 
 export interface RetrievalStageDiag {
@@ -82,6 +88,10 @@ export interface EvidenceSummary {
   evidence_type_breakdown?: Record<string, number>;
   cross_validated_count?: number;
   total_documents?: number;
+  provider_stats?: {
+    chunk_level: Record<string, number>;
+    citation_level: Record<string, number>;
+  };
   // P1 检索诊断
   diagnostics?: RetrievalDiagnostics;
 }
@@ -106,8 +116,9 @@ export interface ChatRequest {
   llm_provider?: string;  // LLM 提供商: deepseek | openai | gemini | claude | kimi 等
   model_override?: string;  // 覆盖默认模型，如 claude-opus-4-6
   mode?: ChatMode;  // 执行模式: chat（默认）| deep_research
-  use_content_fetcher?: boolean;  // 是否对网络搜索结果做全文抓取（None 用后端默认）
-  use_agent?: boolean;  // 是否启用 Agent 模式（ReAct 循环 / LangGraph 引擎）
+  use_content_fetcher?: 'auto' | 'force' | 'off';  // 是否对网络搜索结果做全文抓取（None 用后端默认）
+  use_agent?: boolean;  // [兼容旧字段] 是否启用 Agent，推荐使用 agent_mode
+  agent_mode?: 'standard' | 'assist' | 'autonomous';  // Agent 执行模式
   clarification_answers?: Record<string, string>;
   output_language?: 'auto' | 'en' | 'zh';
   step_models?: Record<string, string | null | undefined>;
@@ -530,9 +541,12 @@ export interface RagConfig {
   localTopK: number;
   localThreshold: number;  // 相似度阈值 (0-1)
   finalTopK: number;  // 最终保留的文档数（local + web 合并重排后）
+  yearStart?: number | null; // 全局年份过滤起始
+  yearEnd?: number | null; // 全局年份过滤结束
   enableHippoRAG: boolean;
   enableReranker: boolean;
-  enableAgent: boolean;  // 是否启用 Agent 模式（ReAct / LangGraph）
+  agentMode: 'standard' | 'assist' | 'autonomous';  // Agent 执行模式
+  agentDebugMode: boolean;  // 是否显示 Agent 详细调试面板
 }
 
 export interface WebSearchConfig {
@@ -540,7 +554,7 @@ export interface WebSearchConfig {
   sources: WebSource[];
   queryOptimizer: boolean;   // 查询优化器（针对不同搜索引擎优化查询格式）
   maxQueriesPerProvider: number; // 每个搜索引擎每种语言的查询数
-  enableContentFetcher: boolean;  // 是否对网络搜索结果做全文抓取
+  contentFetcherMode: 'auto' | 'force' | 'off';  // 全文抓取模式
 }
 
 // ============================================================
@@ -608,6 +622,27 @@ export interface ToolTraceItem {
   arguments: Record<string, unknown>;
   result: string;
   is_error: boolean;
+  tool_latency_ms?: number;
+  llm_latency_ms?: number;
+}
+
+export interface AgentStats {
+  total_iterations: number;
+  total_tool_calls: number;
+  tools_used_summary: Record<string, number>;
+  total_tool_time_ms: number;
+  total_llm_time_ms: number;
+  total_agent_time_ms: number;
+  error_count: number;
+}
+
+export interface AgentDebugData {
+  agent_stats: AgentStats;
+  tool_trace: ToolTraceItem[];
+  tools_contributed: boolean;
+  pre_retrieval_chunks: number;
+  agent_added_chunks: number;
+  cited_from_agent: number;
 }
 
 // ============================================================

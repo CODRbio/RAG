@@ -21,9 +21,34 @@ import traceback
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
+import threading
+
 from src.log import get_logger
 
 logger = get_logger(__name__)
+
+# Thread-local collector for EvidenceChunks produced by Agent tool calls.
+# routes_chat.py activates/reads this around the react_loop invocation.
+_agent_chunks_local = threading.local()
+
+
+def start_agent_chunk_collector() -> None:
+    """Activate the per-thread chunk collector (call before react_loop)."""
+    _agent_chunks_local.chunks = []
+
+
+def drain_agent_chunks() -> list:
+    """Return and clear all collected chunks (call after react_loop)."""
+    chunks = getattr(_agent_chunks_local, "chunks", None) or []
+    _agent_chunks_local.chunks = []
+    return chunks
+
+
+def _collect_chunks(chunks: list) -> None:
+    """Append EvidenceChunks to the thread-local collector if active."""
+    store = getattr(_agent_chunks_local, "chunks", None)
+    if store is not None:
+        store.extend(chunks)
 
 
 # ────────────────────────────────────────────────
@@ -397,6 +422,7 @@ def _handle_search_local(query: str, top_k: int = 10, **_) -> str:
     from src.retrieval.service import get_retrieval_service
     svc = get_retrieval_service()
     pack = svc.search(query=query, mode="local", top_k=top_k)
+    _collect_chunks(pack.chunks[:min(top_k, 15)])
     return pack.to_context_string(max_chunks=min(top_k, 15))
 
 
@@ -404,23 +430,45 @@ def _handle_search_web(query: str, top_k: int = 10, **_) -> str:
     from src.retrieval.service import get_retrieval_service
     svc = get_retrieval_service()
     pack = svc.search(query=query, mode="web", top_k=top_k)
+    _collect_chunks(pack.chunks[:min(top_k, 15)])
     return pack.to_context_string(max_chunks=min(top_k, 15))
 
 
 def _handle_search_scholar(query: str, year_from: Optional[int] = None, limit: int = 5, **_) -> str:
     try:
         from src.retrieval.semantic_scholar import SemanticScholarSearch
+        from src.retrieval.evidence import EvidenceChunk
         ss = SemanticScholarSearch()
         results = ss.search(query, year_from=year_from, limit=limit)
         if not results:
             return "未找到相关学术论文。"
         lines = []
+        chunks = []
         for r in results[:limit]:
             title = r.get("title", "")
             year = r.get("year", "")
             abstract = (r.get("abstract") or "")[:300]
             doi = r.get("externalIds", {}).get("DOI", "")
-            lines.append(f"- **{title}** ({year}) DOI:{doi}\n  {abstract}")
+            paper_id = r.get("paperId", "")
+            authors_raw = r.get("authors") or []
+            author_names = [a.get("name", "") for a in authors_raw if isinstance(a, dict)]
+            url = f"https://api.semanticscholar.org/CorpusID:{paper_id}" if paper_id else ""
+            chunk = EvidenceChunk(
+                chunk_id=f"scholar_{paper_id or title[:20]}",
+                doc_id=doi or paper_id or title[:30],
+                text=f"{title}. {abstract}",
+                score=0.0,
+                source_type="web",
+                doc_title=title,
+                authors=author_names[:5],
+                year=int(year) if year else None,
+                url=url,
+                doi=doi or None,
+                provider="semantic",
+            )
+            chunks.append(chunk)
+            lines.append(f"[{chunk.ref_hash}] **{title}** ({year}) DOI:{doi}\n  {abstract}")
+        _collect_chunks(chunks)
         return "\n".join(lines)
     except Exception as e:
         return f"学术搜索失败: {e}"
@@ -502,6 +550,7 @@ def _handle_search_ncbi(query: str, limit: int = 5, **_) -> str:
     try:
         import asyncio
         from src.retrieval.ncbi_search import get_ncbi_searcher
+        from src.retrieval.evidence import EvidenceChunk
 
         searcher = get_ncbi_searcher()
         try:
@@ -520,6 +569,7 @@ def _handle_search_ncbi(query: str, limit: int = 5, **_) -> str:
             return "PubMed 未找到相关文献。"
 
         lines = []
+        chunks = []
         for r in results[:limit]:
             meta = r.get("metadata", {})
             title = meta.get("title", r.get("content", ""))
@@ -528,11 +578,28 @@ def _handle_search_ncbi(query: str, limit: int = 5, **_) -> str:
             authors = meta.get("authors", [])
             authors_str = ", ".join(authors[:3]) + ("..." if len(authors) > 3 else "")
             url = meta.get("url", "")
+            pmid = meta.get("pmid", "")
+            abstract = (r.get("content") or meta.get("abstract") or "")[:400]
+            chunk = EvidenceChunk(
+                chunk_id=f"ncbi_{pmid or doi or title[:20]}",
+                doc_id=doi or pmid or title[:30],
+                text=f"{title}. {abstract}",
+                score=0.0,
+                source_type="web",
+                doc_title=title,
+                authors=authors[:5],
+                year=int(year) if year else None,
+                url=url or None,
+                doi=doi or None,
+                provider="ncbi",
+            )
+            chunks.append(chunk)
             lines.append(
-                f"- **{title}** ({year})\n"
+                f"[{chunk.ref_hash}] **{title}** ({year})\n"
                 f"  Authors: {authors_str}\n"
                 f"  DOI: {doi or '—'}  URL: {url}"
             )
+        _collect_chunks(chunks)
         return "\n".join(lines)
     except Exception as e:
         return f"NCBI 搜索失败: {e}"

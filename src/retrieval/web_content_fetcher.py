@@ -216,6 +216,7 @@ class WebContentFetcher:
                 maxsize=512,
                 prefix="content_fetcher",
             )
+        self._inflight: Dict[str, asyncio.Future] = {}
 
     @classmethod
     def from_settings(cls) -> "WebContentFetcher":
@@ -458,41 +459,58 @@ class WebContentFetcher:
 
         trafilatura → BrightData → Playwright
 
+        同 URL 并发请求自动合并（in-flight dedup），周期内 TTLCache 防止重复抓取。
+
         Args:
             url: 目标 URL
 
         Returns:
             提取的正文文本，失败返回 None
         """
-        # 检查缓存
+        # ── 1. Fast path: TTLCache 命中直接返回 ──
         if self._cache:
-            cache_key = _make_key("content", url)
-            cached = self._cache.get(cache_key)
+            cached = self._cache.get(_make_key("content", url))
             if cached is not None:
-                logger.debug(f"缓存命中: {url}")
+                logger.debug("周期内缓存命中: %s", url)
                 return cached
 
-        # 第一级：trafilatura
-        text = await self._fetch_trafilatura(url)
+        # ── 2. In-flight dedup: 同 URL 已有在途请求则等待 ──
+        inflight = self._inflight.get(url)
+        if inflight is not None:
+            logger.debug("等待同 URL 在途请求: %s", url)
+            try:
+                return await asyncio.shield(inflight)
+            except Exception:
+                pass
 
-        # 第二级：BrightData
-        if text is None:
-            text = await self._fetch_brightdata(url)
+        # ── 3. 发起新请求，注册 Future 供其他协程复用 ──
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[Optional[str]] = loop.create_future()
+        self._inflight[url] = fut
 
-        # 第三级：Playwright
-        if text is None:
-            text = await self._fetch_playwright(url)
+        try:
+            text = await self._fetch_trafilatura(url)
+            if text is None:
+                text = await self._fetch_brightdata(url)
+            if text is None:
+                text = await self._fetch_playwright(url)
 
-        # 截断到最大长度
-        if text and len(text) > self.max_content_length:
-            text = text[: self.max_content_length]
+            if text and len(text) > self.max_content_length:
+                text = text[: self.max_content_length]
 
-        # 写入缓存
-        if text and self._cache:
-            cache_key = _make_key("content", url)
-            self._cache.set(cache_key, text)
+            # 写入 TTLCache，后续同 URL 请求直接命中
+            if text and self._cache:
+                self._cache.set(_make_key("content", url), text)
 
-        return text
+            if not fut.done():
+                fut.set_result(text)
+            return text
+        except Exception as exc:
+            if not fut.done():
+                fut.set_exception(exc)
+            raise
+        finally:
+            self._inflight.pop(url, None)
 
     # --------------------------------------------------------
     # LLM 预判：哪些 URL 需要抓取全文
@@ -575,19 +593,17 @@ class WebContentFetcher:
         results: List[Dict[str, Any]],
         query: Optional[str] = None,
         llm_client: Optional[Any] = None,
-        use_content_fetcher: Optional[bool] = None,
+        use_content_fetcher: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         异步批量抓取搜索结果的全文内容。
 
         抓取策略由 use_content_fetcher 和 llm_client 共同决定：
 
-        - use_content_fetcher=True  （硬强制）：跳过 LLM 预判，对所有合格 URL 全量抓取。
-        - use_content_fetcher=None  （智能模式）且提供 llm_client：
-            先调用 evaluate_snippets_need_fetch 获取需要抓取的 URL 子集，
-            仅对这些 URL 执行 fetch_content；其余合格 URL 标记
-            metadata.content_type = "snippet_sufficient"。
-        - use_content_fetcher=None  且无 llm_client：全量抓取（兼容旧行为）。
+        - use_content_fetcher='force'：硬强制，跳过来源限制和 LLM 预判，对所有合格 URL 全量抓取。
+        - use_content_fetcher='auto' / None（智能模式）且提供 llm_client：
+            仅对 scholar/google 来源调用 LLM 预判，选择性抓取。
+        - use_content_fetcher='auto' / None 且无 llm_client：对 scholar/google 来源全量抓取。
 
         成功抓取后：
         - 原始 content 保存到 metadata.original_snippet
@@ -598,7 +614,7 @@ class WebContentFetcher:
             results:              UnifiedWebSearcher 返回的搜索结果列表
             query:                原始查询（用于日志与 LLM prompt）
             llm_client:           LLMManager 客户端，不为 None 时启用智能预判
-            use_content_fetcher:  True=强制全量, None=智能/配置, False 由调用层拦截
+            use_content_fetcher:  'force'=强制全量, 'auto'/None=智能, 'off' 由调用层拦截
 
         Returns:
             增强后的结果列表（原地修改）
@@ -608,7 +624,7 @@ class WebContentFetcher:
 
         # 智能模式 + LLM 可用：先预判，再选择性抓取
         urls_to_fetch: Optional[set] = None  # None 表示"全量抓取"
-        if use_content_fetcher is None and llm_client is not None:
+        if use_content_fetcher in (None, "auto") and llm_client is not None:
             fetching_urls = await self.evaluate_snippets_need_fetch(
                 query or "", results, llm_client
             )
@@ -627,11 +643,17 @@ class WebContentFetcher:
                     metadata["content_type"] = "snippet_sufficient"
                     hit["metadata"] = metadata
 
+        is_force = use_content_fetcher == "force"
+
         sem = asyncio.Semaphore(self.max_concurrent)
 
         async def _process_one(hit: Dict[str, Any]) -> None:
             metadata = hit.get("metadata") or {}
+            source = metadata.get("source", "")
             url = (metadata.get("url") or "").strip()
+
+            if not is_force and source not in ("scholar", "google"):
+                return
 
             if not url or not is_qualifying_url(url, only_academic=self.only_academic):
                 return
@@ -683,7 +705,7 @@ class WebContentFetcher:
         results: List[Dict[str, Any]],
         query: Optional[str] = None,
         llm_client: Optional[Any] = None,
-        use_content_fetcher: Optional[bool] = None,
+        use_content_fetcher: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         同步版本的 enrich_results，兼容 RetrievalService。

@@ -34,8 +34,6 @@ export function DeepResearchDialog() {
   // UI-only form state shared across generatePlan and confirmAndRun
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const [outputLanguage, setOutputLanguage] = useState<'auto' | 'en' | 'zh'>('auto');
-  const [yearStart, setYearStart] = useState<number | null>(null);
-  const [yearEnd, setYearEnd] = useState<number | null>(null);
   const [stepModelStrict, setStepModelStrict] = useState(false);
   const [stepModels, setStepModels] = useState<Record<string, string>>({
     scope: 'sonar::sonar-pro',
@@ -92,8 +90,6 @@ export function DeepResearchDialog() {
     const defaults = useConfigStore.getState().deepResearchDefaults;
     setDepth(defaults.depth);
     setOutputLanguage(defaults.outputLanguage);
-    setYearStart(defaults.yearStart ?? null);
-    setYearEnd(defaults.yearEnd ?? null);
     setStepModelStrict(defaults.stepModelStrict);
     setSkipClaimGeneration(defaults.skipClaimGeneration);
     setStepModels({ ...defaults.stepModels });
@@ -115,8 +111,6 @@ export function DeepResearchDialog() {
     topic: deepResearchTopic,
     answers,
     outputLanguage,
-    yearStart,
-    yearEnd,
     stepModels,
     stepModelStrict,
   });
@@ -248,7 +242,7 @@ export function DeepResearchDialog() {
               type="text"
               value={deepResearchTopic}
               onChange={(e) => setDeepResearchTopic(e.target.value)}
-              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none"
+              className="w-full border border-gray-300 bg-white text-gray-900 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none"
               placeholder="输入综述主题..."
             />
           </div>

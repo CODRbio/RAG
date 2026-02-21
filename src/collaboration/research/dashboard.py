@@ -21,18 +21,21 @@ class ResearchBrief:
     exclusions: List[str] = field(default_factory=list)        # 明确排除的内容
     time_range: str = ""                     # 文献时间范围
     source_priority: List[str] = field(default_factory=list)   # 优先来源类型
+    # "biomedical" enables NCBI Tier-1 search; other values ("cs_ai", "general", etc.) skip it
+    topic_domain: str = "general"
 
 
 @dataclass
 class SectionStatus:
     """章节状态"""
     title: str
-    status: str = "pending"  # pending | researching | writing | reviewing | done
+    status: str = "pending"  # pending | researching | completing | writing | reviewing | done
     coverage_score: float = 0.0  # 0-1，信息充分度
     source_count: int = 0
     gaps: List[str] = field(default_factory=list)  # 该章节的信息缺口
     research_rounds: int = 0  # 该章节已执行的研究轮次（用于 per-section 限制）
     evidence_scarce: bool = False  # 检索证据不足（用于写作降级与最终限制说明）
+    completion_round_done: bool = False  # True after Completion Round ran (prevents re-scheduling)
 
 
 @dataclass
@@ -96,11 +99,19 @@ class ResearchDashboard:
             self.overall_confidence = "low"
 
     def get_next_section(self) -> Optional[SectionStatus]:
-        """获取下一个需要处理的章节"""
+        """获取下一个需要处理的章节
+
+        Priority order:
+        1. "completing" — Completion Round scheduled, must run T3 before writing
+        2. "pending" / "researching" — normal research loop
+        3. "reviewing" with low coverage — needs additional research
+        """
+        for s in self.sections:
+            if s.status == "completing":
+                return s
         for s in self.sections:
             if s.status in ("pending", "researching"):
                 return s
-        # 检查是否有 reviewing 的章节需要补充
         for s in self.sections:
             if s.status == "reviewing" and s.coverage_score < 0.6:
                 return s
@@ -130,8 +141,8 @@ class ResearchDashboard:
         # 各章节状态
         lines.append("\nSection Status:")
         for s in self.sections:
-            icon = {"pending": "⬜", "researching": "🔍", "writing": "✍️",
-                    "reviewing": "🔄", "done": "✅"}.get(s.status, "⬜")
+            icon = {"pending": "⬜", "researching": "🔍", "completing": "🔎",
+                    "writing": "✍️", "reviewing": "🔄", "done": "✅"}.get(s.status, "⬜")
             cov = f"{s.coverage_score:.0%}" if s.coverage_score > 0 else "—"
             gaps_str = f" [Gaps: {', '.join(s.gaps[:2])}]" if s.gaps else ""
             lines.append(f"  {icon} {s.title} (Coverage:{cov}, Sources:{s.source_count}){gaps_str}")
@@ -170,6 +181,7 @@ class ResearchDashboard:
                     "gaps": s.gaps,
                     "research_rounds": s.research_rounds,
                     "evidence_scarce": s.evidence_scarce,
+                    "completion_round_done": s.completion_round_done,
                 }
                 for s in self.sections
             ],

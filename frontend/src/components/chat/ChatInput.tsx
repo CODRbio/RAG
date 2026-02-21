@@ -45,9 +45,11 @@ export function ChatInput() {
   /**
    * 触发 Deep Research 流程（打开澄清对话框）
    * 使用 ⚙ 弹窗中持久化的 scope 模型来生成澄清问题。
+   *
+   * @param topic 必须显式传入主题，不从 inputValue 闭包读取，避免 React 并发模式下的值捕获问题
    */
-  const handleDeepResearch = async (topic?: string) => {
-    const researchTopic = topic || inputValue.trim();
+  const handleDeepResearch = async (topic: string) => {
+    const researchTopic = topic.trim();
     if (!researchTopic) {
       addToast(t('chatInput.enterTopic'), 'error');
       return;
@@ -86,8 +88,10 @@ export function ChatInput() {
       });
       const questions = result.questions || [];
       setClarificationQuestions(questions);
-      if (result.suggested_topic) {
-        setDeepResearchTopic(result.suggested_topic);
+      // 仅当 suggested_topic 非空时才覆盖（trim 避免空白字符串误判为有效值）
+      const suggestedTopic = (result.suggested_topic || '').trim();
+      if (suggestedTopic) {
+        setDeepResearchTopic(suggestedTopic);
       }
       if (questions.length === 0) {
         addToast(t('chatInput.topicClear'), 'info');
@@ -119,7 +123,11 @@ export function ChatInput() {
     // /auto 命令 → 触发 Deep Research 流程
     if (messageToSend.startsWith('/auto')) {
       const topic = messageToSend.replace(/^\/auto\s*/, '').trim();
-      handleDeepResearch(topic || undefined);
+      if (topic) {
+        handleDeepResearch(topic);
+      } else {
+        addToast(t('chatInput.enterTopic'), 'error');
+      }
       return;
     }
 
@@ -177,11 +185,11 @@ export function ChatInput() {
       query_optimizer_max_queries: (searchMode !== 'none' && webEnabled) ? maxQueries : undefined,
       local_top_k: (searchMode !== 'none' && localEnabled) ? ragConfig.localTopK : undefined,
       local_threshold: (searchMode !== 'none' && localEnabled) ? (ragConfig.localThreshold ?? undefined) : undefined,
-      year_start: deepResearchDefaults.yearStart ?? undefined,
-      year_end: deepResearchDefaults.yearEnd ?? undefined,
+      year_start: ragConfig.yearStart ?? undefined,
+      year_end: ragConfig.yearEnd ?? undefined,
       final_top_k: (searchMode !== 'none') ? (ragConfig.finalTopK ?? 10) : undefined,
-      use_content_fetcher: (searchMode !== 'none' && webEnabled) ? (webSearchConfig.enableContentFetcher ?? false) : undefined,
-      use_agent: ragConfig.enableAgent || undefined,
+      use_content_fetcher: (searchMode !== 'none' && webEnabled) ? webSearchConfig.contentFetcherMode : undefined,
+      agent_mode: ragConfig.agentMode ?? 'standard',
     };
 
     if (import.meta.env.DEV) {
@@ -204,6 +212,7 @@ export function ChatInput() {
             doi?: string | null;
             bbox?: number[];
             page_num?: number | null;
+            provider?: string;
           }
           const meta = data as {
             session_id: string;
@@ -234,8 +243,10 @@ export function ChatInput() {
               bbox: cite.bbox,
               page_num: cite.page_num,
               type: cite.url ? 'web' : 'local',
+              provider: cite.provider || (cite.url ? 'web' : 'local'),
             }));
-            setLastMessageSources(sources);
+            const pStats = meta.evidence_summary?.provider_stats;
+            setLastMessageSources(sources, pStats || undefined);
           }
 
           if (meta.canvas_id) {
@@ -267,6 +278,10 @@ export function ChatInput() {
           // Agent 工具调用轨迹
           const traceData = data as import('../../types').ToolTraceItem[];
           useChatStore.getState().setToolTrace(traceData);
+        } else if (event === 'agent_debug') {
+          // Agent debug 详情（含 stats + tools_contributed）
+          const debugData = data as import('../../types').AgentDebugData;
+          useChatStore.getState().setLastMessageAgentDebug(debugData);
         } else if (event === 'delta') {
           appendToLastMessage((data as { delta: string }).delta);
           setWorkflowStep('drafting');
@@ -306,9 +321,18 @@ export function ChatInput() {
 
   const handleSelectCommand = (cmd: CommandDefinition) => {
     if (cmd.mode === 'deep_research') {
-      // /auto 命令直接触发 Deep Research
+      // 从当前输入框中提取主题（去除命令前缀，如 "/auto "）
+      const rawInput = inputValue.trim();
+      const match = rawInput.match(/^\/\S+\s+(.*)/);
+      const topic = match ? match[1].trim() : '';
       setInputValue('');
-      handleDeepResearch();
+      if (topic) {
+        handleDeepResearch(topic);
+      } else {
+        // 没有额外输入主题时直接打开对话框，topic 字段留给用户填写
+        setDeepResearchTopic('');
+        setShowDeepResearchDialog(true);
+      }
       return;
     }
     setInputValue(cmd.command + ' ');
@@ -343,7 +367,7 @@ export function ChatInput() {
               <Settings size={14} />
             </button>
             <button
-              onClick={() => handleDeepResearch()}
+              onClick={() => handleDeepResearch(inputValue)}
               disabled={isStreaming || !inputValue.trim()}
               className={`
                 flex items-center gap-1.5 px-3 py-2.5 rounded-r-lg border text-sm font-medium

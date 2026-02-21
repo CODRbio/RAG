@@ -179,6 +179,10 @@ def _hit_to_chunk(hit: Dict[str, Any], source_type: str, query: str) -> Evidence
         elif isinstance(first, list) and len(first) >= 4:
             bbox = first
 
+    provider = meta.get("provider") or meta.get("source")
+    if not provider:
+        provider = "local" if source_type in ("dense", "graph") else "web"
+
     return EvidenceChunk(
         chunk_id=str(chunk_id),
         doc_id=str(doc_id),
@@ -193,6 +197,7 @@ def _hit_to_chunk(hit: Dict[str, Any], source_type: str, query: str) -> Evidence
         page_num=meta.get("page") if isinstance(meta.get("page"), int) else None,
         section_title=meta.get("section_path"),
         bbox=bbox,
+        provider=str(provider) if provider else None,
     )
 
 
@@ -252,6 +257,9 @@ class RetrievalService:
             EvidencePack
         """
         k = top_k if top_k is not None else self.top_k
+        final_top_k = (filters or {}).get("final_top_k")
+        result_limit = final_top_k if final_top_k is not None else k
+        
         sources_used: List[str] = []
         all_chunks: List[EvidenceChunk] = []
         total_candidates = 0
@@ -260,7 +268,7 @@ class RetrievalService:
 
         # Amplify retrieval pool so that the reranker always operates on a
         # sufficiently large candidate set, regardless of the caller's top_k.
-        actual_recall = max(80, k * 4)
+        actual_recall = max(80, result_limit * 4)
         year_start, year_end = _normalize_year_window(filters)
 
         # 诊断信息收集
@@ -305,9 +313,9 @@ class RetrievalService:
             )
             use_content_fetcher = (filters or {}).get("use_content_fetcher")
 
-            # 为 Lazy Fetching 预判构建 LLM 客户端（仅智能模式 use_content_fetcher=None）
+            # 为 Lazy Fetching 预判构建 LLM 客户端（仅智能模式 use_content_fetcher=None 或 'auto'）
             _llm_client = None
-            if use_content_fetcher is None:
+            if use_content_fetcher in (None, "auto"):
                 try:
                     from src.llm.llm_manager import get_manager
                     _llm_client = get_manager().get_client(_llm_provider or "deepseek")
@@ -347,7 +355,6 @@ class RetrievalService:
 
         # 获取阈值过滤参数和最终保留数量
         local_threshold = (filters or {}).get("local_threshold")
-        final_top_k = (filters or {}).get("final_top_k")
 
         if mode == "hybrid":
             local_hits: List[Dict[str, Any]] = []
@@ -438,9 +445,9 @@ class RetrievalService:
                     _auto_per_provider = max(5, math.ceil(_final * 3.5 / (_n_providers * _n_queries)))
                     _use_content_fetcher = (filters or {}).get("use_content_fetcher")
 
-                    # 为 Lazy Fetching 预判构建 LLM 客户端（仅智能模式 use_content_fetcher=None）
+                    # 为 Lazy Fetching 预判构建 LLM 客户端（仅智能模式 _use_content_fetcher=None 或 'auto'）
                     _llm_client = None
-                    if _use_content_fetcher is None:
+                    if _use_content_fetcher in (None, "auto"):
                         try:
                             from src.llm.llm_manager import get_manager
                             _llm_client = get_manager().get_client(_llm_provider or "deepseek")
@@ -468,7 +475,7 @@ class RetrievalService:
                     if web_hits:
                         try:
                             web_hits = _rerank_candidates(
-                                query, web_hits, top_k=min(k, len(web_hits))
+                                query, web_hits, top_k=min(result_limit, len(web_hits))
                             )
                         except Exception as e:
                             logger.warning("web rerank failed: %s", e)

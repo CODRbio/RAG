@@ -60,7 +60,7 @@ from src.collaboration.memory.persistent_store import get_user_profile
 from src.collaboration.workflow import run_workflow
 from src.llm.llm_manager import get_manager
 from src.llm.react_loop import react_loop
-from src.llm.tools import CORE_TOOLS, get_routed_skills
+from src.llm.tools import CORE_TOOLS, get_routed_skills, start_agent_chunk_collector, drain_agent_chunks
 from src.collaboration.citation.manager import (
     _dedupe_citations,
     chunk_to_citation,
@@ -242,7 +242,7 @@ def _chunk_text(text: str, chunk_size: int = 20):
 def _serialize_citation(c: Citation | str) -> dict:
     """将 Citation 对象或字符串序列化为字典。"""
     if isinstance(c, str):
-        return {"cite_key": c, "title": "", "authors": [], "year": None, "doc_id": None, "url": None}
+        return {"cite_key": c, "title": "", "authors": [], "year": None, "doc_id": None, "url": None, "provider": None}
     return {
         "cite_key": c.cite_key or c.id,
         "title": c.title or "",
@@ -253,6 +253,7 @@ def _serialize_citation(c: Citation | str) -> dict:
         "doi": c.doi,
         "bbox": getattr(c, "bbox", None),
         "page_num": getattr(c, "page_num", None),
+        "provider": getattr(c, "provider", None),
     }
 
 
@@ -322,11 +323,42 @@ def _infer_sources_from_citations(citations: List[Citation]) -> List[str]:
     return out or ["deep_research"]
 
 
+def _compute_citation_provider_stats(
+    citations: List[Citation],
+    chunks: list | None = None,
+) -> dict[str, dict[str, int]]:
+    """
+    Compute per-provider counts at two levels:
+    - citation_level: unique docs/URLs — same website only counts once
+    - chunk_level: individual evidence fragments — one article with 5 chunks counts 5
+    """
+    cite_counts: dict[str, int] = {}
+    for c in citations:
+        p = getattr(c, "provider", None) or ("local" if not c.url else "web")
+        cite_counts[p] = cite_counts.get(p, 0) + 1
+
+    chunk_counts: dict[str, int] = {}
+    if chunks:
+        for c in chunks:
+            p = getattr(c, "provider", None) or (
+                "local" if getattr(c, "source_type", "") in ("dense", "graph") else "web"
+            )
+            chunk_counts[p] = chunk_counts.get(p, 0) + 1
+
+    return {
+        "chunk_level": chunk_counts if chunk_counts else {},
+        "citation_level": cite_counts,
+    }
+
+
 def _run_chat(
     body: ChatRequest,
     optional_user_id: str | None = None,
-) -> tuple[str, str, list[Citation], EvidenceSummary, ParsedIntent, dict | None, list | None, dict[str, str]]:
+) -> tuple[str, str, list[Citation], EvidenceSummary, ParsedIntent, dict | None, list | None, dict[str, str], dict | None]:
     import time as _time
+    from src.debug import get_debug_logger
+    dbg = get_debug_logger()
+
     t_start = _time.perf_counter()
 
     session_id = body.session_id
@@ -347,12 +379,23 @@ def _run_chat(
     client = manager.get_client(body.llm_provider or None)
     history_for_intent = memory.get_context_window(n=6)
 
+    agent_debug_data: dict | None = None
+
+    # ── 0. 解析 agent_mode（在所有阶段之前完成，影响后续检索和生成逻辑）──
+    # 优先级：agent_mode 字段 > use_agent 布尔兼容字段 > 默认 standard
+    _raw_agent_mode = getattr(body, "agent_mode", None) or None
+    if _raw_agent_mode in ("standard", "assist", "autonomous"):
+        agent_mode = _raw_agent_mode
+    else:
+        _legacy_agent = body.use_agent if hasattr(body, "use_agent") and body.use_agent is not None else False
+        agent_mode = "assist" if _legacy_agent else "standard"
+
     # ── 1. 请求概览 ──
     _chat_logger.info(
-        "[chat] ▶ 新请求 | session=%s | msg=%r | provider=%s | model=%s | search_mode=%s | collection=%s | agent=%s",
+        "[chat] ▶ 新请求 | session=%s | msg=%r | provider=%s | model=%s | search_mode=%s | collection=%s | agent_mode=%s",
         session_id[:12], message[:60],
         body.llm_provider or "default", body.model_override or "default",
-        search_mode, (body.collection or settings.collection.global_), body.use_agent,
+        search_mode, (body.collection or settings.collection.global_), agent_mode,
     )
 
     # ── 2. 意图判断（Chat vs Deep Research）──
@@ -414,11 +457,13 @@ def _run_chat(
         memory.add_turn("user", message)
         citations_data = [_serialize_citation(c) for c in result.citations] if result.citations else []
         memory.add_turn("assistant", response_text, citations=citations_data)
+        dr_pstats = _compute_citation_provider_stats(result.citations) if result.citations else None
         evidence_summary = EvidenceSummary(
             query=topic,
             total_chunks=len(result.citations),
             sources_used=_infer_sources_from_citations(result.citations),
             retrieval_time_ms=result.total_time_ms,
+            provider_stats=dr_pstats,
         )
         dashboard_data = getattr(result, "dashboard", None)
         if dashboard_data is None and hasattr(result, "__dict__"):
@@ -428,18 +473,31 @@ def _run_chat(
             "[chat] ✔ Deep Research 完成 | citations=%d | time=%.0fms",
             len(result.citations) if result.citations else 0, elapsed,
         )
-        return session_id, response_text, result.citations, evidence_summary, parsed, dashboard_data, None, {}
+        return session_id, response_text, result.citations, evidence_summary, parsed, dashboard_data, None, {}, None
 
     # ── 3. Chat 分支：智能路由（正则 → LLM → 严格解析）──
     t_route = _time.perf_counter()
     query_needs_rag = _classify_query(message, history_for_intent, client)
-    do_retrieval = search_mode != "none" and query_needs_rag
+    # autonomous 模式跳过预检索，由 Agent 自主决定是否检索
+    do_retrieval = search_mode != "none" and query_needs_rag and agent_mode != "autonomous"
+    # 闲聊时不启动 Agent
+    if not query_needs_rag:
+        agent_mode = "standard"
     route_ms = (_time.perf_counter() - t_route) * 1000
 
     _chat_logger.info(
-        "[chat] ③ 查询路由 → %s | do_retrieval=%s (search_mode=%s) | 耗时=%.0fms",
+        "[chat] ③ 查询路由 → %s | do_retrieval=%s (search_mode=%s, agent_mode=%s) | 耗时=%.0fms",
         "rag" if query_needs_rag else "chat",
-        do_retrieval, search_mode, route_ms,
+        do_retrieval, search_mode, agent_mode, route_ms,
+    )
+    dbg.log_query_route(
+        session_id,
+        message=message[:200],
+        decision="rag" if query_needs_rag else "chat",
+        do_retrieval=do_retrieval,
+        search_mode=search_mode,
+        agent_mode=agent_mode,
+        latency_ms=round(route_ms),
     )
 
     # ── 4. 检索 query 构建（仅 rag 模式）──
@@ -454,6 +512,13 @@ def _run_chat(
         _chat_logger.info(
             "[chat] ④ Query 构建 | original=%r → query=%r | 耗时=%.0fms",
             message[:40], query[:60], query_ms,
+        )
+        dbg.log_query_build(
+            session_id,
+            original_message=message[:500],
+            rewritten_query=query[:500],
+            rolling_summary=(memory.rolling_summary or "")[:500],
+            latency_ms=round(query_ms),
         )
     else:
         query = message
@@ -471,7 +536,7 @@ def _run_chat(
             filters=filters or None,
             top_k=body.local_top_k,
         )
-        synthesizer = EvidenceSynthesizer()
+        synthesizer = EvidenceSynthesizer(max_chunks=len(pack.chunks))
         context_str, synthesis_meta = synthesizer.synthesize(pack)
         synth_dict = synthesis_meta.to_dict()
         retrieval_ms = (_time.perf_counter() - t_retrieval) * 1000
@@ -481,7 +546,7 @@ def _run_chat(
             sources_used=pack.sources_used,
             retrieval_time_ms=pack.retrieval_time_ms,
             year_range=synth_dict.get("year_range"),
-            source_breakdown=synth_dict.get("source_breakdown"),
+            source_breakdown=synth_dict.get("unique_source_breakdown") or synth_dict.get("source_breakdown"),
             evidence_type_breakdown=synth_dict.get("evidence_type_breakdown"),
             cross_validated_count=synth_dict.get("cross_validated_count", 0),
             total_documents=synth_dict.get("total_documents", 0),
@@ -495,6 +560,17 @@ def _run_chat(
             "[chat] ⑤ 检索完成 | mode=%s | chunks=%d | sources=%s | 耗时=%.0fms",
             search_mode, len(pack.chunks),
             ",".join(pack.sources_used), retrieval_ms,
+        )
+        dbg.log_retrieval(
+            session_id,
+            query=query[:500],
+            mode=search_mode,
+            total_chunks=len(pack.chunks),
+            sources_used=pack.sources_used,
+            latency_ms=round(retrieval_ms),
+            diagnostics=pack.diagnostics,
+            source_breakdown=synth_dict.get("unique_source_breakdown") or synth_dict.get("source_breakdown"),
+            year_range=synth_dict.get("year_range"),
         )
     else:
         context_str = ""
@@ -517,9 +593,20 @@ def _run_chat(
     )
     next_stage = wf["next_stage"]
     stage_prompt = wf.get("system_prompt") or ""
+
+    # 如果是普通的 chat 意图，直接使用 RAG 问答 prompt，避免被工作流（综述大纲等）提示词污染
+    is_normal_chat = parsed.intent_type.value == "chat"
+
     if not query_needs_rag:
         system_content = _pm.render("chat_direct_system.txt")
         prompt_mode = "chat_direct"
+    elif is_normal_chat:
+        if do_retrieval and context_str:
+            system_content = build_synthesis_system_prompt(context_str)
+            prompt_mode = "rag_synthesis"
+        else:
+            system_content = _build_system_with_context(context_str)
+            prompt_mode = "rag_basic"
     elif stage_prompt:
         system_content = stage_prompt
         prompt_mode = "workflow_stage"
@@ -546,6 +633,14 @@ def _run_chat(
         "[chat] ⑥ Prompt 组装 | mode=%s | stage=%s→%s | system_len=%d",
         prompt_mode, current_stage or "none", next_stage, len(system_content),
     )
+    dbg.log_prompt_assembly(
+        session_id,
+        prompt_mode=prompt_mode,
+        stage_transition=f"{current_stage or 'none'} → {next_stage}",
+        system_content_len=len(system_content),
+        system_content_preview=system_content[:2000],
+        canvas_id=canvas_id or None,
+    )
 
     store.update_session_stage(session_id, next_stage)
 
@@ -557,24 +652,31 @@ def _run_chat(
     messages.append({"role": "user", "content": message})
 
     # ── 8. LLM 生成 ──
-    use_agent = body.use_agent if hasattr(body, "use_agent") and body.use_agent is not None else False
-    use_agent = use_agent and query_needs_rag  # 闲聊时关闭 Agent
+    use_agent = agent_mode in ("assist", "autonomous")
     tool_trace = None
 
-    # Agent + 预检索结果：指示优先使用已有资料
-    if use_agent and do_retrieval and context_str:
+    # 根据模式注入不同的 Agent hint
+    if agent_mode == "assist" and do_retrieval and context_str:
         messages[0]["content"] = messages[0]["content"] + _pm.render("chat_agent_hint.txt")
+    elif agent_mode == "autonomous":
+        messages[0]["content"] = messages[0]["content"] + _pm.render("chat_agent_autonomous_hint.txt")
 
-    gen_mode = "agent" if use_agent else "direct"
+    gen_mode = agent_mode if use_agent else "direct"
     _chat_logger.info(
         "[chat] ⑦ LLM 生成 | mode=%s | provider=%s | model=%s | history_turns=%d | msg_count=%d",
         gen_mode, body.llm_provider or "default", body.model_override or "default",
         len(history), len(messages),
     )
 
+    pre_agent_chunk_ids: set[str] = set()
+    agent_chunk_ids: set[str] = set()
+    if pack:
+        pre_agent_chunk_ids = {c.chunk_id for c in pack.chunks}
+
     t_llm = _time.perf_counter()
     try:
         if use_agent:
+            start_agent_chunk_collector()
             routed_tools = get_routed_skills(
                 message=message,
                 current_stage=current_stage or "",
@@ -587,8 +689,24 @@ def _run_chat(
                 llm_client=client,
                 max_iterations=8,
                 model=body.model_override or None,
-                max_tokens=2000,
+                session_id=session_id,
+                max_tokens=None,
             )
+            agent_extra_chunks = drain_agent_chunks()
+            agent_chunk_ids = {c.chunk_id for c in agent_extra_chunks}
+            if agent_extra_chunks:
+                if pack is None:
+                    from src.retrieval.evidence import EvidencePack
+                    pack = EvidencePack(query=query or message, chunks=[])
+                existing_ids = {c.chunk_id for c in pack.chunks}
+                for c in agent_extra_chunks:
+                    if c.chunk_id not in existing_ids:
+                        pack.chunks.append(c)
+                        existing_ids.add(c.chunk_id)
+                _chat_logger.info(
+                    "[chat] ⑧a Agent 工具证据合并 | extra_chunks=%d | total_chunks=%d",
+                    len(agent_extra_chunks), len(pack.chunks),
+                )
             response_text = react_result.final_text.strip()
             tool_trace = react_result.tool_trace if react_result.tool_trace else None
             llm_ms = (_time.perf_counter() - t_llm) * 1000
@@ -598,7 +716,8 @@ def _run_chat(
                 len(routed_tools), len(CORE_TOOLS), llm_ms,
             )
         else:
-            resp = client.chat(messages, model=body.model_override or None, max_tokens=2000)
+            react_result = None
+            resp = client.chat(messages, model=body.model_override or None, max_tokens=None)
             response_text = (resp.get("final_text") or "").strip()
             llm_ms = (_time.perf_counter() - t_llm) * 1000
             usage = resp.get("meta", {}).get("usage") or resp.get("usage") or {}
@@ -608,21 +727,94 @@ def _run_chat(
                 f"in={usage.get('prompt_tokens', '?')}/out={usage.get('completion_tokens', '?')}" if usage else "N/A",
                 llm_ms,
             )
+            dbg.log_llm_direct(
+                session_id,
+                response_len=len(response_text),
+                tokens=dict(usage) if usage else None,
+                latency_ms=round(llm_ms),
+                message_count=len(messages),
+            )
     except Exception as llm_err:
+        react_result = None
         llm_ms = (_time.perf_counter() - t_llm) * 1000
         _chat_logger.error("[chat] ⑧ LLM 失败 | error=%s | 耗时=%.0fms", llm_err, llm_ms)
         response_text = f"[LLM 调用失败] {type(llm_err).__name__}: {llm_err}\n\n请尝试切换其他模型。"
 
     # ── 9. 引文后处理：将 [ref_hash] 替换为正式 cite_key ──
     ref_map: dict[str, str] = {}
-    if do_retrieval and pack and pack.chunks:
+    all_chunks = (pack.chunks if pack else [])
+    if all_chunks:
         response_text, citations, ref_map = resolve_response_citations(
-            response_text, pack.chunks,
+            response_text, all_chunks,
         )
+        if use_agent and len(all_chunks) > evidence_summary.total_chunks:
+            evidence_summary.total_chunks = len(all_chunks)
+            if "web" not in evidence_summary.sources_used:
+                evidence_summary.sources_used.append("web")
+
+        # 双层来源统计: chunk 级（每个信息块算一次）+ citation 级（同网站/文档只算一次）
+        chunk_counts: dict[str, int] = {}
+        for c in all_chunks:
+            p = getattr(c, "provider", None) or ("local" if c.source_type in ("dense", "graph") else "web")
+            chunk_counts[p] = chunk_counts.get(p, 0) + 1
+        cite_counts: dict[str, int] = {}
+        for c in citations:
+            p = getattr(c, "provider", None) or ("local" if not c.url else "web")
+            cite_counts[p] = cite_counts.get(p, 0) + 1
+        evidence_summary.provider_stats = {
+            "chunk_level": chunk_counts,
+            "citation_level": cite_counts,
+        }
+        # source_breakdown 使用来源级（unique 文献/网页）统计
+        evidence_summary.source_breakdown = cite_counts
+
         _chat_logger.info(
-            "[chat] ⑨ 引文后处理 | cited_docs=%d | ref_map_size=%d",
-            len(citations), len(ref_map),
+            "[chat] ⑨ 引文后处理 | cited_docs=%d | ref_map_size=%d | chunk_stats=%s | cite_stats=%s",
+            len(citations), len(ref_map), chunk_counts, cite_counts,
         )
+
+    # ── 9b. tools_contributed 判定 ──
+    tools_contributed = False
+    cited_from_agent_count = 0
+    non_retrieval_tools_ok = 0
+    if use_agent and react_result and react_result.tool_trace:
+        _non_retrieval = {"run_code", "explore_graph", "canvas", "get_citations", "compare_papers"}
+        for entry in react_result.tool_trace:
+            if entry["tool"] in _non_retrieval and not entry.get("is_error"):
+                non_retrieval_tools_ok += 1
+        if agent_chunk_ids and citations:
+            cited_chunk_ids = set()
+            for c in all_chunks:
+                if any(
+                    (getattr(c, "doc_id", None) and getattr(c, "doc_id", None) == getattr(cit, "doc_id", None))
+                    or (getattr(c, "url", None) and getattr(c, "url", None) == getattr(cit, "url", None))
+                    for cit in citations
+                ):
+                    cited_chunk_ids.add(c.chunk_id)
+            cited_from_agent_count = len(cited_chunk_ids & agent_chunk_ids)
+        tools_contributed = cited_from_agent_count > 0 or non_retrieval_tools_ok > 0
+
+        dbg.log_citation_resolve(
+            session_id,
+            cited_count=len(citations),
+            ref_map_size=len(ref_map),
+            pre_retrieval_chunks=len(pre_agent_chunk_ids),
+            agent_added_chunks=len(agent_chunk_ids),
+            cited_from_agent=cited_from_agent_count,
+            non_retrieval_tools_ok=non_retrieval_tools_ok,
+            tools_contributed=tools_contributed,
+        )
+
+    # ── 9c. 构建 agent_debug payload ──
+    if use_agent and react_result:
+        agent_debug_data = {
+            "agent_stats": react_result.agent_stats,
+            "tool_trace": react_result.tool_trace,
+            "tools_contributed": tools_contributed,
+            "pre_retrieval_chunks": len(pre_agent_chunk_ids),
+            "agent_added_chunks": len(agent_chunk_ids),
+            "cited_from_agent": cited_from_agent_count,
+        }
 
     # ── 10. 写入 Memory ──
     memory.add_turn("user", message)
@@ -641,8 +833,18 @@ def _run_chat(
         gen_mode,
         len(citations), len(response_text), total_ms,
     )
+    dbg.log_turn_summary(
+        session_id,
+        route="rag" if query_needs_rag else "chat",
+        gen_mode=gen_mode,
+        citations=len(citations),
+        response_len=len(response_text),
+        total_ms=round(total_ms),
+        tools_contributed=tools_contributed if use_agent else None,
+        agent_stats=(react_result.agent_stats if react_result else None),
+    )
 
-    return session_id, response_text, citations, evidence_summary, parsed, None, tool_trace, ref_map
+    return session_id, response_text, citations, evidence_summary, parsed, None, tool_trace, ref_map, agent_debug_data
 
 
 def _citation_to_chat_citation(c: Citation) -> ChatCitation:
@@ -657,6 +859,7 @@ def _citation_to_chat_citation(c: Citation) -> ChatCitation:
         doi=c.doi,
         bbox=getattr(c, "bbox", None),
         page_num=getattr(c, "page_num", None),
+        provider=getattr(c, "provider", None),
     )
 
 
@@ -665,7 +868,7 @@ def chat_post(
     body: ChatRequest,
     optional_user_id: str | None = Depends(get_optional_user_id),
 ) -> ChatResponse:
-    session_id, response_text, citations, evidence_summary, _parsed, _dashboard, _trace, _ref_map = _run_chat(body, optional_user_id)
+    session_id, response_text, citations, evidence_summary, _parsed, _dashboard, _trace, _ref_map, _agent_debug = _run_chat(body, optional_user_id)
     return ChatResponse(
         session_id=session_id,
         response=response_text,
@@ -679,7 +882,7 @@ def chat_stream(
     body: ChatRequest,
     optional_user_id: str | None = Depends(get_optional_user_id),
 ) -> StreamingResponse:
-    session_id, response_text, citations, evidence_summary, parsed, dashboard_data, tool_trace_data, ref_map = _run_chat(body, optional_user_id)
+    session_id, response_text, citations, evidence_summary, parsed, dashboard_data, tool_trace_data, ref_map, agent_debug_payload = _run_chat(body, optional_user_id)
     
     # 获取当前会话阶段
     store = get_session_store()
@@ -718,6 +921,9 @@ def chat_stream(
             # Agent 工具调用轨迹
             if tool_trace_data:
                 yield f"event: tool_trace\ndata: {json.dumps(tool_trace_data, ensure_ascii=False, default=str)}\n\n"
+            # Agent debug 详情（含 stats + tools_contributed）
+            if agent_debug_payload:
+                yield f"event: agent_debug\ndata: {json.dumps(agent_debug_payload, ensure_ascii=False, default=str)}\n\n"
             for chunk in _chunk_text(response_text):
                 yield f"event: delta\ndata: {json.dumps({'delta': chunk}, ensure_ascii=False)}\n\n"
             yield "event: done\ndata: {}\n\n"
@@ -793,7 +999,9 @@ def clarify_for_deep_research(
     except Exception:
         pass
 
-    # 获取 chat 历史上下文
+    # Detect topic language to match clarification output language
+    _is_zh_topic = bool(re.search(r"[\u4e00-\u9fff]", body.message or ""))
+
     history_block = ""
     if body.session_id:
         mem = load_session_memory(body.session_id)
@@ -808,10 +1016,19 @@ def clarify_for_deep_research(
                 lines.append(f"{role_label}: {text}")
             history_block = "\n".join(lines)
 
+    language_instruction = (
+        "IMPORTANT: The user's topic is in Chinese. ALL output — including questions, "
+        "suggested_topic, suggested_outline, and research_brief — MUST be in Chinese."
+    ) if _is_zh_topic else (
+        "IMPORTANT: The user's topic is in English. ALL output — including questions, "
+        "suggested_topic, suggested_outline, and research_brief — MUST be in English."
+    )
+
     prompt = _pm.render(
         "chat_deep_research_clarify.txt",
         message=body.message,
-        history_block=history_block or "（无）",
+        history_block=history_block or "(none)",
+        language_instruction=language_instruction,
     )
 
     try:
@@ -828,14 +1045,17 @@ def clarify_for_deep_research(
         text = re.sub(r"\s*```\s*$", "", text)
         data = json.loads(text)
     except Exception as e:
-        # LLM 失败时至少返回 1 个关键问题
         used_fallback = True
         fallback_reason = f"clarify_llm_failed: {str(e)[:240]}"
+        _fallback_q_text = (
+            "请确认本次研究最关键的目标与范围边界" if _is_zh_topic
+            else "Please confirm the key objectives and scope boundaries for this research"
+        )
         data = {
             "suggested_topic": body.message,
             "suggested_outline": [],
             "questions": [
-                {"id": "q1", "text": "请确认本次研究最关键的目标与范围边界", "type": "text", "default": body.message},
+                {"id": "q1", "text": _fallback_q_text, "type": "text", "default": body.message},
             ],
         }
 
@@ -1301,11 +1521,13 @@ def confirm_deep_research_endpoint(
     if memory:
         memory.add_turn("user", f"[Deep Research Confirmed] {body.topic}")
         memory.add_turn("assistant", response_text, citations=[_serialize_citation(c) for c in citations])
+    sc_pstats = _compute_citation_provider_stats(citations) if citations else None
     evidence_summary = EvidenceSummary(
         query=body.topic,
         total_chunks=len(citations),
         sources_used=_infer_sources_from_citations(citations),
         retrieval_time_ms=float(result.get("total_time_ms", 0.0)),
+        provider_stats=sc_pstats,
     )
     dashboard_data = result.get("dashboard") or {}
 

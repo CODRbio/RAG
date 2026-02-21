@@ -71,13 +71,23 @@ class ChatRequest(BaseModel):
         None,
         description="覆盖 provider 的默认模型，值为 models map 中的 key（如 claude-opus-4-6），None 表示使用 provider 默认模型",
     )
-    use_content_fetcher: Optional[bool] = Field(
+    use_content_fetcher: Optional[str] = Field(
         None,
-        description="是否对网络搜索结果做全文抓取，None 表示使用后端配置默认值",
+        description="全文抓取模式: auto | force | off，None 等同于 auto",
     )
     use_agent: Optional[bool] = Field(
         None,
-        description="是否启用 Agent 模式（ReAct 循环，LLM 自主调用工具），None/False 使用传统模式",
+        description="[兼容旧字段] 是否启用 Agent 模式，推荐使用 agent_mode 替代",
+    )
+    agent_mode: Optional[str] = Field(
+        None,
+        description=(
+            "Agent 执行模式: "
+            "standard（标准 RAG，无 Agent）| "
+            "assist（辅助：先预检索再 ReAct，Agent 按需补充工具调用）| "
+            "autonomous（自主：跳过预检索，Agent 全权自主检索和推理）。"
+            "优先级高于 use_agent；为 None 时回退到 use_agent 字段推断。"
+        ),
     )
     clarification_answers: Optional[Dict[str, str]] = Field(
         None,
@@ -106,10 +116,15 @@ class EvidenceSummary(BaseModel):
     retrieval_time_ms: float = 0.0
     # 证据综合元数据
     year_range: Optional[List[Optional[int]]] = Field(None, description="证据时间跨度 [earliest, latest]")
-    source_breakdown: Optional[Dict[str, int]] = Field(None, description="来源分布 {local: N, web: M}")
+    source_breakdown: Optional[Dict[str, int]] = Field(None, description="来源分布（来源级：同 URL/文档只算一次）{local: N, tavily: M, ...}")
     evidence_type_breakdown: Optional[Dict[str, int]] = Field(None, description="证据类型分布 {finding: N, method: M, ...}")
     cross_validated_count: int = Field(0, description="本地+网络交叉验证的文献数")
     total_documents: int = Field(0, description="涉及的独立文献总数")
+    # 双层来源统计
+    provider_stats: Optional[Dict[str, Any]] = Field(
+        None,
+        description="双层来源统计: chunk_level（每个信息块计一次）+ citation_level（同网站/文档只计一次）",
+    )
     # 检索诊断信息
     diagnostics: Optional[Dict[str, Any]] = Field(None, description="检索诊断: stages/web_providers/content_fetcher")
 
@@ -126,6 +141,7 @@ class ChatCitation(BaseModel):
     doi: Optional[str] = None
     bbox: Optional[List[float]] = Field(None, description="Docling bbox 坐标 [x0,y0,x1,y1]")
     page_num: Optional[int] = Field(None, description="证据所在页码")
+    provider: Optional[str] = Field(None, description="来源 provider: local | tavily | scholar | semantic | ncbi | google")
 
 
 class ChatResponse(BaseModel):

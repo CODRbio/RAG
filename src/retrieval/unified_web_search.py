@@ -225,7 +225,7 @@ class UnifiedWebSearcher:
         query_optimizer_max_queries: Optional[int] = None,
         llm_provider: Optional[str] = None,
         model_override: Optional[str] = None,
-        use_content_fetcher: Optional[bool] = None,
+        use_content_fetcher: Optional[str] = None,
         llm_client: Optional[Any] = None,
         year_start: Optional[int] = None,
         year_end: Optional[int] = None,
@@ -349,13 +349,18 @@ class UnifiedWebSearcher:
         logger.info(f"统一搜索完成: 合并前 {len(all_hits)} 条, 去重后 {len(merged)} 条")
 
         # 全文抓取增强：
-        #   True  → 硬强制，全量抓取，不做 LLM 预判
-        #   False → 跳过
-        #   None  → 智能模式：有 llm_client 则先预判，否则按后端 enabled 配置全量抓
+        #   'force' / True  → 硬强制，全量抓取，不做 LLM 预判
+        #   'off' / False → 跳过
+        #   'auto' / None  → 智能模式：有 llm_client 则先预判，否则全量抓取（兼容配置）
         fetcher = self._get_content_fetcher()
-        do_enrich = use_content_fetcher is True or (
-            use_content_fetcher is None and fetcher and getattr(fetcher, "enabled", False)
-        )
+        
+        if use_content_fetcher == "off" or use_content_fetcher is False:
+            do_enrich = False
+        elif use_content_fetcher == "force" or use_content_fetcher is True:
+            do_enrich = True
+        else: # "auto" or None
+            do_enrich = fetcher is not None and getattr(fetcher, "enabled", False)
+
         if do_enrich and fetcher:
             try:
                 merged = await fetcher.enrich_results(
@@ -528,30 +533,34 @@ class UnifiedWebSearcher:
         scholar_max = max_results_per_provider
         google_max = max_results_per_provider
 
+        # UI selection is authoritative — if a provider is in the list,
+        # we only check that the searcher object can be loaded, NOT its
+        # config-level "enabled" flag.  The enabled flag is only used by
+        # _resolve_providers() for auto-discovery.
         for provider in providers:
             qs = _queries_for(provider)
             pmax = _get_max(provider)
 
             if provider == "tavily":
                 tavily = self._get_tavily_searcher()
-                if tavily and getattr(tavily, "enabled", False):
+                if tavily:
                     for q in qs:
                         tasks_with_flags.append(
                             (self._search_tavily(tavily, q, pmax, False), False)
                         )
             elif provider == "scholar":
                 google = self._get_google_searcher()
-                if google and getattr(google, "scholar_enabled", False):
+                if google:
                     scholar_queries.extend(qs)
                     scholar_max = pmax
             elif provider == "google":
                 google = self._get_google_searcher()
-                if google and getattr(google, "google_enabled", False):
+                if google:
                     google_queries.extend(qs)
                     google_max = pmax
             elif provider == "semantic":
                 semantic = self._get_semantic_searcher()
-                if semantic and getattr(semantic, "enabled", False):
+                if semantic:
                     for q in qs:
                         tasks_with_flags.append(
                             (
@@ -650,7 +659,7 @@ class UnifiedWebSearcher:
         query_optimizer_max_queries: Optional[int] = None,
         llm_provider: Optional[str] = None,
         model_override: Optional[str] = None,
-        use_content_fetcher: Optional[bool] = None,
+        use_content_fetcher: Optional[str] = None,
         llm_client: Optional[Any] = None,
         year_start: Optional[int] = None,
         year_end: Optional[int] = None,

@@ -11,5 +11,6 @@ Return strict JSON:
   "key_questions": ["question 1", "question 2", "question 3"],
   "exclusions": ["out-of-scope topics"],
   "time_range": "publication time range (for example: 2020-2025)",
-  "source_priority": ["peer-reviewed papers", "reviews", "datasets"]
+  "source_priority": ["peer-reviewed papers", "reviews", "datasets"],
+  "topic_domain": "biomedical OR cs_ai OR general — choose 'biomedical' if topic is in life sciences / medicine / biology / biochemistry; 'cs_ai' if computer science or AI; 'general' otherwise"
 }}

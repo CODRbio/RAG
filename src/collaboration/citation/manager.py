@@ -211,7 +211,10 @@ def chunk_to_citation(
     bbox = getattr(chunk, "bbox", None) or None
     page_num = getattr(chunk, "page_num", None) or None
 
-    # 先创建不带 cite_key 的 Citation
+    provider = getattr(chunk, "provider", None)
+    if not provider:
+        provider = "local" if chunk.source_type in ("dense", "graph") else "web"
+
     citation = Citation(
         id=chunk.chunk_id[:16] if chunk.chunk_id else "",
         title=title,
@@ -223,6 +226,7 @@ def chunk_to_citation(
         cite_key="",
         bbox=bbox,
         page_num=page_num,
+        provider=provider,
     )
 
     # 使用生成器生成 cite_key
@@ -369,6 +373,9 @@ def resolve_response_citations(
             shared_keys.add(cite_key)
 
         best = _pick_best_metadata(group)
+        prov = getattr(best, "provider", None)
+        if not prov:
+            prov = "local" if best.source_type in ("dense", "graph") else "web"
         citation = Citation(
             id=doc_key[:16],
             title=best.doc_title or "",
@@ -378,6 +385,9 @@ def resolve_response_citations(
             url=best.url,
             doi=getattr(best, "doi", None),
             cite_key=cite_key,
+            bbox=getattr(best, "bbox", None),
+            page_num=getattr(best, "page_num", None),
+            provider=prov,
         )
         citations.append(citation)
 

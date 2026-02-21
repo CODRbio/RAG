@@ -88,19 +88,29 @@ export function RetrievalDebugPanel({ summary }: Props) {
               <div className="font-medium text-gray-500 flex items-center gap-1 mb-1.5">
                 <Database size={11} /> 来源分布
               </div>
-              <div className="flex gap-3">
-                {Object.entries(summary.source_breakdown).map(([src, count]) => (
-                  <span
-                    key={src}
-                    className={`px-2 py-0.5 rounded-full ${
-                      src === 'local'
-                        ? 'bg-blue-100 text-blue-700'
-                        : 'bg-green-100 text-green-700'
-                    }`}
-                  >
-                    {src === 'local' ? '本地' : '网络'} {count}
-                  </span>
-                ))}
+              <div className="flex flex-wrap gap-2">
+                {Object.entries(summary.source_breakdown)
+                  .sort(([, a], [, b]) => (b as number) - (a as number))
+                  .map(([src, count]) => {
+                    const COLORS: Record<string, string> = {
+                      local: 'bg-blue-100 text-blue-700',
+                      tavily: 'bg-violet-100 text-violet-700',
+                      google: 'bg-orange-100 text-orange-700',
+                      scholar: 'bg-emerald-100 text-emerald-700',
+                      semantic: 'bg-yellow-100 text-yellow-700',
+                      ncbi: 'bg-pink-100 text-pink-700',
+                      web: 'bg-gray-200 text-gray-600',
+                    };
+                    const LABELS: Record<string, string> = {
+                      local: '本地', tavily: 'Tavily', google: 'Google',
+                      scholar: 'Scholar', semantic: 'Semantic', ncbi: 'PubMed', web: '网络',
+                    };
+                    return (
+                      <span key={src} className={`px-2 py-0.5 rounded-full ${COLORS[src] || 'bg-gray-200 text-gray-600'}`}>
+                        {LABELS[src] || src} {count}
+                      </span>
+                    );
+                  })}
                 {summary.cross_validated_count ? (
                   <span className="px-2 py-0.5 rounded-full bg-purple-100 text-purple-700">
                     交叉验证 {summary.cross_validated_count}

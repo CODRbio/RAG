@@ -104,8 +104,7 @@ export function Sidebar({ onStartResize }: SidebarProps) {
     updateWebSourceParam,
     setQueryOptimizer,
     setMaxQueriesPerProvider,
-    setContentFetcherEnabled,
-    setAgentEnabled,
+    setAgentMode,
   } = useConfigStore();
 
   const {
@@ -509,6 +508,40 @@ export function Sidebar({ onStartResize }: SidebarProps) {
                   {t('sidebar.thresholdDesc')}
                 </div>
               </div>
+
+              {/* 年份过滤 */}
+              <div className="flex gap-2">
+                <div className="flex-1">
+                  <div className="text-[10px] text-slate-500 mb-1">{t('sidebar.yearStart')}</div>
+                  <input
+                    type="number"
+                    min="1900"
+                    max="2100"
+                    value={ragConfig.yearStart || ''}
+                    placeholder="1900"
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      updateRagConfig({ yearStart: val ? Number(val) : null });
+                    }}
+                    className="w-full text-xs bg-slate-950 border border-slate-700 text-slate-300 rounded px-2 py-1.5 focus:border-sky-500 focus:outline-none"
+                  />
+                </div>
+                <div className="flex-1">
+                  <div className="text-[10px] text-slate-500 mb-1">{t('sidebar.yearEnd')}</div>
+                  <input
+                    type="number"
+                    min="1900"
+                    max="2100"
+                    value={ragConfig.yearEnd || ''}
+                    placeholder="2026"
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      updateRagConfig({ yearEnd: val ? Number(val) : null });
+                    }}
+                    className="w-full text-xs bg-slate-950 border border-slate-700 text-slate-300 rounded px-2 py-1.5 focus:border-sky-500 focus:outline-none"
+                  />
+                </div>
+              </div>
             </div>
           </section>
         )}
@@ -635,49 +668,9 @@ export function Sidebar({ onStartResize }: SidebarProps) {
                               }
                               className="w-full accent-sky-500 h-1 bg-slate-700 rounded-lg appearance-none cursor-pointer"
                             />
-                            {/* Threshold 配置 */}
-                            <div className="flex items-center justify-between text-[10px] text-slate-500 mt-2">
-                              <span>Threshold</span>
-                              <div className="flex items-center gap-2">
-                                <span className="font-mono bg-slate-950 px-1.5 py-0.5 rounded border border-slate-700 text-sky-400">
-                                  {source.threshold.toFixed(2)}
-                                </span>
-                                <input
-                                  id={`web-source-threshold-num-${source.id}`}
-                                  name={`web-source-threshold-num-${source.id}`}
-                                  type="number"
-                                  min="0"
-                                  max="1"
-                                  step="0.05"
-                                  value={source.threshold}
-                                  onChange={(e) =>
-                                    updateWebSourceParam(
-                                      source.id,
-                                      'threshold',
-                                      Math.min(1, Math.max(0, Number(e.target.value)))
-                                    )
-                                  }
-                                  className="w-14 text-[10px] bg-slate-950 border border-slate-700 text-slate-300 rounded px-1 py-0.5 focus:border-sky-500 focus:outline-none"
-                                />
-                              </div>
+                            <div className="text-[9px] text-slate-600 mt-1">
+                              {t('sidebar.webTopKDesc')}
                             </div>
-                            <input
-                              id={`web-source-threshold-range-${source.id}`}
-                              name={`web-source-threshold-range-${source.id}`}
-                              type="range"
-                              min="0"
-                              max="1"
-                              step="0.05"
-                              value={source.threshold}
-                              onChange={(e) =>
-                                updateWebSourceParam(
-                                  source.id,
-                                  'threshold',
-                                  Number(e.target.value)
-                                )
-                              }
-                              className="w-full accent-emerald-500 h-1 bg-slate-700 rounded-lg appearance-none cursor-pointer"
-                            />
                           </div>
                         )}
                       </div>
@@ -775,20 +768,26 @@ export function Sidebar({ onStartResize }: SidebarProps) {
                         {t('sidebar.contentFetcherDesc')}
                       </div>
                     </div>
-                    <input
-                      id="content-fetcher"
-                      name="content-fetcher"
-                      type="checkbox"
-                      checked={webSearchConfig.enableContentFetcher ?? false}
+                    <select
+                      id="content-fetcher-mode"
+                      name="content-fetcher-mode"
+                      value={webSearchConfig.contentFetcherMode ?? 'auto'}
                       onChange={(e) => {
-                        setContentFetcherEnabled(e.target.checked);
-addToast(
-                        e.target.checked ? t('sidebar.contentFetcherEnabled') : t('sidebar.contentFetcherDisabled'),
+                        const mode = e.target.value as 'auto' | 'force' | 'off';
+                        (useConfigStore.getState() as any).setContentFetcherMode(mode);
+                        addToast(
+                          mode === 'force' ? t('sidebar.contentFetcherForce')
+                            : mode === 'off' ? t('sidebar.contentFetcherDisabled')
+                            : t('sidebar.contentFetcherAuto'),
                           'info'
                         );
                       }}
-                      className="accent-sky-500 w-4 h-4 cursor-pointer"
-                    />
+                      className="text-xs border border-slate-700 rounded-md px-2 py-1 bg-slate-950 text-slate-300 focus:outline-none focus:border-sky-500"
+                    >
+                      <option value="auto">Auto</option>
+                      <option value="force">Force</option>
+                      <option value="off">Off</option>
+                    </select>
                   </div>
                 </div>
               )}
@@ -802,42 +801,79 @@ addToast(
             <div className="flex items-center gap-2 mb-4 text-sky-500/80 font-semibold text-xs uppercase tracking-wider pl-1">
               <Cpu size={14} /> {t('sidebar.agentMode')}
             </div>
-            <div className="bg-slate-900/30 border border-slate-700/50 rounded-xl p-3 shadow-inner">
-              <div className="flex items-center justify-between">
-                <div>
-                  <div className="flex items-center gap-1.5">
-                    <span className="text-sm font-medium text-slate-300">{t('sidebar.reactAgent')}</span>
-                    <HelpTooltip content={t('sidebar.reactAgentHelp')}>
-                      <HelpCircle size={12} />
-                    </HelpTooltip>
+            <div className="bg-slate-900/30 border border-slate-700/50 rounded-xl p-3 shadow-inner space-y-2">
+              {/* 三模式选择器 */}
+              {(['standard', 'assist', 'autonomous'] as const).map((mode) => {
+                const isSelected = (ragConfig.agentMode ?? 'assist') === mode;
+                const labels: Record<string, string> = {
+                  standard: t('sidebar.agentModeStandard'),
+                  assist: t('sidebar.agentModeAssist'),
+                  autonomous: t('sidebar.agentModeAutonomous'),
+                };
+                const descs: Record<string, string> = {
+                  standard: t('sidebar.agentModeStandardDesc'),
+                  assist: t('sidebar.agentModeAssistDesc'),
+                  autonomous: t('sidebar.agentModeAutonomousDesc'),
+                };
+                const helps: Record<string, string> = {
+                  standard: t('sidebar.agentModeStandardHelp'),
+                  assist: t('sidebar.agentModeAssistHelp'),
+                  autonomous: t('sidebar.agentModeAutonomousHelp'),
+                };
+                return (
+                  <button
+                    key={mode}
+                    onClick={() => {
+                      setAgentMode(mode);
+                      addToast(t('sidebar.agentModeChanged', { mode: labels[mode] }), 'info');
+                    }}
+                    className={`w-full flex items-center justify-between px-2.5 py-2 rounded-lg border text-left transition-colors ${
+                      isSelected
+                        ? 'bg-indigo-600/20 border-indigo-500/60 text-slate-200'
+                        : 'bg-transparent border-slate-700/40 text-slate-400 hover:bg-slate-800/50'
+                    }`}
+                  >
+                    <div className="flex-1 min-w-0 pr-2">
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-xs font-medium">{labels[mode]}</span>
+                        <HelpTooltip content={helps[mode]}>
+                          <HelpCircle size={10} />
+                        </HelpTooltip>
+                      </div>
+                      <div className="text-[10px] text-slate-500 truncate">{descs[mode]}</div>
+                    </div>
+                    <div className={`w-3.5 h-3.5 rounded-full border-2 flex-shrink-0 ${
+                      isSelected ? 'bg-indigo-500 border-indigo-400' : 'border-slate-600'
+                    }`} />
+                  </button>
+                );
+              })}
+              {/* Agent Debug Mode sub-toggle — only for assist / autonomous */}
+              {(ragConfig.agentMode ?? 'assist') !== 'standard' && (
+                <div className="flex items-center justify-between border-t border-slate-700/30 pt-2 mt-1">
+                  <div>
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-xs text-slate-400">{t('sidebar.agentDebugMode', 'Debug Panel')}</span>
+                      <HelpTooltip content={t('sidebar.agentDebugModeHelp', 'Show detailed Agent stats, tool timing, and contribution analysis in chat')}>
+                        <HelpCircle size={10} />
+                      </HelpTooltip>
+                    </div>
+                    <div className="text-[10px] text-slate-500">
+                      {t('sidebar.agentDebugModeDesc', 'Timeline + stats')}
+                    </div>
                   </div>
-                  <div className="text-[10px] text-slate-500">
-                    {t('sidebar.reactAgentDesc')}
-                  </div>
+                  <input
+                    id="agent-debug-mode"
+                    name="agent-debug-mode"
+                    type="checkbox"
+                    checked={ragConfig.agentDebugMode ?? false}
+                    onChange={(e) => {
+                      updateRagConfig({ agentDebugMode: e.target.checked });
+                    }}
+                    className="accent-purple-500 w-3.5 h-3.5 cursor-pointer"
+                  />
                 </div>
-                <input
-                  id="agent-enabled"
-                  name="agent-enabled"
-                  type="checkbox"
-                  checked={ragConfig.enableAgent ?? true}
-                  onChange={(e) => {
-                    setAgentEnabled(e.target.checked);
-addToast(
-                    e.target.checked ? t('sidebar.agentEnabled') : t('sidebar.agentDisabled'),
-                      'info'
-                    );
-                  }}
-                  className="accent-indigo-500 w-4 h-4 cursor-pointer"
-                />
-              </div>
-              <div className="mt-2 text-[10px] rounded-md p-2 bg-slate-900/50 text-slate-400 border border-slate-700/50">
-                {t('sidebar.agentNote').split('\n').map((line, i, arr) => (
-                  <span key={i}>
-                    {line}
-                    {i < arr.length - 1 && <br />}
-                  </span>
-                ))}
-              </div>
+              )}
             </div>
           </section>
         )}

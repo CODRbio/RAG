@@ -50,6 +50,7 @@ class Citation:
     cite_key: Optional[str] = None
     bbox: Optional[list[float]] = None
     page_num: Optional[int] = None
+    provider: Optional[str] = None  # tavily | scholar | semantic | ncbi | google | local
     created_at: datetime = field(default_factory=datetime.now)
 
 

@@ -152,68 +152,12 @@ export function DeepResearchSettingsPopover({ open, onClose }: Props) {
           <select
             value={deepResearchDefaults.outputLanguage}
             onChange={(e) => updateDeepResearchDefaults({ outputLanguage: e.target.value as 'auto' | 'en' | 'zh' })}
-            className="w-full border border-gray-200 rounded-lg px-2.5 py-1.5 text-[11px] focus:ring-2 focus:ring-indigo-500 outline-none"
+            className="w-full border border-gray-200 rounded-lg px-2.5 py-1.5 text-[11px] bg-white text-gray-900 focus:ring-2 focus:ring-indigo-500 outline-none"
           >
             <option value="auto">Auto (follow topic language)</option>
             <option value="en">English</option>
             <option value="zh">中文</option>
           </select>
-        </div>
-
-        {/* Year Window */}
-        <div>
-          <label className="flex items-center gap-1 text-[11px] font-medium text-gray-600 mb-1">
-            Year Window (Hard Filter)
-            <Tip content="Apply strict publication-year filtering during retrieval. Empty means no limit.">
-              <HelpCircle size={11} />
-            </Tip>
-          </label>
-          <div className="grid grid-cols-2 gap-2">
-            <div>
-              <div className="text-[10px] text-gray-500 mb-1">起始年份</div>
-              <input
-                type="number"
-                min={1900}
-                max={2100}
-                value={deepResearchDefaults.yearStart ?? ''}
-                onChange={(e) => {
-                  const raw = e.target.value.trim();
-                  if (raw === '') {
-                    updateDeepResearchDefaults({ yearStart: null });
-                    return;
-                  }
-                  const n = Number(raw);
-                  updateDeepResearchDefaults({
-                    yearStart: Number.isFinite(n) ? Math.max(1900, Math.min(2100, Math.trunc(n))) : null,
-                  });
-                }}
-                className="w-full border border-gray-200 rounded-lg px-2.5 py-1.5 text-[11px] focus:ring-2 focus:ring-indigo-500 outline-none"
-                placeholder="e.g. 2020"
-              />
-            </div>
-            <div>
-              <div className="text-[10px] text-gray-500 mb-1">结束年份</div>
-              <input
-                type="number"
-                min={1900}
-                max={2100}
-                value={deepResearchDefaults.yearEnd ?? ''}
-                onChange={(e) => {
-                  const raw = e.target.value.trim();
-                  if (raw === '') {
-                    updateDeepResearchDefaults({ yearEnd: null });
-                    return;
-                  }
-                  const n = Number(raw);
-                  updateDeepResearchDefaults({
-                    yearEnd: Number.isFinite(n) ? Math.max(1900, Math.min(2100, Math.trunc(n))) : null,
-                  });
-                }}
-                className="w-full border border-gray-200 rounded-lg px-2.5 py-1.5 text-[11px] focus:ring-2 focus:ring-indigo-500 outline-none"
-                placeholder="e.g. 2025"
-              />
-            </div>
-          </div>
         </div>
 
         {/* Per-step Models */}
@@ -231,7 +175,7 @@ export function DeepResearchSettingsPopover({ open, onClose }: Props) {
                 <select
                   value={deepResearchDefaults.stepModels[step] || ''}
                   onChange={(e) => setDeepResearchStepModel(step, e.target.value)}
-                  className="border border-gray-200 rounded-md px-1.5 py-1 text-[10px] bg-white focus:ring-1 focus:ring-indigo-400 outline-none"
+                  className="border border-gray-200 rounded-md px-1.5 py-1 text-[10px] bg-white text-gray-900 focus:ring-1 focus:ring-indigo-400 outline-none"
                 >
                   {STEP_MODEL_OPTIONS.map((opt) => (
                     <option key={`${step}-${opt.value}`} value={opt.value}>{opt.label}</option>

@@ -6,7 +6,9 @@ ReAct 执行循环：LLM → tool_call → execute → feed back → repeat。
 
 from __future__ import annotations
 
+import json as _json
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -32,10 +34,34 @@ class ReactResult:
     """ReAct 循环的最终结果"""
     final_text: str = ""
     reasoning_text: str = ""
-    tool_trace: List[Dict[str, Any]] = field(default_factory=list)  # 工具调用记录
+    tool_trace: List[Dict[str, Any]] = field(default_factory=list)
     iterations: int = 0
     total_time_ms: float = 0.0
     raw_response: Optional[Dict[str, Any]] = None
+    agent_stats: Dict[str, Any] = field(default_factory=dict)
+
+
+def _build_agent_stats(result: ReactResult) -> Dict[str, Any]:
+    """从完成的 ReactResult 中计算 agent_stats 摘要。"""
+    tool_counts: Counter = Counter()
+    total_tool_ms = 0.0
+    total_llm_ms = 0.0
+    error_count = 0
+    for entry in result.tool_trace:
+        tool_counts[entry["tool"]] += 1
+        total_tool_ms += entry.get("tool_latency_ms", 0)
+        total_llm_ms += entry.get("llm_latency_ms", 0)
+        if entry.get("is_error"):
+            error_count += 1
+    return {
+        "total_iterations": result.iterations,
+        "total_tool_calls": len(result.tool_trace),
+        "tools_used_summary": dict(tool_counts),
+        "total_tool_time_ms": round(total_tool_ms),
+        "total_llm_time_ms": round(total_llm_ms),
+        "total_agent_time_ms": round(result.total_time_ms),
+        "error_count": error_count,
+    }
 
 
 @traceable(run_type="agent", name="react_loop")
@@ -45,6 +71,7 @@ def react_loop(
     llm_client: Any,
     max_iterations: int = 10,
     model: Optional[str] = None,
+    session_id: str = "",
     **llm_kwargs,
 ) -> ReactResult:
     """
@@ -56,22 +83,23 @@ def react_loop(
         llm_client: BaseChatClient 实例
         max_iterations: 最大迭代次数（防止无限循环）
         model: 可选模型覆盖
+        session_id: 会话 ID（用于 debug 日志追溯）
         **llm_kwargs: 传递给 llm_client.chat() 的额外参数
 
     Returns:
         ReactResult
     """
+    from src.debug import get_debug_logger
+    dbg = get_debug_logger()
+
     t0 = time.perf_counter()
     result = ReactResult()
 
-    # 检测 provider 类型
     is_anthropic = getattr(getattr(llm_client, "config", None), "is_anthropic", lambda: False)()
 
-    # 决定是否使用原生 FC
-    supports_fc = True  # 当前所有 provider 都支持
+    supports_fc = True
     working_messages = list(messages)
 
-    # 如果不支持 FC，注入 prompt-based tool 描述到 system message
     if not supports_fc:
         prompt_desc = tools_to_prompt(tools)
         if working_messages and working_messages[0].get("role") == "system":
@@ -85,7 +113,8 @@ def react_loop(
     for iteration in range(max_iterations):
         result.iterations = iteration + 1
 
-        # 调用 LLM
+        # ── LLM 调用（计时）──
+        t_llm = time.perf_counter()
         try:
             resp = llm_client.chat(
                 messages=working_messages,
@@ -97,53 +126,77 @@ def react_loop(
             logger.error(f"ReAct LLM call failed at iteration {iteration}: {e}")
             result.final_text = f"[LLM 调用失败: {e}]"
             break
+        llm_elapsed_ms = round((time.perf_counter() - t_llm) * 1000)
 
         raw = resp.get("raw", {})
         result.raw_response = resp
 
-        # 检查是否有 tool calls
         tool_calls = resp.get("tool_calls") or []
         if not tool_calls and supports_fc:
-            # 原生 FC 没返回 tool_calls → 模型给出了最终回复
             result.final_text = resp.get("final_text", "")
             result.reasoning_text = resp.get("reasoning_text", "")
+
+            dbg.log_agent_iteration(
+                session_id,
+                iteration=iteration,
+                event="final_response",
+                llm_latency_ms=llm_elapsed_ms,
+                final_text_len=len(result.final_text),
+            )
             break
 
         if not tool_calls and not supports_fc:
-            # prompt-based 降级模式：从文本中解析
             text = resp.get("final_text", "")
             tool_calls = parse_tool_calls(raw, is_anthropic)
             if not tool_calls:
-                # 无 tool call → 最终回复
                 result.final_text = text
                 result.reasoning_text = resp.get("reasoning_text", "")
                 break
 
-        # 执行 tool calls
+        # ── 执行 tool calls（逐个计时）──
         tool_results: List[ToolResult] = []
         for tc in tool_calls:
             logger.info(f"ReAct [{iteration}] calling tool: {tc.name}({tc.arguments})")
+
+            t_tool = time.perf_counter()
             tr = execute_tool_call(tc, tools)
+            tool_elapsed_ms = round((time.perf_counter() - t_tool) * 1000)
+
             tool_results.append(tr)
 
-            # 记录到 trace
             result.tool_trace.append({
                 "iteration": iteration,
                 "tool": tc.name,
                 "arguments": tc.arguments,
                 "result": tr.content[:500],
                 "is_error": tr.is_error,
+                "tool_latency_ms": tool_elapsed_ms,
+                "llm_latency_ms": llm_elapsed_ms,
             })
 
-        # 将 assistant 的 tool call + tool results 追加到消息历史
+            dbg.log_agent_iteration(
+                session_id,
+                iteration=iteration,
+                event="tool_call",
+                tool_name=tc.name,
+                tool_arguments=tc.arguments,
+                tool_result=tr.content[:2000],
+                tool_is_error=tr.is_error,
+                tool_latency_ms=tool_elapsed_ms,
+                llm_latency_ms=llm_elapsed_ms,
+                llm_input_messages=[
+                    {"role": m.get("role"), "content_len": len(str(m.get("content", "")))}
+                    for m in working_messages
+                ],
+                llm_raw_final_text=resp.get("final_text", "")[:1000],
+            )
+
+        # ── 将 tool call + results 追加到消息历史 ──
         if is_anthropic:
-            # Anthropic: assistant message 的 content 包含 text + tool_use blocks
             assistant_content = []
-            # 保留 text 部分
             final_text = resp.get("final_text", "")
             if final_text:
                 assistant_content.append({"type": "text", "text": final_text})
-            # 添加 tool_use blocks
             for tc in tool_calls:
                 assistant_content.append({
                     "type": "tool_use",
@@ -152,12 +205,9 @@ def react_loop(
                     "input": tc.arguments,
                 })
             working_messages.append({"role": "assistant", "content": assistant_content})
-
-            # tool results 作为 user message
             tool_result_content = [tool_result_to_anthropic_content(tr) for tr in tool_results]
             working_messages.append({"role": "user", "content": tool_result_content})
         else:
-            # OpenAI: assistant message 包含 tool_calls 字段
             assistant_msg: Dict[str, Any] = {"role": "assistant", "content": resp.get("final_text") or None}
             assistant_msg["tool_calls"] = [
                 {
@@ -165,20 +215,18 @@ def react_loop(
                     "type": "function",
                     "function": {
                         "name": tc.name,
-                        "arguments": __import__("json").dumps(tc.arguments, ensure_ascii=False),
+                        "arguments": _json.dumps(tc.arguments, ensure_ascii=False),
                     },
                 }
                 for tc in tool_calls
             ]
             working_messages.append(assistant_msg)
-
-            # 每个 tool result 作为独立的 tool message
             for tr in tool_results:
                 working_messages.append(tool_result_to_openai_message(tr))
     else:
-        # 达到最大迭代次数
         logger.warning(f"ReAct loop reached max iterations ({max_iterations})")
         result.final_text = resp.get("final_text", "") if 'resp' in dir() else ""
 
     result.total_time_ms = (time.perf_counter() - t0) * 1000
+    result.agent_stats = _build_agent_stats(result)
     return result

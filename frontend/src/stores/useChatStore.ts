@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { Message, WorkflowStep, EvidenceSummary, Source, ClarifyQuestion, ResearchDashboardData, ToolTraceItem } from '../types';
+import type { Message, WorkflowStep, EvidenceSummary, Source, ClarifyQuestion, ResearchDashboardData, ToolTraceItem, AgentDebugData } from '../types';
 import { getSession } from '../api/chat';
 
 interface ChatState {
@@ -28,7 +28,7 @@ interface ChatState {
   addMessage: (msg: Message) => void;
   updateLastMessage: (content: string) => void;
   appendToLastMessage: (delta: string) => void;
-  setLastMessageSources: (sources: Message['sources']) => void;
+  setLastMessageSources: (sources: Message['sources'], providerStats?: Message['providerStats']) => void;
   clearMessages: () => void;
   setWorkflowStep: (step: WorkflowStep) => void;
   setIsStreaming: (streaming: boolean) => void;
@@ -44,6 +44,7 @@ interface ChatState {
   setShowCommandPalette: (show: boolean) => void;
   setResearchDashboard: (dashboard: ResearchDashboardData | null) => void;
   setToolTrace: (trace: ToolTraceItem[] | null) => void;
+  setLastMessageAgentDebug: (debug: AgentDebugData) => void;
 }
 
 export const useChatStore = create<ChatState>((set) => ({
@@ -96,13 +97,14 @@ export const useChatStore = create<ChatState>((set) => ({
       return { messages };
     }),
 
-  setLastMessageSources: (sources) =>
+  setLastMessageSources: (sources, providerStats) =>
     set((state) => {
       const messages = [...state.messages];
       if (messages.length > 0) {
         messages[messages.length - 1] = {
           ...messages[messages.length - 1],
           sources,
+          ...(providerStats ? { providerStats } : {}),
         };
       }
       return { messages };
@@ -139,6 +141,17 @@ export const useChatStore = create<ChatState>((set) => ({
   setShowCommandPalette: (show) => set({ showCommandPalette: show }),
   setResearchDashboard: (dashboard) => set({ researchDashboard: dashboard }),
   setToolTrace: (trace) => set({ toolTrace: trace }),
+  setLastMessageAgentDebug: (debug) =>
+    set((state) => {
+      const messages = [...state.messages];
+      if (messages.length > 0) {
+        messages[messages.length - 1] = {
+          ...messages[messages.length - 1],
+          agentDebug: debug,
+        };
+      }
+      return { messages };
+    }),
 
   loadSession: async (sessionId: string) => {
     set({ isLoadingSession: true });

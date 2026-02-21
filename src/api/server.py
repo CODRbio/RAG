@@ -19,6 +19,7 @@ from src.api.routes_models import router as models_router
 from src.api.routes_ingest import router as ingest_router
 from src.api.routes_graph import router as graph_router
 from src.api.routes_compare import router as compare_router
+from src.api.routes_debug import router as debug_router
 from src.log import get_logger
 from src.utils.storage_cleaner import run_cleanup, get_storage_stats
 from src.utils.task_runner import cleanup_stale_jobs, run_background_worker
@@ -79,7 +80,12 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"[startup] storage cleanup failed: {e}")
 
-    # 3. 启动后台任务轮询 Worker
+    # 3. 初始化全局 DebugLogger
+    from src.debug import init_debug_logger
+    dl = init_debug_logger(enabled=settings.debug)
+    logger.info("[startup] debug mode: %s (log_dir=%s)", "ON" if dl.enabled else "OFF", dl.log_dir)
+
+    # 4. 启动后台任务轮询 Worker
     worker_task = asyncio.create_task(run_background_worker())
 
     yield
@@ -118,6 +124,7 @@ app.include_router(models_router)
 app.include_router(ingest_router)
 app.include_router(graph_router)
 app.include_router(compare_router)
+app.include_router(debug_router)
 
 # Observability: 中间件 + /metrics + /health/detailed
 setup_observability(app)

@@ -653,6 +653,14 @@ class Settings:
         )
 
     @property
+    def debug(self) -> bool:
+        """全局 Debug 模式：env RAG_DEBUG=1 > config debug: true > False"""
+        env_val = os.getenv("RAG_DEBUG", "").lower()
+        if env_val in ("1", "true"):
+            return True
+        return bool(_RAW_CONFIG.get("debug", False))
+
+    @property
     def is_prod(self) -> bool:
         return self.env == "prod"
 

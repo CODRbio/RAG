@@ -837,8 +837,17 @@ class HTTPChatClient(BaseChatClient):
                 # 非标准参数也放入（某些平台支持）
                 payload[key] = value
 
-        # 默认 max_tokens
-        if "max_tokens" not in payload and "max_completion_tokens" not in payload:
+        # Track if max_tokens was explicitly set to None (meaning "no limit")
+        _explicitly_unlimited = payload.get("max_tokens") is None and "max_tokens" in payload
+
+        # Remove None-valued token fields
+        if payload.get("max_tokens") is None:
+            payload.pop("max_tokens", None)
+        if payload.get("max_completion_tokens") is None:
+            payload.pop("max_completion_tokens", None)
+
+        # Only apply default if caller did NOT explicitly request unlimited
+        if not _explicitly_unlimited and "max_tokens" not in payload and "max_completion_tokens" not in payload:
             payload["max_tokens"] = DEFAULT_MAX_TOKENS
 
         # OpenAI 新 API: 使用 max_completion_tokens
@@ -878,9 +887,9 @@ class HTTPChatClient(BaseChatClient):
         for key, value in params.items():
             payload[key] = value
 
-        # 默认 max_tokens
-        if "max_tokens" not in payload:
-            payload["max_tokens"] = DEFAULT_MAX_TOKENS
+        # 默认 max_tokens (Anthropic API 必须提供大于 0 的整型 max_tokens)
+        if payload.get("max_tokens") is None:
+            payload["max_tokens"] = 8192
 
         # ── Function Calling: 注入 tools ──
         if tools:

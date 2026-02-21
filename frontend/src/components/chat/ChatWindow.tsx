@@ -1,16 +1,124 @@
 import { useRef, useEffect, useState, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
-import { MessageSquare, FileSearch, Copy, Download, ExternalLink, FileText, User, Calendar, GitCompareArrows, BookOpen } from 'lucide-react';
+import { MessageSquare, FileSearch, Copy, Download, ExternalLink, FileText, User, Calendar, GitCompareArrows, BookOpen, Database, Globe } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { useChatStore, useToastStore, useCompareStore } from '../../stores';
+import { useChatStore, useConfigStore, useToastStore, useCompareStore } from '../../stores';
 import type { Source, DeepResearchJobInfo } from '../../types';
 import { cancelDeepResearchJob, getDeepResearchJob, listDeepResearchJobEvents } from '../../api/chat';
 import { getChunkDetail } from '../../api/graph';
 import { RetrievalDebugPanel } from './RetrievalDebugPanel';
 import { ToolTracePanel } from './ToolTracePanel';
+import { AgentDebugPanel } from './AgentDebugPanel';
 import { ResearchProgressPanel } from '../research/ResearchProgressPanel';
 import { PdfViewerModal } from '../ui/PdfViewerModal';
+
+const PROVIDER_META: Record<string, { label: string; color: string; icon: 'db' | 'globe' }> = {
+  local:    { label: 'Local RAG',         color: '#38bdf8', icon: 'db' },
+  tavily:   { label: 'Tavily',            color: '#a78bfa', icon: 'globe' },
+  google:   { label: 'Google',            color: '#f97316', icon: 'globe' },
+  scholar:  { label: 'Google Scholar',    color: '#34d399', icon: 'globe' },
+  semantic: { label: 'Semantic Scholar',  color: '#facc15', icon: 'globe' },
+  ncbi:     { label: 'NCBI PubMed',       color: '#f472b6', icon: 'globe' },
+  web:      { label: 'Web',              color: '#94a3b8', icon: 'globe' },
+};
+
+function MiniPieChart({ data, size = 48 }: { data: { label: string; value: number; color: string }[]; size?: number }) {
+  const total = data.reduce((s, d) => s + d.value, 0);
+  if (total === 0) return null;
+  const r = size / 2;
+  const cx = r;
+  const cy = r;
+  const ir = r * 0.55;
+  let cumAngle = -Math.PI / 2;
+
+  const paths = data.map((d) => {
+    const angle = (d.value / total) * 2 * Math.PI;
+    const startOuter = { x: cx + r * Math.cos(cumAngle), y: cy + r * Math.sin(cumAngle) };
+    const endOuter = { x: cx + r * Math.cos(cumAngle + angle), y: cy + r * Math.sin(cumAngle + angle) };
+    const startInner = { x: cx + ir * Math.cos(cumAngle + angle), y: cy + ir * Math.sin(cumAngle + angle) };
+    const endInner = { x: cx + ir * Math.cos(cumAngle), y: cy + ir * Math.sin(cumAngle) };
+    const large = angle > Math.PI ? 1 : 0;
+    const path = [
+      `M ${startOuter.x} ${startOuter.y}`,
+      `A ${r} ${r} 0 ${large} 1 ${endOuter.x} ${endOuter.y}`,
+      `L ${startInner.x} ${startInner.y}`,
+      `A ${ir} ${ir} 0 ${large} 0 ${endInner.x} ${endInner.y}`,
+      'Z',
+    ].join(' ');
+    cumAngle += angle;
+    return <path key={d.label} d={path} fill={d.color} opacity={0.85} />;
+  });
+
+  return (
+    <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} className="flex-shrink-0">
+      {paths}
+      <text x={cx} y={cy} textAnchor="middle" dominantBaseline="central" className="fill-slate-300 text-[9px] font-bold">
+        {total}
+      </text>
+    </svg>
+  );
+}
+
+function ProviderRow({ label, counts, pieSize = 40 }: { label: string; counts: Record<string, number>; pieSize?: number }) {
+  const entries = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+  const total = entries.reduce((s, [, c]) => s + c, 0);
+  if (total === 0) return null;
+  const pieData = entries.map(([prov, count]) => ({
+    label: PROVIDER_META[prov]?.label || prov,
+    value: count,
+    color: PROVIDER_META[prov]?.color || '#64748b',
+  }));
+
+  return (
+    <div className="flex items-center gap-2.5">
+      <MiniPieChart data={pieData} size={pieSize} />
+      <div className="flex-1 min-w-0">
+        <div className="text-[9px] font-semibold text-slate-500 uppercase tracking-wider mb-1">{label}</div>
+        <div className="flex flex-wrap gap-x-3 gap-y-0.5">
+          {entries.map(([prov, count]) => {
+            const meta = PROVIDER_META[prov] || { label: prov, color: '#64748b', icon: 'globe' as const };
+            const pct = Math.round((count / total) * 100);
+            return (
+              <span key={prov} className="flex items-center gap-1 text-[10px] text-slate-400 whitespace-nowrap">
+                <span className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ backgroundColor: meta.color }} />
+                {meta.icon === 'db' ? <Database size={8} className="opacity-60" /> : <Globe size={8} className="opacity-60" />}
+                <span className="text-slate-300 font-medium">{meta.label}</span>
+                <span className="text-slate-500">{count} ({pct}%)</span>
+              </span>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SourceBreakdownBar({ sources, providerStats }: {
+  sources: Source[];
+  providerStats?: { chunk_level: Record<string, number>; citation_level: Record<string, number> };
+}) {
+  if (!sources || sources.length === 0) return null;
+
+  const citeCounts: Record<string, number> = providerStats?.citation_level || {};
+  if (!providerStats?.citation_level) {
+    for (const s of sources) {
+      const p = s.provider || (s.url ? 'web' : 'local');
+      citeCounts[p] = (citeCounts[p] || 0) + 1;
+    }
+  }
+
+  const chunkCounts = providerStats?.chunk_level;
+
+  return (
+    <div className="mb-3 p-2.5 bg-slate-800/60 rounded-lg border border-slate-700/40 space-y-2.5">
+      {chunkCounts && Object.keys(chunkCounts).length > 0 && (
+        <ProviderRow label="Chunks (Evidence Fragments)" counts={chunkCounts} pieSize={38} />
+      )}
+      <ProviderRow label="Citations (Articles / Pages)" counts={citeCounts} pieSize={38} />
+    </div>
+  );
+}
 
 export function ChatWindow() {
   const { t } = useTranslation();
@@ -19,6 +127,7 @@ export function ChatWindow() {
   const deepResearchActive = useChatStore((s) => s.deepResearchActive);
   const researchDashboard = useChatStore((s) => s.researchDashboard);
   const toolTrace = useChatStore((s) => s.toolTrace);
+  const agentDebugMode = useConfigStore((s) => s.ragConfig.agentDebugMode);
   const setShowDeepResearchDialog = useChatStore((s) => s.setShowDeepResearchDialog);
   const setDeepResearchTopic = useChatStore((s) => s.setDeepResearchTopic);
   const isStreaming = useChatStore((s) => s.isStreaming);
@@ -284,10 +393,18 @@ export function ChatWindow() {
       className="max-w-3xl mx-auto space-y-6 pb-24 overflow-y-auto px-4"
     >
       {backgroundBanner}
-      {/* Agent 工具调用轨迹 */}
-      {toolTrace && toolTrace.length > 0 && (
-        <ToolTracePanel trace={toolTrace} />
-      )}
+      {/* Agent 工具调用轨迹 / Debug 面板 */}
+      {(() => {
+        const lastMsg = messages[messages.length - 1];
+        const debugData = lastMsg?.agentDebug;
+        if (agentDebugMode && debugData) {
+          return <AgentDebugPanel data={debugData} />;
+        }
+        if (toolTrace && toolTrace.length > 0) {
+          return <ToolTracePanel trace={toolTrace} />;
+        }
+        return null;
+      })()}
       {/* Deep Research 进度面板 */}
       {(deepResearchActive || researchDashboard) && (
         <ResearchProgressPanel dashboard={researchDashboard} isActive={deepResearchActive} />
@@ -382,6 +499,7 @@ export function ChatWindow() {
                 <div className="text-[11px] font-bold uppercase tracking-wider text-slate-500 flex items-center gap-1.5 mb-3">
                   <FileSearch size={12} className="text-sky-500" /> {t('chat.references')} ({msg.sources.length})
                 </div>
+                <SourceBreakdownBar sources={msg.sources} providerStats={msg.providerStats} />
                 <div className="space-y-2">
                   {msg.sources.map((src) => (
                     <div
@@ -392,11 +510,25 @@ export function ChatWindow() {
                       {/* Glow effect on hover */}
                       <div className="absolute inset-0 bg-gradient-to-r from-transparent via-sky-500/5 to-transparent -translate-x-full group-hover/ref:translate-x-full transition-transform duration-1000 pointer-events-none"></div>
 
-                      {/* 第一行：cite_key + 链接图标 */}
+                      {/* 第一行：cite_key + provider badge + 链接图标 */}
                       <div className="flex items-start justify-between gap-2 mb-1">
-                        <span className="text-xs font-mono font-bold text-sky-400 bg-slate-900/50 border border-slate-700/50 px-1.5 py-0.5 rounded shadow-sm">
-                          [{src.cite_key}]
-                        </span>
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <span className="text-xs font-mono font-bold text-sky-400 bg-slate-900/50 border border-slate-700/50 px-1.5 py-0.5 rounded shadow-sm">
+                            [{src.cite_key}]
+                          </span>
+                          {(() => {
+                            const prov = src.provider || (src.url ? 'web' : 'local');
+                            const meta = PROVIDER_META[prov] || { label: prov, color: '#64748b' };
+                            return (
+                              <span
+                                className="text-[9px] font-medium px-1.5 py-0.5 rounded-full border"
+                                style={{ color: meta.color, borderColor: meta.color + '40', backgroundColor: meta.color + '15' }}
+                              >
+                                {meta.label}
+                              </span>
+                            );
+                          })()}
+                        </div>
                         {(src.url || src.doi) && (
                           <ExternalLink size={12} className="text-slate-500 group-hover/ref:text-sky-400 flex-shrink-0 mt-0.5 transition-colors" />
                         )}

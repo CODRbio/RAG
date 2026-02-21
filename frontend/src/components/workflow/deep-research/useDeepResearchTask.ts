@@ -33,8 +33,6 @@ export type GeneratePlanParams = {
   topic: string;
   answers: Record<string, string>;
   outputLanguage: 'auto' | 'en' | 'zh';
-  yearStart: number | null;
-  yearEnd: number | null;
   stepModels: Record<string, string>;
   stepModelStrict: boolean;
 };
@@ -574,8 +572,9 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       });
       const qs = result.questions || [];
       setClarificationQuestions(qs);
-      if (result.suggested_topic) {
-        setDeepResearchTopic(result.suggested_topic);
+      const suggestedTopic = (result.suggested_topic || '').trim();
+      if (suggestedTopic) {
+        setDeepResearchTopic(suggestedTopic);
       }
       if (result.used_fallback) {
         addToast(`澄清阶段触发回退：${result.fallback_reason || 'unknown'}`, 'warning');
@@ -604,7 +603,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
   };
 
   const generatePlan = async (params: GeneratePlanParams) => {
-    const { topic, answers, outputLanguage, yearStart, yearEnd, stepModels, stepModelStrict } = params;
+    const { topic, answers, outputLanguage, stepModels, stepModelStrict } = params;
     if (!topic.trim()) {
       addToast('请输入研究主题', 'error');
       return;
@@ -634,8 +633,8 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       query_optimizer_max_queries: webEnabled ? maxQueries : undefined,
       local_top_k: localEnabled ? Math.max(ragConfig.localTopK, 15) : undefined,
       local_threshold: localEnabled ? (ragConfig.localThreshold ?? undefined) : undefined,
-      year_start: yearStart ?? undefined,
-      year_end: yearEnd ?? undefined,
+      year_start: ragConfig.yearStart ?? undefined,
+      year_end: ragConfig.yearEnd ?? undefined,
       final_top_k: deepFinalTopK,
       clarification_answers: hasNonEmptyAnswers ? answers : undefined,
       output_language: outputLanguage,
@@ -664,7 +663,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
 
   const confirmAndRun = async (params: ConfirmAndRunParams) => {
     const {
-      topic, outlineDraft: rawOutline, briefDraft: brief, outputLanguage, yearStart, yearEnd,
+      topic, outlineDraft: rawOutline, briefDraft: brief, outputLanguage,
       stepModels, stepModelStrict, userContext, userContextMode, tempDocuments,
       depth, skipDraftReview, skipRefineReview, skipClaimGeneration, keepPreviousJobId,
     } = params;
@@ -711,8 +710,8 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       query_optimizer_max_queries: webEnabled ? maxQueries : undefined,
       local_top_k: localEnabled ? Math.max(ragConfig.localTopK, 15) : undefined,
       local_threshold: localEnabled ? (ragConfig.localThreshold ?? undefined) : undefined,
-      year_start: yearStart ?? undefined,
-      year_end: yearEnd ?? undefined,
+      year_start: ragConfig.yearStart ?? undefined,
+      year_end: ragConfig.yearEnd ?? undefined,
       final_top_k: deepFinalTopK,
       user_context: userContext.trim() || undefined,
       user_context_mode: userContext.trim() ? userContextMode : undefined,

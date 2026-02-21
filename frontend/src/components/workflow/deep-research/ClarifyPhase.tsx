@@ -58,7 +58,7 @@ export function ClarifyPhase({
                 <select
                   value={answers[q.id] || ''}
                   onChange={(e) => onAnswerChange(q.id, e.target.value)}
-                  className="w-full border border-gray-200 rounded-md px-2.5 py-1.5 text-sm bg-white focus:ring-2 focus:ring-indigo-500 outline-none"
+                  className="w-full border border-gray-200 rounded-md px-2.5 py-1.5 text-sm bg-white text-gray-900 focus:ring-2 focus:ring-indigo-500 outline-none"
                 >
                   {q.options.map((opt) => (
                     <option key={opt} value={opt}>{opt}</option>
@@ -70,7 +70,7 @@ export function ClarifyPhase({
                   value={answers[q.id] || ''}
                   onChange={(e) => onAnswerChange(q.id, e.target.value)}
                   placeholder={q.default || '输入回答...'}
-                  className="w-full border border-gray-200 rounded-md px-2.5 py-1.5 text-sm focus:ring-2 focus:ring-indigo-500 outline-none"
+                  className="w-full border border-gray-200 bg-white text-gray-900 rounded-md px-2.5 py-1.5 text-sm focus:ring-2 focus:ring-indigo-500 outline-none"
                 />
               )}
               <div className="mt-1.5 text-xs text-gray-500">

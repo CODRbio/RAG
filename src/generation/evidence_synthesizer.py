@@ -126,7 +126,8 @@ class SynthesisMeta:
     """证据综合元数据"""
 
     year_range: Tuple[Optional[int], Optional[int]] = (None, None)
-    source_breakdown: Dict[str, int] = field(default_factory=dict)
+    source_breakdown: Dict[str, int] = field(default_factory=dict)  # chunk 级：每个 chunk 算一次
+    unique_source_breakdown: Dict[str, int] = field(default_factory=dict)  # 来源级：同 URL/doc_id 只算一次
     evidence_type_breakdown: Dict[str, int] = field(default_factory=dict)
     cross_validated_count: int = 0
     total_documents: int = 0
@@ -135,6 +136,7 @@ class SynthesisMeta:
         return {
             "year_range": list(self.year_range),
             "source_breakdown": self.source_breakdown,
+            "unique_source_breakdown": self.unique_source_breakdown,
             "evidence_type_breakdown": self.evidence_type_breakdown,
             "cross_validated_count": self.cross_validated_count,
             "total_documents": self.total_documents,
@@ -207,15 +209,23 @@ class EvidenceSynthesizer:
         return context, meta
 
     def _compute_meta(self, chunks: List[EvidenceChunk]) -> SynthesisMeta:
-        """计算综合元数据"""
+        """计算综合元数据（chunk 级 + 来源级双层统计）"""
         years = [c.year for c in chunks if c.year is not None]
         year_range = (min(years), max(years)) if years else (None, None)
 
-        # 来源统计（合并为 local / web）
-        source_counts: Dict[str, int] = defaultdict(int)
+        # chunk 级：每个 chunk 算一次（同文档多个 chunk 分别计数）
+        chunk_counts: Dict[str, int] = defaultdict(int)
+        # 来源级：同 doc_group_key（URL/doc_id）只算一次
+        source_docs: Dict[str, set] = defaultdict(set)
+
         for c in chunks:
-            key = "local" if c.source_type in _LOCAL_SOURCES else "web"
-            source_counts[key] += 1
+            prov = getattr(c, "provider", None)
+            if not prov:
+                prov = "local" if c.source_type in _LOCAL_SOURCES else "web"
+            chunk_counts[prov] += 1
+            source_docs[prov].add(c.doc_group_key)
+
+        unique_source_counts = {k: len(v) for k, v in source_docs.items()}
 
         # 证据类型统计
         type_counts: Dict[str, int] = defaultdict(int)
@@ -223,14 +233,15 @@ class EvidenceSynthesizer:
             type_counts[c.evidence_type or "background"] += 1
 
         # 独立文献数
-        doc_ids = {c.doc_id for c in chunks if c.doc_id}
+        doc_keys = {c.doc_group_key for c in chunks}
 
         return SynthesisMeta(
             year_range=year_range,
-            source_breakdown=dict(source_counts),
+            source_breakdown=dict(chunk_counts),
+            unique_source_breakdown=unique_source_counts,
             evidence_type_breakdown=dict(type_counts),
             cross_validated_count=0,
-            total_documents=len(doc_ids),
+            total_documents=len(doc_keys),
         )
 
     def _find_cross_validated(self, chunks: List[EvidenceChunk]) -> set:
@@ -288,14 +299,19 @@ class EvidenceSynthesizer:
         elif meta.total_documents:
             lines.append(f"涉及文献: {meta.total_documents}篇")
 
-        # 来源构成
-        local_n = meta.source_breakdown.get("local", 0)
-        web_n = meta.source_breakdown.get("web", 0)
+        _PROVIDER_LABELS = {
+            "local": "本地", "tavily": "Tavily", "google": "Google",
+            "scholar": "Google Scholar", "semantic": "Semantic Scholar",
+            "ncbi": "NCBI PubMed", "web": "网络",
+        }
         source_parts = []
-        if local_n:
-            source_parts.append(f"本地 {local_n} 条")
-        if web_n:
-            source_parts.append(f"网络 {web_n} 条")
+        for prov, cnt in sorted(meta.source_breakdown.items(), key=lambda x: -x[1]):
+            label = _PROVIDER_LABELS.get(prov, prov)
+            n_sources = meta.unique_source_breakdown.get(prov, 0)
+            if n_sources and n_sources != cnt:
+                source_parts.append(f"{label} {n_sources} 篇/{cnt} 条")
+            else:
+                source_parts.append(f"{label} {cnt} 条")
         if meta.cross_validated_count:
             source_parts.append(f"交叉验证 {meta.cross_validated_count} 条")
         if source_parts:

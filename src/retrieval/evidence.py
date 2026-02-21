@@ -36,6 +36,7 @@ class EvidenceChunk:
     section_title: Optional[str] = None
     evidence_type: Optional[str] = None  # finding | method | interpretation | background | summary
     bbox: Optional[List[float]] = None  # Docling 物理坐标 [x0,y0,x1,y1]
+    provider: Optional[str] = None  # tavily | scholar | semantic | ncbi | google | local
 
     @property
     def ref_hash(self) -> str:
@@ -73,10 +74,11 @@ class EvidencePack:
     def get_chunks_by_source(self, source_type: str) -> List[EvidenceChunk]:
         return [c for c in self.chunks if c.source_type == source_type]
 
-    def to_context_string(self, max_chunks: int = 10) -> str:
+    def to_context_string(self, max_chunks: Optional[int] = None) -> str:
         """生成 LLM 可用的上下文字符串（使用 [ref:xxxx] 作为引用标记）"""
         lines = []
-        for chunk in self.chunks[:max_chunks]:
+        limit = max_chunks if max_chunks is not None else len(self.chunks)
+        for chunk in self.chunks[:limit]:
             ref = f"[{chunk.ref_hash}]"
             lines.append(f"{ref} {chunk.text}")
         return "\n\n".join(lines)

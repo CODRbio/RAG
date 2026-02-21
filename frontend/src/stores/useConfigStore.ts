@@ -46,8 +46,8 @@ interface ConfigState {
   ) => void;
   setQueryOptimizer: (enabled: boolean) => void;
   setMaxQueriesPerProvider: (value: number) => void;
-  setContentFetcherEnabled: (enabled: boolean) => void;
-  setAgentEnabled: (enabled: boolean) => void;
+  setContentFetcherMode: (mode: 'auto' | 'force' | 'off') => void;
+  setAgentMode: (mode: 'standard' | 'assist' | 'autonomous') => void;
 }
 
 const defaultWebSources: WebSource[] = [
@@ -78,9 +78,12 @@ export const useConfigStore = create<ConfigState>()(
         localTopK: 5,
         localThreshold: 0.5,  // 默认相似度阈值
         finalTopK: 10,  // 默认最终保留10条
+        yearStart: null,
+        yearEnd: null,
         enableHippoRAG: false,
         enableReranker: true,
-        enableAgent: true,  // Agent 模式默认开启
+        agentMode: 'assist' as const,
+        agentDebugMode: false,
       },
 
       webSearchConfig: {
@@ -88,7 +91,7 @@ export const useConfigStore = create<ConfigState>()(
         sources: defaultWebSources,
         queryOptimizer: true,   // 默认开启
         maxQueriesPerProvider: 3,
-        enableContentFetcher: false,  // 全文抓取默认关闭
+        contentFetcherMode: 'auto',  // 全文抓取默认智能模式
       },
 
       selectedProvider: 'deepseek',  // 默认 provider
@@ -180,14 +183,14 @@ export const useConfigStore = create<ConfigState>()(
           },
         })),
 
-      setContentFetcherEnabled: (enabled) =>
+      setContentFetcherMode: (mode) =>
         set((state) => ({
-          webSearchConfig: { ...state.webSearchConfig, enableContentFetcher: enabled },
+          webSearchConfig: { ...state.webSearchConfig, contentFetcherMode: mode },
         })),
 
-      setAgentEnabled: (enabled) =>
+      setAgentMode: (mode) =>
         set((state) => ({
-          ragConfig: { ...state.ragConfig, enableAgent: enabled },
+          ragConfig: { ...state.ragConfig, agentMode: mode },
         })),
     }),
     {
@@ -215,14 +218,19 @@ export const useConfigStore = create<ConfigState>()(
             enabled: persisted.ragConfig?.enabled ?? true,
             localThreshold: persisted.ragConfig?.localThreshold ?? 0.5,
             finalTopK: persisted.ragConfig?.finalTopK ?? 10,
-            enableAgent: persisted.ragConfig?.enableAgent ?? true,
+            yearStart: normalizeOptionalYear(persisted.ragConfig?.yearStart),
+            yearEnd: normalizeOptionalYear(persisted.ragConfig?.yearEnd),
+            // Migrate old enableAgent boolean to agentMode tri-state
+            agentMode: (persisted.ragConfig as any)?.agentMode
+              ?? ((persisted.ragConfig as any)?.enableAgent === false ? 'standard' : 'assist'),
+            agentDebugMode: persisted.ragConfig?.agentDebugMode ?? false,
           },
           webSearchConfig: {
             ...currentState.webSearchConfig,
             ...(persisted.webSearchConfig || {}),
             queryOptimizer: persisted.webSearchConfig?.queryOptimizer ?? true,
             maxQueriesPerProvider: persisted.webSearchConfig?.maxQueriesPerProvider ?? 3,
-            enableContentFetcher: persisted.webSearchConfig?.enableContentFetcher ?? false,
+            contentFetcherMode: (persisted.webSearchConfig as any)?.contentFetcherMode ?? ((persisted.webSearchConfig as any)?.enableContentFetcher === true ? 'force' : 'auto'),
             sources: (() => {
               const saved = persisted.webSearchConfig?.sources || [];
               const savedIds = new Set(saved.map((s) => s.id));

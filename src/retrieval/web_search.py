@@ -109,7 +109,7 @@ def _normalize_hit(
         "content": text,
         "score": float(score),
         "metadata": {
-            "source": "web",
+            "source": "tavily",
             "doc_id": title or url or "web",
             "title": title or "无标题",
             "url": url or "",

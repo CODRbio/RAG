@@ -78,9 +78,28 @@ cp config/rag_config.local.example.json config/rag_config.local.json
 cp .env.example .env
 
 # 编辑 .env，设置 Milvus 地址、设备类型等
-# 编辑 config/rag_config.local.json，填入各 LLM provider 的 API Key
+# 编辑 config/rag_config.local.json，填入各 API Key（见下表）
 # 如需覆盖数据库连接，可设置 RAG_DATABASE_URL（默认 sqlite:///data/rag.db）
 ```
+
+### API Key 配置说明
+
+编辑 `config/rag_config.local.json`，按需填入以下 API Key：
+
+| 配置路径 | 用途 | 是否必须 | 获取方式 |
+|---------|------|---------|---------|
+| `llm.providers.openai.api_key` | OpenAI GPT 系列 | 至少配一个 LLM | [platform.openai.com](https://platform.openai.com/api-keys) |
+| `llm.providers.deepseek.api_key` | DeepSeek Chat/Reasoner | 至少配一个 LLM | [platform.deepseek.com](https://platform.deepseek.com/) |
+| `llm.providers.gemini.api_key` | Google Gemini | 至少配一个 LLM | [aistudio.google.com](https://aistudio.google.com/apikey) |
+| `llm.providers.claude.api_key` | Anthropic Claude | 至少配一个 LLM | [console.anthropic.com](https://console.anthropic.com/) |
+| `llm.providers.kimi.api_key` | Moonshot Kimi | 至少配一个 LLM | [platform.moonshot.cn](https://platform.moonshot.cn/) |
+| `llm.providers.sonar.api_key` | Perplexity Sonar | 可选 | [perplexity.ai](https://docs.perplexity.ai/) |
+| `web_search.api_key` | Tavily 网络搜索 | 推荐 | [tavily.com](https://tavily.com/) |
+| `semantic_scholar.api_key` | Semantic Scholar API | 可选（无 key 也可用，有速率限制） | [semanticscholar.org/product/api](https://www.semanticscholar.org/product/api) |
+| `ncbi.api_key` | NCBI PubMed E-Utilities | 可选（无 key 也可用，有速率限制） | [ncbi.nlm.nih.gov/account](https://www.ncbi.nlm.nih.gov/account/) |
+| `content_fetcher.brightdata_api_key` | BrightData 全文抓取代理 | 可选 | [brightdata.com](https://brightdata.com/) |
+
+> **注意**：`thinking` 和 `vision` 变体（如 `openai-thinking`、`gemini-vision`）与对应的基础 provider 共用同一个 API Key，只需填写一次即可。
 
 密钥注入优先级：
 

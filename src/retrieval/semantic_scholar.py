@@ -79,7 +79,8 @@ class SemanticScholarSearcher:
 
     @property
     def enabled(self) -> bool:
-        return bool(self._config.get("enabled") and (self._config.get("api_key") or "").strip())
+        """Config-level enabled flag (for auto-discovery). API key is optional for public API."""
+        return bool(self._config.get("enabled"))
 
     async def _ensure_session(self) -> None:
         if self._session and not self._session.closed:
@@ -149,8 +150,6 @@ class SemanticScholarSearcher:
         year_start: Optional[int] = None,
         year_end: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        if not self.enabled:
-            return []
         q = (query or "").strip()
         if not q:
             return []
@@ -178,6 +177,7 @@ class SemanticScholarSearcher:
             "Accept": "application/json",
             "User-Agent": "DeepSea-RAG/1.0",
         }
+        
         api_key = (self._config.get("api_key") or "").strip()
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"

@@ -1,4 +1,5 @@
 {
+  "debug": false,
   "database": {
     "url": "sqlite:///data/rag.db"
   },
@@ -15,16 +16,21 @@
       "claude-thinking": { "api_key": "sk-ant-xxx" },
       "kimi": { "api_key": "sk-xxx" },
       "kimi-vision": { "api_key": "sk-xxx" },
-      "kimi-thinking": { "api_key": "sk-xxx" }
+      "kimi-thinking": { "api_key": "sk-xxx" },
+      "sonar": { "api_key": "pplx-xxx" }
     }
   },
   "web_search": {
     "api_key": "tvly-xxx"
   },
   "semantic_scholar": {
-    "api_key": "ai4scholar-xxx"
+    "api_key": ""
   },
   "ncbi": {
     "api_key": ""
+  },
+  "content_fetcher": {
+    "brightdata_api_key": "",
+    "brightdata_zone": ""
   }
 }

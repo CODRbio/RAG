@@ -116,7 +116,7 @@ export function ConfirmPhase({
         <select
           value={outputLanguage}
           onChange={(e) => onOutputLanguageChange(e.target.value as 'auto' | 'en' | 'zh')}
-          className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-indigo-500 outline-none"
+          className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm bg-white text-gray-900 focus:ring-2 focus:ring-indigo-500 outline-none"
         >
           <option value="auto">Auto (follow topic language)</option>
           <option value="en">English</option>
@@ -155,7 +155,7 @@ export function ConfirmPhase({
                 <select
                   value={stepModels[step] || ''}
                   onChange={(e) => onStepModelChange(step, e.target.value)}
-                  className="col-span-2 border border-gray-200 rounded-md px-2 py-1 text-xs"
+                  className="col-span-2 border border-gray-200 rounded-md px-2 py-1 text-xs bg-white text-gray-900"
                 >
                   {modelOptions.map((opt) => (
                     <option key={`${step}-${opt.value || 'default'}`} value={opt.value}>{opt.label}</option>
@@ -212,7 +212,7 @@ export function ConfirmPhase({
                 value={item}
                 onChange={(e) => onOutlineChange(idx, e.target.value)}
                 placeholder="New section title..."
-                className="flex-1 border border-gray-200 rounded-md px-2.5 py-1.5 text-sm"
+                className="flex-1 border border-gray-200 rounded-md px-2.5 py-1.5 text-sm bg-white text-gray-900"
               />
               <button
                 onClick={() => onOutlineRemove(idx)}
@@ -352,7 +352,7 @@ export function ConfirmPhase({
           <select
             value={userContextMode}
             onChange={(e) => onUserContextModeChange(e.target.value as 'supporting' | 'direct_injection')}
-            className="w-full border border-gray-200 rounded-md px-2.5 py-1.5 text-xs"
+            className="w-full border border-gray-200 rounded-md px-2.5 py-1.5 text-xs bg-white text-gray-900"
           >
             <option value="supporting">作为补充上下文（默认）</option>
             <option value="direct_injection">作为强提示直接注入（我对内容非常自信）</option>
@@ -364,7 +364,7 @@ export function ConfirmPhase({
           placeholder={userContextMode === 'direct_injection'
             ? '输入高置信观点/约束，系统会作为高优先级提示并要求显式验证...'
             : '可补充新观点、反例、约束条件、重点文献线索...'}
-          className="w-full min-h-20 border border-gray-200 rounded-md px-2.5 py-2 text-sm"
+          className="w-full min-h-20 border border-gray-200 rounded-md px-2.5 py-2 text-sm bg-white text-gray-900"
         />
         <input
           ref={contextFileInputRef}
