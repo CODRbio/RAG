@@ -380,7 +380,7 @@ export function RefineStage({ canvas }: RefineStageProps) {
       },
     ]);
     setActiveLockedId(lockId);
-    addToast('已锁定当前选区（全文重整时不会改动）', 'success');
+    addToast('已锁定当前选区（全文 AI 改写时不会改动）', 'success');
     setSelection(null);
     setShowAnnotationInput(false);
   };
@@ -597,23 +597,23 @@ export function RefineStage({ canvas }: RefineStageProps) {
             onClick={handleRestartSynthesize}
             disabled={restarting}
             className="px-2 py-1.5 rounded text-xs border border-indigo-300 text-indigo-700 hover:bg-indigo-50 disabled:opacity-50 cursor-pointer"
-            title="重新执行最终综合（synthesize）"
+            title="仅重跑 Deep Research 的「最终整合」步骤：把已有各章节合并成一篇连贯全文，不重写各章内容"
           >
-            {restarting ? '提交中...' : '重新综合'}
+            {restarting ? '提交中...' : '重跑最终整合'}
           </button>
           <button
             onClick={handleRefineFull}
             disabled={isFullRefining || isAIEditing || !canvasContent.trim()}
             className="px-2 py-1.5 rounded text-xs bg-violet-100 text-violet-700 hover:bg-violet-200 disabled:opacity-50 cursor-pointer"
-            title="基于当前全文进行全局重整（慎用，可能改动范围较大）"
+            title="对当前整篇文档做 AI 精炼/改写，可能改动范围较大（锁定选区可保持不变）"
           >
-            {isFullRefining ? '重整中...' : '全文重整(慎用)'}
+            {isFullRefining ? '改写中...' : '全文 AI 改写(慎用)'}
           </button>
           <button
             onClick={handleLockSelection}
             disabled={!editMode || !selection}
             className="px-2 py-1.5 rounded text-xs bg-emerald-100 text-emerald-700 hover:bg-emerald-200 disabled:opacity-50 cursor-pointer"
-            title="锁定当前选区，全文重整时保持不变"
+            title="锁定当前选区，执行「全文 AI 改写」时该片段保持不变"
           >
             锁定选区
           </button>
@@ -796,7 +796,7 @@ export function RefineStage({ canvas }: RefineStageProps) {
               全局修改指令
             </h5>
             <div className="text-[10px] text-[var(--text-tertiary)] mb-2">
-              建议优先使用“选区定向精炼”；全文重整可能影响未选中内容。
+              建议优先使用“选区定向精炼”；全文 AI 改写会处理整篇，可能影响未选中内容。
             </div>
             <div className="mb-2 p-2 rounded-md border border-[var(--border-subtle)] bg-[var(--bg-muted)]">
               <div className="flex items-center justify-between mb-1">
@@ -859,7 +859,7 @@ export function RefineStage({ canvas }: RefineStageProps) {
                 disabled={isFullRefining || isAIEditing || !canvasContent.trim()}
                 className="px-2.5 py-1.5 bg-violet-500 text-white rounded-md text-xs hover:bg-violet-600 disabled:opacity-50"
               >
-                全文重整
+                全文 AI 改写
               </button>
             </div>
             {canvas.user_directives.length > 0 && (

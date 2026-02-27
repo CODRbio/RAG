@@ -297,6 +297,159 @@ def _normalize_year_window(filters: Optional[Dict[str, Any]]) -> tuple[Optional[
     return year_start, year_end
 
 
+# ── Pool fusion constants ──────────────────────────────────────────────────────
+# Fraction of top_k slots reserved for gap candidates when they are present.
+_GAP_MIN_KEEP_RATIO: float = 0.25
+# Additive gap score boost as a fraction of the reranked score range.
+_GAP_SCORE_BOOST: float = 0.10
+
+
+def fuse_pools_with_gap_protection(
+    query: str,
+    main_candidates: List[Dict[str, Any]],
+    gap_candidates: List[Dict[str, Any]],
+    top_k: int,
+    *,
+    gap_boost: float = _GAP_SCORE_BOOST,
+    gap_min_keep: Optional[int] = None,
+    reranker_mode: Optional[str] = None,
+    skip_rerank: bool = False,
+    diag: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """Merge main and gap candidate pools with gap-quota protection.
+
+    Algorithm:
+      1. Tag all candidates with pool membership (_pool_tag: "main" | "gap").
+      2. Run ONE global rerank pass on the combined pool so cross-source ordering
+         is based on a single relevance scale.
+      3. Apply additive gap_boost to gap candidates: score += gap_boost * score_range.
+      4. Re-sort by boosted score.
+      5. Enforce gap_min_keep: if fewer than gap_min_keep gap items land in the top_k
+         slice, force-include the highest-scoring remaining gap candidates by swapping
+         out the lowest-scoring main candidates (preserving output length == top_k).
+      6. Strip internal tags and return.
+
+    Args:
+        main_candidates: primary pool hits (local dense + main web hits).
+        gap_candidates:  gap/supplement pool hits (eval_supplement, gap-query hits).
+        top_k:           final output count after fusion.
+        gap_boost:       fractional boost for gap candidate scores
+                         (relative to reranked score range). Default 0.10.
+        gap_min_keep:    guaranteed gap slots in top_k output.
+                         Defaults to ceil(top_k * _GAP_MIN_KEEP_RATIO) when
+                         gap_candidates is non-empty; 0 otherwise.
+        reranker_mode:   reranker mode forwarded to _rerank_candidates.
+        skip_rerank:     use fast embedding rerank instead of cross-encoder.
+        diag:            optional diagnostics dict; updated in-place with pool stats.
+
+    Returns:
+        Fused and ordered list of candidate dicts, length <= top_k.
+        Internal keys (_pool_tag) are stripped; _source_type is preserved for
+        callers that need it (e.g. service.py hybrid flow).
+    """
+    n_main = len(main_candidates)
+    n_gap = len(gap_candidates)
+    if n_main == 0 and n_gap == 0:
+        return []
+
+    # Tag all candidates with pool membership (copies dicts to avoid mutation)
+    all_cands: List[Dict[str, Any]] = []
+    for c in main_candidates:
+        all_cands.append({**c, "_pool_tag": "main"})
+    for c in gap_candidates:
+        all_cands.append({**c, "_pool_tag": "gap"})
+
+    n_total = len(all_cands)
+    rerank_k = min(max(top_k * 2, top_k + n_gap), n_total)
+
+    # Global rerank — one pass covering all candidates from both pools
+    try:
+        if skip_rerank:
+            reranked = _embedding_rerank(query, all_cands, top_k=rerank_k)
+        else:
+            reranked = _rerank_candidates(
+                query, all_cands, top_k=rerank_k, reranker_mode=reranker_mode,
+            )
+    except Exception as e:
+        logger.warning("fuse_pools global rerank failed (%s); falling back to score sort", e)
+        reranked = sorted(
+            all_cands, key=lambda x: float(x.get("score", 0.0)), reverse=True
+        )[:rerank_k]
+
+    if not reranked:
+        # Strip tags and return head slice
+        return [{k: v for k, v in c.items() if k != "_pool_tag"} for c in all_cands[:top_k]]
+
+    # Compute score range for proportional gap boost
+    scores = [float(c.get("score", 0.0)) for c in reranked]
+    score_max = max(scores)
+    score_min = min(scores)
+    score_range = score_max - score_min
+    # When all scores are identical, use a small absolute boost so gap items
+    # are still distinguishable.
+    boost_abs = gap_boost * score_range if score_range > 1e-9 else gap_boost * 0.05
+
+    # Apply boost to gap candidates and re-sort
+    boosted: List[Dict[str, Any]] = []
+    for c in reranked:
+        if c.get("_pool_tag") == "gap":
+            boosted.append({**c, "score": float(c.get("score", 0.0)) + boost_abs})
+        else:
+            boosted.append(c)
+    boosted.sort(key=lambda x: float(x.get("score", 0.0)), reverse=True)
+
+    # Resolve effective gap quota
+    effective_min_keep: int = 0
+    if n_gap > 0:
+        if gap_min_keep is not None:
+            effective_min_keep = gap_min_keep
+        else:
+            effective_min_keep = max(1, math.ceil(top_k * _GAP_MIN_KEEP_RATIO))
+        effective_min_keep = min(effective_min_keep, n_gap, top_k)
+
+    # Gap quota enforcement: force-include top gap items if quota not met in top_k
+    top_slice = boosted[:top_k]
+    if effective_min_keep > 0:
+        gap_in_top = [c for c in top_slice if c.get("_pool_tag") == "gap"]
+        gap_deficit = effective_min_keep - len(gap_in_top)
+        if gap_deficit > 0:
+            top_ids = {
+                str(c.get("chunk_id") or (c.get("metadata") or {}).get("chunk_id") or i)
+                for i, c in enumerate(top_slice)
+            }
+            gap_reserve = [
+                c for c in boosted[top_k:]
+                if c.get("_pool_tag") == "gap"
+            ]
+            forced = gap_reserve[:gap_deficit]
+            if forced:
+                # Replace lowest-scoring main candidates to keep length == top_k
+                main_in_top = [i for i, c in enumerate(top_slice) if c.get("_pool_tag") == "main"]
+                drop_indices = set(main_in_top[-len(forced):]) if main_in_top else set()
+                top_slice = [c for i, c in enumerate(top_slice) if i not in drop_indices]
+                top_slice.extend(forced)
+                top_slice.sort(key=lambda x: float(x.get("score", 0.0)), reverse=True)
+
+    out = top_slice
+
+    # Strip _pool_tag (keep _source_type and other internal keys for callers)
+    clean = [{k: v for k, v in c.items() if k != "_pool_tag"} for c in out]
+
+    if diag is not None:
+        gap_in_output = sum(1 for c in out if c.get("_pool_tag") == "gap")
+        diag["pool_fusion"] = {
+            "main_in": n_main,
+            "gap_in": n_gap,
+            "total_reranked": len(reranked),
+            "gap_boost_abs": round(boost_abs, 5),
+            "gap_min_keep": effective_min_keep,
+            "gap_in_output": gap_in_output,
+            "output_count": len(clean),
+        }
+
+    return clean
+
+
 class RetrievalService:
     """
     统一检索服务。
@@ -458,6 +611,11 @@ class RetrievalService:
         if mode == "hybrid":
             local_hits: List[Dict[str, Any]] = []
             web_hits: List[Dict[str, Any]] = []
+
+            # Return more local candidates so the global cross-source rerank has
+            # a rich pool to work with; final truncation to result_limit is done
+            # by fuse_pools_with_gap_protection after merging with web results.
+            local_recall_k = min(actual_recall, max(result_limit * 2, 20))
             local_config = RetrievalConfig(
                 mode="hybrid",
                 top_k=actual_recall,
@@ -465,69 +623,106 @@ class RetrievalService:
                 year_start=year_start,
                 year_end=year_end,
                 reranker_mode=ui_reranker_mode,
-                step_top_k=(filters or {}).get("step_top_k"),
+                step_top_k=local_recall_k,
             )
-            with ThreadPoolExecutor(max_workers=2) as ex:
-                fl = ex.submit(
-                    self.retriever.retrieve,
-                    query, self.collection, local_config, diagnostics=diag,
-                )
-                fw = ex.submit(_do_web)
-                try:
-                    local_hits = fl.result(timeout=timeout_s)
-                except (FuturesTimeoutError, Exception):
-                    pass
-                try:
-                    web_hits = fw.result(timeout=timeout_s)
-                except (FuturesTimeoutError, Exception):
-                    pass
+
+            # ── Soft-wait: local gets a hard timeout; web gets an extended budget
+            # so slow providers (Scholar browser) can complete rather than being
+            # silently dropped.  Threads are not killed on timeout — they finish
+            # in the background as I/O-bound work naturally completes.
+            soft_wait_s = min(timeout_s * 5, 300)
+
+            ex = ThreadPoolExecutor(max_workers=2)
+            fl = ex.submit(
+                self.retriever.retrieve,
+                query, self.collection, local_config, diagnostics=diag,
+            )
+            fw = ex.submit(_do_web)
+
+            t_parallel_start = time.perf_counter()
+            try:
+                local_hits = fl.result(timeout=timeout_s)
+            except FuturesTimeoutError:
+                diag["local_timeout"] = {"timeout_s": timeout_s}
+                logger.warning("[hybrid] local retrieval timed out after %.0fs", timeout_s)
+            except Exception as e:
+                logger.warning("[hybrid] local retrieval failed: %s", e)
+
+            elapsed_s = time.perf_counter() - t_parallel_start
+            web_wait_s = max(1.0, soft_wait_s - elapsed_s)
+            t_web_start = time.perf_counter()
+            try:
+                web_hits = fw.result(timeout=web_wait_s)
+                web_elapsed_ms = (time.perf_counter() - t_web_start) * 1000
+                if web_elapsed_ms > timeout_s * 1000:
+                    diag["soft_wait_ms"] = round(web_elapsed_ms)
+                    logger.info("[hybrid] web soft-wait completed in %.0fms", web_elapsed_ms)
+            except FuturesTimeoutError:
+                diag["web_timeout"] = {"soft_wait_s": round(web_wait_s, 1)}
+                logger.warning("[hybrid] web retrieval soft-wait timed out after %.0fs", web_wait_s)
+            except Exception as e:
+                logger.warning("[hybrid] web retrieval failed: %s", e)
+            finally:
+                ex.shutdown(wait=False)
+
+            # ── Threshold-filter local hits and tag with source type ──
+            local_main: List[Dict[str, Any]] = []
             for h in local_hits:
-                # 应用阈值过滤
                 score = float(h.get("score", 0.0))
                 if local_threshold is not None and score < local_threshold:
                     continue
                 st = h.get("source") or (h.get("metadata") or {}).get("source")
-                source_type = "graph" if st == "graph" else "dense"
-                if "dense" not in sources_used and source_type == "dense":
+                h["_source_type"] = "graph" if st == "graph" else "dense"
+                local_main.append(h)
+                if "dense" not in sources_used and h["_source_type"] == "dense":
                     sources_used.append("dense")
-                if source_type == "graph" and "graph" not in sources_used:
+                if h["_source_type"] == "graph" and "graph" not in sources_used:
                     sources_used.append("graph")
-                all_chunks.append(_hit_to_chunk(h, source_type, query))
-            total_candidates += len(local_hits) * 2 + len(web_hits)
-            if not sources_used and all_chunks:
+
+            if not sources_used and local_main:
                 sources_used.append("dense")
-            # ── 跨源去重：拦截 web 中与本地重叠的文献 ──
-            if web_hits and all_chunks:
+            total_candidates += len(local_hits) * 2 + len(web_hits)
+
+            # ── Cross-source dedup: build EvidenceChunks from local for the dedup
+            # reference set, then filter web_hits against local documents ──
+            local_chunks_for_dedup = [
+                _hit_to_chunk(h, h.get("_source_type", "dense"), query)
+                for h in local_main
+            ]
+            if web_hits and local_chunks_for_dedup:
                 web_before = len(web_hits)
-                web_hits = cross_source_dedup(all_chunks, web_hits)
+                web_hits = cross_source_dedup(local_chunks_for_dedup, web_hits)
                 dedup_removed = web_before - len(web_hits)
                 if dedup_removed > 0:
                     diag["cross_source_dedup"] = {"removed": dedup_removed, "remaining": len(web_hits)}
-            # Web 结果排序：cross-encoder 精排 or embedding 快排
-            if web_hits:
-                _web_top_k = min(k, len(web_hits))
-                if skip_rerank:
-                    try:
-                        web_hits = _embedding_rerank(query, web_hits, top_k=_web_top_k)
-                    except Exception as e:
-                        logger.warning("embedding rerank failed: %s", e)
-                        web_hits = web_hits[:_web_top_k]
-                else:
-                    try:
-                        web_hits = _rerank_candidates(
-                            query, web_hits, top_k=_web_top_k, reranker_mode=ui_reranker_mode,
-                        )
-                    except Exception as e:
-                        logger.warning("web cross-encoder rerank failed, falling back to embedding: %s", e)
-                        try:
-                            web_hits = _embedding_rerank(query, web_hits, top_k=_web_top_k)
-                        except Exception:
-                            web_hits = web_hits[:_web_top_k]
-            web_hits = _compress_web_fulltext(web_hits, query, filters)
+
+            # ── Tag web hits with source type, compress fulltext ──
+            web_main: List[Dict[str, Any]] = []
             for h in web_hits:
+                h["_source_type"] = "web"
+                web_main.append(h)
                 if "web" not in sources_used:
                     sources_used.append("web")
-                all_chunks.append(_hit_to_chunk(h, "web", query))
+            web_main = _compress_web_fulltext(web_main, query, filters)
+
+            # ── Global fusion: single ranked pool → top result_limit ──
+            # Local + web are merged and globally reranked in one pass so
+            # cross-source ordering reflects a unified relevance scale.
+            # For the chat path there is no dedicated gap pool; gap protection
+            # is applied per-section in Deep Research via _rerank_section_pool_chunks.
+            fused_hits = fuse_pools_with_gap_protection(
+                query=query,
+                main_candidates=local_main + web_main,
+                gap_candidates=[],
+                top_k=result_limit,
+                reranker_mode=ui_reranker_mode,
+                skip_rerank=skip_rerank,
+                diag=diag,
+            )
+
+            for h in fused_hits:
+                source_type = h.get("_source_type", "dense")
+                all_chunks.append(_hit_to_chunk(h, source_type, query))
         else:
             if mode == "local":
                 config = RetrievalConfig(

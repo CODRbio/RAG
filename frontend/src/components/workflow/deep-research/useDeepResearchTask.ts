@@ -53,10 +53,18 @@ export type ConfirmAndRunParams = GeneratePlanParams & {
   keepPreviousJobId: boolean;
 };
 
+export type StalledJobInfo = {
+  jobId: string;
+  topic: string;
+  status: string;
+  canvas_id: string;
+};
+
 export type UseDeepResearchTaskReturn = {
   phase: Phase;
   setPhase: (p: Phase) => void;
   activeJobId: string | null;
+  stalledJob: StalledJobInfo | null;
   isStopping: boolean;
   isClarifying: boolean;
   progressLogs: string[];
@@ -81,6 +89,8 @@ export type UseDeepResearchTaskReturn = {
     sourceJobId?: string,
   ) => Promise<void>;
   handleInsertOptimizationPrompt: (text: string, setUserContext: React.Dispatch<React.SetStateAction<string>>) => void;
+  clearStalledJob: () => void;
+  openCanvasForCurrentJob: () => Promise<void>;
 };
 
 export function useDeepResearchTask(): UseDeepResearchTaskReturn {
@@ -112,10 +122,11 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
   } = useConfigStore();
   const addToast = useToastStore((s) => s.addToast);
   const { setCanvas, setCanvasContent, setIsLoading: setCanvasLoading, setActiveStage } = useCanvasStore();
-  const setCanvasOpen = useUIStore((s) => s.setCanvasOpen);
+  const { setCanvasOpen, requestSessionListRefresh } = useUIStore();
 
   const [phase, setPhase] = useState<Phase>('clarify');
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
+  const [stalledJob, setStalledJob] = useState<StalledJobInfo | null>(null);
   const [isStopping, setIsStopping] = useState(false);
   const [isClarifying, setIsClarifying] = useState(false);
   const [progressLogs, setProgressLogs] = useState<string[]>([]);
@@ -467,12 +478,11 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
     })();
   };
 
-  // Restore job state when dialog opens
+  // Restore job state when dialog opens; set stalledJob when job exists but is not runnable (半途死了)
   useEffect(() => {
     if (!showDeepResearchDialog) return;
     const savedJobId = localStorage.getItem(DEEP_RESEARCH_JOB_KEY);
     if (!savedJobId || activeJobId) return;
-    if (!sessionId) return;
 
     let cancelled = false;
     (async () => {
@@ -483,11 +493,17 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
           || job.status === 'running'
           || job.status === 'cancelling'
           || job.status === 'waiting_review';
-        const sameSession = !job.session_id || job.session_id === sessionId;
+        const sameSession = !sessionId || !job.session_id || job.session_id === sessionId;
         const requestedTopic = (useChatStore.getState().deepResearchTopic || '').trim();
         const runningTopic = String(job.topic || '').trim();
         const sameTopic = !requestedTopic || !runningTopic || requestedTopic === runningTopic;
         if (!isRunnable) {
+          setStalledJob({
+            jobId: savedJobId,
+            topic: String(job.topic || ''),
+            status: job.status,
+            canvas_id: String(job.canvas_id || ''),
+          });
           archiveJobId(savedJobId);
           localStorage.removeItem(DEEP_RESEARCH_JOB_KEY);
           return;
@@ -504,6 +520,12 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
         addToast('已恢复 Deep Research 后台任务状态', 'info');
       } catch (err) {
         console.debug('[DeepResearch] skip stale saved job:', err);
+        setStalledJob({
+          jobId: savedJobId,
+          topic: (useChatStore.getState().deepResearchTopic || '').trim(),
+          status: 'error',
+          canvas_id: '',
+        });
         archiveJobId(savedJobId);
         localStorage.removeItem(DEEP_RESEARCH_JOB_KEY);
       }
@@ -793,6 +815,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       if (keepPreviousJobId && previousActiveJobId && previousActiveJobId !== submitResp.job_id) {
         archiveJobId(previousActiveJobId);
       }
+      requestSessionListRefresh(); // 新建 DR 项目立即进入历史，便于在排队/进行中看到
       setWorkflowStep('drafting');
       startStreamingJob(submitResp.job_id, true);
       setShowDeepResearchDialog(false);
@@ -864,6 +887,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       if (resp.session_id) setSessionId(resp.session_id);
       if (resp.canvas_id) setCanvasId(resp.canvas_id);
       startStreamingJob(resp.job_id, true);
+      requestSessionListRefresh();
       addToast('已提交重启任务，进入后台执行', 'success');
     } catch (err) {
       console.error('[DeepResearch] restart phase failed:', err);
@@ -899,6 +923,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       if (resp.session_id) setSessionId(resp.session_id);
       if (resp.canvas_id) setCanvasId(resp.canvas_id);
       startStreamingJob(resp.job_id, true);
+      requestSessionListRefresh();
       addToast(`已提交章节重启：${sectionTitle}`, 'success');
     } catch (err) {
       console.error('[DeepResearch] restart section failed:', err);
@@ -923,10 +948,49 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
     addToast('已写入 Intervention，可在下一轮直接使用', 'success');
   };
 
+  const clearStalledJob = () => {
+    setStalledJob(null);
+  };
+
+  const openCanvasForCurrentJob = async () => {
+    const cid = canvasId || stalledJob?.canvas_id || '';
+    if (!cid.trim()) {
+      addToast('无画布可打开', 'warning');
+      return;
+    }
+    // 让画布内各阶段能识别为「激活任务」：写入 localStorage
+    const jobIdToActivate = activeJobId || stalledJob?.jobId || '';
+    if (jobIdToActivate) {
+      localStorage.setItem(DEEP_RESEARCH_JOB_KEY, jobIdToActivate);
+    }
+    if (stalledJob?.canvas_id) {
+      setCanvasId(stalledJob.canvas_id);
+    }
+    setCanvasLoading(true);
+    try {
+      const [canvasData, exportResp] = await Promise.all([
+        getCanvas(cid).catch(() => null),
+        exportCanvas(cid, 'markdown').catch(() => null),
+      ]);
+      if (canvasData) {
+        setCanvas(canvasData);
+        setActiveStage(canvasData.stage || 'explore');
+      }
+      if (exportResp?.content) setCanvasContent(exportResp.content);
+      setCanvasOpen(true);
+    } catch (err) {
+      console.error('[DeepResearch] openCanvasForCurrentJob failed:', err);
+      addToast('打开画布失败', 'error');
+    } finally {
+      setCanvasLoading(false);
+    }
+  };
+
   return {
     phase,
     setPhase,
     activeJobId,
+    stalledJob,
     isStopping,
     isClarifying,
     progressLogs,
@@ -944,5 +1008,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
     restartFromPhase,
     restartSection,
     handleInsertOptimizationPrompt,
+    clearStalledJob,
+    openCanvasForCurrentJob,
   };
 }

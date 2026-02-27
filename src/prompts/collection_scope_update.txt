@@ -1,0 +1,7 @@
+Existing scope of the knowledge base (what it already covers):
+{existing_scope}
+
+Summary of newly added materials in this batch:
+{new_materials_summary}
+
+Merge the above into a single updated scope description (1–2 sentences) that reflects both the existing coverage and the new materials. Output only the updated scope, no preamble.

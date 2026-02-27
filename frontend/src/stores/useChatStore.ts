@@ -22,6 +22,16 @@ interface ChatState {
   // 命令面板
   showCommandPalette: boolean;
 
+  /** 查询与本地库范围不符时：是否显示「本会话不用本地库 / 仍使用当前库」选择 */
+  pendingLocalDbChoice: boolean;
+  pendingLocalDbChoiceMessageId: string | null;
+  pendingLocalDbChoiceOriginalMessage: string;
+  /** 弹出时的时间戳（ms），用于弹窗显示剩余倒计时 */
+  pendingLocalDbChoiceStartedAt: number | null;
+  /** 用户选择或 1 分钟超时后执行的 handler，由 ChatInput 注入 */
+  localDbChoiceHandler: ((choice: 'no_local' | 'use') => Promise<void>) | null;
+  localDbChoiceTimeoutId: ReturnType<typeof setTimeout> | null;
+
   // 按任务/会话的流式状态（taskId -> { sessionId, status, queuePosition? }）
   streamingTasks: Record<string, { sessionId: string | null; status: string; queuePosition?: number }>;
 
@@ -31,6 +41,10 @@ interface ChatState {
   setSessionId: (id: string | null) => void;
   setCanvasId: (id: string | null) => void;
   addMessage: (msg: Message) => void;
+  updateMessageById: (id: string, content: string) => void;
+  appendToMessageById: (id: string, delta: string) => void;
+  setMessageSourcesById: (id: string, sources: Message['sources'], providerStats?: Message['providerStats']) => void;
+  setMessageAgentDebugById: (id: string, debug: AgentDebugData) => void;
   updateLastMessage: (content: string) => void;
   appendToLastMessage: (delta: string) => void;
   setLastMessageSources: (sources: Message['sources'], providerStats?: Message['providerStats']) => void;
@@ -50,6 +64,11 @@ interface ChatState {
   setResearchDashboard: (dashboard: ResearchDashboardData | null) => void;
   setToolTrace: (trace: ToolTraceItem[] | null) => void;
   setLastMessageAgentDebug: (debug: AgentDebugData) => void;
+
+  setPendingLocalDbChoice: (show: boolean, messageId?: string | null, originalMessage?: string, startedAt?: number | null) => void;
+  clearPendingLocalDbChoice: () => void;
+  setLocalDbChoiceHandler: (handler: ((choice: 'no_local' | 'use') => Promise<void>) | null) => void;
+  setLocalDbChoiceTimeoutId: (id: ReturnType<typeof setTimeout> | null) => void;
 }
 
 export const useChatStore = create<ChatState>((set) => ({
@@ -69,6 +88,12 @@ export const useChatStore = create<ChatState>((set) => ({
   researchDashboard: null,
   toolTrace: null,
   showCommandPalette: false,
+  pendingLocalDbChoice: false,
+  pendingLocalDbChoiceMessageId: null,
+  pendingLocalDbChoiceOriginalMessage: '',
+  pendingLocalDbChoiceStartedAt: null,
+  localDbChoiceHandler: null,
+  localDbChoiceTimeoutId: null,
   streamingTasks: {},
 
   setStreamingTask: (taskId, sessionId, status, queuePosition) =>
@@ -91,6 +116,24 @@ export const useChatStore = create<ChatState>((set) => ({
   addMessage: (msg) =>
     set((state) => ({
       messages: [...state.messages, { ...msg, timestamp: new Date().toISOString() }],
+    })),
+  updateMessageById: (id, content) =>
+    set((state) => ({
+      messages: state.messages.map((m) => (m.id === id ? { ...m, content } : m)),
+    })),
+  appendToMessageById: (id, delta) =>
+    set((state) => ({
+      messages: state.messages.map((m) => (m.id === id ? { ...m, content: (m.content || '') + delta } : m)),
+    })),
+  setMessageSourcesById: (id, sources, providerStats) =>
+    set((state) => ({
+      messages: state.messages.map((m) =>
+        m.id === id ? { ...m, sources, ...(providerStats ? { providerStats } : {}) } : m
+      ),
+    })),
+  setMessageAgentDebugById: (id, debug) =>
+    set((state) => ({
+      messages: state.messages.map((m) => (m.id === id ? { ...m, agentDebug: debug } : m)),
     })),
 
   updateLastMessage: (content) =>
@@ -173,12 +216,31 @@ export const useChatStore = create<ChatState>((set) => ({
       return { messages };
     }),
 
+  setPendingLocalDbChoice: (show, messageId, originalMessage, startedAt) =>
+    set({
+      pendingLocalDbChoice: show,
+      pendingLocalDbChoiceMessageId: messageId ?? null,
+      pendingLocalDbChoiceOriginalMessage: originalMessage ?? '',
+      pendingLocalDbChoiceStartedAt: startedAt ?? (show ? Date.now() : null),
+    }),
+  clearPendingLocalDbChoice: () =>
+    set({
+      pendingLocalDbChoice: false,
+      pendingLocalDbChoiceMessageId: null,
+      pendingLocalDbChoiceOriginalMessage: '',
+      pendingLocalDbChoiceStartedAt: null,
+      localDbChoiceHandler: null,
+    }),
+  setLocalDbChoiceHandler: (handler) => set({ localDbChoiceHandler: handler }),
+  setLocalDbChoiceTimeoutId: (id) => set({ localDbChoiceTimeoutId: id }),
+
   loadSession: async (sessionId: string) => {
     set({ isLoadingSession: true });
     try {
       const sessionInfo = await getSession(sessionId);
-      const messages: Message[] = sessionInfo.turns.map((turn, index) => {
-        const sources: Source[] = (turn.sources || []).map((s, sIndex) => ({
+      const turns = Array.isArray(sessionInfo.turns) ? sessionInfo.turns : [];
+      const messages: Message[] = turns.map((turn, index) => {
+        const sources: Source[] = (Array.isArray(turn.sources) ? turn.sources : []).map((s, sIndex) => ({
           id: s.cite_key || `${sessionId}-${index}-${sIndex}`,
           cite_key: s.cite_key || '',
           title: s.title || '',
@@ -193,8 +255,8 @@ export const useChatStore = create<ChatState>((set) => ({
         }));
         return {
           id: `${sessionId}-${index}`,
-          role: turn.role as 'user' | 'assistant',
-          content: turn.content,
+          role: (turn.role === 'assistant' ? 'assistant' : 'user') as 'user' | 'assistant',
+          content: typeof turn.content === 'string' ? turn.content : '',
           timestamp: new Date().toISOString(),
           sources,
         };

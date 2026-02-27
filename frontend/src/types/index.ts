@@ -125,6 +125,8 @@ export interface ChatRequest {
   output_language?: 'auto' | 'en' | 'zh';
   step_models?: Record<string, string | null | undefined>;
   reranker_mode?: 'bge_only' | 'colbert_only' | 'cascade';  // 重排序模式，None 使用服务端默认
+  /** 本会话本地库偏好：no_local=本会话不用本地库，use=仍使用当前库（用于回复「查询与本地库范围不符」的提示） */
+  session_preference_local_db?: 'no_local' | 'use';
 }
 
 export interface ChatCitation {
@@ -144,6 +146,10 @@ export interface ChatResponse {
   response: string;
   citations: ChatCitation[];
   evidence_summary?: EvidenceSummary;
+  /** 是否提示用户选择：当前查询与本地库可能不符 */
+  prompt_local_db_choice?: boolean;
+  /** 当 prompt_local_db_choice 为 true 时的提示文案 */
+  local_db_mismatch_message?: string | null;
 }
 
 /** 异步 Chat 提交响应 */
@@ -191,6 +197,8 @@ export interface SessionListItem {
   canvas_id: string;
   stage: string;
   turn_count: number;
+  /** chat | research */
+  session_type?: string;
   created_at: string;
   updated_at: string;
 }

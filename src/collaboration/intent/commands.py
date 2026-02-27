@@ -1,15 +1,161 @@
 """
-显式指令定义与参数解析。
+显式指令定义与参数解析 + 统一上下文分析。
 """
 
+import json
 import re
+from dataclasses import dataclass
 from typing import Any, Iterable, List, Optional, Set
 
 from .parser import ParsedIntent
 from src.utils.prompt_manager import PromptManager
+from src.log import get_logger
 
 _pm = PromptManager()
+_logger = get_logger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# ContextAnalysis: 单次 ultra-lite LLM 调用的结果
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ContextAnalysis:
+    """Single ultra-lite LLM call result for multi-turn context management."""
+
+    action: str = "rag"  # chat / rag / deep_research
+    context_status: str = "self_contained"  # self_contained / resolved / needs_clarification
+    rewritten_query: str = ""
+    clarification: str = ""
+
+
+def analyze_chat_context(
+    message: str,
+    rolling_summary: str,
+    history: Optional[Iterable[Any]] = None,
+    llm_client: Any = None,
+    max_history_turns: int = 6,
+) -> ContextAnalysis:
+    """
+    Single ultra-lite LLM call that combines:
+      - Intent classification (chat / rag / deep_research)
+      - Reference / pronoun detection (LLM-based, not regex)
+      - Query rewriting when references are resolvable
+      - Clarification question when references are not resolvable
+
+    Replaces the old pipeline of: IntentParser(NL) + _classify_query + regex _has_unresolved_references + get_clarification_if_unresolved.
+    """
+    if not llm_client:
+        return ContextAnalysis(action="rag")
+
+    history_block = _format_history_block(history, max_turns=max_history_turns)
+
+    prompt = _pm.render(
+        "chat_context_analyze.txt",
+        rolling_summary=rolling_summary or "（首轮对话）",
+        history=history_block or "（首轮对话）",
+        message=message,
+    )
+
+    try:
+        resp = llm_client.chat(
+            messages=[
+                {"role": "system", "content": _pm.render("chat_context_analyze_system.txt")},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        raw = (resp.get("final_text") or "").strip()
+    except Exception as exc:
+        _logger.debug("analyze_chat_context LLM failed: %s", exc)
+        return ContextAnalysis(action="rag")
+
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```\s*$", "", raw)
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        _logger.debug("analyze_chat_context JSON parse failed: raw=%r", raw[:200])
+        return ContextAnalysis(action="rag")
+
+    action = (data.get("action") or "rag").strip().lower()
+    if action not in ("chat", "rag", "deep_research"):
+        action = "rag"
+
+    context_status = (data.get("context_status") or "self_contained").strip().lower()
+    if context_status not in ("self_contained", "resolved", "needs_clarification"):
+        context_status = "self_contained"
+
+    return ContextAnalysis(
+        action=action,
+        context_status=context_status,
+        rewritten_query=(data.get("rewritten_query") or "").strip(),
+        clarification=(data.get("clarification") or "").strip(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 查询与本地库范围匹配检查（ultra-lite）
+# ---------------------------------------------------------------------------
+
+# 本地库名称 -> 简短范围描述，用于 LLM 判断 query 是否明显不符
+COLLECTION_SCOPE: dict = {
+    "DeepSea_symbiosis": "深海共生、海洋生物、共生关系、深海生态与相关研究",
+    "deepsea_life": "深海生命、海洋生物、深海生态",
+    "deepsea_ocean": "深海海洋、海洋环境",
+    "deepsea_env": "深海环境、海洋环境",
+}
+
+
+def check_query_collection_scope(
+    collection_name: str,
+    query: str,
+    llm_client: Any,
+) -> str:
+    """
+    判断当前查询是否与本地库范围明显不符。
+    返回 "match" | "mismatch" | "unclear"。
+    优先使用建库/刷新时生成的 scope 摘要（collection_scope 模块），否则回退到内置 COLLECTION_SCOPE。
+    """
+    if not (collection_name and query and llm_client):
+        return "match"
+    try:
+        from src.indexing.collection_scope import get_scope
+        scope = get_scope(collection_name.strip())
+    except Exception:
+        scope = None
+    if not scope:
+        scope = COLLECTION_SCOPE.get(
+            collection_name.strip(),
+            collection_name or "本地知识库",
+        )
+    if isinstance(scope, str) and scope == (collection_name or "").strip():
+        scope = f"主题：{collection_name}"
+    prompt = _pm.render(
+        "chat_local_scope_check.txt",
+        collection_name=collection_name,
+        scope_description=scope,
+        query=query[:500],
+    )
+    try:
+        resp = llm_client.chat(
+            messages=[
+                {"role": "system", "content": _pm.render("chat_local_scope_check_system.txt")},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        raw = (resp.get("final_text") or "").strip().lower()
+    except Exception:
+        return "match"
+    if "mismatch" in raw:
+        return "mismatch"
+    if "unclear" in raw:
+        return "unclear"
+    return "match"
+
+
+# ---------------------------------------------------------------------------
+# 原有 query 构建逻辑（保留，供 rag 分支使用）
+# ---------------------------------------------------------------------------
 
 def get_search_query_from_intent(parsed: ParsedIntent, fallback: str) -> str:
     """
@@ -37,16 +183,16 @@ def build_search_query_from_context(
     rolling_summary: str = "",
 ) -> str:
     """
-    Build retrieval query with current-focus enforcement:
-    - explicit command first
-    - only use context when current message has unresolved references
-    - validate generated query still overlaps current message semantics
+    Build retrieval query with current-focus enforcement.
+
+    If the caller already resolved references (e.g. via analyze_chat_context),
+    pass the rewritten_query as ``fallback`` — the function will detect it is
+    self-contained and skip the expensive LLM rewrite step.
     """
     base = get_search_query_from_intent(parsed, fallback)
     if parsed.from_command:
         return base
 
-    # Self-contained input should not be polluted by history.
     needs_context = _has_unresolved_references(base)
     if not needs_context or not llm_client:
         return _truncate_query(base, max_len=max_len)
@@ -70,6 +216,10 @@ def build_search_query_from_context(
     return _truncate_query(query, max_len=max_len)
 
 
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
 def _extract_recent_user_inputs(
     history: Optional[Iterable[Any]],
     max_user_turns: int = 3,
@@ -88,13 +238,14 @@ def _extract_recent_user_inputs(
 
 
 _REFERENCE_PATTERNS = re.compile(
-    r"\b(it|this|that|these|those|them|its|the above|above|former|latter)\b|前面|上面|之前|这个|那个|它|它们",
+    r"\b(it|this|that|these|those|them|its|the above|above|former|latter)\b"
+    r"|前面|上面|之前|这个|那个|它|它们|那些|这些|该|此",
     re.IGNORECASE,
 )
 
 
 def _has_unresolved_references(text: str) -> bool:
-    """Detect pronouns/references that require session context."""
+    """Lightweight regex pre-filter for build_search_query_from_context."""
     return bool(_REFERENCE_PATTERNS.search(text or ""))
 
 
@@ -140,6 +291,29 @@ def _is_chinese(text: str) -> bool:
     return bool(re.search(r"[\u4e00-\u9fff]", text or ""))
 
 
+def _format_history_block(
+    history: Optional[Iterable[Any]], max_turns: int = 6, max_len: int = 150,
+) -> str:
+    """Format recent turns for the context-analysis prompt."""
+    if not history:
+        return ""
+    turns = list(history)
+    if max_turns > 0:
+        turns = turns[-max_turns:]
+    lines: List[str] = []
+    for t in turns:
+        role = getattr(t, "role", "") or ""
+        content = getattr(t, "content", "") or ""
+        if not isinstance(content, str):
+            continue
+        text = content.strip().replace("\n", " ")
+        if max_len and len(text) > max_len:
+            text = text[:max_len] + "…"
+        label = "用户" if role == "user" else "助手"
+        lines.append(f"{label}: {text}")
+    return "\n".join(lines)
+
+
 def _generate_focused_query(
     llm_client: Any,
     current_msg: str,
@@ -170,7 +344,6 @@ def _generate_focused_query(
                 {"role": "system", "content": system_content},
                 {"role": "user", "content": prompt},
             ],
-
         )
         text = (resp.get("final_text") or "").strip()
     except Exception:

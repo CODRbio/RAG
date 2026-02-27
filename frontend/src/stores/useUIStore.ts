@@ -21,6 +21,10 @@ interface UIState {
   showCreateCollectionModal: boolean;
   showUserModal: boolean;
 
+  /** 递增后触发侧栏历史列表刷新（新建会话/项目后立即出现在历史中） */
+  sessionListRefreshKey: number;
+  requestSessionListRefresh: () => void;
+
   // Actions
   setSidebarWidth: (width: number) => void;
   setCanvasWidth: (width: number) => void;
@@ -46,6 +50,8 @@ export const useUIStore = create<UIState>()(
       showSettingsModal: false,
       showCreateCollectionModal: false,
       showUserModal: false,
+      sessionListRefreshKey: 0,
+      requestSessionListRefresh: () => set((s) => ({ sessionListRefreshKey: s.sessionListRefreshKey + 1 })),
 
       setSidebarWidth: (width) => set({ sidebarWidth: width }),
       setCanvasWidth: (width) => set({ canvasWidth: width }),

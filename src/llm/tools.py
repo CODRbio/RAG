@@ -427,7 +427,8 @@ def _handle_search_local(query: str, top_k: int = 10, **_) -> str:
     from src.retrieval.service import get_retrieval_service
     col = getattr(_agent_chunks_local, "collection", None)
     svc = get_retrieval_service(collection=col)
-    pack = svc.search(query=query, mode="local", top_k=top_k)
+    # Chat 场景下 Agent 检索固定 bge_only，与主检索一致，不用 ColBERT
+    pack = svc.search(query=query, mode="local", top_k=top_k, filters={"reranker_mode": "bge_only"})
     _collect_chunks(pack.chunks[:min(top_k, 15)])
     return pack.to_context_string(max_chunks=min(top_k, 15))
 
@@ -436,7 +437,8 @@ def _handle_search_web(query: str, top_k: int = 10, **_) -> str:
     from src.retrieval.service import get_retrieval_service
     col = getattr(_agent_chunks_local, "collection", None)
     svc = get_retrieval_service(collection=col)
-    pack = svc.search(query=query, mode="web", top_k=top_k)
+    # Chat 场景下 Agent 检索固定 bge_only，与主检索一致，不用 ColBERT
+    pack = svc.search(query=query, mode="web", top_k=top_k, filters={"reranker_mode": "bge_only"})
     _collect_chunks(pack.chunks[:min(top_k, 15)])
     return pack.to_context_string(max_chunks=min(top_k, 15))
 

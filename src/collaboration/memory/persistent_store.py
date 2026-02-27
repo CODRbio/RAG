@@ -77,6 +77,19 @@ def add_user_project(user_id: str, canvas_id: str, title: str = "") -> None:
         session.commit()
 
 
+def delete_user_project(user_id: str, canvas_id: str) -> bool:
+    """删除用户下的某画布关联记录。"""
+    if not user_id or not canvas_id:
+        return False
+    with Session(get_engine()) as session:
+        row = session.get(UserProject, (user_id, canvas_id))
+        if row is None:
+            return False
+        session.delete(row)
+        session.commit()
+    return True
+
+
 def get_user_projects(user_id: str, limit: int = 50) -> List[Dict[str, Any]]:
     """返回用户最近项目列表。"""
     if not user_id:

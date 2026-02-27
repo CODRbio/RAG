@@ -1,0 +1,1 @@
+Summarize in 1–2 sentences what topics/domains this batch of content covers. Same language as the content. Output only the summary.

@@ -49,13 +49,17 @@ from src.api.schemas import (
     TurnItem,
 )
 from src.collaboration.intent import (
+    ContextAnalysis,
     IntentParser,
     IntentType,
     ParsedIntent,
+    analyze_chat_context,
     build_search_query_from_context,
+    check_query_collection_scope,
     is_deep_research,
 )
 from src.collaboration.memory.session_memory import (
+    SessionStore,
     get_session_store,
     load_session_memory,
 )
@@ -368,10 +372,39 @@ def _compute_citation_provider_stats(
     }
 
 
+def _generate_and_set_session_title(
+    store: SessionStore,
+    session_id: str,
+    message: str,
+    ultra_lite_provider: Optional[str] = None,
+    max_chars: int = 80,
+) -> None:
+    """根据首条用户消息用 ultra-lite 模型生成会话标题并写入 store。"""
+    if not (message or message.strip()):
+        return
+    try:
+        manager = get_manager(str(_CONFIG_PATH))
+        client = manager.get_ultra_lite_client(ultra_lite_provider)
+        prompt = _pm.render("chat_title_from_message.txt", message=(message or "").strip()[:500])
+        resp = client.chat(
+            messages=[
+                {"role": "system", "content": "Output only the title phrase in one line, no quotes or explanation."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        text = (resp.get("final_text") or "").strip()
+        if text:
+            title = text[:max_chars].strip()
+            if title:
+                store.update_session_meta(session_id, {"title": title})
+    except Exception as e:
+        _chat_logger.debug("session title generation failed: %s", e)
+
+
 def _run_chat(
     body: ChatRequest,
     optional_user_id: str | None = None,
-) -> tuple[str, str, list[Citation], EvidenceSummary, ParsedIntent, dict | None, list | None, dict[str, str], dict | None]:
+) -> tuple[str, str, list[Citation], EvidenceSummary, ParsedIntent, dict | None, list | None, dict[str, str], dict | None, bool, Optional[str]]:
     import time as _time
     from src.debug import get_debug_logger
     dbg = get_debug_logger()
@@ -387,6 +420,31 @@ def _run_chat(
         raise HTTPException(status_code=404, detail="session not found")
 
     message = body.message.strip()
+
+    # ── 0½. 本会话本地库偏好（前端传入用户选择后写入 session 变量，立即返回无需 LLM）──
+    pref_local = getattr(body, "session_preference_local_db", None)
+    if pref_local in ("no_local", "use"):
+        store.update_session_meta(session_id, {"preferences": {"local_db": pref_local}})
+        confirm = (
+            "已设置：本会话将不使用本地知识库，仅使用网络检索。"
+            if pref_local == "no_local"
+            else "已设置：本会话继续使用当前本地知识库。"
+        )
+        memory.add_turn("user", message or "(设置偏好)")
+        memory.add_turn("assistant", confirm, citations=[])
+        _chat_logger.info("[chat] 0½ 写入 session 偏好 local_db=%s", pref_local)
+        empty_ev = EvidenceSummary(query=message or "", total_chunks=0, sources_used=[], retrieval_time_ms=0)
+        _parsed = ParsedIntent(intent_type=IntentType.CHAT, confidence=1.0, raw_input=message or "")
+        return session_id, confirm, [], empty_ev, _parsed, None, None, {}, None, False, None
+    # 仅当会话尚无标题时用首条消息生成短标题（提交时已用问题作为标题的则保留）
+    meta = store.get_session_meta(session_id)
+    if store.get_turn_count(session_id) == 0 and message and not (meta and (meta.get("title") or "").strip()):
+        _generate_and_set_session_title(
+            store,
+            session_id,
+            message,
+            ultra_lite_provider=getattr(body, "ultra_lite_provider", None),
+        )
     search_mode = body.search_mode or "local"
     if search_mode not in ("local", "web", "hybrid", "none"):
         search_mode = "local"
@@ -425,8 +483,10 @@ def _run_chat(
         body.use_query_optimizer,
     )
 
-    # ── 2. 意图判断（Chat vs Deep Research）──
+    # ── 2. 意图 + 上下文分析（单次 ultra-lite LLM 调用）──
     request_mode = (body.mode or "chat").strip().lower()
+    ctx_analysis: ContextAnalysis | None = None
+
     if request_mode == "deep_research":
         parsed = ParsedIntent(
             intent_type=IntentType.DEEP_RESEARCH,
@@ -443,10 +503,37 @@ def _run_chat(
             parsed.intent_type.value, parsed.confidence,
         )
     else:
-        parsed = ParsedIntent(
-            intent_type=IntentType.CHAT,
-            confidence=1.0,
-            raw_input=message,
+        # 统一上下文分析：一次 ultra-lite 调用完成 意图分类 + 指代检测 + query 重写/澄清
+        t_analyze = _time.perf_counter()
+        ctx_analysis = analyze_chat_context(
+            message=message,
+            rolling_summary=memory.rolling_summary,
+            history=history_for_intent,
+            llm_client=lite_client,
+        )
+        analyze_ms = (_time.perf_counter() - t_analyze) * 1000
+
+        # 关键词强制 rag（零成本兜底，覆盖 LLM 误判为 chat 的情况）
+        if _FORCE_RAG_RE.search(message):
+            ctx_analysis.action = "rag"
+
+        if ctx_analysis.action == "deep_research":
+            parsed = ParsedIntent(
+                intent_type=IntentType.DEEP_RESEARCH,
+                confidence=0.9,
+                params={"args": message},
+                raw_input=message,
+            )
+        else:
+            parsed = ParsedIntent(
+                intent_type=IntentType.CHAT,
+                confidence=0.9,
+                raw_input=message,
+            )
+        _chat_logger.info(
+            "[chat] ② 上下文分析 → action=%s | context_status=%s | rewritten=%r | 耗时=%.0fms",
+            ctx_analysis.action, ctx_analysis.context_status,
+            (ctx_analysis.rewritten_query or "")[:60], analyze_ms,
         )
 
     meta = store.get_session_meta(session_id)
@@ -455,12 +542,17 @@ def _run_chat(
     # ── Deep Research 分支 ──
     if is_deep_research(parsed):
         _chat_logger.info("[chat] ── 进入 Deep Research 分支 ──")
+        topic = (parsed.params.get("args") or message).strip() or "综述"
+        meta_now = store.get_session_meta(session_id) or {}
+        update_dr_meta = {"session_type": "research"}
+        if not (meta_now.get("title") or "").strip():
+            update_dr_meta["title"] = (topic or "Deep Research")[:80]
+        store.update_session_meta(session_id, update_dr_meta)
         query = build_search_query_from_context(
             parsed, message, history_for_intent,
             llm_client=client, enforce_english_if_input_english=True,
             rolling_summary=memory.rolling_summary,
         )
-        topic = (parsed.params.get("args") or message).strip() or "综述"
         filters = _build_filters(body)
         max_sections = getattr(body, "max_sections", None) or 4
         svc = AutoCompleteService(llm_client=client, max_sections=max_sections, include_abstract=True)
@@ -485,6 +577,7 @@ def _run_chat(
         memory.add_turn("user", message)
         citations_data = [_serialize_citation(c) for c in result.citations] if result.citations else []
         memory.add_turn("assistant", response_text, citations=citations_data)
+        memory.update_rolling_summary(client)
         dr_pstats = _compute_citation_provider_stats(result.citations) if result.citations else None
         evidence_summary = EvidenceSummary(
             query=topic,
@@ -501,22 +594,46 @@ def _run_chat(
             "[chat] ✔ Deep Research 完成 | citations=%d | time=%.0fms",
             len(result.citations) if result.citations else 0, elapsed,
         )
-        return session_id, response_text, result.citations, evidence_summary, parsed, dashboard_data, None, {}, None
+        return session_id, response_text, result.citations, evidence_summary, parsed, dashboard_data, None, {}, None, False, None
 
-    # ── 3. Chat 分支：智能路由（正则 → LLM → 严格解析）──
-    t_route = _time.perf_counter()
-    query_needs_rag = _classify_query(message, history_for_intent, lite_client)
-    # autonomous 模式跳过预检索，由 Agent 自主决定是否检索
+    # ── 2½. 指代澄清短路（LLM 判定无法推断时直接追问用户）──
+    if ctx_analysis and ctx_analysis.context_status == "needs_clarification" and ctx_analysis.clarification:
+        _chat_logger.info("[chat] ②½ 指代不明 → 返回澄清问题，跳过检索")
+        memory.add_turn("user", message)
+        memory.add_turn("assistant", ctx_analysis.clarification, citations=[])
+        memory.update_rolling_summary(client)
+        empty_evidence = EvidenceSummary(
+            query=message,
+            total_chunks=0,
+            sources_used=[],
+            retrieval_time_ms=0,
+        )
+        return (
+            session_id,
+            ctx_analysis.clarification,
+            [],
+            empty_evidence,
+            parsed,
+            None,
+            None,
+            {},
+            None,
+        )
+
+    # ── 3. 查询路由（基于上下文分析结果）──
+    if ctx_analysis:
+        query_needs_rag = ctx_analysis.action == "rag"
+    else:
+        # /command 或前端指定 mode 时，走原有 _classify_query 兜底
+        query_needs_rag = _classify_query(message, history_for_intent, lite_client)
     do_retrieval = search_mode != "none" and query_needs_rag and agent_mode != "autonomous"
-    # 闲聊时不启动 Agent
     if not query_needs_rag:
         agent_mode = "standard"
-    route_ms = (_time.perf_counter() - t_route) * 1000
 
     _chat_logger.info(
-        "[chat] ③ 查询路由 → %s | do_retrieval=%s (search_mode=%s, agent_mode=%s) | 耗时=%.0fms",
+        "[chat] ③ 查询路由 → %s | do_retrieval=%s (search_mode=%s, agent_mode=%s)",
         "rag" if query_needs_rag else "chat",
-        do_retrieval, search_mode, agent_mode, route_ms,
+        do_retrieval, search_mode, agent_mode,
     )
     dbg.log_query_route(
         session_id,
@@ -525,21 +642,27 @@ def _run_chat(
         do_retrieval=do_retrieval,
         search_mode=search_mode,
         agent_mode=agent_mode,
-        latency_ms=round(route_ms),
+        latency_ms=0,
     )
 
     # ── 4. 检索 query 构建（仅 rag 模式）──
     if do_retrieval:
+        # 若上下文分析已完成指代补全，使用 rewritten_query 作为输入（避免重复 LLM 调用）
+        effective_msg = (
+            ctx_analysis.rewritten_query
+            if ctx_analysis and ctx_analysis.context_status == "resolved" and ctx_analysis.rewritten_query
+            else message
+        )
         t_query = _time.perf_counter()
         query = build_search_query_from_context(
-            parsed, message, history_for_intent,
+            parsed, effective_msg, history_for_intent,
             llm_client=client, enforce_english_if_input_english=True,
             rolling_summary=memory.rolling_summary,
         )
         query_ms = (_time.perf_counter() - t_query) * 1000
         _chat_logger.info(
-            "[chat] ④ Query 构建 | original=%r → query=%r | 耗时=%.0fms",
-            message[:40], query[:60], query_ms,
+            "[chat] ④ Query 构建 | original=%r → effective=%r → query=%r | 耗时=%.0fms",
+            message[:40], effective_msg[:40], query[:60], query_ms,
         )
         dbg.log_query_build(
             session_id,
@@ -552,8 +675,59 @@ def _run_chat(
         query = message
         _chat_logger.info("[chat] ④ Query 构建 → 跳过 (不需要检索)")
 
-    # ── 5. 检索执行 ──
+    # ── 4½. 本会话「不用本地库」偏好（session 变量）──
+    meta = store.get_session_meta(session_id) or {}
+    session_preferences = meta.get("preferences") or {}
+    effective_use_local = session_preferences.get("local_db") != "no_local"
+    effective_search_mode = search_mode
+    if not effective_use_local and search_mode in ("local", "hybrid"):
+        effective_search_mode = "web" if search_mode == "hybrid" else "none"
+        _chat_logger.info("[chat] ④½ 本会话已选不用本地库 → effective_search_mode=%s", effective_search_mode)
+    if effective_search_mode == "none" and do_retrieval:
+        do_retrieval = False
+
+    # ── 4¾. 查询与本地库范围检查：明显不符则提示换库/本会话不用本地库 ──
     target_collection = (body.collection or "").strip() or None
+    actual_collection = target_collection or settings.collection.global_
+    if (
+        do_retrieval
+        and effective_use_local
+        and effective_search_mode in ("local", "hybrid")
+        and actual_collection
+        and query
+    ):
+        scope_result = check_query_collection_scope(actual_collection, query, lite_client)
+        # 用户已在本会话中明确选择「仍使用当前库」时，不再提示，直接走检索
+        if scope_result == "mismatch" and session_preferences.get("local_db") != "use":
+            mismatch_msg = (
+                f"当前问题与本地知识库（{actual_collection}）主题可能不符。"
+                "您可以选择：**本会话暂不使用本地库**（仅用网络检索），或**仍使用当前库**继续检索。"
+            )
+            _chat_logger.info("[chat] ④¾ 查询与本地库范围不符 → 提示用户选择")
+            memory.add_turn("user", message)
+            memory.add_turn("assistant", mismatch_msg, citations=[])
+            memory.update_rolling_summary(client)
+            empty_evidence = EvidenceSummary(
+                query=query or message,
+                total_chunks=0,
+                sources_used=[],
+                retrieval_time_ms=0,
+            )
+            return (
+                session_id,
+                mismatch_msg,
+                [],
+                empty_evidence,
+                parsed,
+                None,
+                None,
+                {},
+                None,
+                True,
+                mismatch_msg,
+            )
+
+    # ── 5. 检索执行 ──
     if do_retrieval:
         t_retrieval = _time.perf_counter()
         retrieval = get_retrieval_service(collection=target_collection)
@@ -561,7 +735,7 @@ def _run_chat(
         filters["reranker_mode"] = "bge_only"  # Chat 检索固定 bge_only，优先速度
         pack = retrieval.search(
             query=query or message,
-            mode=search_mode,
+            mode=effective_search_mode,
             filters=filters or None,
             top_k=body.local_top_k,
         )
@@ -586,8 +760,8 @@ def _run_chat(
         # 注意：citations 会在 LLM 生成后通过 resolve_response_citations() 获得
         citations: list[Citation] = []
         _chat_logger.info(
-            "[chat] ⑤ 检索完成 | mode=%s | top_k=%s | step_top_k=%s | reranker_mode=%s | chunks=%d | sources=%s | 耗时=%.0fms",
-            search_mode, body.local_top_k, body.step_top_k, body.reranker_mode,
+            "[chat] ⑤ 检索完成 | mode=%s | top_k=%s | step_top_k=%s | reranker_mode=%s (effective) | chunks=%d | sources=%s | 耗时=%.0fms",
+            search_mode, body.local_top_k, body.step_top_k, filters.get("reranker_mode", "bge_only"),
             len(pack.chunks), ",".join(pack.sources_used), retrieval_ms,
         )
         dbg.log_retrieval(
@@ -880,7 +1054,7 @@ def _run_chat(
     memory.add_turn("user", message)
     citations_data = [_serialize_citation(c) for c in citations] if citations else []
     memory.add_turn("assistant", response_text, citations=citations_data)
-    memory.update_rolling_summary(client, interval=4)
+    memory.update_rolling_summary(client)
 
     # ── 11. 总结 ──
     total_ms = (_time.perf_counter() - t_start) * 1000
@@ -904,7 +1078,7 @@ def _run_chat(
         agent_stats=(react_result.agent_stats if react_result else None),
     )
 
-    return session_id, response_text, citations, evidence_summary, parsed, None, tool_trace, ref_map, agent_debug_data
+    return session_id, response_text, citations, evidence_summary, parsed, None, tool_trace, ref_map, agent_debug_data, False, None
 
 
 def _citation_to_chat_citation(c: Citation) -> ChatCitation:
@@ -928,12 +1102,15 @@ def chat_post(
     body: ChatRequest,
     optional_user_id: str | None = Depends(get_optional_user_id),
 ) -> ChatResponse:
-    session_id, response_text, citations, evidence_summary, _parsed, _dashboard, _trace, _ref_map, _agent_debug = _run_chat(body, optional_user_id)
+    (session_id, response_text, citations, evidence_summary, _parsed, _dashboard, _trace, _ref_map, _agent_debug,
+     prompt_local_db_choice, local_db_mismatch_message) = _run_chat(body, optional_user_id)
     return ChatResponse(
         session_id=session_id,
         response=response_text,
         citations=[_citation_to_chat_citation(c) for c in citations],
         evidence_summary=evidence_summary,
+        prompt_local_db_choice=prompt_local_db_choice or False,
+        local_db_mismatch_message=local_db_mismatch_message,
     )
 
 
@@ -948,31 +1125,43 @@ def chat_submit(
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Queue unavailable: {e}")
     payload = body.model_dump()
+    store = get_session_store()
+    if not body.session_id:
+        created_session_id = store.create_session(canvas_id=body.canvas_id or "")
+        payload["session_id"] = created_session_id
+        # 提问时即用首条消息作为会话标题，历史里立即显示问题而非「未命名对话」
+        first_msg = (body.message or "").strip()
+        if first_msg:
+            store.update_session_meta(created_session_id, {"title": first_msg[:80]})
+    else:
+        created_session_id = body.session_id
     payload["_optional_user_id"] = optional_user_id
-    session_id = body.session_id or ""
+    session_id = created_session_id or ""
     user_id = optional_user_id or body.user_id or ""
-    task_id = q.submit(TaskKind.chat, session_id, user_id or "", payload)
+    try:
+        task_id = q.submit(TaskKind.chat, session_id, user_id or "", payload)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Queue submit failed: {e}")
     if _obs_metrics and hasattr(_obs_metrics, "task_queue_submitted_total"):
         _obs_metrics.task_queue_submitted_total.labels(kind="chat").inc()
     return ChatSubmitResponse(task_id=task_id)
 
 
-@router.get("/chat/stream/{task_id}")
-def chat_stream_by_task_id(task_id: str):
-    """SSE 订阅任务流式输出；事件由调度器在执行时推送。"""
-    import time
-    try:
-        q = get_task_queue()
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Queue unavailable: {e}")
+def _task_event_stream(task_id: str, q):
+    """SSE 事件流生成器。
 
-    def event_stream():
-        last_id = "-"
+    关键顺序：先读取所有待推送事件，再检查是否终态。
+    这样即使任务瞬间完成（如 mismatch 路径无 LLM 调用），
+    meta/local_db_choice/delta/done 事件也能全部送达前端，
+    不会被「已终态→直接 return」的提前退出所跳过。
+    """
+    import time
+    last_id = "-"
+    if _obs_metrics:
+        _obs_metrics.active_connections.inc()
+    try:
         while True:
-            state = q.get_state(task_id)
-            if state and state.is_terminal():
-                yield f"event: {state.status.value}\ndata: {json.dumps({'status': state.status.value}, ensure_ascii=False)}\n\n"
-                return
+            # ① 先读取所有已推送但未发送的事件
             events = q.read_events(task_id, after_id=last_id)
             for ev in events:
                 last_id = ev.get("id", last_id)
@@ -981,9 +1170,37 @@ def chat_stream_by_task_id(task_id: str):
                 yield f"event: {typ}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
                 if typ in ("done", "error", "cancelled", "timeout"):
                     return
-            time.sleep(0.3)
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+            # ② 再检查任务是否已进入终态（事件已读完则可以安全退出）
+            state = q.get_state(task_id)
+            if state and state.is_terminal():
+                # 再读一次，防止「检查 state」和「读 events」之间有新事件写入
+                events = q.read_events(task_id, after_id=last_id)
+                for ev in events:
+                    last_id = ev.get("id", last_id)
+                    typ = ev.get("type", "message")
+                    data = ev.get("data", {})
+                    yield f"event: {typ}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+                    if typ in ("done", "error", "cancelled", "timeout"):
+                        return
+                # 所有事件已发送完毕，补发终态通知
+                yield f"event: {state.status.value}\ndata: {json.dumps({'status': state.status.value}, ensure_ascii=False)}\n\n"
+                return
+
+            time.sleep(0.3)
+    finally:
+        if _obs_metrics:
+            _obs_metrics.active_connections.dec()
+
+
+@router.get("/chat/stream/{task_id}")
+def chat_stream_by_task_id(task_id: str):
+    """SSE 订阅任务流式输出；事件由调度器在执行时推送。"""
+    try:
+        q = get_task_queue()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Queue unavailable: {e}")
+    return StreamingResponse(_task_event_stream(task_id, q), media_type="text/event-stream")
 
 
 @router.post("/chat/stream")
@@ -991,56 +1208,31 @@ def chat_stream(
     body: ChatRequest,
     optional_user_id: str | None = Depends(get_optional_user_id),
 ) -> StreamingResponse:
-    session_id, response_text, citations, evidence_summary, parsed, dashboard_data, tool_trace_data, ref_map, agent_debug_payload = _run_chat(body, optional_user_id)
-    
-    # 获取当前会话阶段
+    try:
+        q = get_task_queue()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Queue unavailable: {e}")
+    payload = body.model_dump()
     store = get_session_store()
-    current_stage = store.get_session_stage(session_id) or "explore"
-
-    def event_stream():
-        if _obs_metrics:
-            _obs_metrics.active_connections.inc()
-        try:
-            # 序列化 citations 为完整的引用信息
-            citations_data = [_serialize_citation(c) for c in citations]
-            # 返回模式/意图信息
-            intent_info = {
-                "mode": parsed.intent_type.value,  # "chat" or "deep_research"
-                "intent_type": parsed.intent_type.value,  # 兼容
-                "confidence": parsed.confidence,
-                "from_command": parsed.from_command,
-            }
-            # 获取 canvas_id
-            session_meta = store.get_session_meta(session_id)
-            canvas_id = (session_meta or {}).get("canvas_id") or ""
-            meta = {
-                "session_id": session_id,
-                "canvas_id": canvas_id,  # 返回 canvas_id 供前端加载画布
-                "citations": citations_data,
-                "ref_map": ref_map or {},  # ref_hash → cite_key 映射
-                "evidence_summary": evidence_summary.model_dump() if evidence_summary else None,
-                "intent": intent_info,
-                "current_stage": current_stage,  # 返回当前工作流阶段
-            }
-            yield f"event: meta\ndata: {json.dumps(meta, ensure_ascii=False)}\n\n"
-            # Deep Research 进度仪表盘
-            if dashboard_data:
-                dash = dashboard_data if isinstance(dashboard_data, dict) else {}
-                yield f"event: dashboard\ndata: {json.dumps(dash, ensure_ascii=False, default=str)}\n\n"
-            # Agent 工具调用轨迹
-            if tool_trace_data:
-                yield f"event: tool_trace\ndata: {json.dumps(tool_trace_data, ensure_ascii=False, default=str)}\n\n"
-            # Agent debug 详情（含 stats + tools_contributed）
-            if agent_debug_payload:
-                yield f"event: agent_debug\ndata: {json.dumps(agent_debug_payload, ensure_ascii=False, default=str)}\n\n"
-            for chunk in _chunk_text(response_text):
-                yield f"event: delta\ndata: {json.dumps({'delta': chunk}, ensure_ascii=False)}\n\n"
-            yield "event: done\ndata: {}\n\n"
-        finally:
-            if _obs_metrics:
-                _obs_metrics.active_connections.dec()
-
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    if not body.session_id:
+        created_session_id = store.create_session(canvas_id=body.canvas_id or "")
+        payload["session_id"] = created_session_id
+        # 提问时即用首条消息作为会话标题，历史里立即显示问题而非「未命名对话」
+        first_msg = (body.message or "").strip()
+        if first_msg:
+            store.update_session_meta(created_session_id, {"title": first_msg[:80]})
+    else:
+        created_session_id = body.session_id
+    payload["_optional_user_id"] = optional_user_id
+    session_id = created_session_id or ""
+    user_id = optional_user_id or body.user_id or ""
+    try:
+        task_id = q.submit(TaskKind.chat, session_id, user_id or "", payload)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Queue submit failed: {e}")
+    if _obs_metrics and hasattr(_obs_metrics, "task_queue_submitted_total"):
+        _obs_metrics.task_queue_submitted_total.labels(kind="chat").inc()
+    return StreamingResponse(_task_event_stream(task_id, q), media_type="text/event-stream")
 
 
 @router.post("/intent/detect", response_model=IntentDetectResponse)
@@ -1958,11 +2150,16 @@ def stream_deep_research_events(job_id: str, after_id: int = 0) -> StreamingResp
                 break
 
             idle_ticks += 1
-            if idle_ticks % 5 == 0:
+            # Heartbeat every 10 idle ticks (~20s) to reduce DB/network load and avoid proxy timeouts
+            if idle_ticks % 10 == 0:
                 yield _dr_sse("heartbeat", _dr_job_status_payload(job))
-            _time.sleep(1)
+            _time.sleep(2)
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    resp = StreamingResponse(event_stream(), media_type="text/event-stream")
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    resp.headers["X-Accel-Buffering"] = "no"
+    resp.headers["Connection"] = "keep-alive"
+    return resp
 
 
 @router.post("/deep-research/jobs/{job_id}/cancel")
@@ -1984,6 +2181,25 @@ def cancel_deep_research_job(job_id: str) -> dict:
     update_job(job_id, status="cancelling", message="收到停止请求，正在终止任务...")
     append_event(job_id, "cancel_requested", {"job_id": job_id, "message": "已请求停止"})
     return {"ok": True, "job_id": job_id, "status": "cancelling"}
+
+
+@router.delete("/deep-research/jobs/{job_id}")
+def delete_deep_research_job(job_id: str) -> dict:
+    """删除已终态的后台调研任务及其关联数据（events、reviews、resume_queue 等），释放资源。"""
+    from src.collaboration.research.job_store import get_job, delete_job
+
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job 不存在")
+    current_status = str(job.get("status") or "")
+    if current_status not in ("done", "error", "cancelled"):
+        raise HTTPException(
+            status_code=400,
+            detail="只能删除已结束/已取消的任务，当前状态: " + current_status,
+        )
+    if not delete_job(job_id):
+        raise HTTPException(status_code=404, detail="job 不存在或无法删除")
+    return {"ok": True, "job_id": job_id, "deleted": True}
 
 
 @router.get("/deep-research/jobs/{job_id}/checkpoints")
@@ -2385,6 +2601,8 @@ def update_insight_status_endpoint(job_id: str, insight_id: int, body: dict) -> 
 def get_session(session_id: str) -> SessionInfo:
     store = get_session_store()
     meta = store.get_session_meta(session_id)
+    if meta is not None:
+        store.touch_session(session_id)
     if meta is None:
         # 可能是仅存在于 Deep Research 任务中的 session（ChatSession 无记录），尝试从 job 恢复
         try:
@@ -2467,6 +2685,7 @@ def list_sessions(limit: int = 100) -> List[SessionListItem]:
             canvas_id=s["canvas_id"] or "",
             stage=s.get("stage", "explore"),
             turn_count=s["turn_count"],
+            session_type=s.get("session_type") or "chat",
             created_at=s["created_at"],
             updated_at=s["updated_at"],
         )
@@ -2493,6 +2712,7 @@ def list_sessions(limit: int = 100) -> List[SessionListItem]:
                     canvas_id=(j.get("canvas_id") or "").strip(),
                     stage="explore",
                     turn_count=0,
+                    session_type="research",
                     created_at=created_iso,
                     updated_at=updated_iso,
                 )

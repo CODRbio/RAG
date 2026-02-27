@@ -1,0 +1,7 @@
+Summarize in ONE short sentence: main topic and current focus.
+
+Previous: {previous_summary}
+New segment:
+{turns_text}
+
+Output only the updated one-sentence summary.

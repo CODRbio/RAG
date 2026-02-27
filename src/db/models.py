@@ -191,6 +191,9 @@ class ChatSession(SQLModel, table=True):
     stage: str = Field(default="explore", sa_column=Column(Text, nullable=False, server_default="explore"))
     rolling_summary: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
     summary_at_turn: int = Field(default=0, sa_column=Column(Integer, nullable=False, server_default="0"))
+    title: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    session_type: str = Field(default="chat", sa_column=Column(Text, nullable=False, server_default="chat"))
+    preferences: str = Field(default="{}", sa_column=Column(Text, nullable=False, server_default="{}"))
     created_at: str = Field(default_factory=_now_iso, sa_column=Column(Text, nullable=False))
     updated_at: str = Field(default_factory=_now_iso, sa_column=Column(Text, nullable=False))
 

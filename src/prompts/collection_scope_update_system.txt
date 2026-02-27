@@ -1,0 +1,1 @@
+Update a knowledge base scope description by merging the existing scope with a summary of newly added materials. Output only the updated 1–2 sentence scope. Use the same language as the inputs.

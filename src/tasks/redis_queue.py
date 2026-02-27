@@ -122,16 +122,27 @@ class TaskQueue:
     def acquire_slot(self, task_id: str, session_id: str) -> bool:
         """Try to mark task as running (consume a slot). Returns True if acquired."""
         self._ensure_client()
-        active = self._client.scard(SET_ACTIVE)
-        if active >= settings.tasks.max_active_slots:
-            return False
-        if self._client.sismember(KEY_ACTIVE_SESSIONS, session_id):
-            return False
-        pipe = self._client.pipeline()
-        pipe.sadd(SET_ACTIVE, task_id)
-        pipe.sadd(KEY_ACTIVE_SESSIONS, session_id)
-        pipe.execute()
-        return True
+        import redis
+        for _ in range(5):
+            try:
+                with self._client.pipeline() as pipe:
+                    pipe.watch(SET_ACTIVE, KEY_ACTIVE_SESSIONS)
+                    active = pipe.scard(SET_ACTIVE)
+                    if active >= settings.tasks.max_active_slots:
+                        pipe.unwatch()
+                        return False
+                    if session_id and pipe.sismember(KEY_ACTIVE_SESSIONS, session_id):
+                        pipe.unwatch()
+                        return False
+                    pipe.multi()
+                    pipe.sadd(SET_ACTIVE, task_id)
+                    if session_id:
+                        pipe.sadd(KEY_ACTIVE_SESSIONS, session_id)
+                    pipe.execute()
+                    return True
+            except redis.WatchError:
+                continue
+        return False
 
     def release_slot(self, task_id: str, session_id: str) -> None:
         self._ensure_client()
@@ -240,7 +251,7 @@ class TaskQueue:
         state = self.get_state(task_id)
         if not state or state.status != TaskStatus.queued:
             return False
-        entries = self._client.xrange(STREAM_QUEUE, count=500)
+        entries = self._client.xrange(STREAM_QUEUE, count=settings.tasks.queue_max_len)
         for eid, data in entries:
             if data.get("task_id") == task_id:
                 self._client.xdel(STREAM_QUEUE, eid)

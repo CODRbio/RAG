@@ -17,6 +17,19 @@ from src.utils.prompt_manager import PromptManager
 _pm = PromptManager()
 
 
+def delete_working_memory(canvas_id: str) -> bool:
+    """删除该画布的 working memory 记录。"""
+    if not canvas_id:
+        return False
+    with Session(get_engine()) as session:
+        row = session.get(WorkingMemoryRow, canvas_id)
+        if row is None:
+            return False
+        session.delete(row)
+        session.commit()
+    return True
+
+
 def get_working_memory(canvas_id: str) -> Optional[Dict[str, Any]]:
     """返回缓存的 working memory，无则返回 None。"""
     if not canvas_id:

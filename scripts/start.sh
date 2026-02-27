@@ -6,6 +6,7 @@
 #   bash scripts/start.sh              # 默认端口（后端 9999，前端 5173）
 #   bash scripts/start.sh --backend-only   # 仅启动后端
 #   bash scripts/start.sh --frontend-only  # 仅启动前端
+#   bash scripts/start.sh --no-redis       # 不自动检查/拉起 Redis（不推荐）
 #   API_PORT=8000 bash scripts/start.sh    # 自定义后端端口
 #
 # 退出: Ctrl+C 会同时关闭后端和前端进程
@@ -101,10 +102,12 @@ NC='\033[0m'
 # ── 参数解析 ──
 RUN_BACKEND=true
 RUN_FRONTEND=true
+RUN_REDIS=true
 for arg in "$@"; do
   case "$arg" in
     --backend-only)  RUN_FRONTEND=false ;;
     --frontend-only) RUN_BACKEND=false ;;
+    --no-redis)      RUN_REDIS=false ;;
   esac
 done
 
@@ -141,6 +144,7 @@ kill_port() {
 
 # ── 清理函数 ──
 PIDS=()
+REDIS_STARTED_BY_SCRIPT=0
 cleanup() {
   echo ""
   echo -e "${YELLOW}[start.sh] 正在关闭服务...${NC}"
@@ -153,16 +157,64 @@ cleanup() {
     fi
     kill "$pid" 2>/dev/null || true
   done
+  if [ "$REDIS_STARTED_BY_SCRIPT" = "1" ]; then
+    local redis_host redis_port
+    redis_host="${REDIS_HOST:-127.0.0.1}"
+    redis_port="${REDIS_PORT:-6379}"
+    echo -e "${YELLOW}[start.sh] 关闭脚本拉起的 Redis (${redis_host}:${redis_port})...${NC}"
+    redis-cli -h "$redis_host" -p "$redis_port" shutdown nosave >/dev/null 2>&1 || true
+  fi
   wait 2>/dev/null
   echo -e "${GREEN}[start.sh] 已退出${NC}"
 }
 trap cleanup EXIT INT TERM
+
+# ── Redis 就绪检查（队列模式必需） ──
+ensure_redis() {
+  local redis_host redis_port
+  redis_host="${REDIS_HOST:-127.0.0.1}"
+  redis_port="${REDIS_PORT:-6379}"
+
+  if ! command -v redis-cli >/dev/null 2>&1; then
+    echo -e "${YELLOW}[start.sh] 未找到 redis-cli，请先安装 Redis（例如: brew install redis）${NC}"
+    return 1
+  fi
+
+  if redis-cli -h "$redis_host" -p "$redis_port" ping >/dev/null 2>&1; then
+    echo -e "${GREEN}[start.sh] Redis 已就绪 ✓ (${redis_host}:${redis_port})${NC}"
+    return 0
+  fi
+
+  if ! command -v redis-server >/dev/null 2>&1; then
+    echo -e "${YELLOW}[start.sh] Redis 未运行且未找到 redis-server，可手动启动后重试。${NC}"
+    return 1
+  fi
+
+  echo -e "${CYAN}[start.sh] Redis 未就绪，尝试自动启动 (${redis_host}:${redis_port})...${NC}"
+  # 仅用于本地开发，禁用持久化以便快速拉起
+  redis-server --port "$redis_port" --save "" --appendonly no --daemonize yes >/dev/null 2>&1 || true
+  sleep 1
+  if redis-cli -h "$redis_host" -p "$redis_port" ping >/dev/null 2>&1; then
+    REDIS_STARTED_BY_SCRIPT=1
+    echo -e "${GREEN}[start.sh] Redis 启动成功 ✓ (${redis_host}:${redis_port})${NC}"
+    return 0
+  fi
+
+  echo -e "${YELLOW}[start.sh] Redis 启动失败，请手动启动后重试。${NC}"
+  return 1
+}
 
 # ── 启动后端 ──
 if [ "$RUN_BACKEND" = true ]; then
   BACKEND_PORT="${API_PORT:-9999}"
   BACKEND_HOST="${API_HOST:-127.0.0.1}"
   kill_port "$BACKEND_PORT" "后端 API"
+
+  if [ "$RUN_REDIS" = true ]; then
+    ensure_redis || exit 1
+  else
+    echo -e "${YELLOW}[start.sh] 已跳过 Redis 检查 (--no-redis)；队列接口可能返回 503。${NC}"
+  fi
 
   if [ "${SKIP_DB_MIGRATION:-0}" != "1" ]; then
     echo -e "${CYAN}[start.sh] 执行数据库迁移 (alembic upgrade head)...${NC}"

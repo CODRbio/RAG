@@ -4,8 +4,8 @@ import { MessageSquare, FileSearch, Copy, Download, ExternalLink, FileText, User
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useChatStore, useConfigStore, useToastStore, useCompareStore } from '../../stores';
-import type { Source, DeepResearchJobInfo } from '../../types';
-import { cancelDeepResearchJob, getDeepResearchJob, streamDeepResearchEvents } from '../../api/chat';
+import type { Source, DeepResearchJobInfo, ResearchDashboardData } from '../../types';
+import { cancelDeepResearchJob, getDeepResearchJob, streamDeepResearchEvents, listDeepResearchJobs } from '../../api/chat';
 import { DEEP_RESEARCH_JOB_KEY } from '../workflow/deep-research/types';
 import { getChunkDetail } from '../../api/graph';
 import { RetrievalDebugPanel } from './RetrievalDebugPanel';
@@ -132,9 +132,14 @@ export function ChatWindow() {
   const researchDashboard = useChatStore((s) => s.researchDashboard);
   const toolTrace = useChatStore((s) => s.toolTrace);
   const agentDebugMode = useConfigStore((s) => s.ragConfig.agentDebugMode);
+  const sessionId = useChatStore((s) => s.sessionId);
   const setShowDeepResearchDialog = useChatStore((s) => s.setShowDeepResearchDialog);
   const setDeepResearchTopic = useChatStore((s) => s.setDeepResearchTopic);
+  const setSessionId = useChatStore((s) => s.setSessionId);
+  const setCanvasId = useChatStore((s) => s.setCanvasId);
+  const setResearchDashboard = useChatStore((s) => s.setResearchDashboard);
   const isStreaming = useChatStore((s) => s.isStreaming);
+  // LocalDbChoiceDialog 由 App.tsx 全局挂载，ChatWindow 不再处理内联按钮
   const addToast = useToastStore((s) => s.addToast);
   const addComparePreselected = useCompareStore((s) => s.addComparePreselected);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -312,10 +317,36 @@ export function ChatWindow() {
     }
   };
 
-  const handleWakeDeepResearch = (topic?: string) => {
-    setDeepResearchTopic(topic || '');
+  const handleWakeDeepResearch = useCallback(async (topic?: string) => {
+    const topicTrim = (topic || '').trim();
+    setDeepResearchTopic(topicTrim || '');
+    try {
+      const jobs = await listDeepResearchJobs(15);
+      const runnable = ['pending', 'running', 'cancelling', 'waiting_review'];
+      const match = (j: DeepResearchJobInfo) =>
+        (sessionId && j.session_id === sessionId) ||
+        (topicTrim && String(j.topic || '').trim() === topicTrim);
+      const candidates = jobs.filter(match);
+      const best = candidates.sort((a, b) => {
+        const aRun = runnable.includes(a.status);
+        const bRun = runnable.includes(b.status);
+        if (aRun !== bRun) return aRun ? -1 : 1;
+        return (b.updated_at || 0) - (a.updated_at || 0);
+      })[0];
+      if (best) {
+        localStorage.setItem(DEEP_RESEARCH_JOB_KEY, best.job_id);
+        setDeepResearchTopic(best.topic || topicTrim || '');
+        if (best.session_id) setSessionId(best.session_id);
+        if (best.canvas_id) setCanvasId(best.canvas_id);
+        if (best.result_dashboard && Object.keys(best.result_dashboard).length > 0) {
+          setResearchDashboard(best.result_dashboard as ResearchDashboardData);
+        }
+      }
+    } catch (e) {
+      console.debug('[ChatWindow] list jobs for wake failed:', e);
+    }
     setShowDeepResearchDialog(true);
-  };
+  }, [sessionId, setDeepResearchTopic, setSessionId, setCanvasId, setResearchDashboard, setShowDeepResearchDialog]);
 
   const formatAuthors = (authors: string[] | undefined): string => {
     if (!authors || authors.length === 0) return '佚名';
@@ -466,7 +497,7 @@ export function ChatWindow() {
           </div>
         </div>
       )}
-      {!deepResearchActive && researchDashboard && researchDashboard.coverage_gaps.length > 0 && (
+      {!deepResearchActive && researchDashboard && (researchDashboard.coverage_gaps?.length ?? 0) > 0 && (
         <div className="border rounded-lg bg-amber-900/20 border-amber-500/30 p-3 text-sm text-amber-400">
           <div className="font-medium mb-1 flex items-center gap-2">
             <span className="relative flex h-2 w-2">

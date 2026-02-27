@@ -1,0 +1,15 @@
+Knowledge base / collection name: {collection_name}
+
+Generate a clear, detailed scope description (2–4 sentences or a short paragraph) that states:
+- What main topics and domains this knowledge base covers
+- Key sub-themes, species/methods/regions if evident from the titles
+- What kind of user queries would match this collection
+
+Use it for judging whether a user query matches the collection. Prefer being specific over generic.
+
+If a list of document titles from the collection is provided below, infer the scope from those titles (keywords, themes, organisms, methods). If other sample content is provided, base the description on it. Otherwise infer from the collection name only.
+
+Sample (optional — often document titles):
+{sample_block}
+
+Output only the scope description, no preamble. Example style: "深海热液喷口生态系统中的共生关系，特别是与贻贝（如 Bathymodiolus azoricus）相关的代谢、生理、遗传及进化研究；涵盖共生机制、微生物群落、生态系统响应与起源探索。适用于查询深海共生、热液生物、化能合成等主题。"

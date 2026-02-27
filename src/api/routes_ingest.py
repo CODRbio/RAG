@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import APIRouter, File, Form, UploadFile, HTTPException
+from fastapi import APIRouter, Body, File, Form, UploadFile, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 
 from config.settings import settings
@@ -72,7 +72,7 @@ def list_collections() -> dict:
 
 @router.post("/collections")
 def create_collection(body: dict) -> dict:
-    """创建新集合（v2 schema: chunk_id 主键，支持 upsert）"""
+    """创建新集合（v2 schema: chunk_id 主键，支持 upsert），并生成覆盖范围摘要（可后续刷新）"""
     name = (body.get("name") or "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="集合名称不能为空")
@@ -82,6 +82,18 @@ def create_collection(body: dict) -> dict:
         milvus.create_collection(name, recreate=recreate, schema_version="v2")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    # 建库时用当前模型根据库名生成 scope 摘要，供「查询与库是否匹配」使用
+    try:
+        from src.indexing.collection_scope import generate_scope_summary, set_scope
+        from src.llm.llm_manager import get_manager
+        _config_path = Path(__file__).resolve().parents[2] / "config" / "rag_config.json"
+        manager = get_manager(str(_config_path))
+        client = manager.get_client(None)
+        summary = generate_scope_summary(name, sample_texts=None, llm_client=client)
+        if summary:
+            set_scope(name, summary)
+    except Exception as e:
+        logger.debug("create_collection scope summary failed (non-fatal): %s", e)
     return {"ok": True, "name": name}
 
 
@@ -105,6 +117,69 @@ def delete_collection(name: str) -> dict:
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     return {"ok": True, "name": name}
+
+
+@router.get("/collections/{name}/scope")
+def get_collection_scope(name: str) -> dict:
+    """获取指定集合的覆盖范围摘要（建库/入库或刷新时生成）。"""
+    name = (name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="集合名称不能为空")
+    from src.indexing.collection_scope import get_scope_meta
+    meta = get_scope_meta(name)
+    if meta is None:
+        return {"ok": True, "name": name, "scope_summary": None, "updated_at": None}
+    return {"ok": True, "name": name, **meta}
+
+
+@router.put("/collections/{name}/scope")
+def update_collection_scope(name: str, body: dict = Body(...)) -> dict:
+    """编辑并保存指定集合的覆盖范围摘要。body: { "scope_summary": "..." }"""
+    name = (name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="集合名称不能为空")
+    from src.indexing.milvus_ops import milvus
+    if not milvus.client.has_collection(name):
+        raise HTTPException(status_code=404, detail=f"集合 '{name}' 不存在")
+    scope_summary = (body.get("scope_summary") or "").strip()
+    from src.indexing.collection_scope import set_scope, get_scope_meta
+    set_scope(name, scope_summary)
+    meta = get_scope_meta(name)
+    return {"ok": True, "name": name, "scope_summary": scope_summary or None, "updated_at": meta.get("updated_at") if meta else None}
+
+
+@router.post("/collections/{name}/scope-refresh")
+def refresh_collection_scope(name: str, body: Optional[dict] = Body(None)) -> dict:
+    """刷新指定集合的覆盖范围摘要。默认根据集合内文档题目用 LLM 生成；body 可选: { "sample_texts": ["..."] } 覆盖默认。"""
+    name = (name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="集合名称不能为空")
+    from src.indexing.milvus_ops import milvus
+    if not milvus.client.has_collection(name):
+        raise HTTPException(status_code=404, detail=f"集合 '{name}' 不存在")
+    sample_texts = None
+    if body and isinstance(body.get("sample_texts"), list):
+        sample_texts = [str(t).strip() for t in body["sample_texts"] if t and str(t).strip()][:20]
+    if not sample_texts:
+        from src.indexing.collection_scope import get_document_titles_for_collection
+        titles = get_document_titles_for_collection(name, max_titles=None)
+        if titles:
+            sample_texts = ["Document titles (use these to infer scope):\n- " + "\n- ".join(titles)]
+    try:
+        from src.indexing.collection_scope import generate_scope_summary, set_scope
+        from src.llm.llm_manager import get_manager
+        config_path = Path(__file__).resolve().parents[2] / "config" / "rag_config.json"
+        manager = get_manager(str(config_path))
+        client = manager.get_client(None)
+        summary = generate_scope_summary(
+            name, sample_texts=sample_texts, llm_client=client, max_sample_chars=40000
+        )
+        if summary:
+            set_scope(name, summary)
+        return {"ok": True, "name": name, "scope_summary": summary or ""}
+    except Exception as e:
+        logger.warning("scope-refresh failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ============================================================
@@ -356,6 +431,8 @@ def _run_ingest_job(job_id: str, cfg: dict) -> None:
     parsed_dir = settings.path.parsed
     processed_files = 0
     failed_files = 0
+    sample_texts_for_scope: List[str] = []  # 收集片段供入库完成后生成 scope 摘要
+    max_scope_samples = 10
 
     _emit_job_event(job_id, "start", {
         "total": total,
@@ -533,6 +610,12 @@ def _run_ingest_job(job_id: str, cfg: dict) -> None:
             if doc_metadata.get("doi") or doc_metadata.get("title"):
                 _update_paper_metadata(doc_id, doc_metadata)
             texts = [r.pop("_text_for_embed") for r in rows]
+            if len(sample_texts_for_scope) < max_scope_samples and texts:
+                for t in texts[:3]:
+                    if len(sample_texts_for_scope) >= max_scope_samples:
+                        break
+                    if t and isinstance(t, str) and t.strip():
+                        sample_texts_for_scope.append(t.strip()[:2000])
             batch_size = 32
             total_batches = (len(texts) + batch_size - 1) // batch_size
             for bi, i in enumerate(range(0, len(texts), batch_size)):
@@ -649,6 +732,21 @@ def _run_ingest_job(job_id: str, cfg: dict) -> None:
             current_stage="done",
             message=f"已完成 {processed_files}/{total}",
         )
+
+    # 入库完成后：本批材料摘要 + 与已有 scope 合并，增量更新（不重算全量）
+    if total_upserted > 0 and collection_name and sample_texts_for_scope:
+        try:
+            from src.indexing.collection_scope import summarize_new_materials, update_scope_with_new_materials
+            from src.llm.llm_manager import get_manager
+            config_path = Path(__file__).resolve().parents[2] / "config" / "rag_config.json"
+            manager = get_manager(str(config_path))
+            client = manager.get_client(None)
+            new_summary = summarize_new_materials(sample_texts_for_scope, client)
+            if new_summary:
+                update_scope_with_new_materials(collection_name, new_summary, client)
+                logger.info("ingest job done: scope updated (incremental) for %s", collection_name)
+        except Exception as e:
+            logger.debug("ingest scope update failed (non-fatal): %s", e)
 
     _emit_job_event(job_id, "done", {
         "total_files": total,

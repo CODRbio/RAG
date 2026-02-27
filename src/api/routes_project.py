@@ -1,11 +1,16 @@
 """
 项目管理 API：列出当前用户项目、存档/取消存档、删除。
+删除项目时会一并清理该画布下的会话、后台调研任务、working memory、用户项目关联。
 """
 
 from fastapi import APIRouter, Depends, HTTPException
 
 from src.api.routes_auth import get_current_user_id
 from src.collaboration.canvas.canvas_manager import get_canvas_store
+from src.collaboration.memory.session_memory import get_session_store
+from src.collaboration.memory.working_memory import delete_working_memory
+from src.collaboration.memory.persistent_store import delete_user_project
+from src.collaboration.research.job_store import delete_jobs_by_canvas_id
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
@@ -75,6 +80,11 @@ def delete_project(
             status_code=400,
             detail="archived project must be unarchived before deletion",
         )
+    # 清理该画布关联资源：会话、后台调研任务、working memory、用户项目关联
+    get_session_store().delete_sessions_by_canvas_id(canvas_id)
+    delete_jobs_by_canvas_id(canvas_id)
+    delete_working_memory(canvas_id)
+    delete_user_project(user_id, canvas_id)
     if not store.delete(canvas_id):
         raise HTTPException(status_code=404, detail="project not found")
     return {"canvas_id": canvas_id, "deleted": True}

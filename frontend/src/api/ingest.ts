@@ -22,6 +22,42 @@ export async function deleteCollection(name: string): Promise<void> {
   await client.delete(`/ingest/collections/${encodeURIComponent(name)}`);
 }
 
+/** 获取集合的覆盖范围摘要（用于「查询与库是否匹配」判断） */
+export interface CollectionScopeInfo {
+  ok: boolean;
+  name: string;
+  scope_summary: string | null;
+  updated_at: string | null;
+}
+
+export async function getCollectionScope(name: string): Promise<CollectionScopeInfo> {
+  const res = await client.get<CollectionScopeInfo>(
+    `/ingest/collections/${encodeURIComponent(name)}/scope`,
+  );
+  return res.data;
+}
+
+/** 编辑并保存集合的覆盖范围摘要 */
+export async function updateCollectionScope(
+  name: string,
+  scopeSummary: string,
+): Promise<CollectionScopeInfo> {
+  const res = await client.put<CollectionScopeInfo>(
+    `/ingest/collections/${encodeURIComponent(name)}/scope`,
+    { scope_summary: scopeSummary },
+  );
+  return res.data;
+}
+
+/** 刷新集合的覆盖范围摘要（LLM 根据库名与可选样本重新生成） */
+export async function refreshCollectionScope(name: string): Promise<{ ok: boolean; name: string; scope_summary: string }> {
+  const res = await client.post<{ ok: boolean; name: string; scope_summary: string }>(
+    `/ingest/collections/${encodeURIComponent(name)}/scope-refresh`,
+    {},
+  );
+  return res.data;
+}
+
 // ---- Papers (文件级管理) ----
 
 export interface PaperInfo {

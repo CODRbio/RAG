@@ -24,7 +24,7 @@ import {
 } from 'lucide-react';
 import { useAuthStore, useConfigStore, useUIStore, useToastStore, useChatStore, useCanvasStore } from '../../stores';
 import { checkHealth } from '../../api/health';
-import { listSessions, deleteSession, listDeepResearchJobs, cancelDeepResearchJob } from '../../api/chat';
+import { listSessions, deleteSession, listDeepResearchJobs, cancelDeepResearchJob, deleteDeepResearchJob } from '../../api/chat';
 import { getModelStatus, syncModels } from '../../api/models';
 import { exportCanvas, getCanvas } from '../../api/canvas';
 import type { SessionListItem, DeepResearchJobInfo, ResearchDashboardData } from '../../types';
@@ -116,6 +116,9 @@ export function Sidebar({ onStartResize }: SidebarProps) {
     isSidebarOpen,
     setShowSettingsModal,
     setCanvasOpen,
+    setActiveTab,
+    sessionListRefreshKey,
+    requestSessionListRefresh,
   } = useUIStore();
 
   const {
@@ -164,9 +167,10 @@ export function Sidebar({ onStartResize }: SidebarProps) {
     }
   }, [dbStatus]);
 
+  // 初始加载 + 新建/重启任务后刷新（与 sessionListRefreshKey 同步，便于重启后立即在后台调研与历史中看到新任务）
   useEffect(() => {
     loadBackgroundJobs();
-  }, [loadBackgroundJobs]);
+  }, [loadBackgroundJobs, sessionListRefreshKey]);
 
   // 有运行中任务时定期刷新状态
   const hasRunningJob = backgroundJobs.some((j) =>
@@ -178,7 +182,7 @@ export function Sidebar({ onStartResize }: SidebarProps) {
     return () => clearInterval(t);
   }, [hasRunningJob, dbStatus, loadBackgroundJobs]);
 
-  // 加载会话历史
+  // 加载会话历史（新建会话/项目后 requestSessionListRefresh 会触发立即刷新，便于在排队/进行中看到）
   useEffect(() => {
     const loadSessions = async () => {
       if (dbStatus !== 'connected') return;
@@ -193,7 +197,7 @@ export function Sidebar({ onStartResize }: SidebarProps) {
       }
     };
     loadSessions();
-  }, [dbStatus]);
+  }, [dbStatus, sessionListRefreshKey]);
 
   const handleDeleteSession = async (sessionId: string) => {
     try {
@@ -206,9 +210,11 @@ export function Sidebar({ onStartResize }: SidebarProps) {
   };
 
   const handleLoadSession = async (sessionId: string) => {
-    if (isLoadingSession || sessionId === currentSessionId) return;
+    if (isLoadingSession) return;
     try {
+      setActiveTab('chat'); // 切换到对话页，确保加载的会话在对话窗中显示
       await loadSession(sessionId);
+      requestSessionListRefresh(); // 后端 GET 已 touch_session，刷新列表使该会话上移到最新
       addToast(t('sidebar.sessionLoaded'), 'success');
       
       // 加载 Canvas 内容（如果有）
@@ -239,6 +245,7 @@ export function Sidebar({ onStartResize }: SidebarProps) {
   const handleRestoreBackgroundJob = async (job: DeepResearchJobInfo) => {
     const runnable = ['pending', 'running', 'cancelling', 'waiting_review'];
     try {
+      setActiveTab('chat'); // 恢复任务时切换到对话页，确保会话内容在对话窗显示
       localStorage.setItem(DEEP_RESEARCH_JOB_KEY, job.job_id);
       setDeepResearchTopic(job.topic || '');
       setResearchDashboard((job.result_dashboard as unknown as ResearchDashboardData) || null);
@@ -246,30 +253,56 @@ export function Sidebar({ onStartResize }: SidebarProps) {
       setCanvasId(job.canvas_id || null);
       if (job.session_id) {
         await loadSession(job.session_id);
+        // loadSession 会覆盖 researchDashboard，恢复为当前任务的 dashboard
+        setResearchDashboard((job.result_dashboard as unknown as ResearchDashboardData) || null);
+        // 有 session 时也要加载对应 Canvas，否则浏览页是空的
+        const loadedCanvasId = useChatStore.getState().canvasId;
+        if (loadedCanvasId) {
+          clearCanvas();
+          setCanvasLoading(true);
+          try {
+            const [canvasData, exportResp] = await Promise.all([
+              getCanvas(loadedCanvasId).catch(() => null),
+              exportCanvas(loadedCanvasId, 'markdown').catch(() => null),
+            ]);
+            if (canvasData) {
+              setCanvas(canvasData);
+              setActiveStage(canvasData.stage || 'explore');
+            }
+            if (exportResp?.content) setCanvasContent(exportResp.content);
+          } catch (err) {
+            console.error('[Sidebar] Failed to load canvas for job:', err);
+          } finally {
+            setCanvasLoading(false);
+          }
+        } else {
+          clearCanvas();
+        }
       } else {
         setSessionId(null);
         setCanvasId(job.canvas_id || null);
-      }
-      if (!job.session_id && job.canvas_id) {
-        clearCanvas();
-        setCanvasLoading(true);
-        try {
-          const canvasPromise = getCanvas(job.canvas_id).catch(() => null);
-          const exportPromise = exportCanvas(job.canvas_id, 'markdown').catch(() => null);
-          const [canvasData, exportResp] = await Promise.all([canvasPromise, exportPromise]);
-          if (canvasData) {
-            setCanvas(canvasData);
-            setActiveStage(canvasData.stage || 'explore');
+        if (job.canvas_id) {
+          clearCanvas();
+          setCanvasLoading(true);
+          try {
+            const canvasPromise = getCanvas(job.canvas_id).catch(() => null);
+            const exportPromise = exportCanvas(job.canvas_id, 'markdown').catch(() => null);
+            const [canvasData, exportResp] = await Promise.all([canvasPromise, exportPromise]);
+            if (canvasData) {
+              setCanvas(canvasData);
+              setActiveStage(canvasData.stage || 'explore');
+            }
+            if (exportResp?.content) setCanvasContent(exportResp.content);
+          } catch (err) {
+            console.error('[Sidebar] Failed to load canvas for job:', err);
+          } finally {
+            setCanvasLoading(false);
           }
-          if (exportResp?.content) setCanvasContent(exportResp.content);
-        } catch (err) {
-          console.error('[Sidebar] Failed to load canvas for job:', err);
-        } finally {
-          setCanvasLoading(false);
         }
       }
       setShowDeepResearchDialog(true);
       setCanvasOpen(true);
+      if (job.session_id) requestSessionListRefresh(); // 激活的会话上移到历史最新
       addToast(
         runnable.includes(job.status)
           ? t('sidebar.bgJobRestoredRunning')
@@ -313,13 +346,19 @@ export function Sidebar({ onStartResize }: SidebarProps) {
     }
   };
 
-  const handleDeleteBackgroundJob = (e: React.MouseEvent, job: DeepResearchJobInfo) => {
+  const handleDeleteBackgroundJob = async (e: React.MouseEvent, job: DeepResearchJobInfo) => {
     e.stopPropagation();
     const terminal = ['done', 'error', 'cancelled'].includes(job.status);
     if (!terminal) return;
     if (!window.confirm(t('sidebar.confirmDeleteBgJob'))) return;
-    archiveBackgroundJob(job.job_id);
-    addToast(t('sidebar.bgJobDeleted'), 'success');
+    try {
+      await deleteDeepResearchJob(job.job_id);
+      archiveBackgroundJob(job.job_id);
+      await loadBackgroundJobs();
+      addToast(t('sidebar.bgJobDeleted'), 'success');
+    } catch (err) {
+      addToast(t('sidebar.bgJobStopFailed'), 'error');
+    }
   };
 
   const handleConnect = async () => {
@@ -1308,14 +1347,14 @@ export function Sidebar({ onStartResize }: SidebarProps) {
               <History size={14} /> {t('sidebar.history')}
               {isLoadingSessions && <Loader2 size={12} className="animate-spin" />}
             </div>
-            <div className="space-y-2 max-h-48 overflow-y-auto pr-1 scrollbar-thin">
+            <div className="space-y-2 max-h-48 overflow-y-auto overflow-x-hidden pr-1 pb-1 scrollbar-thin">
               {chatHistory.length === 0 && !isLoadingSessions && (
                 <div className="text-xs text-slate-600 text-center py-4">{t('sidebar.noHistory')}</div>
               )}
               {chatHistory.map((h) => (
                 <div
                   key={h.session_id}
-                  className={`group p-2 rounded-lg hover:bg-slate-800/50 cursor-pointer text-sm relative transition-colors border border-transparent ${
+                  className={`group p-2 rounded-lg hover:bg-slate-800/50 cursor-pointer text-sm relative transition-colors border border-transparent overflow-hidden ${
                     currentSessionId === h.session_id 
                       ? 'bg-sky-900/20 border-sky-500/30 shadow-[0_0_10px_rgba(56,189,248,0.1)]' 
                       : ''
@@ -1323,11 +1362,27 @@ export function Sidebar({ onStartResize }: SidebarProps) {
                   onClick={() => handleLoadSession(h.session_id)}
                 >
                   <div className="flex justify-between items-start gap-1">
-                    <span className={`font-medium truncate flex-1 transition-colors ${
-                      currentSessionId === h.session_id ? 'text-sky-400' : 'text-slate-300 group-hover:text-sky-200'
-                    }`}>
-                      {h.title}
-                    </span>
+                    <div className="flex-1 min-w-0 flex flex-col gap-0.5 overflow-hidden">
+                      <span
+                        className={`font-medium block truncate transition-colors ${
+                          currentSessionId === h.session_id ? 'text-sky-400' : 'text-slate-300 group-hover:text-sky-200'
+                        }`}
+                        title={h.title || t('sidebar.unnamedChat')}
+                      >
+                        {h.title || t('sidebar.unnamedChat')}
+                      </span>
+                      <span className="text-[10px] flex items-center gap-1.5 shrink-0">
+                        <span className={`px-1.5 py-0 rounded text-[9px] font-medium ${
+                          h.session_type === 'research'
+                            ? 'bg-amber-500/20 text-amber-400'
+                            : 'bg-slate-600/40 text-slate-400'
+                        }`}>
+                          {h.session_type === 'research'
+                            ? t('sidebar.sessionTypeResearch')
+                            : t('sidebar.sessionTypeChat')}
+                        </span>
+                      </span>
+                    </div>
                     {(Object.values(streamingTasks).some(
                       (t) => t.sessionId === h.session_id && (t.status === 'queued' || t.status === 'running')
                     ) || (isLoadingSession && currentSessionId !== h.session_id)) && (

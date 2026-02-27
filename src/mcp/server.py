@@ -48,7 +48,7 @@ def search_local(query: str, top_k: int = 10) -> str:
     """检索本地知识库（向量数据库 + 图谱融合检索），适用于查找已入库的论文和文档内容。"""
     from src.retrieval.service import get_retrieval_service
     svc = get_retrieval_service()
-    pack = svc.search(query=query, mode="local", top_k=top_k)
+    pack = svc.search(query=query, mode="local", top_k=top_k, filters={"reranker_mode": "bge_only"})
     return pack.to_context_string(max_chunks=min(top_k, 15))
 
 
@@ -57,7 +57,7 @@ def search_web(query: str, top_k: int = 10) -> str:
     """网络搜索（Tavily/Google），获取最新的在线信息和网页内容。"""
     from src.retrieval.service import get_retrieval_service
     svc = get_retrieval_service()
-    pack = svc.search(query=query, mode="web", top_k=top_k)
+    pack = svc.search(query=query, mode="web", top_k=top_k, filters={"reranker_mode": "bge_only"})
     return pack.to_context_string(max_chunks=min(top_k, 15))
 
 

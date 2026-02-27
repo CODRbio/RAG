@@ -1,0 +1,6 @@
+The following are excerpts from newly added documents in a knowledge base. Summarize in 1–2 sentences what topics and domains this batch covers.
+
+Excerpts:
+{sample_block}
+
+Output only the summary (e.g. "深海共生体代谢与基因调控相关研究").

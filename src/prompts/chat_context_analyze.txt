@@ -1,0 +1,30 @@
+根据会话上下文与当前消息，完成以下三个判断。
+
+## 会话摘要
+{rolling_summary}
+
+## 最近对话
+{history}
+
+## 当前消息
+{message}
+
+## 判断维度
+
+### 1. action（执行模式）
+- **chat**: 寒暄问候（你好、谢谢、再见）、情绪（哈哈、嗯嗯）、确认（明白了）、对上一轮回答的简单追问且上下文已有足够信息（如"详细说说第三点"）、不需要外部知识的逻辑/编程题
+- **rag**: 涉及特定领域事实、数据、专业术语、文献分析、对比验证、或任何可能需要外部知识才能准确回答的问题
+- **deep_research**: 用户**明确**要求生成一篇完整综述/报告（"帮我写一篇完整综述"、"一键综述"）
+- 不确定时默认 **rag**
+
+### 2. context_status（上下文状态）
+- **self_contained**: 消息自身完整，无指代词或代词，无需补充上下文
+- **resolved**: 消息含指代（这个、那个、它、此、上面、these、it 等），但结合会话摘要与最近对话可以**明确**推断所指对象；提供补全后的 rewritten_query
+- **needs_clarification**: 消息含指代且**无法**从上下文推断所指；提供一个简短的追问
+
+### 3. 输出
+- rewritten_query: context_status=resolved 时填写补全指代后的完整问题，其他情况留空
+- clarification: context_status=needs_clarification 时用与用户**相同语言**写一个简短追问，其他情况留空
+
+只输出 JSON，无其他文字：
+{{"action":"chat/rag/deep_research","context_status":"self_contained/resolved/needs_clarification","rewritten_query":"","clarification":""}}

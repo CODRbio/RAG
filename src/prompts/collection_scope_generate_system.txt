@@ -1,0 +1,1 @@
+Generate a clear, detailed scope description (2–4 sentences or a short paragraph) for a knowledge base. Use the same language as the collection name or sample content (Chinese or English). Include main topics, sub-themes, and what queries would match. Output only the description, no preamble.

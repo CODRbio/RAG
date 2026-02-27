@@ -1,0 +1,10 @@
+Local knowledge base: {collection_name}
+Scope (topics covered): {scope_description}
+
+User query: {query}
+
+If the query clearly falls OUTSIDE the scope (e.g. finance, sports, general trivia when the DB is marine biology), answer: mismatch
+If the query clearly fits the scope or is ambiguous/general, answer: match
+If you cannot tell, answer: unclear
+
+Output only one word.

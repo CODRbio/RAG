@@ -41,7 +41,12 @@ class SessionStore:
         # db_path ignored — we use the shared engine
         pass
 
-    def create_session(self, canvas_id: str = "", stage: str = "explore") -> str:
+    def create_session(
+        self,
+        canvas_id: str = "",
+        stage: str = "explore",
+        session_type: str = "chat",
+    ) -> str:
         session_id = str(uuid.uuid4())
         now = datetime.now().isoformat()
         with Session(get_engine()) as session:
@@ -51,6 +56,8 @@ class SessionStore:
                 stage=stage,
                 rolling_summary="",
                 summary_at_turn=0,
+                title="",
+                session_type=session_type if session_type in ("chat", "research") else "chat",
                 created_at=now,
                 updated_at=now,
             )
@@ -63,12 +70,22 @@ class SessionStore:
             row = session.get(ChatSession, session_id)
         if row is None:
             return None
+        preferences = {}
+        raw_prefs = getattr(row, "preferences", None) or ""
+        if raw_prefs:
+            try:
+                preferences = json.loads(raw_prefs)
+            except (TypeError, ValueError):
+                pass
         meta = {
             "session_id": row.session_id,
             "canvas_id": row.canvas_id or "",
             "stage": row.stage or "explore",
             "rolling_summary": row.rolling_summary or "",
             "summary_at_turn": row.summary_at_turn or 0,
+            "title": getattr(row, "title", None) or "",
+            "session_type": getattr(row, "session_type", None) or "chat",
+            "preferences": preferences,
             "created_at": row.created_at,
             "updated_at": row.updated_at,
         }
@@ -90,7 +107,7 @@ class SessionStore:
                 session.commit()
 
     def update_session_meta(self, session_id: str, meta: Dict[str, Any]) -> None:
-        """更新会话元数据，如 canvas_id"""
+        """更新会话元数据，如 canvas_id、title、session_type"""
         with Session(get_engine()) as session:
             row = session.get(ChatSession, session_id)
             if not row:
@@ -101,9 +118,31 @@ class SessionStore:
                 row.rolling_summary = meta["rolling_summary"]
             if isinstance(meta.get("summary_at_turn"), int):
                 row.summary_at_turn = meta["summary_at_turn"]
+            if "title" in meta and isinstance(meta.get("title"), str):
+                row.title = meta["title"]
+            if meta.get("session_type") in ("chat", "research"):
+                row.session_type = meta["session_type"]
+            if "preferences" in meta and isinstance(meta["preferences"], dict):
+                existing = {}
+                if getattr(row, "preferences", None):
+                    try:
+                        existing = json.loads(row.preferences)
+                    except (TypeError, ValueError):
+                        pass
+                existing.update(meta["preferences"])
+                row.preferences = json.dumps(existing, ensure_ascii=False)
             row.updated_at = datetime.now().isoformat()
             session.add(row)
             session.commit()
+
+    def touch_session(self, session_id: str) -> None:
+        """仅更新 updated_at，用于「重新激活」后使会话排到历史列表最前。"""
+        with Session(get_engine()) as session:
+            row = session.get(ChatSession, session_id)
+            if row:
+                row.updated_at = datetime.now().isoformat()
+                session.add(row)
+                session.commit()
 
     def get_turns(
         self,
@@ -211,6 +250,18 @@ class SessionStore:
             session.commit()
         return True
 
+    def delete_sessions_by_canvas_id(self, canvas_id: str) -> int:
+        """删除该画布下的所有会话（及其轮次），返回删除的会话数。"""
+        if not canvas_id:
+            return 0
+        with Session(get_engine()) as session:
+            stmt = select(ChatSession).where(ChatSession.canvas_id == canvas_id)
+            rows = list(session.exec(stmt).all())
+            for row in rows:
+                session.delete(row)  # cascade deletes turns
+            session.commit()
+        return len(rows)
+
     def list_all_sessions(self, limit: int = 100) -> List[Dict[str, Any]]:
         """列出所有会话，按更新时间倒序"""
         with Session(get_engine()) as session:
@@ -229,11 +280,18 @@ class SessionStore:
                 "stage": row.stage or "explore",
                 "rolling_summary": row.rolling_summary or "",
                 "summary_at_turn": row.summary_at_turn or 0,
+                "title": getattr(row, "title", None) or "",
+                "session_type": getattr(row, "session_type", None) or "chat",
                 "created_at": row.created_at,
                 "updated_at": row.updated_at,
             }
-            turns = self.get_turns(meta["session_id"], limit=1)
-            meta["title"] = turns[0].content[:50] + "..." if turns and turns[0].content else "未命名对话"
+            if not meta["title"]:
+                turns = self.get_turns(meta["session_id"], limit=1)
+                meta["title"] = (
+                    (turns[0].content[:50] + "..." if len((turns[0].content or "")) > 50 else (turns[0].content or "").strip())
+                    if turns and turns[0].content
+                    else "未命名对话"
+                )
             meta["turn_count"] = self._count_turns(meta["session_id"])
             sessions.append(meta)
         return sessions
@@ -246,6 +304,10 @@ class SessionStore:
                 select(func.count()).select_from(TurnRow).where(TurnRow.session_id == session_id)
             ).one()
             return result
+
+    def get_turn_count(self, session_id: str) -> int:
+        """返回会话当前轮次数（公开接口）"""
+        return self._count_turns(session_id)
 
 
 _store: Optional[SessionStore] = None
@@ -291,8 +353,10 @@ class SessionMemory:
     def to_messages(self) -> List[Dict[str, str]]:
         return [{"role": t.role, "content": t.content} for t in self.turns]
 
-    def update_rolling_summary(self, llm_client: Any, interval: int = 4) -> None:
-        """Update rolling summary every `interval` turns."""
+    def update_rolling_summary(
+        self, llm_client: Any, interval: int = 4, ultra_lite: bool = True,
+    ) -> None:
+        """Update rolling summary every `interval` turns (default 4). ultra_lite=True 用一句话总结，省 token。"""
         current_count = len(self.turns)
         if current_count - self.summary_at_turn < max(1, interval):
             return
@@ -302,15 +366,24 @@ class SessionMemory:
             f"{'User' if t.role == 'user' else 'Assistant'}: {(t.content or '')[:200]}"
             for t in recent_turns
         )
-        prompt = _pm.render(
-            "session_memory_summarize.txt",
-            previous_summary=self.rolling_summary or "(start of conversation)",
-            turns_text=turns_text,
-        )
+        if ultra_lite:
+            prompt = _pm.render(
+                "session_memory_summarize_ultra_lite.txt",
+                previous_summary=self.rolling_summary or "(start of conversation)",
+                turns_text=turns_text,
+            )
+            system_content = _pm.render("session_memory_summarize_ultra_lite_system.txt")
+        else:
+            prompt = _pm.render(
+                "session_memory_summarize.txt",
+                previous_summary=self.rolling_summary or "(start of conversation)",
+                turns_text=turns_text,
+            )
+            system_content = _pm.render("session_memory_summarize_system.txt")
         try:
             resp = llm_client.chat(
                 messages=[
-                    {"role": "system", "content": _pm.render("session_memory_summarize_system.txt")},
+                    {"role": "system", "content": system_content},
                     {"role": "user", "content": prompt},
                 ],
 

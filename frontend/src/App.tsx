@@ -11,6 +11,7 @@ import { Header } from './components/layout/Header';
 import { CanvasPanel } from './components/canvas/CanvasPanel';
 import { SettingsModal } from './components/settings/SettingsModal';
 import { DeepResearchDialog } from './components/workflow/DeepResearchDialog';
+import { LocalDbChoiceDialog } from './components/chat/LocalDbChoiceDialog';
 import { ToastContainer } from './components/ui/Toast';
 
 function App() {
@@ -124,6 +125,9 @@ function App() {
 
       {/* Deep Research 澄清对话框 */}
       <DeepResearchDialog />
+
+      {/* 查询与本地库范围不符时的选择弹窗 */}
+      <LocalDbChoiceDialog />
     </div>
   );
 }

@@ -107,6 +107,33 @@ def list_jobs(limit: int = 20, status: Optional[str] = None) -> List[Dict[str, A
     return [r.to_dict() for r in rows]
 
 
+def delete_job(job_id: str) -> bool:
+    """删除单个 Deep Research 任务（及其关联的 events、reviews、resume_queue 等）。仅允许终态任务。"""
+    with Session(get_engine()) as session:
+        row = session.get(DeepResearchJob, job_id)
+        if not row:
+            return False
+        status = (row.status or "").strip()
+        if status not in ("done", "error", "cancelled"):
+            return False
+        session.delete(row)  # cascade deletes events, section_reviews, resume_queue, gap_supplements, insights, checkpoints
+        session.commit()
+    return True
+
+
+def delete_jobs_by_canvas_id(canvas_id: str) -> int:
+    """删除该画布下的所有 Deep Research 任务（含关联数据），返回删除的任务数。"""
+    if not canvas_id:
+        return 0
+    with Session(get_engine()) as session:
+        stmt = select(DeepResearchJob).where(DeepResearchJob.canvas_id == canvas_id)
+        rows = list(session.exec(stmt).all())
+        for row in rows:
+            session.delete(row)
+        session.commit()
+    return len(rows)
+
+
 # ── Checkpoints ───────────────────────────────────────────────────────────────
 
 def save_checkpoint(

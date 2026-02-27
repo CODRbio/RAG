@@ -117,6 +117,13 @@ class ChatRequest(BaseModel):
         "chat",
         description="执行模式: chat（普通对话）| deep_research（多步综述流水线），默认 chat",
     )
+    session_preference_local_db: Optional[str] = Field(
+        None,
+        description=(
+            "本会话本地库偏好（由前端在用户选择「换库/本会话不用本地库」后传入）："
+            "no_local = 本会话暂不使用本地库；use = 仍使用当前库。"
+        ),
+    )
 
 
 class EvidenceSummary(BaseModel):
@@ -165,6 +172,14 @@ class ChatResponse(BaseModel):
     response: str = Field(..., description="助手回复")
     citations: List[ChatCitation] = Field(default_factory=list, description="引用来源列表")
     evidence_summary: Optional[EvidenceSummary] = Field(None, description="本轮检索摘要")
+    prompt_local_db_choice: bool = Field(
+        False,
+        description="是否提示用户选择：当前查询与本地库可能不符，可换库或本会话不用本地库",
+    )
+    local_db_mismatch_message: Optional[str] = Field(
+        None,
+        description="当 prompt_local_db_choice 为 true 时，前端展示的提示文案",
+    )
 
 
 class ChatSubmitResponse(BaseModel):
@@ -231,10 +246,11 @@ class SessionListItem(BaseModel):
     """会话列表项（用于历史记录）"""
 
     session_id: str
-    title: str = Field(..., description="会话标题（取第一轮用户消息）")
+    title: str = Field(..., description="会话标题（首条消息生成或第一轮用户消息）")
     canvas_id: str = ""
     stage: str = "explore"
     turn_count: int = 0
+    session_type: str = Field(default="chat", description="chat | research")
     created_at: str
     updated_at: str
 

@@ -1,0 +1,4 @@
+Generate a very short phrase (under 15 words, one line) that summarizes this user question for use as a chat list title. Output only the phrase, no quotes or explanation.
+
+User question:
+{{message}}

@@ -16,6 +16,8 @@ import copy
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypedDict
 
+import requests
+
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import StateGraph, END
 from langgraph.types import interrupt
@@ -4384,6 +4386,7 @@ def synthesize_node(state: DeepResearchState) -> DeepResearchState:
                     win_budget = min(win_budget, sec_tokens + 600)
                 else:
                     win_budget = min(3500, sec_tokens + 600)
+                win_budget = max(1, min(win_budget, 16384))  # avoid 0 or over model limit
 
                 try:
                     resp_win = client.chat(
@@ -4401,6 +4404,14 @@ def synthesize_node(state: DeepResearchState) -> DeepResearchState:
                         "coherence_window_done",
                         {"window": idx + 1, "total": n_sections, "section": heading.lstrip("#").strip()},
                     )
+                except requests.exceptions.HTTPError as e:
+                    body = (e.response.text or "")[:800] if getattr(e, "response", None) else ""
+                    logger.warning(
+                        "Coherence window %d/%d failed: %s | response: %s",
+                        idx + 1, n_sections, e, body,
+                    )
+                    refined_sections.append(current_section_text)
+                    window_errors += 1
                 except Exception as e:
                     logger.warning("Coherence window %d/%d failed: %s", idx + 1, n_sections, e)
                     refined_sections.append(current_section_text)

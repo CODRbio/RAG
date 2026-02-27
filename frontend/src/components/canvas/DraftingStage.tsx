@@ -1,5 +1,6 @@
-import { FileText, BookOpen, AlertTriangle, ChevronDown, ChevronUp, Send, CheckCircle2, RefreshCw } from 'lucide-react';
+import { FileText, BookOpen, AlertTriangle, ChevronDown, ChevronUp, Send, CheckCircle2, RefreshCw, LifeBuoy } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import {
   listSectionReviews,
   submitSectionReview,
@@ -8,8 +9,9 @@ import {
   restartDeepResearchPhase,
   restartDeepResearchSection,
 } from '../../api/chat';
+import { exportCanvas, getCanvas, updateCanvas } from '../../api/canvas';
 import { useToastStore } from '../../stores';
-import { useChatStore } from '../../stores';
+import { useChatStore, useCanvasStore } from '../../stores';
 import type { Canvas, GapSupplement } from '../../types';
 import {
   DEEP_RESEARCH_JOB_KEY,
@@ -21,6 +23,7 @@ interface DraftingStageProps {
 }
 
 export function DraftingStage({ canvas }: DraftingStageProps) {
+  const { t } = useTranslation();
   const { outline, drafts, citation_pool, identified_gaps, skip_draft_review } = canvas;
   const [expandedSections, setExpandedSections] = useState<Set<string>>(new Set());
   const [reviewingSectionId, setReviewingSectionId] = useState<string | null>(null);
@@ -36,11 +39,14 @@ export function DraftingStage({ canvas }: DraftingStageProps) {
   const [supplementText, setSupplementText] = useState('');
   const [supplementSubmitting, setSupplementSubmitting] = useState(false);
   const [restarting, setRestarting] = useState(false);
+  const [rescueRefineLoading, setRescueRefineLoading] = useState(false);
   const addToast = useToastStore((s) => s.addToast);
   const researchDashboard = useChatStore((s) => s.researchDashboard);
   const setShowDeepResearchDialog = useChatStore((s) => s.setShowDeepResearchDialog);
   const setDeepResearchTopic = useChatStore((s) => s.setDeepResearchTopic);
   const setDeepResearchActive = useChatStore((s) => s.setDeepResearchActive);
+  const setWorkflowStep = useChatStore((s) => s.setWorkflowStep);
+  const { setCanvas, setActiveStage, setCanvasContent } = useCanvasStore();
 
   const sortedOutline = [...(outline || [])].sort((a, b) => a.order - b.order);
 
@@ -376,6 +382,44 @@ export function DraftingStage({ canvas }: DraftingStageProps) {
     setBulkApproving(false);
   };
 
+  /** 拯救：全部通过但精炼未自动触发时，手动将当前草稿设为精炼内容并进入精炼阶段 */
+  const handleRescueRefine = async () => {
+    if (!canvas?.id) {
+      addToast('无画布，无法进入精炼', 'error');
+      return;
+    }
+    setRescueRefineLoading(true);
+    try {
+      const exportResp = await exportCanvas(canvas.id, 'markdown');
+      const content = (exportResp?.content || '').trim();
+      if (!content) {
+        addToast('当前无正文内容，无法进入精炼', 'warning');
+        setRescueRefineLoading(false);
+        return;
+      }
+      await updateCanvas(canvas.id, { stage: 'refine', refined_markdown: content });
+      const updated = await getCanvas(canvas.id);
+      if (updated) {
+        setCanvas(updated);
+        setCanvasContent(updated.refined_markdown || content);
+        setActiveStage('refine');
+        setWorkflowStep('refine');
+        addToast('已手动进入精炼阶段，可继续编辑与全文精炼', 'success');
+      }
+    } catch (err) {
+      console.error('[DraftingStage] rescue refine failed:', err);
+      addToast('进入精炼失败，请重试', 'error');
+    } finally {
+      setRescueRefineLoading(false);
+    }
+  };
+
+  const allPassedButStillDrafting =
+    !skip_draft_review &&
+    sortedOutline.length > 0 &&
+    approvedCount >= sortedOutline.length &&
+    canvas?.stage === 'drafting';
+
   return (
     <div className="p-4 space-y-3 overflow-y-auto h-full">
       <div className="bg-[var(--bg-surface)] rounded-lg p-3 border border-[var(--border-subtle)]">
@@ -421,7 +465,7 @@ export function DraftingStage({ canvas }: DraftingStageProps) {
               审核进度：已通过 {approvedCount} / {sortedOutline.length}
             </div>
             <div className="text-[10px] text-amber-300">规则：章节可继续生成，但需全部通过后才会进入最终整合。</div>
-            <div className="pt-1">
+            <div className="pt-1 flex flex-wrap items-center gap-1.5">
               <button
                 onClick={handleApproveAllSections}
                 disabled={bulkApproving || approvedCount >= sortedOutline.length}
@@ -429,6 +473,17 @@ export function DraftingStage({ canvas }: DraftingStageProps) {
               >
                 {bulkApproving ? '批量提交中...' : '全部通过并触发整合'}
               </button>
+              {allPassedButStillDrafting && (
+                <button
+                  onClick={handleRescueRefine}
+                  disabled={rescueRefineLoading}
+                  className="px-2.5 py-1 text-[11px] rounded-md border border-amber-500/50 text-amber-200 hover:bg-amber-900/30 disabled:opacity-50 cursor-pointer flex items-center gap-1"
+                  title={t('workflow.rescueRefineTitle')}
+                >
+                  <LifeBuoy size={10} />
+                  {rescueRefineLoading ? t('workflow.rescueRefineLoading') : t('workflow.rescueRefine')}
+                </button>
+              )}
             </div>
           </div>
         )}

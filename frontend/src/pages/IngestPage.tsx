@@ -13,6 +13,7 @@ import {
   RefreshCw,
   ChevronLeft,
   ChevronRight,
+  List,
 } from 'lucide-react';
 import { useConfigStore, useUIStore, useToastStore } from '../stores';
 import { Modal } from '../components/ui/Modal';
@@ -20,6 +21,9 @@ import {
   listCollections,
   createCollection,
   deleteCollection,
+  getCollectionScope,
+  updateCollectionScope,
+  refreshCollectionScope,
   listPapers,
   deletePaper,
   uploadFiles,
@@ -134,6 +138,15 @@ export function IngestPage() {
   const [duplicateActionPreference, setDuplicateActionPreference] = useState<'skip' | 'overwrite' | null>(null);
   /** 弹窗内勾选「应用到所有类似」 */
   const [applyToAllSimilar, setApplyToAllSimilar] = useState(false);
+  /** 正在刷新覆盖范围摘要的集合名 */
+  const [scopeRefreshingCollection, setScopeRefreshingCollection] = useState<string | null>(null);
+  /** 覆盖范围摘要弹窗：当前集合、摘要文本、更新时间、加载/保存中 */
+  const [scopeModalOpen, setScopeModalOpen] = useState(false);
+  const [scopeModalCollection, setScopeModalCollection] = useState<string | null>(null);
+  const [scopeSummaryText, setScopeSummaryText] = useState('');
+  const [scopeUpdatedAt, setScopeUpdatedAt] = useState<string | null>(null);
+  const [scopeModalLoading, setScopeModalLoading] = useState(false);
+  const [scopeModalSaving, setScopeModalSaving] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
@@ -717,6 +730,70 @@ export function IngestPage() {
     }
   };
 
+  // ---- 覆盖范围摘要：打开弹窗并加载 ----
+  const handleOpenScopeModal = async (name: string) => {
+    setScopeModalCollection(name);
+    setScopeModalOpen(true);
+    setScopeSummaryText('');
+    setScopeUpdatedAt(null);
+    setScopeModalLoading(true);
+    try {
+      const res = await getCollectionScope(name);
+      setScopeSummaryText(res.scope_summary ?? '');
+      setScopeUpdatedAt(res.updated_at ?? null);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      addToast(`加载摘要失败: ${msg}`, 'error');
+    } finally {
+      setScopeModalLoading(false);
+    }
+  };
+
+  const handleSaveScope = async () => {
+    if (scopeModalCollection == null) return;
+    setScopeModalSaving(true);
+    try {
+      await updateCollectionScope(scopeModalCollection, scopeSummaryText);
+      setScopeUpdatedAt(new Date().toISOString());
+      addToast('已保存覆盖范围摘要', 'success');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      addToast(`保存失败: ${msg}`, 'error');
+    } finally {
+      setScopeModalSaving(false);
+    }
+  };
+
+  const handleRefreshScopeInModal = async () => {
+    if (scopeModalCollection == null) return;
+    setScopeRefreshingCollection(scopeModalCollection);
+    try {
+      const res = await refreshCollectionScope(scopeModalCollection);
+      setScopeSummaryText(res.scope_summary ?? '');
+      setScopeUpdatedAt(new Date().toISOString());
+      addToast('已用 LLM 重新生成摘要', 'success');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      addToast(`刷新失败: ${msg}`, 'error');
+    } finally {
+      setScopeRefreshingCollection(null);
+    }
+  };
+
+  // ---- Refresh collection scope (列表内按钮) ----
+  const handleRefreshScope = async (name: string) => {
+    setScopeRefreshingCollection(name);
+    try {
+      const res = await refreshCollectionScope(name);
+      addToast(res.scope_summary ? `已刷新「${name}」覆盖范围摘要` : `已刷新「${name}」（暂无摘要）`, 'success');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      addToast(`刷新覆盖范围失败: ${msg}`, 'error');
+    } finally {
+      setScopeRefreshingCollection(null);
+    }
+  };
+
   // ---- Delete collection ----
   const handleDeleteCollection = async (name: string) => {
     if (!window.confirm(`确定要删除集合「${name}」？此操作不可恢复，集合内所有数据将被永久删除。`)) {
@@ -893,16 +970,39 @@ export function IngestPage() {
                       </div>
                     </div>
                   </div>
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      handleDeleteCollection(c.name);
-                    }}
-                    className="p-1.5 text-gray-300 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors"
-                    title={`删除集合 ${c.name}`}
-                  >
-                    <Trash2 size={14} />
-                  </button>
+                  <div className="flex items-center gap-1">
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleOpenScopeModal(c.name);
+                      }}
+                      className="p-1.5 text-gray-300 hover:text-emerald-600 hover:bg-emerald-50 rounded-lg transition-colors"
+                      title="查看/编辑覆盖范围摘要"
+                    >
+                      <List size={14} />
+                    </button>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleRefreshScope(c.name);
+                      }}
+                      disabled={scopeRefreshingCollection === c.name}
+                      className="p-1.5 text-gray-300 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors disabled:opacity-50"
+                      title="刷新覆盖范围摘要（LLM 重新生成）"
+                    >
+                      <RefreshCw size={14} className={scopeRefreshingCollection === c.name ? 'animate-spin' : ''} />
+                    </button>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleDeleteCollection(c.name);
+                      }}
+                      className="p-1.5 text-gray-300 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors"
+                      title={`删除集合 ${c.name}`}
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
                 </div>
               ))}
             </div>
@@ -985,10 +1085,10 @@ export function IngestPage() {
               </div>
             ) : (
               <>
-                <table className="w-full text-sm">
+                <table className="w-full text-sm table-fixed">
                   <thead>
-                    <tr className="text-left text-gray-400 border-b">
-                      <th className="px-6 py-2.5 font-medium">文件名</th>
+                    <tr className="text-left text-gray-500 border-b">
+                      <th className="px-6 py-2.5 font-medium w-[40%]">文件名</th>
                       <th className="px-6 py-2.5 font-medium w-24">大小</th>
                       <th className="px-6 py-2.5 font-medium w-20">Chunks</th>
                       <th className="px-6 py-2.5 font-medium w-40">图表解析</th>
@@ -1000,11 +1100,17 @@ export function IngestPage() {
                   <tbody className="divide-y">
                     {displayedPapers.map((p) => (
                       <tr key={p.paper_id} className="hover:bg-gray-50 transition-colors">
-                        <td className="px-6 py-2.5 font-medium flex items-center gap-2">
-                          <FileText size={14} className="text-gray-400 flex-shrink-0" />
-                          <span className="truncate max-w-[300px]" title={p.filename || p.paper_id}>
-                            {p.filename || p.paper_id}
-                          </span>
+                        <td className="px-6 py-2.5 align-middle">
+                          <div className="flex items-center gap-2 min-w-0">
+                            <FileText size={16} className="text-gray-400 flex-shrink-0" />
+                            <span
+                              className="text-base text-gray-800 leading-relaxed truncate block min-w-0"
+                              style={{ maxWidth: '100%' }}
+                              title={p.filename || p.paper_id}
+                            >
+                              {p.filename || p.paper_id}
+                            </span>
+                          </div>
                         </td>
                         <td className="px-6 py-2.5 text-gray-500">{formatSize(p.file_size)}</td>
                         <td className="px-6 py-2.5 text-gray-500">{p.chunk_count}</td>
@@ -1590,6 +1696,70 @@ export function IngestPage() {
             创建
           </button>
         </div>
+      </Modal>
+
+      {/* 覆盖范围摘要 - 查看/编辑 */}
+      <Modal
+        open={scopeModalOpen}
+        onClose={() => setScopeModalOpen(false)}
+        title={scopeModalCollection ? `覆盖范围摘要 · ${scopeModalCollection}` : '覆盖范围摘要'}
+        maxWidth="max-w-xl"
+      >
+        {scopeModalCollection && (
+          <div className="space-y-4">
+            {scopeModalLoading ? (
+              <div className="py-8 flex items-center justify-center text-gray-500">
+                <Loader2 size={28} className="animate-spin" />
+              </div>
+            ) : (
+              <>
+                <p className="text-sm text-gray-600 leading-relaxed">
+                  用于判断用户查询是否与本地库匹配；可手动编辑或使用下方「LLM 重新生成」根据集合内文档题目自动生成更详细的摘要。
+                </p>
+                <textarea
+                  value={scopeSummaryText}
+                  onChange={(e) => setScopeSummaryText(e.target.value)}
+                  placeholder="例如：深海共生、海洋生物、共生关系、深海生态与相关研究；或更详细的 2～4 句描述"
+                  rows={6}
+                  className="w-full min-h-[8rem] border border-gray-200 rounded-lg p-4 text-base leading-relaxed text-gray-800 placeholder:text-gray-400 focus:ring-2 focus:ring-blue-500 outline-none resize-y"
+                />
+                {scopeUpdatedAt && (
+                  <p className="text-xs text-gray-500">
+                    更新时间：{new Date(scopeUpdatedAt).toLocaleString('zh-CN')}
+                  </p>
+                )}
+                <div className="flex justify-end gap-3 pt-2">
+                  <button
+                    onClick={() => setScopeModalOpen(false)}
+                    className="px-4 py-2.5 text-gray-600 hover:text-gray-800 hover:bg-gray-100 rounded-lg text-sm font-medium"
+                  >
+                    关闭
+                  </button>
+                  <button
+                    onClick={handleRefreshScopeInModal}
+                    disabled={scopeRefreshingCollection === scopeModalCollection}
+                    className="px-4 py-2.5 bg-gray-100 text-gray-700 hover:bg-gray-200 rounded-lg text-sm font-medium flex items-center gap-1.5 disabled:opacity-50"
+                  >
+                    {scopeRefreshingCollection === scopeModalCollection ? (
+                      <Loader2 size={16} className="animate-spin" />
+                    ) : (
+                      <RefreshCw size={16} />
+                    )}
+                    LLM 重新生成
+                  </button>
+                  <button
+                    onClick={handleSaveScope}
+                    disabled={scopeModalSaving}
+                    className="px-4 py-2.5 bg-blue-600 text-white hover:bg-blue-700 rounded-lg text-sm font-medium disabled:opacity-50 flex items-center gap-1.5"
+                  >
+                    {scopeModalSaving ? <Loader2 size={16} className="animate-spin" /> : null}
+                    保存
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        )}
       </Modal>
     </div>
   );

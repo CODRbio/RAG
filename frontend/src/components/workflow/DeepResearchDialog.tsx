@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from 'react';
+import { useTranslation } from 'react-i18next';
 import { Telescope, Loader2, X, ChevronRight, Square } from 'lucide-react';
 import { useChatStore, useConfigStore, useToastStore } from '../../stores';
 import { useDeepResearchTask } from './deep-research/useDeepResearchTask';
@@ -26,12 +27,37 @@ export function DeepResearchDialog() {
     isStreaming,
     setDeepResearchActive,
     deepResearchActive,
+    researchDashboard,
   } = useChatStore();
   const { selectedProvider, selectedModel } = useConfigStore();
   const addToast = useToastStore((s) => s.addToast);
+  const { t } = useTranslation();
 
   const task = useDeepResearchTask();
   const autoClarifyTriggeredRef = useRef(false);
+
+  // 执行研究阶段时，根据 dashboard 显示当前具体阶段（研究中/撰写中/审阅中/整合中）
+  const runningStageLabel = useMemo(() => {
+    if (!researchDashboard?.sections?.length) return null;
+    const sections = researchDashboard.sections;
+    const inProgress = sections.find(
+      (s) => s.status === 'researching' || s.status === 'writing' || s.status === 'reviewing',
+    );
+    const pending = sections.find((s) => s.status === 'pending');
+    const allDone = sections.every((s) => s.status === 'done');
+    if (inProgress) {
+      const stageKey =
+        inProgress.status === 'researching'
+          ? 'deepResearch.stageResearching'
+          : inProgress.status === 'writing'
+            ? 'deepResearch.stageWriting'
+            : 'deepResearch.stageReviewing';
+      return { stageKey, sectionTitle: inProgress.title };
+    }
+    if (pending) return { stageKey: 'deepResearch.stagePending', sectionTitle: pending.title };
+    if (allDone) return { stageKey: 'deepResearch.stageSynthesize', sectionTitle: '' };
+    return null;
+  }, [researchDashboard?.sections]);
 
   // UI-only form state shared across generatePlan and confirmAndRun
   const [answers, setAnswers] = useState<Record<string, string>>({});
@@ -170,6 +196,7 @@ export function DeepResearchDialog() {
   });
 
   const handleClose = () => {
+    task.clearStalledJob();
     setShowDeepResearchDialog(false);
     if (!task.activeJobId) {
       setDeepResearchActive(false);
@@ -257,8 +284,8 @@ export function DeepResearchDialog() {
 
         {/* Body */}
         <div className="flex-1 overflow-y-auto px-6 py-4 space-y-4">
-          {/* Phase indicator */}
-          <div className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-2">
+          {/* Phase indicator + 当前状态 */}
+          <div className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 space-y-1">
             <div className="text-xs text-gray-600">
               <span className={task.phase === 'clarify' ? 'font-semibold text-indigo-600' : ''}>1. 澄清问题</span>
               <span className="mx-2 text-gray-300">→</span>
@@ -266,7 +293,41 @@ export function DeepResearchDialog() {
               <span className="mx-2 text-gray-300">→</span>
               <span className={task.phase === 'running' ? 'font-semibold text-indigo-600' : ''}>3. 执行研究</span>
             </div>
+            <div className="text-xs text-gray-500">
+              {task.stalledJob
+                ? t('deepResearch.currentStateStalled')
+                : task.phase === 'clarify'
+                  ? t('deepResearch.currentStateClarify')
+                  : task.phase === 'confirm'
+                    ? t('deepResearch.currentStateConfirm')
+                    : task.phase === 'running'
+                      ? runningStageLabel
+                        ? runningStageLabel.sectionTitle
+                          ? t('deepResearch.currentStateRunningDetail', {
+                              stage: t(runningStageLabel.stageKey),
+                              section: runningStageLabel.sectionTitle,
+                            })
+                          : t('deepResearch.currentStateRunningDetailNoSection', {
+                              stage: t(runningStageLabel.stageKey),
+                            })
+                        : task.activeJobId
+                          ? t('deepResearch.currentStateRunningWithId', { id: task.activeJobId.slice(0, 8) })
+                          : t('deepResearch.currentStateRunning')
+                      : ''}
+            </div>
           </div>
+
+          {/* 已中断的调研：提示与操作 */}
+          {task.stalledJob && (
+            <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 space-y-2">
+              <p className="text-sm text-amber-800">
+                {t('deepResearch.stalledBanner')}
+              </p>
+              {task.stalledJob.topic && (
+                <p className="text-xs text-amber-700 truncate">{t('deepResearch.stalledTopic', { topic: task.stalledJob.topic })}</p>
+              )}
+            </div>
+          )}
 
           {/* Topic input */}
           <div>
@@ -280,7 +341,7 @@ export function DeepResearchDialog() {
             />
           </div>
 
-          {task.phase === 'clarify' && (
+          {task.stalledJob ? null : task.phase === 'clarify' && (
             <ClarifyPhase
               questions={clarificationQuestions}
               answers={answers}
@@ -294,7 +355,7 @@ export function DeepResearchDialog() {
             />
           )}
 
-          {task.phase === 'confirm' && (
+          {task.stalledJob ? null : task.phase === 'confirm' && (
             <div className="space-y-3">
               <ConfirmPhase
                 outlineDraft={task.outlineDraft}
@@ -416,7 +477,7 @@ export function DeepResearchDialog() {
             </div>
           )}
 
-          {task.phase === 'running' && (
+          {task.stalledJob ? null : task.phase === 'running' && (
             <ProgressMonitor
               researchMonitor={task.researchMonitor}
               progressLogs={task.progressLogs}
@@ -434,12 +495,28 @@ export function DeepResearchDialog() {
           <button
             onClick={handleClose}
             className="px-4 py-2 text-sm text-gray-600 hover:bg-gray-200 rounded-lg transition-colors"
-            disabled={task.phase === 'running'}
           >
-            取消
+            {task.phase === 'running' && !task.stalledJob ? t('deepResearch.exit') : t('deepResearch.cancel')}
           </button>
           <div className="flex items-center gap-2">
-            {task.phase === 'clarify' && clarificationQuestions.length > 0 && (
+            {/* 已中断的调研：进入画布 | 放弃并重新开始 | 退出（取消在上面） */}
+            {task.stalledJob && (
+              <>
+                <button
+                  onClick={async () => { await task.openCanvasForCurrentJob(); handleClose(); }}
+                  className="px-4 py-2 text-sm text-indigo-600 hover:bg-indigo-50 rounded-lg transition-colors"
+                >
+                  {t('deepResearch.goToCanvas')}
+                </button>
+                <button
+                  onClick={() => { task.clearStalledJob(); task.setPhase('clarify'); }}
+                  className="px-4 py-2 text-sm text-amber-700 hover:bg-amber-100 rounded-lg transition-colors"
+                >
+                  {t('deepResearch.discardAndRestart')}
+                </button>
+              </>
+            )}
+            {!task.stalledJob && task.phase === 'clarify' && clarificationQuestions.length > 0 && (
               <button
                 onClick={handleSkipClarificationAndGenerate}
                 disabled={isStreaming || !deepResearchTopic.trim()}
@@ -448,7 +525,7 @@ export function DeepResearchDialog() {
                 跳过澄清
               </button>
             )}
-            {task.phase === 'clarify' && (
+            {!task.stalledJob && task.phase === 'clarify' && (
               <button
                 onClick={handleGeneratePlan}
                 disabled={isStreaming || !deepResearchTopic.trim()}
@@ -458,7 +535,7 @@ export function DeepResearchDialog() {
                 生成大纲
               </button>
             )}
-            {task.phase === 'confirm' && (
+            {!task.stalledJob && task.phase === 'confirm' && (
               <>
                 <button
                   onClick={() => task.setPhase('clarify')}
@@ -477,8 +554,14 @@ export function DeepResearchDialog() {
                 </button>
               </>
             )}
-            {task.phase === 'running' && (
+            {!task.stalledJob && task.phase === 'running' && (
               <div className="flex items-center gap-2">
+                <button
+                  onClick={() => task.openCanvasForCurrentJob()}
+                  className="px-4 py-2 text-sm text-indigo-600 hover:bg-indigo-50 rounded-lg transition-colors"
+                >
+                  {t('deepResearch.goToCanvas')}
+                </button>
                 <div className="flex items-center gap-2 px-4 py-2 bg-indigo-100 text-indigo-700 text-sm font-medium rounded-lg">
                   <Loader2 size={16} className="animate-spin" />
                   后台研究中

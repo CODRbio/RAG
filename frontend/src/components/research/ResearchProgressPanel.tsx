@@ -219,10 +219,10 @@ export function ResearchProgressPanel({ dashboard, isActive }: Props) {
       </div>
 
       {/* Sections */}
-      {dashboard.sections.length > 0 && (
+      {(dashboard.sections?.length ?? 0) > 0 && (
         <div className="px-2 pb-2">
           <div className="text-xs text-gray-400 px-2 mb-1 font-medium">{t('research.sections')}</div>
-          {dashboard.sections.map((s, i) => (
+          {(dashboard.sections ?? []).map((s, i) => (
             <SectionRow
               key={i}
               section={s}
@@ -235,10 +235,10 @@ export function ResearchProgressPanel({ dashboard, isActive }: Props) {
       )}
 
       {/* Coverage Gaps */}
-      {dashboard.coverage_gaps.length > 0 && (
+      {(dashboard.coverage_gaps?.length ?? 0) > 0 && (
         <div className="px-4 py-2 border-t">
           <div className="text-xs text-gray-400 mb-1 font-medium">{t('research.coverageGaps')}</div>
-          {dashboard.coverage_gaps.slice(0, 5).map((g, i) => (
+          {(dashboard.coverage_gaps ?? []).slice(0, 5).map((g, i) => (
             <div key={i} className="text-xs text-red-500 flex items-start gap-1 py-0.5">
               <span>❗</span>
               <span>{g}</span>
@@ -248,10 +248,10 @@ export function ResearchProgressPanel({ dashboard, isActive }: Props) {
       )}
 
       {/* Conflicts */}
-      {dashboard.conflict_notes.length > 0 && (
+      {(dashboard.conflict_notes?.length ?? 0) > 0 && (
         <div className="px-4 py-2 border-t">
           <div className="text-xs text-gray-400 mb-1 font-medium">{t('research.conflicts')}</div>
-          {dashboard.conflict_notes.slice(0, 3).map((c, i) => (
+          {(dashboard.conflict_notes ?? []).slice(0, 3).map((c, i) => (
             <div key={i} className="text-xs text-amber-600 flex items-start gap-1 py-0.5">
               <span>⚠️</span>
               <span>{c}</span>

@@ -86,20 +86,47 @@ export async function* streamChatByTaskId(
     const { done, value } = await reader.read();
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = lines.pop() || '';
-    let currentEvent = '';
-    for (const line of lines) {
-      if (line.startsWith('event: ')) {
-        currentEvent = line.slice(7).trim();
-      } else if (line.startsWith('data: ')) {
-        const dataStr = line.slice(6);
-        try {
-          const data = JSON.parse(dataStr) as unknown;
-          yield { event: currentEvent, data };
-        } catch {
-          yield { event: currentEvent, data: { raw: dataStr } };
+    // SSE 事件以双换行分隔，按 \n\n 切分再解析，避免 data 被截断导致 JSON 解析失败
+    const blocks = buffer.split(/\n\n/);
+    buffer = blocks.pop() || '';
+    for (const block of blocks) {
+      let eventType = 'message';
+      const dataLines: string[] = [];
+      for (const line of block.split('\n')) {
+        if (line.startsWith('event: ')) {
+          eventType = line.slice(7).trim();
+        } else if (line.startsWith('data: ')) {
+          dataLines.push(line.slice(6));
         }
+      }
+      const dataStr = dataLines.join('\n');
+      if (dataStr === '') {
+        yield { event: eventType, data: {} };
+        continue;
+      }
+      try {
+        const data = JSON.parse(dataStr) as unknown;
+        yield { event: eventType, data };
+      } catch {
+        yield { event: eventType, data: { raw: dataStr } };
+      }
+    }
+  }
+  // 剩余 buffer 若含完整 event+data 也解析一次
+  if (buffer.trim()) {
+    let eventType = 'message';
+    const dataLines: string[] = [];
+    for (const line of buffer.split('\n')) {
+      if (line.startsWith('event: ')) eventType = line.slice(7).trim();
+      else if (line.startsWith('data: ')) dataLines.push(line.slice(6));
+    }
+    const dataStr = dataLines.join('\n');
+    if (dataStr) {
+      try {
+        const data = JSON.parse(dataStr) as unknown;
+        yield { event: eventType, data };
+      } catch {
+        yield { event: eventType, data: { raw: dataStr } };
       }
     }
   }
@@ -229,6 +256,14 @@ export async function* streamDeepResearchEvents(
 export async function cancelDeepResearchJob(jobId: string): Promise<{ ok: boolean; job_id: string; status: string }> {
   const res = await client.post<{ ok: boolean; job_id: string; status: string }>(
     `/deep-research/jobs/${encodeURIComponent(jobId)}/cancel`,
+  );
+  return res.data;
+}
+
+/** 删除已终态的后台调研任务，服务端会清空该任务及关联数据（events、reviews 等）。 */
+export async function deleteDeepResearchJob(jobId: string): Promise<{ ok: boolean; job_id: string; deleted: boolean }> {
+  const res = await client.delete<{ ok: boolean; job_id: string; deleted: boolean }>(
+    `/deep-research/jobs/${encodeURIComponent(jobId)}`,
   );
   return res.data;
 }
