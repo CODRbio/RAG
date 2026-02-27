@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from src.db.engine import get_engine
@@ -163,36 +164,43 @@ class SessionStore:
         meta = self.get_session_meta(session_id)
         if meta is None:
             raise ValueError(f"Session not found: {session_id}")
-        with Session(get_engine()) as session:
-            # Get next turn index atomically
-            existing = session.exec(
-                select(TurnRow)
-                .where(TurnRow.session_id == session_id)
-                .order_by(TurnRow.turn_index.desc())
-                .limit(1)
-            ).first()
-            idx = (existing.turn_index + 1) if existing else 0
+        max_retries = 3
+        for attempt in range(max_retries):
+            with Session(get_engine()) as session:
+                existing = session.exec(
+                    select(TurnRow)
+                    .where(TurnRow.session_id == session_id)
+                    .order_by(TurnRow.turn_index.desc())
+                    .limit(1)
+                ).first()
+                idx = (existing.turn_index + 1) if existing else 0
 
-            turn = TurnRow(
-                session_id=session_id,
-                turn_index=idx,
-                role=role,
-                content=content,
-                intent=intent,
-                evidence_pack_id=evidence_pack_id,
-                canvas_patch=json.dumps(canvas_patch, ensure_ascii=False) if canvas_patch else None,
-                citations_json=json.dumps(citations, ensure_ascii=False) if citations else None,
-                timestamp=datetime.now().isoformat(),
-            )
-            session.add(turn)
+                turn = TurnRow(
+                    session_id=session_id,
+                    turn_index=idx,
+                    role=role,
+                    content=content,
+                    intent=intent,
+                    evidence_pack_id=evidence_pack_id,
+                    canvas_patch=json.dumps(canvas_patch, ensure_ascii=False) if canvas_patch else None,
+                    citations_json=json.dumps(citations, ensure_ascii=False) if citations else None,
+                    timestamp=datetime.now().isoformat(),
+                )
+                session.add(turn)
 
-            # Update session's updated_at
-            chat_session = session.get(ChatSession, session_id)
-            if chat_session:
-                chat_session.updated_at = datetime.now().isoformat()
-                session.add(chat_session)
+                chat_session = session.get(ChatSession, session_id)
+                if chat_session:
+                    chat_session.updated_at = datetime.now().isoformat()
+                    session.add(chat_session)
 
-            session.commit()
+                try:
+                    session.commit()
+                    return
+                except IntegrityError:
+                    session.rollback()
+                    if attempt == max_retries - 1:
+                        raise
+                    logger.debug("[session_memory] append_turn conflict, retry %s/%s", attempt + 1, max_retries)
 
     def delete_session(self, session_id: str) -> bool:
         with Session(get_engine()) as session:

@@ -127,6 +127,7 @@ export function Sidebar({ onStartResize }: SidebarProps) {
     setResearchDashboard,
     setSessionId,
     setCanvasId,
+    streamingTasks,
   } = useChatStore();
   const { setCanvas, setCanvasContent, clearCanvas, setIsLoading: setCanvasLoading, setActiveStage } = useCanvasStore();
 
@@ -1321,14 +1322,16 @@ export function Sidebar({ onStartResize }: SidebarProps) {
                   }`}
                   onClick={() => handleLoadSession(h.session_id)}
                 >
-                  <div className="flex justify-between items-start">
+                  <div className="flex justify-between items-start gap-1">
                     <span className={`font-medium truncate flex-1 transition-colors ${
                       currentSessionId === h.session_id ? 'text-sky-400' : 'text-slate-300 group-hover:text-sky-200'
                     }`}>
                       {h.title}
                     </span>
-                    {isLoadingSession && currentSessionId !== h.session_id && (
-                      <Loader2 size={12} className="animate-spin text-sky-500 flex-shrink-0" />
+                    {(Object.values(streamingTasks).some(
+                      (t) => t.sessionId === h.session_id && (t.status === 'queued' || t.status === 'running')
+                    ) || (isLoadingSession && currentSessionId !== h.session_id)) && (
+                      <Loader2 size={12} className="animate-spin text-sky-500 flex-shrink-0" title={t('sidebar.streaming', 'Streaming')} />
                     )}
                   </div>
                   <div className="text-[10px] text-slate-500 flex items-center gap-1 mt-1">

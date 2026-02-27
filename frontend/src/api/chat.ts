@@ -2,6 +2,7 @@ import client, { streamChat } from './client';
 import type {
   ChatRequest,
   ChatResponse,
+  ChatSubmitResponse,
   SessionInfo,
   SessionListItem,
   IntentDetectRequest,
@@ -17,6 +18,7 @@ import type {
   DeepResearchJobEvent,
   GapSupplement,
   ResearchInsight,
+  TaskQueueResponse,
 } from '../types';
 
 const BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api';
@@ -50,6 +52,71 @@ export async function clarifyForDeepResearch(data: {
 
 export function chatStream(data: ChatRequest, signal?: AbortSignal) {
   return streamChat('/chat/stream', data, signal);
+}
+
+/** 异步提交 Chat，返回 task_id；配合 streamChatByTaskId 使用 */
+export async function submitChat(data: ChatRequest): Promise<ChatSubmitResponse> {
+  const res = await client.post<ChatSubmitResponse>('/chat/submit', data);
+  return res.data;
+}
+
+/** SSE 订阅任务流（GET /chat/stream/{taskId}） */
+export async function* streamChatByTaskId(
+  taskId: string,
+  signal?: AbortSignal
+): AsyncGenerator<{ event: string; data: unknown }> {
+  const token = localStorage.getItem('token');
+  const url = `${BASE_URL}/chat/stream/${encodeURIComponent(taskId)}`;
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: {
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    signal,
+  });
+  if (!response.ok) {
+    const errBody = await response.text().catch(() => '');
+    throw new Error(`HTTP ${response.status}: ${response.statusText} - ${errBody}`);
+  }
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error('No response body');
+  const decoder = new TextDecoder();
+  let buffer = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+    let currentEvent = '';
+    for (const line of lines) {
+      if (line.startsWith('event: ')) {
+        currentEvent = line.slice(7).trim();
+      } else if (line.startsWith('data: ')) {
+        const dataStr = line.slice(6);
+        try {
+          const data = JSON.parse(dataStr) as unknown;
+          yield { event: currentEvent, data };
+        } catch {
+          yield { event: currentEvent, data: { raw: dataStr } };
+        }
+      }
+    }
+  }
+}
+
+/** 排队区快照 */
+export async function getTaskQueue(): Promise<TaskQueueResponse> {
+  const res = await client.get<TaskQueueResponse>('/tasks/queue');
+  return res.data;
+}
+
+/** 取消任务（排队或运行中） */
+export async function cancelTask(taskId: string): Promise<{ success: boolean; message: string }> {
+  const res = await client.post<{ success: boolean; message: string }>(
+    `/tasks/${encodeURIComponent(taskId)}/cancel`
+  );
+  return res.data;
 }
 
 export async function deepResearchStart(data: DeepResearchStartRequest): Promise<DeepResearchStartResponse> {

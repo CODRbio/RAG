@@ -28,6 +28,7 @@ from src.api.schemas import (
     ChatCitation,
     ChatRequest,
     ChatResponse,
+    ChatSubmitResponse,
     ClarifyRequest,
     ClarifyResponse,
     ClarifyQuestion,
@@ -76,6 +77,8 @@ from dataclasses import asdict
 from src.retrieval.service import get_retrieval_service
 from src.generation.evidence_synthesizer import EvidenceSynthesizer, build_synthesis_system_prompt
 from src.collaboration.auto_complete import AutoCompleteService
+from src.tasks import get_task_queue
+from src.tasks.task_state import TaskKind, TaskStatus
 
 router = APIRouter(tags=["chat"])
 
@@ -932,6 +935,55 @@ def chat_post(
         citations=[_citation_to_chat_citation(c) for c in citations],
         evidence_summary=evidence_summary,
     )
+
+
+@router.post("/chat/submit", response_model=ChatSubmitResponse)
+def chat_submit(
+    body: ChatRequest,
+    optional_user_id: str | None = Depends(get_optional_user_id),
+) -> ChatSubmitResponse:
+    """异步提交 Chat 任务；返回 task_id，客户端通过 GET /chat/stream/{task_id} 订阅 SSE。"""
+    try:
+        q = get_task_queue()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Queue unavailable: {e}")
+    payload = body.model_dump()
+    payload["_optional_user_id"] = optional_user_id
+    session_id = body.session_id or ""
+    user_id = optional_user_id or body.user_id or ""
+    task_id = q.submit(TaskKind.chat, session_id, user_id or "", payload)
+    if _obs_metrics and hasattr(_obs_metrics, "task_queue_submitted_total"):
+        _obs_metrics.task_queue_submitted_total.labels(kind="chat").inc()
+    return ChatSubmitResponse(task_id=task_id)
+
+
+@router.get("/chat/stream/{task_id}")
+def chat_stream_by_task_id(task_id: str):
+    """SSE 订阅任务流式输出；事件由调度器在执行时推送。"""
+    import time
+    try:
+        q = get_task_queue()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Queue unavailable: {e}")
+
+    def event_stream():
+        last_id = "-"
+        while True:
+            state = q.get_state(task_id)
+            if state and state.is_terminal():
+                yield f"event: {state.status.value}\ndata: {json.dumps({'status': state.status.value}, ensure_ascii=False)}\n\n"
+                return
+            events = q.read_events(task_id, after_id=last_id)
+            for ev in events:
+                last_id = ev.get("id", last_id)
+                typ = ev.get("type", "message")
+                data = ev.get("data", {})
+                yield f"event: {typ}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+                if typ in ("done", "error", "cancelled", "timeout"):
+                    return
+            time.sleep(0.3)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @router.post("/chat/stream")

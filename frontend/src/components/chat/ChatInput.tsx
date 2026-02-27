@@ -2,7 +2,7 @@ import { useState, useRef, useCallback, type KeyboardEvent } from 'react';
 import { useTranslation } from 'react-i18next';
 import { ArrowRight, Loader2, Telescope, Settings } from 'lucide-react';
 import { useChatStore, useConfigStore, useToastStore, useCanvasStore, useUIStore } from '../../stores';
-import { chatStream, clarifyForDeepResearch } from '../../api/chat';
+import { submitChat, streamChatByTaskId, clarifyForDeepResearch } from '../../api/chat';
 import { exportCanvas, getCanvas } from '../../api/canvas';
 import { CommandPalette, DeepResearchSettingsPopover } from '../workflow';
 import { COMMAND_LIST } from '../../types';
@@ -28,6 +28,8 @@ export function ChatInput() {
     setShowDeepResearchDialog,
     setDeepResearchTopic,
     setClarificationQuestions,
+    setStreamingTask,
+    clearStreamingTask,
   } = useChatStore();
   const {
     webSearchConfig,
@@ -205,11 +207,15 @@ export function ChatInput() {
 
     if (import.meta.env.DEV) {
       const base = import.meta.env.VITE_API_BASE_URL || '/api';
-      console.log('[ChatInput] POST', `${base}/chat/stream`, JSON.stringify(request, null, 2));
+      console.log('[ChatInput] POST', `${base}/chat/submit`, JSON.stringify(request, null, 2));
     }
 
+    let taskId: string | null = null;
     try {
-      const stream = chatStream(request);
+      const { task_id } = await submitChat(request);
+      taskId = task_id;
+      setStreamingTask(task_id, sessionId ?? null, 'queued');
+      const stream = streamChatByTaskId(task_id);
 
       for await (const { event, data } of stream) {
         if (event === 'meta') {
@@ -234,7 +240,10 @@ export function ChatInput() {
             current_stage?: string;
           };
 
-          if (meta.session_id) setSessionId(meta.session_id);
+          if (meta.session_id) {
+            setSessionId(meta.session_id);
+            if (taskId) setStreamingTask(taskId, meta.session_id, 'running');
+          }
           if (meta.current_stage) setWorkflowStep(meta.current_stage as any);
           if (meta.evidence_summary) {
             setLastEvidenceSummary(meta.evidence_summary);
@@ -299,6 +308,12 @@ export function ChatInput() {
         } else if (event === 'done') {
           setWorkflowStep('refine');
           setTimeout(() => setWorkflowStep('idle'), 1000);
+        } else if (event === 'error' || event === 'cancelled' || event === 'timeout') {
+          if (event === 'error') {
+            appendToLastMessage('\n\n' + (t('chat.requestError') || 'Error'));
+            addToast(t('chat.sendFailed'), 'error');
+          }
+          break;
         }
       }
     } catch (error) {
@@ -306,6 +321,7 @@ export function ChatInput() {
       addToast(t('chat.sendFailed'), 'error');
       appendToLastMessage('\n\n' + t('chat.requestError'));
     } finally {
+      if (taskId) clearStreamingTask(taskId);
       setIsStreaming(false);
     }
     } catch (err) {

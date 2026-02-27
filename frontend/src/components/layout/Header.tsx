@@ -15,12 +15,14 @@ import {
   Globe,
   Telescope,
   RefreshCw,
+  ListOrdered,
 } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useAuthStore, useConfigStore, useChatStore, useUIStore, useToastStore } from '../../stores';
 import { checkHealth } from '../../api/health';
 import { listLLMProviders, listAllLiveModels, type LLMProviderInfo } from '../../api/ingest';
+import { TaskCenter } from '../tasks/TaskCenter';
 
 const LLM_PROVIDER_CACHE_KEY = 'llm_provider_cache_v1';
 const LLM_PROVIDER_BOOTSTRAP_FLAG = 'llm_provider_bootstrap_refreshed_v1';
@@ -192,6 +194,7 @@ export function Header() {
   const [compactHeader, setCompactHeader] = useState(false);
   const [headerWidth, setHeaderWidth] = useState(0);
   const [showMoreTabs, setShowMoreTabs] = useState(false);
+  const [taskCenterOpen, setTaskCenterOpen] = useState(false);
   const user = useAuthStore((s) => s.user);
   const { dbStatus, setDbStatus, selectedProvider, setSelectedProvider, selectedModel, setSelectedModel } = useConfigStore();
   const { workflowStep, deepResearchActive, setShowDeepResearchDialog, newChat } = useChatStore();
@@ -666,6 +669,18 @@ export function Header() {
             >
               <History size={18} />
             </button>
+            <div className="relative">
+              <button
+                onClick={() => setTaskCenterOpen((o) => !o)}
+                className={`p-2 rounded-lg transition-colors cursor-pointer ${
+                  taskCenterOpen ? 'bg-sky-900/30 text-sky-400 border border-sky-500/30' : 'hover:bg-slate-800/60 text-slate-400'
+                }`}
+                title={currentLang === 'zh' ? '任务队列' : 'Task Queue'}
+              >
+                <ListOrdered size={18} />
+              </button>
+              <TaskCenter open={taskCenterOpen} onClose={() => setTaskCenterOpen(false)} />
+            </div>
           </>
         )}
 

@@ -167,6 +167,44 @@ class ChatResponse(BaseModel):
     evidence_summary: Optional[EvidenceSummary] = Field(None, description="本轮检索摘要")
 
 
+class ChatSubmitResponse(BaseModel):
+    """异步 Chat 提交响应"""
+
+    task_id: str = Field(..., description="任务 ID，用于 GET /chat/stream/{task_id} 订阅流式结果")
+
+
+class TaskStateItem(BaseModel):
+    """任务状态项（排队区）"""
+
+    task_id: str = ""
+    kind: str = "chat"
+    status: str = "queued"
+    session_id: str = ""
+    user_id: str = ""
+    queue_position: int = 0
+    created_at: Optional[float] = None
+    started_at: Optional[float] = None
+    finished_at: Optional[float] = None
+    error_message: Optional[str] = None
+    payload: Optional[Dict[str, Any]] = None
+
+
+class TaskQueueResponse(BaseModel):
+    """排队区快照"""
+
+    active_count: int = 0
+    max_slots: int = 2
+    active: List[TaskStateItem] = Field(default_factory=list)
+    queued: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class TaskCancelResponse(BaseModel):
+    """取消任务响应"""
+
+    success: bool = Field(..., description="是否取消成功")
+    message: str = Field("", description="说明")
+
+
 class TurnItem(BaseModel):
     """单轮对话项"""
 

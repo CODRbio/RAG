@@ -16,6 +16,7 @@ from typing import Any, Dict, List
 
 from sqlmodel import Session, select
 
+from config.settings import settings
 from src.db.engine import get_engine
 from src.db.models import DeepResearchJob, DRResumeQueue, IngestJob
 from src.log import get_logger
@@ -23,7 +24,7 @@ from src.log import get_logger
 logger = get_logger(__name__)
 
 # ── Concurrency caps ──────────────────────────────────────────────────────────
-_DR_MAX_CONCURRENT = 2
+# DR shares global slots with Chat (Redis); ingest remains independent
 _INGEST_MAX_CONCURRENT = 2
 _POLL_INTERVAL = 5  # seconds
 
@@ -197,6 +198,7 @@ def _claim_ingest_job(job_id: str) -> bool:
 
 async def _exec_dr_job(job_id: str, request: dict) -> None:
     """Execute a deep-research job; wraps the existing sync business logic."""
+    session_id = request.get("session_id", "")
     try:
         from src.api.routes_chat import _run_deep_research_job_safe
         from src.api.schemas import DeepResearchConfirmRequest
@@ -225,6 +227,12 @@ async def _exec_dr_job(job_id: str, request: dict) -> None:
                 message=f"Worker 执行失败: {e}",
                 finished_at=time.time(),
             )
+        except Exception:
+            pass
+    finally:
+        try:
+            from src.tasks import get_task_queue
+            get_task_queue().release_slot(job_id, session_id)
         except Exception:
             pass
 
@@ -268,13 +276,21 @@ async def _exec_ingest_job(job_id: str, cfg: dict) -> None:
 # Main polling loop
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _dr_slots_available() -> int:
+    """Number of free global slots (Chat + DR)."""
+    try:
+        from src.tasks import get_task_queue
+        return max(0, settings.tasks.max_active_slots - get_task_queue().active_count())
+    except Exception:
+        return 0
+
+
 async def run_background_worker() -> None:
-    """Poll rag.db for pending tasks every POLL_INTERVAL seconds and dispatch them."""
+    """Poll rag.db and Redis for pending tasks; Chat + DR share global slots."""
     logger.info(
-        "[task_runner] background worker started (instance=%s, poll=%ds, dr_max=%d, ingest_max=%d)",
+        "[task_runner] background worker started (instance=%s, poll=%ds, ingest_max=%d)",
         _WORKER_INSTANCE_ID,
         _POLL_INTERVAL,
-        _DR_MAX_CONCURRENT,
         _INGEST_MAX_CONCURRENT,
     )
 
@@ -283,20 +299,40 @@ async def run_background_worker() -> None:
 
     while True:
         try:
+            # ── Update queue metrics ──
+            try:
+                from src.observability import metrics as _m
+                from src.tasks import get_task_queue as _get_tq
+                _tq = _get_tq()
+                _m.task_queue_active_slots.set(_tq.active_count())
+                _m.task_queue_pending_count.set(_tq.pending_count())
+            except Exception:
+                pass
+
             # ── Prune completed tasks ──
             for jid in [k for k, t in dr_tasks.items() if t.done()]:
                 dr_tasks.pop(jid, None)
             for jid in [k for k, t in ingest_tasks.items() if t.done()]:
                 ingest_tasks.pop(jid, None)
 
-            # ── Deep Research: process resume queue first (same DR slots) ──
-            dr_available = _DR_MAX_CONCURRENT - len(dr_tasks)
+            # ── Unified Chat: drain Redis queue into global slots ──
+            try:
+                from src.tasks.dispatcher import run_unified_chat_worker_once
+                while await run_unified_chat_worker_once():
+                    await asyncio.sleep(0)
+            except Exception as e:
+                logger.debug("[task_runner] unified chat worker: %s", e)
+
+            dr_available = _dr_slots_available()
+
+            # ── Deep Research: process resume queue first (same slots) ──
             if dr_available > 0:
                 try:
                     from src.collaboration.research.job_store import (
                         claim_resume_requests,
                         complete_resume_request,
                     )
+                    from src.tasks import get_task_queue
                     resume_rows = claim_resume_requests(_WORKER_INSTANCE_ID, limit=dr_available)
                     for row in resume_rows:
                         rid = int(row.get("id") or 0)
@@ -308,29 +344,62 @@ async def run_background_worker() -> None:
                         if existing and not existing.done():
                             complete_resume_request(rid, "error", "任务正在执行，无法恢复")
                             continue
+                        session_id = ""
+                        try:
+                            with Session(get_engine()) as session:
+                                dr_row = session.get(DeepResearchJob, jid)
+                                if dr_row and dr_row.request_json:
+                                    data = json.loads(dr_row.request_json or "{}")
+                                    session_id = data.get("session_id", "")
+                        except Exception:
+                            pass
+                        if get_task_queue().active_count() >= settings.tasks.max_active_slots:
+                            break
+                        if not get_task_queue().acquire_slot(jid, session_id):
+                            continue
 
-                        async def _run_resume_request(resume_id: int, job_id: str) -> None:
+                        async def _run_resume_request(resume_id: int, job_id: str, sid: str) -> None:
                             try:
                                 await _exec_resume(job_id)
                                 complete_resume_request(resume_id, "done", "恢复请求执行完成")
                             except Exception as e:
                                 complete_resume_request(resume_id, "error", f"恢复请求失败: {e}")
+                            finally:
+                                try:
+                                    get_task_queue().release_slot(job_id, sid)
+                                except Exception:
+                                    pass
 
                         logger.info("[task_runner] claimed resume request id=%s job=%s", rid, jid)
-                        dr_tasks[jid] = asyncio.create_task(_run_resume_request(rid, jid))
+                        dr_tasks[jid] = asyncio.create_task(_run_resume_request(rid, jid, session_id))
+                        dr_available = _dr_slots_available()
                 except Exception as e:
                     logger.warning("[task_runner] resume queue poll failed: %s", e)
 
-            # ── Deep Research: claim pending jobs ──
-            dr_available = _DR_MAX_CONCURRENT - len(dr_tasks)
+            # ── Deep Research: claim pending jobs (with global slot) ──
+            dr_available = _dr_slots_available()
             if dr_available > 0:
+                try:
+                    from src.tasks import get_task_queue
+                    tq = get_task_queue()
+                except Exception:
+                    tq = None
                 pending = _fetch_pending_dr(limit=dr_available, exclude=set(dr_tasks.keys()))
                 for job in pending:
+                    if not tq:
+                        break
                     jid = job["job_id"]
+                    data = job.get("data") or {}
+                    session_id = data.get("session_id", "")
+                    if tq.active_count() >= settings.tasks.max_active_slots:
+                        break
+                    if not tq.acquire_slot(jid, session_id):
+                        continue
                     if not _claim_dr_job(jid):
+                        tq.release_slot(jid, session_id)
                         continue
                     logger.info("[task_runner] claimed DR job %s", jid)
-                    dr_tasks[jid] = asyncio.create_task(_exec_dr_job(jid, job["data"]))
+                    dr_tasks[jid] = asyncio.create_task(_exec_dr_job(jid, data))
 
             # ── Ingest: claim pending jobs ──
             ingest_available = _INGEST_MAX_CONCURRENT - len(ingest_tasks)

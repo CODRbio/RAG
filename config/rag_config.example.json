@@ -199,5 +199,14 @@
       "cache_enabled": false,
       "cache_ttl_seconds": 1800
     }
+  },
+  "tasks": {
+    "redis_url": "redis://localhost:6379/0",
+    "max_active_slots": 2,
+    "queue_max_len": 500,
+    "queue_timeout_seconds": 3600,
+    "run_timeout_seconds": 600,
+    "heartbeat_interval_seconds": 15,
+    "task_state_ttl_seconds": 86400
   }
 }

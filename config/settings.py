@@ -467,6 +467,10 @@ def _auth_from_config() -> Dict[str, Any]:
     return (_RAW_CONFIG.get("auth") or {})
 
 
+def _tasks_from_config() -> Dict[str, Any]:
+    return (_RAW_CONFIG.get("tasks") or {})
+
+
 @dataclass
 class RetrievalPerfSettings:
     """检索层：超时、缓存、并行"""
@@ -543,6 +547,18 @@ class AuthSettings:
     token_expire_hours: float = 24.0
     admin_username: str = "admin"
     admin_default_password: str = "admin123"
+
+
+@dataclass
+class TaskQueueSettings:
+    """统一任务队列：Research + Chat 全局槽位与 Redis"""
+    redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    max_active_slots: int = 2
+    queue_max_len: int = 500
+    queue_timeout_seconds: int = 3600
+    run_timeout_seconds: int = 600
+    heartbeat_interval_seconds: int = 15
+    task_state_ttl_seconds: int = 86400
 
 
 class Settings:
@@ -729,6 +745,16 @@ class Settings:
             token_expire_hours=float(au.get("token_expire_hours", 24)),
             admin_username=str(au.get("admin_username", "admin")),
             admin_default_password=str(au.get("admin_default_password", "admin123")),
+        )
+        tq = _tasks_from_config()
+        self.tasks = TaskQueueSettings(
+            redis_url=str(os.getenv("REDIS_URL", tq.get("redis_url", "redis://localhost:6379/0"))),
+            max_active_slots=int(tq.get("max_active_slots", 2)),
+            queue_max_len=int(tq.get("queue_max_len", 500)),
+            queue_timeout_seconds=int(tq.get("queue_timeout_seconds", 3600)),
+            run_timeout_seconds=int(tq.get("run_timeout_seconds", 600)),
+            heartbeat_interval_seconds=int(tq.get("heartbeat_interval_seconds", 15)),
+            task_state_ttl_seconds=int(tq.get("task_state_ttl_seconds", 86400)),
         )
 
     @property

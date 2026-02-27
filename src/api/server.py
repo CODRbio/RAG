@@ -24,6 +24,7 @@ from src.api.routes_ingest import router as ingest_router
 from src.api.routes_graph import router as graph_router
 from src.api.routes_compare import router as compare_router
 from src.api.routes_debug import router as debug_router
+from src.api.routes_tasks import router as tasks_router
 from src.log import get_logger
 from src.utils.storage_cleaner import run_cleanup, get_storage_stats
 from src.utils.task_runner import cleanup_stale_jobs, run_background_worker
@@ -121,6 +122,7 @@ app.include_router(auth_router)
 app.include_router(admin_router)
 app.include_router(project_router)
 app.include_router(chat_router)
+app.include_router(tasks_router)
 app.include_router(canvas_router)
 app.include_router(export_router)
 app.include_router(auto_router)
@@ -137,6 +139,23 @@ setup_observability(app)
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
+
+
+@app.get("/health/detailed")
+def health_detailed() -> dict:
+    """Health + queue and Redis status for monitoring."""
+    out: dict = {"status": "ok", "queue": None}
+    try:
+        from src.tasks import get_task_queue
+        q = get_task_queue()
+        out["queue"] = {
+            "active_count": q.active_count(),
+            "pending_count": q.pending_count(),
+            "max_slots": settings.tasks.max_active_slots,
+        }
+    except Exception as e:
+        out["queue"] = {"error": str(e)}
+    return out
 
 
 @app.get("/storage/stats")

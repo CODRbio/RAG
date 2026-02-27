@@ -95,6 +95,31 @@ class _Metrics:
             "应用元信息",
         )
 
+        # ── 任务队列 (Chat + DR 统一槽位) ──
+        self.task_queue_active_slots = Gauge(
+            "rag_task_queue_active_slots",
+            "当前占用的活跃槽位数 (0..max_slots)",
+        )
+        self.task_queue_pending_count = Gauge(
+            "rag_task_queue_pending_count",
+            "排队中的任务数",
+        )
+        self.task_queue_submitted_total = Counter(
+            "rag_task_queue_submitted_total",
+            "提交到队列的任务总数",
+            ["kind"],  # chat / dr
+        )
+        self.task_queue_cancelled_total = Counter(
+            "rag_task_queue_cancelled_total",
+            "取消的任务数",
+            ["kind"],
+        )
+        self.task_queue_timeout_total = Counter(
+            "rag_task_queue_timeout_total",
+            "超时任务数",
+            ["kind"],
+        )
+
 
 # 单例
 metrics = _Metrics()

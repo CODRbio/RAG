@@ -146,6 +146,36 @@ export interface ChatResponse {
   evidence_summary?: EvidenceSummary;
 }
 
+/** 异步 Chat 提交响应 */
+export interface ChatSubmitResponse {
+  task_id: string;
+}
+
+/** 任务状态（排队区） */
+export type TaskStatus = 'queued' | 'running' | 'completed' | 'error' | 'cancelled' | 'timeout';
+
+export interface TaskStateItem {
+  task_id: string;
+  kind: string;
+  status: TaskStatus;
+  session_id: string;
+  user_id: string;
+  queue_position: number;
+  created_at?: number;
+  started_at?: number;
+  finished_at?: number;
+  error_message?: string;
+  payload?: Record<string, unknown>;
+}
+
+/** 排队区快照 */
+export interface TaskQueueResponse {
+  active_count: number;
+  max_slots: number;
+  active: TaskStateItem[];
+  queued: Array<{ task_id: string; kind: string; session_id: string; user_id: string; queue_position: number; state?: TaskStateItem | null }>;
+}
+
 export interface SessionInfo {
   session_id: string;
   canvas_id: string;

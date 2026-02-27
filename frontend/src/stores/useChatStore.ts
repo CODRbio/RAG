@@ -22,7 +22,12 @@ interface ChatState {
   // 命令面板
   showCommandPalette: boolean;
 
+  // 按任务/会话的流式状态（taskId -> { sessionId, status, queuePosition? }）
+  streamingTasks: Record<string, { sessionId: string | null; status: string; queuePosition?: number }>;
+
   // Actions
+  setStreamingTask: (taskId: string, sessionId: string | null, status: string, queuePosition?: number) => void;
+  clearStreamingTask: (taskId: string) => void;
   setSessionId: (id: string | null) => void;
   setCanvasId: (id: string | null) => void;
   addMessage: (msg: Message) => void;
@@ -64,6 +69,21 @@ export const useChatStore = create<ChatState>((set) => ({
   researchDashboard: null,
   toolTrace: null,
   showCommandPalette: false,
+  streamingTasks: {},
+
+  setStreamingTask: (taskId, sessionId, status, queuePosition) =>
+    set((state) => ({
+      streamingTasks: {
+        ...state.streamingTasks,
+        [taskId]: { sessionId, status, ...(queuePosition !== undefined ? { queuePosition } : {}) },
+      },
+    })),
+  clearStreamingTask: (taskId) =>
+    set((state) => {
+      const next = { ...state.streamingTasks };
+      delete next[taskId];
+      return { streamingTasks: next };
+    }),
 
   setSessionId: (id) => set({ sessionId: id }),
   setCanvasId: (id) => set({ canvasId: id }),
