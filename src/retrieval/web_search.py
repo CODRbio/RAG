@@ -72,7 +72,7 @@ def _get_web_search_config() -> Dict[str, Any]:
         "enabled": ws.get("enabled", True),
         "api_key": (ws.get("api_key") or "").strip(),
         "search_depth": ws.get("search_depth", "advanced"),
-        "max_results": min(int(ws.get("max_results", 5)), 10),
+        "max_results": int(ws.get("max_results", 5)),
         "include_answer": ws.get("include_answer", True),
         "include_domains": include or [],
         "exclude_domains": exclude or [],
@@ -145,18 +145,18 @@ class TavilySearcher:
     def enabled(self) -> bool:
         return bool(self._config.get("enabled") and (self._config.get("api_key") or "").strip())
 
-    def _generate_queries_sync(self, user_query: str) -> List[str]:
-        """同步：使用 LLM 生成多查询（可选）"""
+    def _generate_queries_sync(self, user_query: str, llm_provider: Optional[str] = None) -> List[str]:
+        """同步：使用 LLM 生成多查询（可选）。优先使用传入的 llm_provider（UI），无则用 config。"""
         if not self._config.get("enable_query_expansion"):
             return [user_query]
         try:
             from src.llm import LLMManager
             cfg_path = Path(__file__).resolve().parents[2] / "config" / "rag_config.json"
             manager = LLMManager.from_json(str(cfg_path))
-            provider = (self._config.get("query_expansion_llm") or "deepseek").strip()
+            provider = (llm_provider or self._config.get("query_expansion_llm") or "deepseek").strip()
             if not manager.is_available(provider):
                 return [user_query]
-            client = manager.get_client(provider)
+            client = manager.get_lite_client(provider)
             from datetime import datetime
             year = datetime.now().strftime("%Y")
             prompt = _pm.render("web_search_optimize.txt", user_query=user_query, year=year)
@@ -165,7 +165,7 @@ class TavilySearcher:
                     {"role": "system", "content": _pm.render("web_search_optimize_system.txt")},
                     {"role": "user", "content": prompt},
                 ],
-                max_tokens=600,
+
                 response_model=_QueryExpansionResponse,
             )
             parsed: Optional[_QueryExpansionResponse] = resp.get("parsed_object")
@@ -180,12 +180,19 @@ class TavilySearcher:
             pass
         return [user_query]
 
-    async def _generate_queries_async(self, user_query: str) -> List[str]:
-        """异步：LLM 生成多查询（在 executor 中跑同步）"""
+    async def _generate_queries_async(self, user_query: str, llm_provider: Optional[str] = None) -> List[str]:
+        """异步：LLM 生成多查询（在 executor 中跑同步）。优先使用传入的 llm_provider（UI），无则用 config。"""
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._generate_queries_sync, user_query)
+        return await loop.run_in_executor(
+            None,
+            lambda: self._generate_queries_sync(user_query, llm_provider),
+        )
 
-    def _search_tavily_sync(self, queries: List[str]) -> List[Dict[str, Any]]:
+    def _search_tavily_sync(
+        self,
+        queries: List[str],
+        max_results: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
         """同步调用 Tavily API，返回标准化 hit 列表"""
         try:
             from tavily import TavilyClient
@@ -201,7 +208,8 @@ class TavilySearcher:
         except Exception as e:
             logger.error(f"Tavily search failed (client init): {type(e).__name__}: {e}")
             return []
-        max_results = min(self._config.get("max_results", 5), 10)
+        if max_results is None:
+            max_results = int(self._config.get("max_results", 5))
         search_depth = self._config.get("search_depth", "advanced")
         include_answer = self._config.get("include_answer", True)
         include_domains = self._config.get("include_domains") or []
@@ -246,20 +254,23 @@ class TavilySearcher:
         query: str,
         *,
         use_query_expansion: Optional[bool] = None,
+        max_results: Optional[int] = None,
+        llm_provider: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         同步搜索。返回与 hybrid_retriever 兼容的 hit 列表。
+        查询扩展时优先使用 llm_provider（UI），无则用 config。
         """
         if not self.enabled:
             logger.warning("Tavily search skipped: disabled or api_key not set.")
             return []
         expand = use_query_expansion if use_query_expansion is not None else self._config.get("enable_query_expansion", False)
-        cache_key = _make_key("tavily", query, expand)
+        cache_key = _make_key("tavily", query, expand, max_results)
         if self._cache:
             cached = self._cache.get(cache_key)
             if cached is not None:
                 return cached
-        queries = self._generate_queries_sync(query) if expand else [query]
+        queries = self._generate_queries_sync(query, llm_provider) if expand else [query]
         if not queries:
             logger.warning("Tavily search skipped: no queries (query expansion may have failed).")
             return []
@@ -267,7 +278,7 @@ class TavilySearcher:
         try:
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                future = ex.submit(self._search_tavily_sync, queries)
+                future = ex.submit(self._search_tavily_sync, queries, max_results)
                 out = future.result(timeout=timeout_s)
         except concurrent.futures.TimeoutError:
             logger.warning("Tavily search timeout: %ss", timeout_s)
@@ -281,22 +292,26 @@ class TavilySearcher:
         query: str,
         *,
         use_query_expansion: Optional[bool] = None,
+        max_results: Optional[int] = None,
+        llm_provider: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """异步搜索。"""
+        """异步搜索。查询扩展时优先使用 llm_provider（UI），无则用 config。"""
         if not self.enabled:
             return []
         expand = use_query_expansion if use_query_expansion is not None else self._config.get("enable_query_expansion", False)
-        cache_key = _make_key("tavily", query, expand)
+        cache_key = _make_key("tavily", query, expand, max_results)
         if self._cache:
             cached = self._cache.get(cache_key)
             if cached is not None:
                 return cached
-        queries = await self._generate_queries_async(query) if expand else [query]
+        queries = await self._generate_queries_async(query, llm_provider) if expand else [query]
         timeout_s = getattr(getattr(settings, "perf_web_search", None), "timeout_seconds", 30) or 30
         loop = asyncio.get_event_loop()
         try:
             out = await asyncio.wait_for(
-                loop.run_in_executor(None, self._search_tavily_sync, queries),
+                loop.run_in_executor(
+                    None, self._search_tavily_sync, queries, max_results,
+                ),
                 timeout=float(timeout_s),
             )
         except asyncio.TimeoutError:

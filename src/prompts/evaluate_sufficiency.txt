@@ -3,12 +3,18 @@ Evaluate information sufficiency for this section.
 Section: {section_title}
 Research topic: {topic}
 Collected sources: {source_count}
-Findings so far:
+Top relevant evidence retrieved:
 {findings}
+
+Instructions:
+- Base your judgment on the evidence content above (not only source count).
+- Identify whether the section can be written with concrete, substantive support.
+- A gap is valid only if the evidence does NOT provide a direct answer/mechanism/data for it.
+- Avoid generic or speculative gaps.
 
 Return JSON:
 {{
   "coverage_score": 0.0-1.0,
-  "gaps": ["missing information points"],
+  "gaps": ["missing information points that are truly absent from evidence"],
   "sufficient": true/false
 }}

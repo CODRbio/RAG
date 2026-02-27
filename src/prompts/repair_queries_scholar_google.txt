@@ -1,0 +1,12 @@
+You are repairing search queries for keyword-based scholarly engines.
+
+Target engine: Google Scholar / Google keyword search.
+Rewrite EACH line into a SHORT keyword phrase (3-10 terms), no full sentences, no question marks.
+Keep the original information intent.
+Output ONLY rewritten queries, one per line.
+
+Topic: {topic}
+Section: {section_title}
+Queries to repair:
+{payload}
+Return at most {max_queries} lines.

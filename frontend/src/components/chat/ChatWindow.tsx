@@ -5,7 +5,8 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useChatStore, useConfigStore, useToastStore, useCompareStore } from '../../stores';
 import type { Source, DeepResearchJobInfo } from '../../types';
-import { cancelDeepResearchJob, getDeepResearchJob, listDeepResearchJobEvents } from '../../api/chat';
+import { cancelDeepResearchJob, getDeepResearchJob, streamDeepResearchEvents } from '../../api/chat';
+import { DEEP_RESEARCH_JOB_KEY } from '../workflow/deep-research/types';
 import { getChunkDetail } from '../../api/graph';
 import { RetrievalDebugPanel } from './RetrievalDebugPanel';
 import { ToolTracePanel } from './ToolTracePanel';
@@ -16,6 +17,9 @@ import { PdfViewerModal } from '../ui/PdfViewerModal';
 const PROVIDER_META: Record<string, { label: string; color: string; icon: 'db' | 'globe' }> = {
   local:    { label: 'Local RAG',         color: '#38bdf8', icon: 'db' },
   tavily:   { label: 'Tavily',            color: '#a78bfa', icon: 'globe' },
+  serpapi:  { label: 'SerpAPI',           color: '#22c55e', icon: 'globe' },
+  serpapi_scholar: { label: 'SerpAPI Scholar', color: '#22c55e', icon: 'globe' },
+  serpapi_google:  { label: 'SerpAPI Google',  color: '#16a34a', icon: 'globe' },
   google:   { label: 'Google',            color: '#f97316', icon: 'globe' },
   scholar:  { label: 'Google Scholar',    color: '#34d399', icon: 'globe' },
   semantic: { label: 'Semantic Scholar',  color: '#facc15', icon: 'globe' },
@@ -157,9 +161,20 @@ export function ChatWindow() {
     }
   }, [messages]);
 
-  // 新对话场景下：如果后台仍有 Deep Research 任务，显示窄条提示并允许停止。
+  // 后台 Deep Research 任务：用 SSE 实时订阅，替代轮询
   useEffect(() => {
+    const activeJobId = localStorage.getItem(DEEP_RESEARCH_JOB_KEY);
+    if (!activeJobId) {
+      setBackgroundJob(null);
+      setBackgroundEventLines([]);
+      setShowBackgroundLogs(false);
+      trackedBackgroundJobIdRef.current = null;
+      lastBackgroundEventIdRef.current = 0;
+      return;
+    }
+
     let cancelled = false;
+    const ac = new AbortController();
 
     const toEventLine = (eventName: string, data: Record<string, unknown>): string => {
       const section = typeof data.section === 'string' ? data.section : '';
@@ -170,60 +185,85 @@ export function ChatWindow() {
       return `[${eventName}] ${JSON.stringify(data)}`;
     };
 
-    const refreshBackgroundJob = async () => {
-      const activeJobId = localStorage.getItem('deep_research_active_job_id');
-      if (!activeJobId) {
-        if (!cancelled) {
-          setBackgroundJob(null);
-          setBackgroundEventLines([]);
-          setShowBackgroundLogs(false);
-        }
-        trackedBackgroundJobIdRef.current = null;
-        lastBackgroundEventIdRef.current = 0;
-        return;
+    const mergeJobFromPayload = (prev: DeepResearchJobInfo | null, data: Record<string, unknown>): DeepResearchJobInfo => ({
+      ...(prev || {
+        job_id: activeJobId,
+        topic: '',
+        session_id: '',
+        canvas_id: '',
+        status: 'running',
+        current_stage: '',
+        message: '',
+        error_message: '',
+        result_markdown: '',
+        result_citations: [],
+        result_dashboard: {},
+        total_time_ms: 0,
+        created_at: 0,
+        updated_at: 0,
+      }),
+      job_id: String(data.job_id || prev?.job_id || activeJobId),
+      topic: String(data.topic ?? prev?.topic ?? ''),
+      status: String(data.status ?? prev?.status ?? 'running'),
+      current_stage: String(data.current_stage ?? prev?.current_stage ?? ''),
+      message: String(data.message ?? prev?.message ?? ''),
+      canvas_id: String(data.canvas_id ?? prev?.canvas_id ?? ''),
+    });
+
+    const clearState = () => {
+      if (!cancelled) {
+        setBackgroundJob(null);
+        setBackgroundEventLines([]);
+        setShowBackgroundLogs(false);
       }
-      try {
-        const job = await getDeepResearchJob(activeJobId);
-        if (cancelled) return;
-        if (trackedBackgroundJobIdRef.current !== activeJobId) {
-          trackedBackgroundJobIdRef.current = activeJobId;
-          lastBackgroundEventIdRef.current = 0;
-          setBackgroundEventLines([]);
-          setShowBackgroundLogs(false);
-        }
-        const running = job.status === 'pending' || job.status === 'running' || job.status === 'cancelling';
-        if (running) {
-          setBackgroundJob(job);
-          const events = await listDeepResearchJobEvents(activeJobId, lastBackgroundEventIdRef.current, 30);
-          if (events.length > 0) {
-            const maxId = events[events.length - 1].event_id;
-            lastBackgroundEventIdRef.current = Math.max(lastBackgroundEventIdRef.current, maxId);
-            setBackgroundEventLines((prev) => {
-              const next = [...prev];
-              events.forEach((evt) => {
-                if (evt.event === 'progress' || evt.event === 'warning' || evt.event === 'waiting_review') {
-                  next.push(toEventLine(evt.event, evt.data || {}));
-                }
-              });
-              return next.slice(-10);
-            });
-          }
-        } else {
-          setBackgroundJob(null);
-          setBackgroundEventLines([]);
-          setShowBackgroundLogs(false);
-          localStorage.removeItem('deep_research_active_job_id');
-        }
-      } catch {
-        if (!cancelled) setBackgroundJob(null);
-      }
+      trackedBackgroundJobIdRef.current = null;
+      lastBackgroundEventIdRef.current = 0;
+      localStorage.removeItem(DEEP_RESEARCH_JOB_KEY);
     };
 
-    refreshBackgroundJob();
-    const timer = window.setInterval(refreshBackgroundJob, 10000);
+    (async () => {
+      try {
+        const job = await getDeepResearchJob(activeJobId);
+        if (cancelled || ac.signal.aborted) return;
+        const running = ['pending', 'running', 'cancelling', 'waiting_review'].includes(job.status);
+        if (!running) {
+          clearState();
+          return;
+        }
+        trackedBackgroundJobIdRef.current = activeJobId;
+        setBackgroundJob(job);
+
+        for await (const { event, data } of streamDeepResearchEvents(
+          activeJobId,
+          ac.signal,
+          lastBackgroundEventIdRef.current,
+        )) {
+          if (cancelled || ac.signal.aborted) break;
+          const eid = typeof data._event_id === 'number' ? data._event_id : null;
+          if (eid != null) lastBackgroundEventIdRef.current = Math.max(lastBackgroundEventIdRef.current, eid);
+
+          if (event === 'heartbeat' || event === 'job_status') {
+            setBackgroundJob((prev) => mergeJobFromPayload(prev, data));
+            const status = String(data.status || '');
+            if (status === 'done' || status === 'error' || status === 'cancelled') {
+              clearState();
+              break;
+            }
+          } else if (event === 'progress' || event === 'warning' || event === 'waiting_review') {
+            setBackgroundEventLines((prev) => [...prev.slice(-9), toEventLine(event, data)]);
+          }
+        }
+      } catch (err) {
+        if (!ac.signal.aborted && !cancelled) {
+          console.debug('[ChatWindow] Background job SSE ended:', err);
+          clearState();
+        }
+      }
+    })();
+
     return () => {
       cancelled = true;
-      window.clearInterval(timer);
+      ac.abort();
     };
   }, []);
 
@@ -270,6 +310,11 @@ export function ChatWindow() {
     } finally {
       setStoppingJobId(null);
     }
+  };
+
+  const handleWakeDeepResearch = (topic?: string) => {
+    setDeepResearchTopic(topic || '');
+    setShowDeepResearchDialog(true);
   };
 
   const formatAuthors = (authors: string[] | undefined): string => {
@@ -342,12 +387,11 @@ export function ChatWindow() {
           <button
             onClick={() => {
               if (!backgroundJob) return;
-              setDeepResearchTopic(backgroundJob.topic || '');
-              setShowDeepResearchDialog(true);
+              handleWakeDeepResearch(backgroundJob.topic || '');
             }}
             className="px-2 py-1 rounded-md border border-sky-500/30 text-sky-400 hover:bg-sky-500/10 transition-colors"
           >
-            {t('chat.viewTask')}
+            {t('chat.wakeTask')}
           </button>
           <button
             onClick={handleForceStopBackgroundJob}
@@ -408,6 +452,19 @@ export function ChatWindow() {
       {/* Deep Research 进度面板 */}
       {(deepResearchActive || researchDashboard) && (
         <ResearchProgressPanel dashboard={researchDashboard} isActive={deepResearchActive} />
+      )}
+      {!deepResearchActive && researchDashboard && (
+        <div className="border rounded-lg bg-indigo-900/20 border-indigo-500/30 p-3 text-sm text-indigo-200">
+          <div className="flex items-center justify-between gap-3">
+            <div className="text-xs text-indigo-200/90">{t('chat.bgResearchRunning')}</div>
+            <button
+              onClick={() => handleWakeDeepResearch(researchDashboard?.topic || '')}
+              className="px-3 py-1.5 text-xs rounded-md bg-indigo-600/20 border border-indigo-500/30 text-indigo-200 hover:bg-indigo-600/40 transition-colors"
+            >
+              {t('chat.wakeTask')}
+            </button>
+          </div>
+        </div>
       )}
       {!deepResearchActive && researchDashboard && researchDashboard.coverage_gaps.length > 0 && (
         <div className="border rounded-lg bg-amber-900/20 border-amber-500/30 p-3 text-sm text-amber-400">

@@ -101,7 +101,7 @@ class AutoCompleteService:
             search_mode: 检索模式 local | web | hybrid
             existing_outline: 可选，已有大纲（跳过生成大纲）
             user_id: 用户 ID
-            filters: UI 检索参数透传（web_providers, llm_provider, model_override, final_top_k 等）
+            filters: UI 检索参数透传（web_providers, llm_provider, model_override, step_top_k 等）
             clarification_answers: 澄清问题回答 {question_id: answer_text}
             use_agent: 是否使用递归研究 Agent（LangGraph）
 
@@ -120,7 +120,7 @@ class AutoCompleteService:
         retrieval = self.retrieval or get_retrieval_service(collection=collection, top_k=15)
 
         # 从 filters 取 top_k，Deep Research 默认更大
-        main_top_k = filters.get("final_top_k") or 15
+        main_top_k = filters.get("step_top_k") or 15
         section_top_k = max(main_top_k // 2, 10)
 
         # 1. 检索主题资料（透传完整 filters）
@@ -254,7 +254,7 @@ class AutoCompleteService:
                     {"role": "system", "content": _pm.render("auto_complete_outline_system.txt")},
                     {"role": "user", "content": prompt},
                 ],
-                max_tokens=512,
+
             )
             text = (resp.get("final_text") or "").strip()
             parsed = _parse_outline_from_llm(text)
@@ -286,7 +286,7 @@ class AutoCompleteService:
                     {"role": "system", "content": _pm.render("auto_complete_abstract_system.txt")},
                     {"role": "user", "content": prompt},
                 ],
-                max_tokens=400,
+
             )
             return (resp.get("final_text") or "").strip()
         except Exception:
@@ -312,7 +312,7 @@ class AutoCompleteService:
                     {"role": "system", "content": _pm.render("auto_complete_section_system.txt")},
                     {"role": "user", "content": prompt},
                 ],
-                max_tokens=1200,
+
             )
             return (resp.get("final_text") or "").strip()
         except Exception:
@@ -343,6 +343,7 @@ class AutoCompleteService:
             search_mode=search_mode,
             filters=filters,
             max_iterations=self.max_sections * 5,
+            max_sections=self.max_sections,
             clarification_answers=clarification_answers,
             output_language=output_language or "auto",
             step_models=step_models,

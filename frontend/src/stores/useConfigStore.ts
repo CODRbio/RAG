@@ -47,13 +47,15 @@ interface ConfigState {
   setQueryOptimizer: (enabled: boolean) => void;
   setMaxQueriesPerProvider: (value: number) => void;
   setContentFetcherMode: (mode: 'auto' | 'force' | 'off') => void;
+  toggleSourceSerpapi: (sourceId: string) => void;
+  setSerpapiRatio: (value: number) => void;
   setAgentMode: (mode: 'standard' | 'assist' | 'autonomous') => void;
 }
 
 const defaultWebSources: WebSource[] = [
   { id: 'tavily', name: 'Tavily API', enabled: true, topK: 5, threshold: 0.5 },
-  { id: 'google', name: 'Google Search', enabled: false, topK: 5, threshold: 0.4 },
-  { id: 'scholar', name: 'Google Scholar', enabled: false, topK: 3, threshold: 0.6 },
+  { id: 'google', name: 'Google Search', enabled: false, topK: 5, threshold: 0.4, useSerpapi: false },
+  { id: 'scholar', name: 'Google Scholar', enabled: false, topK: 3, threshold: 0.6, useSerpapi: false },
   { id: 'semantic', name: 'Semantic Scholar', enabled: false, topK: 3, threshold: 0.7 },
   { id: 'ncbi', name: 'NCBI PubMed', enabled: false, topK: 5, threshold: 0.6 },
 ];
@@ -77,7 +79,8 @@ export const useConfigStore = create<ConfigState>()(
         enabled: true,  // 默认启用本地 RAG
         localTopK: 5,
         localThreshold: 0.5,  // 默认相似度阈值
-        finalTopK: 10,  // 默认最终保留10条
+        stepTopK: 10,  // 默认每步保留10条
+        writeTopK: 15,  // 默认撰写阶段 Top-K（>= stepTopK * 1.5）
         yearStart: null,
         yearEnd: null,
         enableHippoRAG: false,
@@ -92,6 +95,7 @@ export const useConfigStore = create<ConfigState>()(
         queryOptimizer: true,   // 默认开启
         maxQueriesPerProvider: 3,
         contentFetcherMode: 'auto',  // 全文抓取默认智能模式
+        serpapiRatio: 50,
       },
 
       selectedProvider: 'deepseek',  // 默认 provider
@@ -104,6 +108,9 @@ export const useConfigStore = create<ConfigState>()(
         yearEnd: null,
         stepModelStrict: false,
         skipClaimGeneration: false,
+        maxSections: 4,
+        gapQueryIntent: 'broad',
+        ultra_lite_provider: null as string | null | undefined,
         stepModels: {
           scope: 'sonar::sonar-pro',
           plan: '',
@@ -188,6 +195,24 @@ export const useConfigStore = create<ConfigState>()(
           webSearchConfig: { ...state.webSearchConfig, contentFetcherMode: mode },
         })),
 
+      toggleSourceSerpapi: (sourceId) =>
+        set((state) => ({
+          webSearchConfig: {
+            ...state.webSearchConfig,
+            sources: state.webSearchConfig.sources.map((s) =>
+              s.id === sourceId ? { ...s, useSerpapi: !s.useSerpapi } : s
+            ),
+          },
+        })),
+
+      setSerpapiRatio: (value) => {
+        const VALID = [0, 25, 33, 50, 67, 75, 100];
+        const snapped = VALID.reduce((best, v) => Math.abs(v - value) < Math.abs(best - value) ? v : best, VALID[3]);
+        set((state) => ({
+          webSearchConfig: { ...state.webSearchConfig, serpapiRatio: snapped },
+        }));
+      },
+
       setAgentMode: (mode) =>
         set((state) => ({
           ragConfig: { ...state.ragConfig, agentMode: mode },
@@ -217,7 +242,9 @@ export const useConfigStore = create<ConfigState>()(
             // 确保新字段有默认值
             enabled: persisted.ragConfig?.enabled ?? true,
             localThreshold: persisted.ragConfig?.localThreshold ?? 0.5,
-            finalTopK: persisted.ragConfig?.finalTopK ?? 10,
+            stepTopK: persisted.ragConfig?.stepTopK ?? (persisted.ragConfig as any)?.finalTopK ?? 10,
+            writeTopK: persisted.ragConfig?.writeTopK
+              ?? Math.ceil((persisted.ragConfig?.stepTopK ?? (persisted.ragConfig as any)?.finalTopK ?? 10) * 1.5),
             yearStart: normalizeOptionalYear(persisted.ragConfig?.yearStart),
             yearEnd: normalizeOptionalYear(persisted.ragConfig?.yearEnd),
             // Migrate old enableAgent boolean to agentMode tri-state
@@ -231,8 +258,16 @@ export const useConfigStore = create<ConfigState>()(
             queryOptimizer: persisted.webSearchConfig?.queryOptimizer ?? true,
             maxQueriesPerProvider: persisted.webSearchConfig?.maxQueriesPerProvider ?? 3,
             contentFetcherMode: (persisted.webSearchConfig as any)?.contentFetcherMode ?? ((persisted.webSearchConfig as any)?.enableContentFetcher === true ? 'force' : 'auto'),
+            serpapiRatio: (persisted.webSearchConfig as any)?.serpapiRatio ?? 50,
             sources: (() => {
-              const saved = persisted.webSearchConfig?.sources || [];
+              const saved = (persisted.webSearchConfig?.sources || [])
+                .filter((s) => s.id !== 'serpapi')
+                .map((s) => {
+                  if ((s.id === 'google' || s.id === 'scholar') && s.useSerpapi === undefined) {
+                    return { ...s, useSerpapi: false };
+                  }
+                  return s;
+                });
               const savedIds = new Set(saved.map((s) => s.id));
               const missing = defaultWebSources.filter((d) => !savedIds.has(d.id));
               return [...saved, ...missing];
@@ -241,12 +276,17 @@ export const useConfigStore = create<ConfigState>()(
           deepResearchDefaults: {
             ...currentState.deepResearchDefaults,
             ...(persisted.deepResearchDefaults || {}),
+            gapQueryIntent: ((): 'broad' | 'review_pref' | 'reviews_only' => {
+              const raw = (persisted.deepResearchDefaults as any)?.gapQueryIntent;
+              return (raw === 'review_pref' || raw === 'reviews_only' || raw === 'broad') ? raw : 'broad';
+            })(),
             yearStart: normalizeOptionalYear(persisted.deepResearchDefaults?.yearStart),
             yearEnd: normalizeOptionalYear(persisted.deepResearchDefaults?.yearEnd),
             stepModels: {
               ...currentState.deepResearchDefaults.stepModels,
               ...(persisted.deepResearchDefaults?.stepModels || {}),
             },
+            ultra_lite_provider: (persisted.deepResearchDefaults as any)?.ultra_lite_provider ?? currentState.deepResearchDefaults.ultra_lite_provider,
           },
         };
       },
@@ -258,14 +298,33 @@ export const useConfigStore = create<ConfigState>()(
 // This covers cases where the merge callback didn't fire (e.g. HMR).
 useConfigStore.persist.onFinishHydration?.(() => {
   const { webSearchConfig } = useConfigStore.getState();
-  const existingIds = new Set(webSearchConfig.sources.map((s) => s.id));
+  const filtered = webSearchConfig.sources.filter((s) => s.id !== 'serpapi');
+  const existingIds = new Set(filtered.map((s) => s.id));
   const missing = defaultWebSources.filter((d) => !existingIds.has(d.id));
-  if (missing.length > 0) {
+  const needsUpdate = missing.length > 0 || filtered.length !== webSearchConfig.sources.length;
+  if (needsUpdate) {
     useConfigStore.setState({
       webSearchConfig: {
         ...webSearchConfig,
-        sources: [...webSearchConfig.sources, ...missing],
+        sources: [...filtered, ...missing],
       },
     });
   }
+
+  // Sync collection list from backend so Chat page always has real Milvus collections.
+  import('../api/ingest').then(({ listCollections }) => {
+    listCollections()
+      .then((cols) => {
+        const names = cols.map((c) => c.name);
+        if (names.length > 0) {
+          const { currentCollection } = useConfigStore.getState();
+          useConfigStore.setState({
+            collections: names,
+            dbStatus: 'connected',
+            ...(names.includes(currentCollection) ? {} : { currentCollection: names[0] }),
+          });
+        }
+      })
+      .catch(() => { /* Milvus unavailable; keep persisted values */ });
+  });
 });

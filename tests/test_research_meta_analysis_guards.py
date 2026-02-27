@@ -86,16 +86,16 @@ def test_effective_write_k_respects_floor_scaling_and_cap():
     # No UI override -> preset floor.
     assert research_agent._compute_effective_write_k(preset, {}) == 12
     # Moderate UI top_k -> 1.5x scaling.
-    assert research_agent._compute_effective_write_k(preset, {"final_top_k": 10}) == 15
+    assert research_agent._compute_effective_write_k(preset, {"step_top_k": 10}) == 15
     # Large UI top_k -> capped.
-    assert research_agent._compute_effective_write_k(preset, {"final_top_k": 100}) == 40
+    assert research_agent._compute_effective_write_k(preset, {"step_top_k": 100}) == 40
 
     # Cap below floor is normalized to floor.
     preset_bad_cap = {"search_top_k_write": 20, "search_top_k_write_max": 10}
-    assert research_agent._compute_effective_write_k(preset_bad_cap, {"final_top_k": 200}) == 20
+    assert research_agent._compute_effective_write_k(preset_bad_cap, {"step_top_k": 200}) == 20
 
     # Invalid UI top_k falls back to preset floor.
-    assert research_agent._compute_effective_write_k(preset, {"final_top_k": "not-a-number"}) == 12
+    assert research_agent._compute_effective_write_k(preset, {"step_top_k": "not-a-number"}) == 12
 
 
 def test_write_node_uses_run_code_path_when_structured_numeric_data_present(monkeypatch):

@@ -5,7 +5,7 @@ export interface AutoCompleteRequest {
   session_id?: string;
   canvas_id?: string;
   search_mode?: 'local' | 'web' | 'hybrid';
-  max_sections?: number; // 1-12, default 6
+  max_sections?: number; // 2-6, default 4
 }
 
 export interface AutoCompleteResponse {

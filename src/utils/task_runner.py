@@ -202,7 +202,9 @@ async def _exec_dr_job(job_id: str, request: dict) -> None:
         from src.api.schemas import DeepResearchConfirmRequest
 
         optional_user_id = request.get("_worker_user_id")
+        restart_spec = request.get("_restart")
         body_data = {k: v for k, v in request.items() if k != "_worker_user_id"}
+        body_data.pop("_restart", None)
         body = DeepResearchConfirmRequest(**body_data)
 
         await asyncio.to_thread(
@@ -210,6 +212,7 @@ async def _exec_dr_job(job_id: str, request: dict) -> None:
             job_id=job_id,
             body=body,
             optional_user_id=optional_user_id,
+            restart_spec=restart_spec if isinstance(restart_spec, dict) else None,
         )
     except Exception as e:
         logger.error("[task_runner] DR job %s failed: %s", job_id, e, exc_info=True)

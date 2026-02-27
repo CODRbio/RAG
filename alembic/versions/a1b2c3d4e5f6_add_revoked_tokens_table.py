@@ -21,17 +21,28 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     """Create the revoked_tokens table for JWT revocation tracking."""
-    op.create_table(
-        'revoked_tokens',
-        sa.Column('token_hash', sa.Text(), nullable=False),
-        sa.Column('expires_at', sa.Text(), nullable=False),
-        sa.Column('revoked_at', sa.Text(), nullable=False),
-        sa.PrimaryKeyConstraint('token_hash'),
-    )
-    op.create_index('idx_revoked_tokens_expires_at', 'revoked_tokens', ['expires_at'], unique=False)
+    bind = op.get_bind()
+    inspector = sa.inspect(bind)
+    if not inspector.has_table('revoked_tokens'):
+        op.create_table(
+            'revoked_tokens',
+            sa.Column('token_hash', sa.Text(), nullable=False),
+            sa.Column('expires_at', sa.Text(), nullable=False),
+            sa.Column('revoked_at', sa.Text(), nullable=False),
+            sa.PrimaryKeyConstraint('token_hash'),
+        )
+
+    index_names = {idx.get("name") for idx in inspector.get_indexes('revoked_tokens')}
+    if 'idx_revoked_tokens_expires_at' not in index_names:
+        op.create_index('idx_revoked_tokens_expires_at', 'revoked_tokens', ['expires_at'], unique=False)
 
 
 def downgrade() -> None:
     """Drop the revoked_tokens table."""
-    op.drop_index('idx_revoked_tokens_expires_at', table_name='revoked_tokens')
-    op.drop_table('revoked_tokens')
+    bind = op.get_bind()
+    inspector = sa.inspect(bind)
+    if inspector.has_table('revoked_tokens'):
+        index_names = {idx.get("name") for idx in inspector.get_indexes('revoked_tokens')}
+        if 'idx_revoked_tokens_expires_at' in index_names:
+            op.drop_index('idx_revoked_tokens_expires_at', table_name='revoked_tokens')
+        op.drop_table('revoked_tokens')

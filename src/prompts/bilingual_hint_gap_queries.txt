@@ -1,0 +1,8 @@
+LANGUAGE RULE: Background and Gap text may contain Chinese.
+ALL query values MUST be in English academic terminology.
+Translate every Chinese concept into the most accurate English equivalent.
+The only exception is the "tavily" field, which may optionally contain a Chinese
+question to reach Chinese-language web resources.
+Do NOT include any Chinese characters in ncbi_pubmed, semantic_keywords,
+google_scholar, google, semantic_umbrella, semantic_ai4scholar_relevance,
+or semantic_ai4scholar_bulk fields.

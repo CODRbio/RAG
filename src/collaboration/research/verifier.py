@@ -106,7 +106,7 @@ def extract_claims(
                 {"role": "user", "content": prompt},
             ],
             model=model,
-            max_tokens=2000,
+
             response_model=_ExtractedClaimsResponse,
         )
         parsed: Optional[_ExtractedClaimsResponse] = resp.get("parsed_object")
@@ -176,7 +176,7 @@ def verify_claims(
                 {"role": "user", "content": prompt},
             ],
             model=model,
-            max_tokens=2000,
+
             response_model=_VerificationsResponse,
         )
         parsed_verif: Optional[_VerificationsResponse] = resp.get("parsed_object")

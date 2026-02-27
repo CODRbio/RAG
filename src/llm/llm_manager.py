@@ -49,7 +49,6 @@ except Exception:
 
 ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_TIMEOUT = 120  # seconds
-DEFAULT_MAX_TOKENS = 4096
 LOG_DIR_NAME = "llm_raw"
 LOG_MAX_AGE_DAYS = 10
 LOG_MAX_TOTAL_MB = 100
@@ -61,12 +60,21 @@ MESSAGE_DIGEST_LENGTH = 200
 # ============================================================
 
 @dataclass
+class PlatformConfig:
+    """平台级配置：api_key + base_url，多个 provider 变体共享"""
+    name: str
+    api_key: str
+    base_url: str
+
+
+@dataclass
 class ProviderConfig:
-    """单个 provider 的配置"""
+    """单个 provider 的配置（api_key/base_url 从所属 platform 继承）"""
     name: str
     api_key: str
     base_url: str
     default_model: str
+    platform: str = ""
     models: Dict[str, str] = field(default_factory=dict)
     params: Dict[str, Any] = field(default_factory=dict)
 
@@ -80,6 +88,7 @@ class LLMConfig:
     """完整 LLM 配置"""
     default: str
     dry_run: bool
+    platforms: Dict[str, PlatformConfig] = field(default_factory=dict)
     providers: Dict[str, ProviderConfig] = field(default_factory=dict)
 
 
@@ -647,7 +656,7 @@ class HTTPChatClient(BaseChatClient):
         **overrides
     ) -> Dict[str, Any]:
         resolved_model = self._resolve_model(model)
-        timeout_override = overrides.pop("timeout_seconds", None)
+        timeout_override = overrides.pop("timeout_seconds", None) or overrides.pop("timeout", None)
         if timeout_override is not None:
             try:
                 timeout_override = int(timeout_override)
@@ -808,9 +817,70 @@ class HTTPChatClient(BaseChatClient):
         tools: Optional[List] = None,
     ) -> Dict[str, Any]:
         """构建 OpenAI-compatible 请求 payload"""
+        # Sanitize messages for stricter OpenAI-compatible providers (e.g. Moonshot/Kimi):
+        # - Never send content=null
+        # - Ensure assistant.tool_calls[*].id/function.arguments are valid
+        # - Ensure tool messages carry a valid tool_call_id
+        def _to_text(v: Any) -> str:
+            if v is None:
+                return ""
+            if isinstance(v, str):
+                return v
+            try:
+                return json.dumps(v, ensure_ascii=False, default=str)
+            except Exception:
+                return str(v)
+
+        sanitized: List[Dict[str, Any]] = []
+        pending_tool_ids: List[str] = []
+        auto_idx = 0
+        for msg in messages:
+            role = str(msg.get("role") or "")
+            normalized = dict(msg)
+            normalized["role"] = role
+            normalized["content"] = _to_text(normalized.get("content"))
+
+            if role == "assistant" and isinstance(normalized.get("tool_calls"), list):
+                tc_list = []
+                for tc in normalized.get("tool_calls") or []:
+                    if not isinstance(tc, dict):
+                        continue
+                    fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                    tc_id = str(tc.get("id") or "")
+                    if not tc_id:
+                        tc_id = f"call_auto_{auto_idx}"
+                        auto_idx += 1
+                    fn_name = str(fn.get("name") or tc.get("name") or "")
+                    fn_args = fn.get("arguments", {})
+                    if not isinstance(fn_args, str):
+                        fn_args = _to_text(fn_args)
+                    tc_list.append(
+                        {
+                            "id": tc_id,
+                            "type": "function",
+                            "function": {
+                                "name": fn_name,
+                                "arguments": fn_args,
+                            },
+                        }
+                    )
+                    pending_tool_ids.append(tc_id)
+                normalized["tool_calls"] = tc_list
+
+            if role == "tool":
+                tc_id = str(normalized.get("tool_call_id") or "")
+                if not tc_id:
+                    tc_id = pending_tool_ids.pop(0) if pending_tool_ids else f"call_auto_{auto_idx}"
+                    auto_idx += 1
+                normalized["tool_call_id"] = tc_id
+                # Some providers are stricter and expect name on tool messages.
+                if normalized.get("name") is None:
+                    normalized["name"] = "tool"
+
+            sanitized.append(normalized)
         payload = {
             "model": model,
-            "messages": messages,
+            "messages": sanitized,
         }
 
         # ── Function Calling: 注入 tools ──
@@ -837,18 +907,25 @@ class HTTPChatClient(BaseChatClient):
                 # 非标准参数也放入（某些平台支持）
                 payload[key] = value
 
-        # Track if max_tokens was explicitly set to None (meaning "no limit")
-        _explicitly_unlimited = payload.get("max_tokens") is None and "max_tokens" in payload
-
-        # Remove None-valued token fields
+        # Remove None-valued token fields — None means "let the API decide"
         if payload.get("max_tokens") is None:
             payload.pop("max_tokens", None)
         if payload.get("max_completion_tokens") is None:
             payload.pop("max_completion_tokens", None)
 
-        # Only apply default if caller did NOT explicitly request unlimited
-        if not _explicitly_unlimited and "max_tokens" not in payload and "max_completion_tokens" not in payload:
-            payload["max_tokens"] = DEFAULT_MAX_TOKENS
+        # Reasoning/thinking models: avoid restricting chain-of-thought with a small limit.
+        # Covers: OpenAI reasoning_effort, DeepSeek thinking.type, Kimi thinking.type,
+        #         Qwen enable_thinking
+        _is_thinking_openai_compat = (
+            payload.get("reasoning_effort")
+            or (payload.get("thinking") or {}).get("type") in ("enabled",)
+            or payload.get("enable_thinking") is True
+        )
+        if _is_thinking_openai_compat:
+            for key in ("max_tokens", "max_completion_tokens"):
+                val = payload.get(key)
+                if val is not None and val < 8000:
+                    payload.pop(key, None)
 
         # OpenAI 新 API: 使用 max_completion_tokens
         is_openai = "api.openai.com" in (self.config.base_url or "")
@@ -887,9 +964,20 @@ class HTTPChatClient(BaseChatClient):
         for key, value in params.items():
             payload[key] = value
 
-        # 默认 max_tokens (Anthropic API 必须提供大于 0 的整型 max_tokens)
+        # Anthropic API 必须提供大于 0 的整型 max_tokens。
+        # Sonnet 4.6 / Opus 4.6 支持最高 128K output，给一个宽裕的默认值。
+        thinking_cfg = payload.get("thinking") or {}
+        thinking_type = thinking_cfg.get("type")
+        is_thinking = thinking_type in ("enabled", "adaptive")
+
         if payload.get("max_tokens") is None:
-            payload["max_tokens"] = 8192
+            payload["max_tokens"] = 64000 if is_thinking else 16384
+
+        # Extended thinking: max_tokens 必须 > budget_tokens，否则 API 报错
+        if is_thinking and thinking_type == "enabled":
+            budget = int(thinking_cfg.get("budget_tokens") or 10000)
+            if payload["max_tokens"] <= budget:
+                payload["max_tokens"] = budget + 8000
 
         # ── Function Calling: 注入 tools ──
         if tools:
@@ -937,24 +1025,52 @@ class LLMManager:
 
         default = llm_section.get("default", "claude")
         dry_run = llm_section.get("dry_run", False)
-        providers_raw = llm_section.get("providers", {})
 
-        providers = {}
+        # ── 1. 加载 platforms（平台级 api_key + base_url）──
+        platforms_raw = llm_section.get("platforms", {})
+        platforms: Dict[str, PlatformConfig] = {}
+        for pname, pcfg in platforms_raw.items():
+            env_var = provider_env_var(pname)
+            api_key = os.getenv(env_var) or pcfg.get("api_key", "")
+            platforms[pname] = PlatformConfig(
+                name=pname,
+                api_key=api_key,
+                base_url=pcfg.get("base_url", ""),
+            )
+
+        # ── 2. 加载 providers（变体配置，api_key/base_url 从 platform 继承）──
+        providers_raw = llm_section.get("providers", {})
+        providers: Dict[str, ProviderConfig] = {}
         for name, pcfg in providers_raw.items():
-            # API key 优先级: 环境变量 > JSON
+            platform_name = pcfg.get("platform", "")
+            platform = platforms.get(platform_name)
+
+            # api_key 解析优先级:
+            #   provider 级环境变量 > provider 级 JSON > platform 环境变量 > platform JSON
             env_var = provider_env_var(name)
             api_key = os.getenv(env_var) or pcfg.get("api_key", "")
+            if not api_key and platform:
+                api_key = platform.api_key
+
+            # base_url: provider 级 > platform 级
+            base_url = pcfg.get("base_url", "")
+            if not base_url and platform:
+                base_url = platform.base_url
 
             providers[name] = ProviderConfig(
                 name=name,
                 api_key=api_key,
-                base_url=pcfg.get("base_url", ""),
+                base_url=base_url,
                 default_model=pcfg.get("default_model", ""),
+                platform=platform_name,
                 models=pcfg.get("models", {}),
                 params=pcfg.get("params", {}),
             )
 
-        config = LLMConfig(default=default, dry_run=dry_run, providers=providers)
+        config = LLMConfig(
+            default=default, dry_run=dry_run,
+            platforms=platforms, providers=providers,
+        )
         return cls(config)
 
     def get_provider_names(self) -> List[str]:
@@ -1021,6 +1137,56 @@ class LLMManager:
                 semaphore = self._semaphores[provider_name]
 
         return HTTPChatClient(pcfg, http_provider, self.log_store, semaphore=semaphore)
+
+    # ── Thinking → Base provider mapping ──
+    # "openai-thinking" → "openai", "claude-thinking" → "claude", etc.
+    _THINKING_DOWNGRADE: Dict[str, str] = {}  # populated lazily
+
+    def _build_downgrade_map(self) -> None:
+        """Build a {thinking_provider -> base_provider} mapping from config."""
+        self._THINKING_DOWNGRADE.clear()
+        for name in self.config.providers:
+            if "-thinking" in name:
+                base = name.replace("-thinking", "")
+                if base in self.config.providers:
+                    self._THINKING_DOWNGRADE[name] = base
+
+    def get_lite_client(
+        self,
+        provider: Optional[str] = None,
+        api_key: Optional[str] = None,
+    ) -> BaseChatClient:
+        """
+        获取轻量级 client —— 自动将 thinking 变体降级到同平台基础 provider。
+
+        用于路由分类、查询生成、JSON 解析等不需要 reasoning 能力的场景。
+        例如: "claude-thinking" → "claude", "openai-thinking" → "openai"
+        非 thinking 变体直接透传。
+        """
+        provider_name = provider or self.config.default
+        if not self._THINKING_DOWNGRADE:
+            self._build_downgrade_map()
+        lite_provider = self._THINKING_DOWNGRADE.get(provider_name, provider_name)
+        return self.get_client(lite_provider, api_key=api_key)
+
+    def get_ultra_lite_client(
+        self,
+        provider: Optional[str] = None,
+        api_key: Optional[str] = None,
+    ) -> BaseChatClient:
+        """
+        获取极轻量级 client (Ultra Lite)
+        专门用于长文本压缩、简单抽取等超高上下文、低逻辑要求的任务。
+        如果未指定 provider，默认回退到最高性价比模型 (openai-mini)。
+        """
+        provider_name = provider or "openai-mini"
+        if provider_name not in self.config.providers:
+            provider_name = self.config.default
+            
+        if not self._THINKING_DOWNGRADE:
+            self._build_downgrade_map()
+        ultra_lite_provider = self._THINKING_DOWNGRADE.get(provider_name, provider_name)
+        return self.get_client(ultra_lite_provider, api_key=api_key)
 
     def resolve_model(self, provider: str, model: Optional[str] = None) -> str:
         """

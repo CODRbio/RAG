@@ -61,6 +61,7 @@ class MilvusOps:
         schema.add_field("chunk_type", DataType.VARCHAR, max_length=128)
         schema.add_field("section_path", DataType.VARCHAR, max_length=65535)
         schema.add_field("page", DataType.INT32)
+        schema.add_field("year", DataType.INT32, default_value=0)
         index_params = self.client.prepare_index_params()
         index_params.add_index(field_name="dense_vector", **settings.index.params)
         index_params.add_index(
@@ -85,6 +86,7 @@ class MilvusOps:
         schema.add_field("chunk_type", DataType.VARCHAR, max_length=128)
         schema.add_field("section_path", DataType.VARCHAR, max_length=65535)
         schema.add_field("page", DataType.INT32)
+        schema.add_field("year", DataType.INT32, default_value=0)
         index_params = self.client.prepare_index_params()
         index_params.add_index(field_name="dense_vector", **settings.index.params)
         index_params.add_index(
@@ -114,15 +116,9 @@ class MilvusOps:
         return self.client.search(collection_name=collection, **kwargs)
 
     def hybrid_search(self, collection: str, **kwargs):
-        year_start = kwargs.pop("year_start", None)
-        year_end = kwargs.pop("year_end", None)
-        year_expr = self.build_year_expr(year_start=year_start, year_end=year_end)
-        if year_expr:
-            existing_expr = (kwargs.get("expr") or "").strip()
-            if existing_expr:
-                kwargs["expr"] = f"({existing_expr}) and ({year_expr})"
-            else:
-                kwargs["expr"] = year_expr
+        kwargs.pop("year_start", None)
+        kwargs.pop("year_end", None)
+        kwargs.pop("expr", None)
         return self.client.hybrid_search(collection_name=collection, **kwargs)
 
     def query(self, collection: str, **kwargs):
@@ -135,13 +131,8 @@ class MilvusOps:
     @staticmethod
     def build_year_expr(year_start: Optional[int] = None, year_end: Optional[int] = None) -> str:
         """
-        构造 Milvus 年份过滤表达式（硬过滤）。
-
-        规则：
-        - year_start / year_end 均为空 -> ""
-        - 仅 start -> "year >= start"
-        - 仅 end -> "year <= end"
-        - 同时存在 -> "year >= start and year <= end"
+        构造 Milvus 年份过滤表达式。
+        year==0 表示年份未知，始终放行避免误杀。
         """
         if year_start is None and year_end is None:
             return ""
@@ -150,7 +141,8 @@ class MilvusOps:
             clauses.append(f"year >= {int(year_start)}")
         if year_end is not None:
             clauses.append(f"year <= {int(year_end)}")
-        return " and ".join(clauses)
+        year_filter = " and ".join(clauses)
+        return f"(year == 0 or ({year_filter}))"
 
 
 # 全局实例

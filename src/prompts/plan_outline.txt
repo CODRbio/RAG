@@ -1,4 +1,4 @@
-Based on the research brief and initial retrieval context, generate a 3-6 section review outline.
+Based on the research brief and initial retrieval context, generate a comprehensive review outline with 2-{max_sections} sections.
 
 Research brief:
 - Topic: {topic}
@@ -8,7 +8,14 @@ Research brief:
 Initial retrieval context:
 {context}
 
-Return a numbered list, one section title per line:
-1. Section title
-2. Section title
-...
+Requirements:
+- Each section should cover a distinct sub-topic or aspect of the research.
+- Sections should follow a logical progression (e.g. background → methodology → findings → discussion → outlook).
+- Do not exceed {max_sections} sections.
+- Output ONLY a numbered list, one section title per line, no additional text.
+
+Example format (for max_sections={max_sections}):
+1. Background and motivation
+2. Current research landscape and key methodologies
+3. Major findings and breakthroughs
+4. Open challenges and future directions

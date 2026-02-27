@@ -123,7 +123,24 @@ def react_loop(
                 **llm_kwargs,
             )
         except Exception as e:
-            logger.error(f"ReAct LLM call failed at iteration {iteration}: {e}")
+            msg_preview = []
+            for m in working_messages[-8:]:
+                content = m.get("content", "")
+                msg_preview.append(
+                    {
+                        "role": m.get("role"),
+                        "has_tool_calls": bool(m.get("tool_calls")),
+                        "tool_call_id": m.get("tool_call_id"),
+                        "content_type": type(content).__name__,
+                        "content_len": len(content) if isinstance(content, str) else len(str(content)),
+                    }
+                )
+            logger.error(
+                "ReAct LLM call failed at iteration %d: %s | message_preview=%s",
+                iteration,
+                e,
+                msg_preview,
+            )
             result.final_text = f"[LLM 调用失败: {e}]"
             break
         llm_elapsed_ms = round((time.perf_counter() - t_llm) * 1000)
@@ -155,7 +172,15 @@ def react_loop(
 
         # ── 执行 tool calls（逐个计时）──
         tool_results: List[ToolResult] = []
-        for tc in tool_calls:
+        for i, tc in enumerate(tool_calls):
+            if not tc.id:
+                tc.id = f"call_{iteration}_{i}"
+                logger.warning(
+                    "ReAct [%d] tool_call missing id, auto-filled with %s for %s",
+                    iteration,
+                    tc.id,
+                    tc.name,
+                )
             logger.info(f"ReAct [{iteration}] calling tool: {tc.name}({tc.arguments})")
 
             t_tool = time.perf_counter()
@@ -208,7 +233,9 @@ def react_loop(
             tool_result_content = [tool_result_to_anthropic_content(tr) for tr in tool_results]
             working_messages.append({"role": "user", "content": tool_result_content})
         else:
-            assistant_msg: Dict[str, Any] = {"role": "assistant", "content": resp.get("final_text") or None}
+            # Use "" instead of None: many OpenAI-compatible providers (Moonshot/Kimi,
+            # Qwen, etc.) reject content:null even when tool_calls are present.
+            assistant_msg: Dict[str, Any] = {"role": "assistant", "content": resp.get("final_text") or ""}
             assistant_msg["tool_calls"] = [
                 {
                     "id": tc.id,

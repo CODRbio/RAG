@@ -32,12 +32,14 @@ Choose 1 backup engine. Rules:
 
 **STEP 4 — Generate queries:**
 Generate 1-{max_per} optimized queries for each selected engine (primary + fallback).
-Query styles:
-- ncbi: MeSH-style medical keywords, 3-6 words, English preferred.
-- scholar: Short academic keyword phrases, 3-6 words. No "review/survey/overview".
-- semantic: Precise technical terms only, no natural language.
-- tavily: Natural language question or full sentence. Prefer recency framing if is_fresh.
-- google: Concise general keywords.{bilingual_note}
+Before generation, distill the user query into core entities/concepts (no filler words).
+NEVER copy full user sentences as search queries.
+Query styles and language:
+- ncbi: PubMed-oriented biomedical query, compact concept groups (e.g. `(A) AND (B)`), MeSH-like terminology. ENGLISH ONLY — do not output Chinese for ncbi.
+- scholar: Short academic keyword phrases, 3-8 words, concept-dense; avoid generic suffixes unless user asks for reviews. ENGLISH ONLY — do not output Chinese for scholar.
+- semantic: Strict technical concept terms only (no full sentence/question), 3-8 words. ENGLISH ONLY — do not output Chinese for semantic.
+- tavily: One concise natural-language question (<=15 words); when is_fresh=true, include recency framing. When input is Chinese, may use {{"zh": [...], "en": [...]}}.
+- google: Plain keyword web query, 6-12 words, core concepts + optional one anchor. When input is Chinese, may use {{"zh": [...], "en": [...]}}.{bilingual_note}
 
 ---
 **Output JSON format:**
@@ -54,7 +56,8 @@ Query styles:
 Rules:
 - primary can have 1-2 engines, fallback must have exactly 1 engine.
 - Only include engines from the available list.
-- For Chinese input: each engine value is {{"zh": [...], "en": [...]}} instead of an array.
+- For Chinese input: **ncbi, semantic, scholar** — use a plain array of English query strings only. **google, tavily** — use an object {{"zh": [...], "en": [...]}}.
+- For English input: every engine value is a plain array of query strings.
 - Do NOT include engines not in the available list.
 
 Examples:
@@ -65,4 +68,4 @@ Query="deep sea cold seep microbiology", engines=[ncbi, scholar, tavily, google]
 {{"is_fresh": false, "primary": {{"ncbi": ["cold seep microbial community methane oxidation"]}}, "fallback": {{"scholar": ["cold seep microbiology chemosynthesis"]}}}}
 
 Query="如何治疗新冠肺炎", engines=[ncbi, tavily, scholar]:
-{{"is_fresh": false, "primary": {{"ncbi": {{"zh": ["新冠肺炎 治疗方案"], "en": ["COVID-19 treatment clinical outcomes"]}}}}, "fallback": {{"scholar": {{"zh": ["新冠 临床治疗"], "en": ["SARS-CoV-2 treatment efficacy"]}}}}}}
+{{"is_fresh": false, "primary": {{"ncbi": ["COVID-19 treatment clinical outcomes"], "tavily": {{"zh": ["新冠肺炎治疗方案有哪些？", "新冠治疗最新进展"], "en": ["COVID-19 treatment options", "coronavirus treatment clinical outcomes"]}}}}, "fallback": {{"scholar": ["SARS-CoV-2 treatment efficacy"]}}}}

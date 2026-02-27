@@ -3,6 +3,8 @@
 同步/检查本地模型缓存。
 前置：可通过环境变量控制缓存路径与离线模式
 - MODEL_CACHE_ROOT=~/Hug
+- HF_HOME=~/Hug
+- HF_HUB_CACHE=~/Hug/hub
 - EMBEDDING_CACHE_DIR=...
 - RERANKER_CACHE_DIR=...
 - COLBERT_CACHE_DIR=...
@@ -12,6 +14,7 @@
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -25,6 +28,11 @@ def main():
     parser.add_argument("--force", action="store_true", help="强制更新模型缓存")
     parser.add_argument("--offline", action="store_true", help="仅检查本地缓存（不联网）")
     args = parser.parse_args()
+
+    # Keep behavior aligned with runtime start.sh defaults.
+    model_cache_root = Path(os.path.expanduser(os.getenv("MODEL_CACHE_ROOT", "~/Hug")))
+    os.environ.setdefault("HF_HOME", str(model_cache_root))
+    os.environ.setdefault("HF_HUB_CACHE", str(model_cache_root / "hub"))
 
     from src.utils.model_sync import check_models, sync_models
 

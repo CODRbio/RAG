@@ -151,7 +151,7 @@ class IntentParser:
                     {"role": "system", "content": _pm.render("intent_classify_system.txt")},
                     {"role": "user", "content": prompt},
                 ],
-                max_tokens=128,
+
             )
             text = (resp.get("final_text") or "").strip()
         except Exception:

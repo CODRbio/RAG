@@ -7,8 +7,9 @@ import re
 import threading
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from pydantic import BaseModel, Field
 from fastapi.responses import StreamingResponse
 
 from config.settings import settings
@@ -35,6 +36,8 @@ from src.api.schemas import (
     DeepResearchStartResponse,
     DeepResearchConfirmRequest,
     DeepResearchSubmitResponse,
+    DeepResearchRestartPhaseRequest,
+    DeepResearchRestartSectionRequest,
     DeepResearchJobInfo,
     DeepResearchContextExtractResponse,
     EvidenceSummary,
@@ -60,7 +63,7 @@ from src.collaboration.memory.persistent_store import get_user_profile
 from src.collaboration.workflow import run_workflow
 from src.llm.llm_manager import get_manager
 from src.llm.react_loop import react_loop
-from src.llm.tools import CORE_TOOLS, get_routed_skills, start_agent_chunk_collector, drain_agent_chunks
+from src.llm.tools import CORE_TOOLS, get_routed_skills, start_agent_chunk_collector, drain_agent_chunks, set_tool_collection
 from src.collaboration.citation.manager import (
     _dedupe_citations,
     chunk_to_citation,
@@ -202,7 +205,6 @@ def _classify_query(message: str, history_turns: list, llm_client) -> bool:
                 {"role": "system", "content": _ROUTE_SYSTEM},
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=128,  # thinking 模型的 reasoning 也消耗 tokens，需留足空间
         )
         # 取 final_text；某些 thinking 模型答案可能在 reasoning_text 里
         raw_answer = (resp.get("final_text") or "").strip().lower()
@@ -264,6 +266,8 @@ def _build_filters(body: ChatRequest) -> dict:
         filters["web_providers"] = body.web_providers
     if body.web_source_configs:
         filters["web_source_configs"] = body.web_source_configs
+    if body.serpapi_ratio is not None:
+        filters["serpapi_ratio"] = body.serpapi_ratio
     if body.use_query_expansion is not None:
         filters["use_query_expansion"] = body.use_query_expansion
     if body.use_query_optimizer is not None:
@@ -276,10 +280,14 @@ def _build_filters(body: ChatRequest) -> dict:
         filters["year_start"] = body.year_start
     if body.year_end is not None:
         filters["year_end"] = body.year_end
-    if body.final_top_k is not None:
-        filters["final_top_k"] = body.final_top_k
-    if body.llm_provider:
+    if body.step_top_k is not None:
+        filters["step_top_k"] = body.step_top_k
+    if body.reranker_mode:
+        filters["reranker_mode"] = body.reranker_mode
+    if getattr(body, "llm_provider", None):
         filters["llm_provider"] = body.llm_provider
+    if getattr(body, "ultra_lite_provider", None):
+        filters["ultra_lite_provider"] = body.ultra_lite_provider
     if body.model_override:
         filters["model_override"] = body.model_override
     if body.use_content_fetcher is not None:
@@ -295,16 +303,22 @@ def _build_deep_research_filters(body: Any) -> dict:
     for key in (
         "web_providers",
         "web_source_configs",
+        "serpapi_ratio",
         "use_query_optimizer",
         "query_optimizer_max_queries",
         "local_top_k",
         "local_threshold",
         "year_start",
         "year_end",
-        "final_top_k",
+        "step_top_k",
+        "write_top_k",
+        "reranker_mode",
         "llm_provider",
+        "ultra_lite_provider",
         "model_override",
         "collection",
+        "use_content_fetcher",
+        "gap_query_intent",
     ):
         val = getattr(body, key, None)
         if val is not None and val != "":
@@ -377,6 +391,7 @@ def _run_chat(
     current_stage = store.get_session_stage(session_id)
     manager = get_manager(str(_CONFIG_PATH))
     client = manager.get_client(body.llm_provider or None)
+    lite_client = manager.get_lite_client(body.llm_provider or None)
     history_for_intent = memory.get_context_window(n=6)
 
     agent_debug_data: dict | None = None
@@ -392,10 +407,19 @@ def _run_chat(
 
     # ── 1. 请求概览 ──
     _chat_logger.info(
-        "[chat] ▶ 新请求 | session=%s | msg=%r | provider=%s | model=%s | search_mode=%s | collection=%s | agent_mode=%s",
+        "[chat] ▶ 新请求 | session=%s | msg=%r | provider=%s | model=%s | search_mode=%s"
+        " | collection=%s | agent_mode=%s"
+        " | local_top_k=%s | step_top_k=%s | reranker_mode=%s | web_providers=%s | serpapi_ratio=%s"
+        " | year=%s~%s | optimizer=%s",
         session_id[:12], message[:60],
         body.llm_provider or "default", body.model_override or "default",
         search_mode, (body.collection or settings.collection.global_), agent_mode,
+        body.local_top_k, body.step_top_k,
+        body.reranker_mode,
+        ",".join(body.web_providers) if body.web_providers else "none",
+        body.serpapi_ratio,
+        body.year_start, body.year_end,
+        body.use_query_optimizer,
     )
 
     # ── 2. 意图判断（Chat vs Deep Research）──
@@ -409,7 +433,7 @@ def _run_chat(
         )
         _chat_logger.info("[chat] ② 意图判断 → deep_research (前端 mode 指定)")
     elif message.startswith("/"):
-        parser = IntentParser(client)
+        parser = IntentParser(lite_client)
         parsed = parser.parse(message, current_stage=current_stage, history=history_for_intent)
         _chat_logger.info(
             "[chat] ② 意图判断 → %s (命令解析, confidence=%.2f)",
@@ -435,7 +459,8 @@ def _run_chat(
         )
         topic = (parsed.params.get("args") or message).strip() or "综述"
         filters = _build_filters(body)
-        svc = AutoCompleteService(llm_client=client, max_sections=6, include_abstract=True)
+        max_sections = getattr(body, "max_sections", None) or 4
+        svc = AutoCompleteService(llm_client=client, max_sections=max_sections, include_abstract=True)
         user_id = optional_user_id or body.user_id or ""
         use_agent_flag = getattr(body, "use_agent", None) or False
         result = svc.complete(
@@ -477,7 +502,7 @@ def _run_chat(
 
     # ── 3. Chat 分支：智能路由（正则 → LLM → 严格解析）──
     t_route = _time.perf_counter()
-    query_needs_rag = _classify_query(message, history_for_intent, client)
+    query_needs_rag = _classify_query(message, history_for_intent, lite_client)
     # autonomous 模式跳过预检索，由 Agent 自主决定是否检索
     do_retrieval = search_mode != "none" and query_needs_rag and agent_mode != "autonomous"
     # 闲聊时不启动 Agent
@@ -525,11 +550,12 @@ def _run_chat(
         _chat_logger.info("[chat] ④ Query 构建 → 跳过 (不需要检索)")
 
     # ── 5. 检索执行 ──
+    target_collection = (body.collection or "").strip() or None
     if do_retrieval:
         t_retrieval = _time.perf_counter()
-        target_collection = (body.collection or "").strip() or None
         retrieval = get_retrieval_service(collection=target_collection)
         filters = _build_filters(body)
+        filters["reranker_mode"] = "bge_only"  # Chat 检索固定 bge_only，优先速度
         pack = retrieval.search(
             query=query or message,
             mode=search_mode,
@@ -557,9 +583,9 @@ def _run_chat(
         # 注意：citations 会在 LLM 生成后通过 resolve_response_citations() 获得
         citations: list[Citation] = []
         _chat_logger.info(
-            "[chat] ⑤ 检索完成 | mode=%s | chunks=%d | sources=%s | 耗时=%.0fms",
-            search_mode, len(pack.chunks),
-            ",".join(pack.sources_used), retrieval_ms,
+            "[chat] ⑤ 检索完成 | mode=%s | top_k=%s | step_top_k=%s | reranker_mode=%s | chunks=%d | sources=%s | 耗时=%.0fms",
+            search_mode, body.local_top_k, body.step_top_k, body.reranker_mode,
+            len(pack.chunks), ",".join(pack.sources_used), retrieval_ms,
         )
         dbg.log_retrieval(
             session_id,
@@ -583,6 +609,30 @@ def _run_chat(
         )
         citations: list[Citation] = []
         _chat_logger.info("[chat] ⑤ 检索 → 跳过 (路由判定为 chat)")
+
+    # ── 5.5 轻量证据充分性检查 ──
+    evidence_scarce = False
+    _evidence_distinct_docs = 0
+    if do_retrieval and pack:
+        _doc_keys: set[str] = set()
+        for c in pack.chunks:
+            if getattr(c, "doi", None):
+                _doc_keys.add(f"doi:{c.doi}")
+            else:
+                _doc_keys.add(c.doc_group_key)
+        _evidence_distinct_docs = len(_doc_keys)
+        if len(pack.chunks) < 3 or _evidence_distinct_docs < 2:
+            evidence_scarce = True
+            evidence_summary.evidence_scarce = True
+            _chat_logger.info(
+                "[chat] ⑤½ 证据不足 | chunks=%d | distinct_docs=%d → 标记 evidence_scarce",
+                len(pack.chunks), _evidence_distinct_docs,
+            )
+        if agent_mode == "standard" and evidence_scarce and query_needs_rag:
+            agent_mode = "assist"
+            _chat_logger.info(
+                "[chat] ⑤½ 证据不足 → 自动升级 agent_mode: standard → assist (允许工具补搜)",
+            )
 
     # ── 6. System Prompt 组装 ──
     wf = run_workflow(
@@ -656,7 +706,13 @@ def _run_chat(
     tool_trace = None
 
     # 根据模式注入不同的 Agent hint
-    if agent_mode == "assist" and do_retrieval and context_str:
+    if agent_mode == "assist" and evidence_scarce:
+        messages[0]["content"] = messages[0]["content"] + _pm.render(
+            "chat_agent_evidence_scarce_hint.txt",
+            chunk_count=len(pack.chunks) if pack else 0,
+            distinct_docs=_evidence_distinct_docs,
+        )
+    elif agent_mode == "assist" and do_retrieval and context_str:
         messages[0]["content"] = messages[0]["content"] + _pm.render("chat_agent_hint.txt")
     elif agent_mode == "autonomous":
         messages[0]["content"] = messages[0]["content"] + _pm.render("chat_agent_autonomous_hint.txt")
@@ -677,6 +733,7 @@ def _run_chat(
     try:
         if use_agent:
             start_agent_chunk_collector()
+            set_tool_collection(target_collection)
             routed_tools = get_routed_skills(
                 message=message,
                 current_stage=current_stage or "",
@@ -939,9 +996,10 @@ def detect_intent(body: IntentDetectRequest) -> IntentDetectResponse:
     """
     意图检测 API（简化版）：Chat vs Deep Research 二分类。
     检索由前端 UI 开关决定，此处只判断执行模式。
+    LLM 优先使用 body.llm_provider（UI），无则使用 config 默认。
     """
     manager = get_manager(str(_CONFIG_PATH))
-    client = manager.get_client()
+    client = manager.get_lite_client(body.llm_provider or None)
     parser = IntentParser(client)
 
     history = None
@@ -1038,7 +1096,7 @@ def clarify_for_deep_research(
                 {"role": "user", "content": prompt},
             ],
             model=body.model_override or None,
-            max_tokens=1024,
+
         )
         text = (resp.get("final_text") or "").strip()
         text = re.sub(r"^```(?:json)?\s*", "", text)
@@ -1175,6 +1233,7 @@ def start_deep_research_endpoint(
         user_id=user_id,
         search_mode=body.search_mode,
         filters=filters or None,
+        max_sections=body.max_sections,
         clarification_answers=body.clarification_answers,
         output_language=body.output_language or "auto",
         model_override=body.model_override or None,
@@ -1197,13 +1256,15 @@ def _run_deep_research_job_safe(
     job_id: str,
     body: DeepResearchConfirmRequest,
     optional_user_id: str | None,
+    restart_spec: dict[str, Any] | None = None,
 ) -> None:
     """后台执行 Deep Research 并持久化状态。"""
     from src.collaboration.research.agent import (
         prepare_deep_research_runtime,
         build_deep_research_result_from_state,
+        reconstruct_state_from_checkpoint,
     )
-    from src.collaboration.research.job_store import append_event, update_job, get_pending_review
+    from src.collaboration.research.job_store import append_event, update_job, get_pending_review, load_checkpoint
     import time as _time
 
     t0 = _time.perf_counter()
@@ -1222,33 +1283,218 @@ def _run_deep_research_job_safe(
     try:
         update_job(job_id, status="running", message="Deep Research 任务已启动")
         append_event(job_id, "start", {"job_id": job_id, "topic": body.topic, "session_id": session_id})
+        runtime_kwargs: Dict[str, Any] = {
+            "topic": body.topic.strip(),
+            "llm_client": client,
+            "confirmed_outline": body.confirmed_outline,
+            "confirmed_brief": body.confirmed_brief,
+            "canvas_id": body.canvas_id,
+            "session_id": session_id,
+            "user_id": user_id,
+            "search_mode": body.search_mode,
+            "filters": filters or None,
+            "model_override": body.model_override or None,
+            "output_language": body.output_language or "auto",
+            "step_models": body.step_models,
+            "step_model_strict": bool(body.step_model_strict),
+            "user_context": body.user_context,
+            "user_context_mode": body.user_context_mode or "supporting",
+            "user_documents": body.user_documents,
+            "progress_callback": _progress_cb,
+            "cancel_check": lambda: _dr_is_cancel_requested(job_id),
+            "review_waiter": lambda section_id: get_pending_review(job_id, section_id),
+            "skip_draft_review": bool(body.skip_draft_review),
+            "skip_refine_review": bool(body.skip_refine_review),
+            "skip_claim_generation": bool(body.skip_claim_generation),
+            "job_id": job_id,
+            "depth": body.depth or "comprehensive",
+            "max_sections": body.max_sections,
+        }
+        if restart_spec:
+            source_job_id = str(restart_spec.get("source_job_id") or "").strip()
+            mode = str(restart_spec.get("mode") or "").strip().lower()
+            # plan 阶段重启允许无 checkpoint（用于中断/报错后从大纲阶段重新开始）
+            if mode == "phase" and str(restart_spec.get("phase") or "").strip().lower() == "plan":
+                runtime_kwargs["start_node"] = "plan"
+                append_event(
+                    job_id,
+                    "restart_start",
+                    {
+                        "job_id": job_id,
+                        "source_job_id": source_job_id,
+                        "mode": mode,
+                        "start_node": "plan",
+                        "checkpoint_required": False,
+                    },
+                )
+                checkpoint = None
+            else:
+                checkpoint = load_checkpoint(source_job_id)
+                if not checkpoint:
+                    raise RuntimeError(f"重启失败：未找到 checkpoint（source_job_id={source_job_id}）")
 
-        runtime = prepare_deep_research_runtime(
-            topic=body.topic.strip(),
-            llm_client=client,
-            confirmed_outline=body.confirmed_outline,
-            confirmed_brief=body.confirmed_brief,
-            canvas_id=body.canvas_id,
-            session_id=session_id,
-            user_id=user_id,
-            search_mode=body.search_mode,
-            filters=filters or None,
-            model_override=body.model_override or None,
-            output_language=body.output_language or "auto",
-            step_models=body.step_models,
-            step_model_strict=bool(body.step_model_strict),
-            user_context=body.user_context,
-            user_context_mode=body.user_context_mode or "supporting",
-            user_documents=body.user_documents,
-            progress_callback=_progress_cb,
-            cancel_check=lambda: _dr_is_cancel_requested(job_id),
-            review_waiter=lambda section_id: get_pending_review(job_id, section_id),
-            skip_draft_review=bool(body.skip_draft_review),
-            skip_refine_review=bool(body.skip_refine_review),
-            skip_claim_generation=bool(body.skip_claim_generation),
-            job_id=job_id,
-            depth=body.depth or "comprehensive",
-        )
+            if checkpoint:
+                reconstructed = reconstruct_state_from_checkpoint(
+                    checkpoint_data=checkpoint,
+                    llm_client=client,
+                    progress_callback=_progress_cb,
+                    cancel_check=lambda: _dr_is_cancel_requested(job_id),
+                    review_waiter=lambda section_id: get_pending_review(job_id, section_id),
+                    model_override=body.model_override or None,
+                )
+                reconstructed["job_id"] = job_id
+                reconstructed["session_id"] = session_id
+                if body.canvas_id:
+                    reconstructed["canvas_id"] = body.canvas_id
+                if body.user_context is not None:
+                    reconstructed["user_context"] = body.user_context
+                if body.user_documents is not None:
+                    reconstructed["user_documents"] = body.user_documents
+
+                start_node = "research"
+                if mode == "phase":
+                    phase = str(restart_spec.get("phase") or "research").strip().lower()
+                    if phase == "plan":
+                        reconstructed["sections_completed"] = []
+                        reconstructed["current_section"] = ""
+                        reconstructed["markdown_parts"] = []
+                        reconstructed["citations"] = []
+                        reconstructed["iteration_count"] = 0
+                        reconstructed["coverage_history"] = {}
+                        reconstructed["review_handled_at"] = {}
+                        reconstructed["review_seen_at"] = {}
+                        reconstructed["review_gate_rounds"] = 0
+                        reconstructed["review_gate_unchanged"] = 0
+                        reconstructed["review_gate_last_snapshot"] = ""
+                        reconstructed["verified_claims"] = ""
+                        reconstructed["force_synthesize"] = False
+                        reconstructed["cost_warned"] = False
+                        reconstructed["graph_step_count"] = 0
+                        reconstructed["last_cost_tick_step"] = 0
+                        for sec in reconstructed["dashboard"].sections:
+                            sec.status = "pending"
+                            sec.coverage_score = 0.0
+                            sec.source_count = 0
+                            sec.gaps = []
+                            sec.research_rounds = 0
+                            sec.evidence_scarce = False
+                            sec.completion_round_done = False
+                        start_node = "plan"
+                    elif phase == "research":
+                        reconstructed["sections_completed"] = []
+                        reconstructed["current_section"] = ""
+                        reconstructed["markdown_parts"] = []
+                        reconstructed["citations"] = []
+                        reconstructed["verified_claims"] = ""
+                        for sec in reconstructed["dashboard"].sections:
+                            sec.status = "pending"
+                            sec.source_count = 0
+                            sec.gaps = []
+                            sec.research_rounds = 0
+                            sec.evidence_scarce = False
+                            sec.completion_round_done = False
+                        start_node = "research"
+                    elif phase == "write":
+                        reconstructed["sections_completed"] = []
+                        reconstructed["current_section"] = ""
+                        for sec in reconstructed["dashboard"].sections:
+                            sec.status = "researching"
+                        start_node = "write"
+                    elif phase == "generate_claims":
+                        reconstructed["sections_completed"] = []
+                        reconstructed["current_section"] = ""
+                        reconstructed["verified_claims"] = ""
+                        for sec in reconstructed["dashboard"].sections:
+                            sec.status = "researching"
+                        start_node = "generate_claims"
+                    elif phase == "verify":
+                        reconstructed["sections_completed"] = []
+                        reconstructed["verified_claims"] = ""
+                        if not reconstructed.get("current_section"):
+                            first_title = ""
+                            if reconstructed["dashboard"].sections:
+                                first_title = reconstructed["dashboard"].sections[0].title
+                            reconstructed["current_section"] = first_title
+                        for sec in reconstructed["dashboard"].sections:
+                            if sec.title == reconstructed.get("current_section"):
+                                sec.status = "writing"
+                            elif sec.title in reconstructed.get("sections_completed", []):
+                                sec.status = "done"
+                            else:
+                                sec.status = "pending"
+                        start_node = "verify"
+                    elif phase == "review_gate":
+                        start_node = "review_gate"
+                    elif phase == "synthesize":
+                        start_node = "synthesize"
+                    elif phase == "auto":
+                        completed_set = set(reconstructed.get("sections_completed") or [])
+                        all_titles = [s.title for s in reconstructed["dashboard"].sections]
+                        if all(t in completed_set for t in all_titles):
+                            start_node = "synthesize"
+                        else:
+                            reconstructed["current_section"] = ""
+                            for sec in reconstructed["dashboard"].sections:
+                                if sec.title not in completed_set:
+                                    sec.status = "pending"
+                                    sec.completion_round_done = False
+                            start_node = "research"
+                    else:
+                        raise RuntimeError(f"不支持的重启阶段: {phase}")
+                elif mode == "section":
+                    target = str(restart_spec.get("section_title") or "").strip()
+                    action = str(restart_spec.get("action") or "research").strip().lower()
+                    if not target:
+                        raise RuntimeError("重启失败：section_title 不能为空")
+                    matched = None
+                    for sec in reconstructed["dashboard"].sections:
+                        if sec.title == target or sec.title.strip().lower() == target.lower():
+                            matched = sec
+                            target = sec.title
+                            break
+                    if matched is None:
+                        raise RuntimeError(f"重启失败：章节不存在 ({target})")
+                    reconstructed["current_section"] = target
+                    reconstructed["sections_completed"] = [
+                        s for s in (reconstructed.get("sections_completed") or []) if str(s).strip() != target
+                    ]
+                    matched.completion_round_done = False
+                    if action == "research":
+                        matched.status = "researching"
+                        matched.source_count = 0
+                        matched.gaps = []
+                        matched.research_rounds = 0
+                        matched.evidence_scarce = False
+                        start_node = "research"
+                    elif action == "write":
+                        matched.status = "researching"
+                        start_node = "write"
+                    else:
+                        raise RuntimeError(f"不支持的 section 重启动作: {action}")
+                else:
+                    raise RuntimeError("重启失败：mode 无效")
+
+                runtime_kwargs["start_node"] = start_node
+                runtime_kwargs["initial_state_override"] = reconstructed
+                runtime_kwargs["confirmed_outline"] = [sec.title for sec in reconstructed["dashboard"].sections]
+                runtime_kwargs["confirmed_brief"] = {
+                    "topic": reconstructed["dashboard"].brief.topic,
+                    "scope": reconstructed["dashboard"].brief.scope,
+                }
+                runtime_kwargs["topic"] = reconstructed.get("topic") or body.topic.strip()
+
+                append_event(
+                    job_id,
+                    "restart_start",
+                    {
+                        "job_id": job_id,
+                        "source_job_id": source_job_id,
+                        "mode": mode,
+                        "start_node": start_node,
+                    },
+                )
+
+        runtime = prepare_deep_research_runtime(**runtime_kwargs)
         compiled = runtime["compiled"]
         config = runtime["config"]
         initial_state = runtime["initial_state"]
@@ -1602,6 +1848,7 @@ def _dr_job_status_payload(job: dict) -> dict:
             dashboard = {}
     return {
         "job_id": job.get("job_id", ""),
+        "topic": job.get("topic", ""),
         "status": job.get("status", ""),
         "current_stage": job.get("current_stage", ""),
         "message": job.get("message", ""),
@@ -1685,6 +1932,195 @@ def cancel_deep_research_job(job_id: str) -> dict:
     update_job(job_id, status="cancelling", message="收到停止请求，正在终止任务...")
     append_event(job_id, "cancel_requested", {"job_id": job_id, "message": "已请求停止"})
     return {"ok": True, "job_id": job_id, "status": "cancelling"}
+
+
+@router.get("/deep-research/jobs/{job_id}/checkpoints")
+def list_deep_research_checkpoints(job_id: str) -> dict:
+    """List all saved checkpoints for a Deep Research job."""
+    from src.collaboration.research.job_store import get_job, list_checkpoints
+
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job 不存在")
+    raw = list_checkpoints(job_id)
+    items = []
+    for cp in raw:
+        state = cp.get("state") or {}
+        completed = state.get("sections_completed") or []
+        total_sections = len((state.get("dashboard") or {}).get("sections") or [])
+        items.append({
+            "phase": cp.get("phase", ""),
+            "section_title": cp.get("section_title", ""),
+            "created_at": cp.get("created_at", 0),
+            "sections_completed": len(completed),
+            "total_sections": total_sections,
+            "resumable": cp.get("phase") in ("confirmed", "section_done", "research", "write", "verify", "synthesize", "crash"),
+        })
+    return {"job_id": job_id, "checkpoints": items}
+
+
+@router.post("/deep-research/jobs/{job_id}/restart-phase", response_model=DeepResearchSubmitResponse)
+def restart_deep_research_phase(
+    job_id: str,
+    body: DeepResearchRestartPhaseRequest,
+    optional_user_id: str | None = Depends(get_optional_user_id),
+) -> DeepResearchSubmitResponse:
+    from src.collaboration.research.job_store import get_job, create_job, update_job, append_event
+
+    source_job = get_job(job_id)
+    if not source_job:
+        raise HTTPException(status_code=404, detail="job 不存在")
+    source_status = str(source_job.get("status") or "")
+    if source_status in {"pending", "running", "cancelling", "waiting_review"}:
+        _dr_request_cancel(job_id)
+        update_job(job_id, status="cancelling", message="收到重启请求，正在终止旧任务...")
+        append_event(
+            job_id,
+            "restart_requested",
+            {
+                "message": "收到重启请求，旧任务将被中止并创建新任务",
+                "source_status": source_status,
+            },
+        )
+    phase = str(body.phase or "").strip().lower()
+    if phase not in {"plan", "research", "generate_claims", "write", "verify", "review_gate", "synthesize"}:
+        raise HTTPException(
+            status_code=400,
+            detail="phase must be plan|research|generate_claims|write|verify|review_gate|synthesize",
+        )
+
+    req_payload = source_job.get("request") or {}
+    if not isinstance(req_payload, dict) or not req_payload:
+        raise HTTPException(status_code=400, detail="原任务缺少 request payload，无法重启")
+
+    payload = dict(req_payload)
+    payload["_worker_user_id"] = optional_user_id
+    payload["_restart"] = {
+        "source_job_id": job_id,
+        "mode": "phase",
+        "phase": phase,
+    }
+    payload["session_id"] = source_job.get("session_id") or payload.get("session_id")
+    job = create_job(
+        topic=str(source_job.get("topic") or payload.get("topic") or "").strip(),
+        session_id=str(source_job.get("session_id") or payload.get("session_id") or ""),
+        canvas_id=str(source_job.get("canvas_id") or payload.get("canvas_id") or ""),
+        request_payload=payload,
+    )
+    new_job_id = str(job.get("job_id") or "")
+    return DeepResearchSubmitResponse(
+        ok=True,
+        job_id=new_job_id,
+        session_id=str(job.get("session_id") or ""),
+        canvas_id=str(job.get("canvas_id") or ""),
+    )
+
+
+@router.post("/deep-research/jobs/{job_id}/restart-section", response_model=DeepResearchSubmitResponse)
+def restart_deep_research_section(
+    job_id: str,
+    body: DeepResearchRestartSectionRequest,
+    optional_user_id: str | None = Depends(get_optional_user_id),
+) -> DeepResearchSubmitResponse:
+    from src.collaboration.research.job_store import get_job, create_job, update_job, append_event
+
+    source_job = get_job(job_id)
+    if not source_job:
+        raise HTTPException(status_code=404, detail="job 不存在")
+    source_status = str(source_job.get("status") or "")
+    if source_status in {"pending", "running", "cancelling", "waiting_review"}:
+        _dr_request_cancel(job_id)
+        update_job(job_id, status="cancelling", message="收到重启请求，正在终止旧任务...")
+        append_event(
+            job_id,
+            "restart_requested",
+            {
+                "message": "收到重启请求，旧任务将被中止并创建新任务",
+                "source_status": source_status,
+            },
+        )
+    section_title = str(body.section_title or "").strip()
+    action = str(body.action or "research").strip().lower()
+    if not section_title:
+        raise HTTPException(status_code=400, detail="section_title 不能为空")
+    if action not in {"research", "write"}:
+        raise HTTPException(status_code=400, detail="action must be research|write")
+
+    req_payload = source_job.get("request") or {}
+    if not isinstance(req_payload, dict) or not req_payload:
+        raise HTTPException(status_code=400, detail="原任务缺少 request payload，无法重启")
+
+    payload = dict(req_payload)
+    payload["_worker_user_id"] = optional_user_id
+    payload["_restart"] = {
+        "source_job_id": job_id,
+        "mode": "section",
+        "section_title": section_title,
+        "action": action,
+    }
+    payload["session_id"] = source_job.get("session_id") or payload.get("session_id")
+    job = create_job(
+        topic=str(source_job.get("topic") or payload.get("topic") or "").strip(),
+        session_id=str(source_job.get("session_id") or payload.get("session_id") or ""),
+        canvas_id=str(source_job.get("canvas_id") or payload.get("canvas_id") or ""),
+        request_payload=payload,
+    )
+    new_job_id = str(job.get("job_id") or "")
+    return DeepResearchSubmitResponse(
+        ok=True,
+        job_id=new_job_id,
+        session_id=str(job.get("session_id") or ""),
+        canvas_id=str(job.get("canvas_id") or ""),
+    )
+
+
+class EvidenceOptimizeRequest(BaseModel):
+    section_title: str = Field(..., min_length=1, description="要优化的章节标题")
+    web_providers: Optional[List[str]] = Field(None, description="允许使用的搜索源（None=全部）")
+    web_source_configs: Optional[Dict[str, Dict[str, Any]]] = Field(None, description="每个搜索源配置")
+    use_content_fetcher: Optional[str] = Field(None, description="全文抓取模式: auto | force | off")
+
+
+@router.post("/deep-research/jobs/{job_id}/optimize-evidence")
+def optimize_section_evidence_endpoint(
+    job_id: str,
+    body: EvidenceOptimizeRequest,
+    optional_user_id: Optional[str] = Depends(get_optional_user_id),
+) -> dict:
+    """Trigger full T1+T2+T3 evidence optimization for a specific section.
+
+    Available when section status is 'written', 'done', or 'evidence_scarce'.
+    Loads the job checkpoint, runs a targeted 3-tier search using the section's
+    accumulated evidence + gaps as context, and updates the checkpoint.
+    """
+    from src.collaboration.research.job_store import get_job
+    from src.collaboration.research.agent import optimize_section_evidence
+
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job 不存在")
+
+    filters: Dict[str, Any] = {}
+    if body.web_providers is not None:
+        filters["web_providers"] = body.web_providers
+    if body.web_source_configs is not None:
+        filters["web_source_configs"] = body.web_source_configs
+    if body.use_content_fetcher is not None:
+        filters["use_content_fetcher"] = body.use_content_fetcher
+
+    manager = get_manager(str(_CONFIG_PATH))
+    req_payload = job.get("request_payload") or {}
+    llm_client = manager.get_client(req_payload.get("llm_provider") or None)
+    search_mode = str(req_payload.get("search_mode") or "hybrid")
+
+    result = optimize_section_evidence(
+        job_id=job_id,
+        section_title=body.section_title,
+        llm_client=llm_client,
+        search_mode=search_mode,
+        filters=filters or None,
+    )
+    return result
 
 
 @router.post("/deep-research/jobs/{job_id}/review")
@@ -1898,6 +2334,23 @@ def get_session(session_id: str) -> SessionInfo:
     store = get_session_store()
     meta = store.get_session_meta(session_id)
     if meta is None:
+        # 可能是仅存在于 Deep Research 任务中的 session（ChatSession 无记录），尝试从 job 恢复
+        try:
+            from src.collaboration.research.job_store import get_latest_job_by_session
+            latest_job = get_latest_job_by_session(session_id)
+            if latest_job:
+                dashboard = latest_job.get("result_dashboard") or {}
+                dash = dashboard if isinstance(dashboard, dict) and dashboard else None
+                return SessionInfo(
+                    session_id=session_id,
+                    canvas_id=latest_job.get("canvas_id") or "",
+                    stage="explore",
+                    turn_count=0,
+                    turns=[],
+                    research_dashboard=dash,
+                )
+        except Exception:
+            pass
         raise HTTPException(status_code=404, detail="session not found")
     turns = store.get_turns(session_id)
     turn_items = []
@@ -1951,10 +2404,11 @@ def delete_session(session_id: str) -> dict:
 
 @router.get("/sessions", response_model=List[SessionListItem])
 def list_sessions(limit: int = 100) -> List[SessionListItem]:
-    """获取所有会话列表"""
+    """获取所有会话列表。会合并 Deep Research 任务中存在的 session，确保有后台调研的会话出现在历史中。"""
     store = get_session_store()
     sessions = store.list_all_sessions(limit=limit)
-    return [
+    session_ids = {s["session_id"] for s in sessions}
+    items: list[SessionListItem] = [
         SessionListItem(
             session_id=s["session_id"],
             title=s["title"],
@@ -1966,3 +2420,43 @@ def list_sessions(limit: int = 100) -> List[SessionListItem]:
         )
         for s in sessions
     ]
+    # 合并 DR 任务中的 session：若某 job 的 session_id 不在列表中，补一条记录（修复「历史中没有后台调研」的 bug）
+    try:
+        from src.collaboration.research.job_store import list_jobs
+
+        jobs = list_jobs(limit=50)
+        for j in jobs:
+            sid = (j.get("session_id") or "").strip()
+            if not sid or sid in session_ids:
+                continue
+            session_ids.add(sid)
+            created = j.get("created_at") or 0
+            updated = j.get("updated_at") or created
+            created_iso = _ts_to_iso(created) if created else ""
+            updated_iso = _ts_to_iso(updated) if updated else ""
+            items.append(
+                SessionListItem(
+                    session_id=sid,
+                    title=(j.get("topic") or "未命名 Deep Research")[:80],
+                    canvas_id=(j.get("canvas_id") or "").strip(),
+                    stage="explore",
+                    turn_count=0,
+                    created_at=created_iso,
+                    updated_at=updated_iso,
+                )
+            )
+        # 按 updated_at 倒序，保持 limit
+        items.sort(key=lambda x: x.updated_at or "", reverse=True)
+        items = items[:limit]
+    except Exception:
+        pass
+    return items
+
+
+def _ts_to_iso(ts: float) -> str:
+    from datetime import datetime
+
+    try:
+        return datetime.fromtimestamp(ts).isoformat()
+    except (ValueError, OSError, TypeError):
+        return "1970-01-01T00:00:00"

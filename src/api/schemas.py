@@ -25,7 +25,11 @@ class ChatRequest(BaseModel):
     )
     web_source_configs: Optional[Dict[str, Dict[str, Any]]] = Field(
         None,
-        description="每个搜索源的独立配置 {provider_id: {topK: int, threshold: float}}",
+        description="每个搜索源的独立配置 {provider_id: {topK: int, threshold: float, useSerpapi?: bool}}",
+    )
+    serpapi_ratio: Optional[float] = Field(
+        None,
+        description="SerpAPI 轮询比例 0-1，控制 google/scholar 中走 SerpAPI 的查询比例",
     )
     use_query_expansion: Optional[bool] = Field(
         None,
@@ -59,13 +63,17 @@ class ChatRequest(BaseModel):
         le=2100,
         description="年份窗口结束（硬过滤，含边界）",
     )
-    final_top_k: Optional[int] = Field(
+    step_top_k: Optional[int] = Field(
         None,
-        description="最终保留的文档数（local + web 合并重排后），None 表示使用配置默认值",
+        description="每步检索保留文档数（local + web 合并重排后），None 表示使用配置默认值",
     )
     llm_provider: Optional[str] = Field(
         None,
         description="LLM 提供商: deepseek | openai | gemini | claude | kimi 等，None 表示使用配置默认值",
+    )
+    ultra_lite_provider: Optional[str] = Field(
+        None,
+        description="专门用于长文本压缩等超轻量任务的 LLM 提供商 (如 openai-mini, gemini-flash, deepseek 等)",
     )
     model_override: Optional[str] = Field(
         None,
@@ -101,6 +109,10 @@ class ChatRequest(BaseModel):
         None,
         description="Deep Research 各步骤模型覆盖，格式 provider::model，键支持 scope/plan/research/evaluate/write/verify/synthesize",
     )
+    reranker_mode: Optional[str] = Field(
+        None,
+        description="重排序模式: bge_only | colbert_only | cascade；None 表示使用服务端配置默认值",
+    )
     mode: Optional[str] = Field(
         "chat",
         description="执行模式: chat（普通对话）| deep_research（多步综述流水线），默认 chat",
@@ -125,6 +137,8 @@ class EvidenceSummary(BaseModel):
         None,
         description="双层来源统计: chunk_level（每个信息块计一次）+ citation_level（同网站/文档只计一次）",
     )
+    # 证据充分性
+    evidence_scarce: bool = Field(False, description="True when pre-retrieval evidence is insufficient (chunks<3 or distinct_docs<2)")
     # 检索诊断信息
     diagnostics: Optional[Dict[str, Any]] = Field(None, description="检索诊断: stages/web_providers/content_fetcher")
 
@@ -373,6 +387,7 @@ class IntentDetectRequest(BaseModel):
     message: str = Field(..., min_length=1, description="用户消息")
     session_id: Optional[str] = Field(None, description="会话 ID，用于获取历史上下文")
     current_stage: str = Field("explore", description="当前工作流阶段")
+    llm_provider: Optional[str] = Field(None, description="LLM 提供商，用于意图解析；无则使用 config 默认")
 
 
 class IntentDetectResponse(BaseModel):
@@ -433,7 +448,7 @@ class AutoCompleteRequest(BaseModel):
     session_id: Optional[str] = Field(None, description="会话 ID")
     canvas_id: Optional[str] = Field(None, description="画布 ID")
     search_mode: str = Field("hybrid", description="检索模式: local | web | hybrid")
-    max_sections: int = Field(6, ge=1, le=12, description="最大章节数")
+    max_sections: int = Field(4, ge=2, le=6, description="最大章节数")
 
 
 class AutoCompleteResponse(BaseModel):
@@ -456,6 +471,7 @@ class ClarifyRequest(BaseModel):
     session_id: Optional[str] = Field(None, description="会话 ID（用于获取 chat 历史上下文）")
     search_mode: str = Field("hybrid", description="检索模式，用于预检索领域资料辅助生成问题")
     llm_provider: Optional[str] = Field(None, description="LLM 提供商")
+    ultra_lite_provider: Optional[str] = Field(None, description="超轻量级 LLM 提供商（长文本压缩等）")
     model_override: Optional[str] = Field(None, description="覆盖 provider 默认模型")
 
 
@@ -490,7 +506,7 @@ class DeepResearchRequest(BaseModel):
     canvas_id: Optional[str] = Field(None, description="画布 ID")
     user_id: Optional[str] = Field(None, description="用户 ID")
     search_mode: str = Field("hybrid", description="检索模式: local | web | hybrid")
-    max_sections: int = Field(6, ge=1, le=12, description="最大章节数")
+    max_sections: int = Field(4, ge=2, le=6, description="最大章节数")
     clarification_answers: Dict[str, str] = Field(
         default_factory=dict,
         description="澄清问题回答 {question_id: answer_text}",
@@ -498,14 +514,17 @@ class DeepResearchRequest(BaseModel):
     # ---- 完整检索参数（与 ChatRequest 保持一致）----
     web_providers: Optional[List[str]] = Field(None, description="Web 搜索来源")
     web_source_configs: Optional[Dict[str, Dict[str, Any]]] = Field(None, description="每个搜索源配置")
+    serpapi_ratio: Optional[float] = Field(None, description="SerpAPI 轮询比例 0-1")
     use_query_optimizer: Optional[bool] = Field(None, description="启用查询优化器")
     query_optimizer_max_queries: Optional[int] = Field(None, description="每个搜索引擎查询数")
     local_top_k: Optional[int] = Field(None, description="本地检索 top_k")
     local_threshold: Optional[float] = Field(None, description="本地检索阈值")
     year_start: Optional[int] = Field(None, ge=1900, le=2100, description="年份窗口起始（硬过滤）")
     year_end: Optional[int] = Field(None, ge=1900, le=2100, description="年份窗口结束（硬过滤）")
-    final_top_k: Optional[int] = Field(None, description="最终保留文档数（合并重排后）")
+    step_top_k: Optional[int] = Field(None, description="每步检索保留文档数（合并重排后）")
+    write_top_k: Optional[int] = Field(None, description="Deep Research 写作阶段保留文档数")
     llm_provider: Optional[str] = Field(None, description="LLM 提供商")
+    ultra_lite_provider: Optional[str] = Field(None, description="超轻量级 LLM 提供商（长文本压缩等）")
     model_override: Optional[str] = Field(None, description="覆盖 provider 默认模型")
     use_agent: bool = Field(False, description="是否使用递归研究 Agent（LangGraph 引擎）")
     output_language: str = Field("auto", description="输出语言: auto | en | zh")
@@ -523,6 +542,7 @@ class DeepResearchStartRequest(BaseModel):
     canvas_id: Optional[str] = Field(None, description="画布 ID")
     user_id: Optional[str] = Field(None, description="用户 ID")
     search_mode: str = Field("hybrid", description="检索模式: local | web | hybrid")
+    max_sections: int = Field(4, ge=2, le=6, description="最大章节数")
     clarification_answers: Optional[Dict[str, str]] = Field(
         None,
         description="澄清问题回答 {question_id: answer_text}",
@@ -538,16 +558,28 @@ class DeepResearchStartRequest(BaseModel):
     )
     web_providers: Optional[List[str]] = Field(None, description="Web 搜索来源")
     web_source_configs: Optional[Dict[str, Dict[str, Any]]] = Field(None, description="每个搜索源配置")
+    serpapi_ratio: Optional[float] = Field(None, description="SerpAPI 轮询比例 0-1")
     use_query_optimizer: Optional[bool] = Field(None, description="启用查询优化器")
     query_optimizer_max_queries: Optional[int] = Field(None, description="每个搜索引擎查询数")
     local_top_k: Optional[int] = Field(None, description="本地检索 top_k")
     local_threshold: Optional[float] = Field(None, description="本地检索阈值")
     year_start: Optional[int] = Field(None, ge=1900, le=2100, description="年份窗口起始（硬过滤）")
     year_end: Optional[int] = Field(None, ge=1900, le=2100, description="年份窗口结束（硬过滤）")
-    final_top_k: Optional[int] = Field(None, description="最终保留文档数")
+    step_top_k: Optional[int] = Field(None, description="每步检索保留文档数")
+    write_top_k: Optional[int] = Field(None, description="Deep Research 写作阶段保留文档数")
     llm_provider: Optional[str] = Field(None, description="LLM 提供商")
+    ultra_lite_provider: Optional[str] = Field(None, description="超轻量级 LLM 提供商（长文本压缩等）")
     model_override: Optional[str] = Field(None, description="覆盖 provider 默认模型")
     collection: Optional[str] = Field(None, description="本地检索目标 collection")
+    use_content_fetcher: Optional[str] = Field(None, description="全文抓取模式: auto | force | off")
+    gap_query_intent: Optional[str] = Field(
+        None,
+        description="Gap 查询意图: broad | review_pref | reviews_only",
+    )
+    reranker_mode: Optional[str] = Field(
+        None,
+        description="重排序模式: bge_only | colbert_only | cascade；研究过程强制 bge_only，写作阶段使用此值",
+    )
 
 
 class DeepResearchStartResponse(BaseModel):
@@ -588,16 +620,28 @@ class DeepResearchConfirmRequest(BaseModel):
     )
     web_providers: Optional[List[str]] = Field(None, description="Web 搜索来源")
     web_source_configs: Optional[Dict[str, Dict[str, Any]]] = Field(None, description="每个搜索源配置")
+    serpapi_ratio: Optional[float] = Field(None, description="SerpAPI 轮询比例 0-1")
     use_query_optimizer: Optional[bool] = Field(None, description="启用查询优化器")
     query_optimizer_max_queries: Optional[int] = Field(None, description="每个搜索引擎查询数")
     local_top_k: Optional[int] = Field(None, description="本地检索 top_k")
     local_threshold: Optional[float] = Field(None, description="本地检索阈值")
     year_start: Optional[int] = Field(None, ge=1900, le=2100, description="年份窗口起始（硬过滤）")
     year_end: Optional[int] = Field(None, ge=1900, le=2100, description="年份窗口结束（硬过滤）")
-    final_top_k: Optional[int] = Field(None, description="最终保留文档数")
+    step_top_k: Optional[int] = Field(None, description="每步检索保留文档数")
+    write_top_k: Optional[int] = Field(None, description="Deep Research 写作阶段保留文档数")
     llm_provider: Optional[str] = Field(None, description="LLM 提供商")
+    ultra_lite_provider: Optional[str] = Field(None, description="超轻量级 LLM 提供商（长文本压缩等）")
     model_override: Optional[str] = Field(None, description="覆盖 provider 默认模型")
     collection: Optional[str] = Field(None, description="本地检索目标 collection")
+    use_content_fetcher: Optional[str] = Field(None, description="全文抓取模式: auto | force | off")
+    gap_query_intent: Optional[str] = Field(
+        None,
+        description="Gap 查询意图: broad | review_pref | reviews_only",
+    )
+    reranker_mode: Optional[str] = Field(
+        None,
+        description="重排序模式: bge_only | colbert_only | cascade；研究过程强制 bge_only，写作阶段使用此值",
+    )
     user_context: Optional[str] = Field(
         None,
         description="用户补充的观点/约束（仅本次 Deep Research 使用，不写入持久知识库）",
@@ -623,6 +667,7 @@ class DeepResearchConfirmRequest(BaseModel):
         False,
         description="跳过前置论点提炼（Claim Generation）阶段，直接进入写作",
     )
+    max_sections: int = Field(4, ge=2, le=6, description="最大章节数")
 
 
 class DeepResearchSubmitResponse(BaseModel):
@@ -632,6 +677,22 @@ class DeepResearchSubmitResponse(BaseModel):
     job_id: str = Field(..., description="后台任务 ID")
     session_id: str = Field("", description="会话 ID")
     canvas_id: str = Field("", description="画布 ID")
+
+
+class DeepResearchRestartPhaseRequest(BaseModel):
+    """Restart deep-research from a major phase."""
+
+    phase: str = Field(
+        ...,
+        description="重启阶段: plan | research | generate_claims | write | verify | review_gate | synthesize",
+    )
+
+
+class DeepResearchRestartSectionRequest(BaseModel):
+    """Restart deep-research for a specific outline section."""
+
+    section_title: str = Field(..., min_length=1, description="章节标题（与 confirmed_outline 一致）")
+    action: str = Field("research", description="重启动作: research | write")
 
 
 class DeepResearchJobInfo(BaseModel):

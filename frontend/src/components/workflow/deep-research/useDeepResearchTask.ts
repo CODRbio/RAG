@@ -4,6 +4,8 @@ import {
   clarifyForDeepResearch,
   deepResearchStart,
   deepResearchSubmit,
+  restartDeepResearchPhase,
+  restartDeepResearchSection,
   getDeepResearchJob,
   streamDeepResearchEvents,
   cancelDeepResearchJob,
@@ -35,6 +37,7 @@ export type GeneratePlanParams = {
   outputLanguage: 'auto' | 'en' | 'zh';
   stepModels: Record<string, string>;
   stepModelStrict: boolean;
+  maxSections: number;
 };
 
 export type ConfirmAndRunParams = GeneratePlanParams & {
@@ -68,6 +71,15 @@ export type UseDeepResearchTaskReturn = {
   generatePlan: (params: GeneratePlanParams) => Promise<void>;
   confirmAndRun: (params: ConfirmAndRunParams) => Promise<void>;
   stopJob: () => Promise<void>;
+  restartFromPhase: (
+    phase: 'plan' | 'research' | 'generate_claims' | 'write' | 'verify' | 'review_gate' | 'synthesize',
+    sourceJobId?: string,
+  ) => Promise<void>;
+  restartSection: (
+    sectionTitle: string,
+    action: 'research' | 'write',
+    sourceJobId?: string,
+  ) => Promise<void>;
   handleInsertOptimizationPrompt: (text: string, setUserContext: React.Dispatch<React.SetStateAction<string>>) => void;
 };
 
@@ -96,6 +108,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
     selectedProvider,
     selectedModel,
     currentCollection,
+    deepResearchDefaults,
   } = useConfigStore();
   const addToast = useToastStore((s) => s.addToast);
   const { setCanvas, setCanvasContent, setIsLoading: setCanvasLoading, setActiveStage } = useCanvasStore();
@@ -115,6 +128,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
   const abortControllerRef = useRef<AbortController | null>(null);
   const lastEventIdRef = useRef(0);
   const canvasRefreshCounterRef = useRef(0);
+  const latestJobIdRef = useRef<string | null>(null);
 
   const stopStreaming = () => {
     if (abortControllerRef.current) {
@@ -288,6 +302,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
   };
 
   const finalizeRunningJob = async (jobId: string) => {
+    latestJobIdRef.current = jobId;
     try {
       const job = await getDeepResearchJob(jobId);
       if (job.session_id) setSessionId(job.session_id);
@@ -339,6 +354,10 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       }
     } finally {
       stopStreaming();
+      const finishedJobId = localStorage.getItem(DEEP_RESEARCH_JOB_KEY);
+      if (finishedJobId) {
+        archiveJobId(finishedJobId);
+      }
       localStorage.removeItem(DEEP_RESEARCH_JOB_KEY);
       setActiveJobId(null);
       setIsStopping(false);
@@ -358,6 +377,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       setOptimizationPromptDraft('');
     }
     setActiveJobId(jobId);
+    latestJobIdRef.current = jobId;
     localStorage.setItem(DEEP_RESEARCH_JOB_KEY, jobId);
 
     const ac = new AbortController();
@@ -459,12 +479,16 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       try {
         const job = await getDeepResearchJob(savedJobId);
         if (cancelled) return;
-        const isRunnable = job.status === 'running' || job.status === 'cancelling';
+        const isRunnable = job.status === 'pending'
+          || job.status === 'running'
+          || job.status === 'cancelling'
+          || job.status === 'waiting_review';
         const sameSession = !job.session_id || job.session_id === sessionId;
         const requestedTopic = (useChatStore.getState().deepResearchTopic || '').trim();
         const runningTopic = String(job.topic || '').trim();
         const sameTopic = !requestedTopic || !runningTopic || requestedTopic === runningTopic;
         if (!isRunnable) {
+          archiveJobId(savedJobId);
           localStorage.removeItem(DEEP_RESEARCH_JOB_KEY);
           return;
         }
@@ -480,6 +504,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
         addToast('已恢复 Deep Research 后台任务状态', 'info');
       } catch (err) {
         console.debug('[DeepResearch] skip stale saved job:', err);
+        archiveJobId(savedJobId);
         localStorage.removeItem(DEEP_RESEARCH_JOB_KEY);
       }
     })();
@@ -500,12 +525,15 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       .filter((s) => s.enabled)
       .map((s) => s.id);
 
-    const webSourceConfigs: Record<string, { topK: number; threshold: number }> = {};
+    const webSourceConfigs: Record<string, { topK: number; threshold: number; useSerpapi?: boolean }> = {};
     webSearchConfig.sources.forEach((source) => {
       if (source.enabled) {
-        webSourceConfigs[source.id] = { topK: source.topK, threshold: source.threshold };
+        const cfg: { topK: number; threshold: number; useSerpapi?: boolean } = { topK: source.topK, threshold: source.threshold };
+        if (source.useSerpapi) cfg.useSerpapi = true;
+        webSourceConfigs[source.id] = cfg;
       }
     });
+    const hasAnySerpapi = webSearchConfig.sources.some((s) => s.enabled && s.useSerpapi);
 
     const localEnabled = ragConfig.enabled ?? true;
     const webEnabled = webSearchConfig.enabled && enabledProviders.length > 0;
@@ -521,7 +549,14 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
 
     const queryOptimizerEnabled = Boolean(webSearchConfig.queryOptimizer ?? true);
     const maxQueries = Math.min(5, Math.max(1, Number(webSearchConfig.maxQueriesPerProvider ?? 3)));
-    const deepFinalTopK = Math.max(ragConfig.finalTopK ?? 10, 30);
+    const deepStepTopK = Math.max(ragConfig.stepTopK ?? 10, 40);
+    const deepWriteTopK = Math.max(
+      ragConfig.writeTopK ?? 15,
+      Math.ceil((ragConfig.stepTopK ?? 10) * 1.5),
+    );
+    const gapQueryIntent = (deepResearchDefaults.gapQueryIntent || 'broad') as 'broad' | 'review_pref' | 'reviews_only';
+
+    const serpapiRatio = hasAnySerpapi ? (webSearchConfig.serpapiRatio ?? 50) / 100 : undefined;
 
     return {
       searchMode,
@@ -531,7 +566,10 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       localEnabled,
       queryOptimizerEnabled,
       maxQueries,
-      deepFinalTopK,
+      deepStepTopK,
+      deepWriteTopK,
+      gapQueryIntent,
+      serpapiRatio,
     };
   };
 
@@ -603,7 +641,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
   };
 
   const generatePlan = async (params: GeneratePlanParams) => {
-    const { topic, answers, outputLanguage, stepModels, stepModelStrict } = params;
+    const { topic, answers, outputLanguage, stepModels, stepModelStrict, maxSections } = params;
     if (!topic.trim()) {
       addToast('请输入研究主题', 'error');
       return;
@@ -616,7 +654,10 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       localEnabled,
       queryOptimizerEnabled,
       maxQueries,
-      deepFinalTopK,
+      deepStepTopK,
+      deepWriteTopK,
+      gapQueryIntent,
+      serpapiRatio,
     } = buildCommonRequestParams();
     const hasNonEmptyAnswers = Object.values(answers).some((v) => v.trim().length > 0);
     const startRequest: DeepResearchStartRequest = {
@@ -625,17 +666,26 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       canvas_id: canvasId || undefined,
       collection: currentCollection || undefined,
       search_mode: searchMode,
+      max_sections: maxSections,
       llm_provider: selectedProvider || undefined,
+      ultra_lite_provider: deepResearchDefaults.ultra_lite_provider || undefined,
       model_override: selectedModel || undefined,
       web_providers: webEnabled ? enabledProviders : undefined,
       web_source_configs: (webEnabled && Object.keys(webSourceConfigs).length > 0) ? webSourceConfigs : undefined,
+      serpapi_ratio: (webEnabled && serpapiRatio !== undefined) ? serpapiRatio : undefined,
       use_query_optimizer: webEnabled ? queryOptimizerEnabled : undefined,
       query_optimizer_max_queries: webEnabled ? maxQueries : undefined,
-      local_top_k: localEnabled ? Math.max(ragConfig.localTopK, 15) : undefined,
+      use_content_fetcher: webEnabled ? webSearchConfig.contentFetcherMode : undefined,
+      gap_query_intent: gapQueryIntent,
+      local_top_k: localEnabled ? ragConfig.localTopK : undefined,
       local_threshold: localEnabled ? (ragConfig.localThreshold ?? undefined) : undefined,
       year_start: ragConfig.yearStart ?? undefined,
       year_end: ragConfig.yearEnd ?? undefined,
-      final_top_k: deepFinalTopK,
+      step_top_k: deepStepTopK,
+      write_top_k: deepWriteTopK,
+      reranker_mode: ragConfig.enableReranker
+        ? ((localStorage.getItem('adv_reranker_mode') || 'cascade') as 'bge_only' | 'colbert_only' | 'cascade')
+        : 'bge_only',
       clarification_answers: hasNonEmptyAnswers ? answers : undefined,
       output_language: outputLanguage,
       step_models: normalizeStepModels(stepModels),
@@ -664,7 +714,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
   const confirmAndRun = async (params: ConfirmAndRunParams) => {
     const {
       topic, outlineDraft: rawOutline, briefDraft: brief, outputLanguage,
-      stepModels, stepModelStrict, userContext, userContextMode, tempDocuments,
+      stepModels, stepModelStrict, maxSections, userContext, userContextMode, tempDocuments,
       depth, skipDraftReview, skipRefineReview, skipClaimGeneration, keepPreviousJobId,
     } = params;
     if (!topic.trim()) return;
@@ -681,7 +731,10 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       localEnabled,
       queryOptimizerEnabled,
       maxQueries,
-      deepFinalTopK,
+      deepStepTopK,
+      deepWriteTopK,
+      gapQueryIntent,
+      serpapiRatio,
     } = buildCommonRequestParams();
 
     setDeepResearchActive(true);
@@ -703,16 +756,24 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       step_models: normalizeStepModels(stepModels),
       step_model_strict: stepModelStrict,
       llm_provider: selectedProvider || undefined,
+      ultra_lite_provider: deepResearchDefaults.ultra_lite_provider || undefined,
       model_override: selectedModel || undefined,
       web_providers: webEnabled ? enabledProviders : undefined,
       web_source_configs: (webEnabled && Object.keys(webSourceConfigs).length > 0) ? webSourceConfigs : undefined,
+      serpapi_ratio: (webEnabled && serpapiRatio !== undefined) ? serpapiRatio : undefined,
       use_query_optimizer: webEnabled ? queryOptimizerEnabled : undefined,
       query_optimizer_max_queries: webEnabled ? maxQueries : undefined,
-      local_top_k: localEnabled ? Math.max(ragConfig.localTopK, 15) : undefined,
+      use_content_fetcher: webEnabled ? webSearchConfig.contentFetcherMode : undefined,
+      gap_query_intent: gapQueryIntent,
+      local_top_k: localEnabled ? ragConfig.localTopK : undefined,
       local_threshold: localEnabled ? (ragConfig.localThreshold ?? undefined) : undefined,
       year_start: ragConfig.yearStart ?? undefined,
       year_end: ragConfig.yearEnd ?? undefined,
-      final_top_k: deepFinalTopK,
+      step_top_k: deepStepTopK,
+      write_top_k: deepWriteTopK,
+      reranker_mode: ragConfig.enableReranker
+        ? ((localStorage.getItem('adv_reranker_mode') || 'cascade') as 'bge_only' | 'colbert_only' | 'cascade')
+        : 'bge_only',
       user_context: userContext.trim() || undefined,
       user_context_mode: userContext.trim() ? userContextMode : undefined,
       user_documents: tempDocuments.length ? tempDocuments : undefined,
@@ -720,6 +781,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       skip_draft_review: skipDraftReview,
       skip_refine_review: skipRefineReview,
       skip_claim_generation: skipClaimGeneration,
+      max_sections: maxSections,
     };
 
     let submitted = false;
@@ -741,6 +803,8 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       addToast('Deep Research 失败，请重试', 'error');
       appendToLastMessage('\n\n[错误] Deep Research 请求失败。');
       stopStreaming();
+      const failedJobId = localStorage.getItem(DEEP_RESEARCH_JOB_KEY);
+      if (failedJobId) archiveJobId(failedJobId);
       localStorage.removeItem(DEEP_RESEARCH_JOB_KEY);
       setActiveJobId(null);
       setDeepResearchActive(false);
@@ -762,6 +826,86 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       console.error('[DeepResearch] Cancel failed:', err);
       setIsStopping(false);
       addToast('停止任务失败，请重试', 'error');
+    }
+  };
+
+  const resolveSourceJobId = (provided?: string): string | null => {
+    if (provided && provided.trim()) return provided.trim();
+    if (activeJobId) return activeJobId;
+    if (latestJobIdRef.current) return latestJobIdRef.current;
+    const saved = localStorage.getItem(DEEP_RESEARCH_JOB_KEY);
+    if (saved && saved.trim()) return saved.trim();
+    try {
+      const raw = localStorage.getItem(DEEP_RESEARCH_ARCHIVED_JOBS_KEY);
+      const parsed = raw ? JSON.parse(raw) : [];
+      if (Array.isArray(parsed) && parsed.length > 0 && typeof parsed[0] === 'string') {
+        return parsed[0];
+      }
+    } catch {
+      // noop
+    }
+    return null;
+  };
+
+  const restartFromPhase = async (
+    phaseToRestart: 'plan' | 'research' | 'generate_claims' | 'write' | 'verify' | 'review_gate' | 'synthesize',
+    sourceJobId?: string,
+  ) => {
+    const source = resolveSourceJobId(sourceJobId);
+    if (!source) {
+      addToast('未找到可重启的 Deep Research 任务', 'warning');
+      return;
+    }
+    setDeepResearchActive(true);
+    setPhase('running');
+    setIsStreaming(true);
+    try {
+      const resp = await restartDeepResearchPhase(source, { phase: phaseToRestart });
+      if (resp.session_id) setSessionId(resp.session_id);
+      if (resp.canvas_id) setCanvasId(resp.canvas_id);
+      startStreamingJob(resp.job_id, true);
+      addToast('已提交重启任务，进入后台执行', 'success');
+    } catch (err) {
+      console.error('[DeepResearch] restart phase failed:', err);
+      setIsStreaming(false);
+      setDeepResearchActive(false);
+      setPhase('confirm');
+      addToast('重启任务失败，请重试', 'error');
+    }
+  };
+
+  const restartSection = async (
+    sectionTitle: string,
+    action: 'research' | 'write',
+    sourceJobId?: string,
+  ) => {
+    const source = resolveSourceJobId(sourceJobId);
+    if (!source) {
+      addToast('未找到可重启的 Deep Research 任务', 'warning');
+      return;
+    }
+    if (!sectionTitle.trim()) {
+      addToast('章节标题不能为空', 'warning');
+      return;
+    }
+    setDeepResearchActive(true);
+    setPhase('running');
+    setIsStreaming(true);
+    try {
+      const resp = await restartDeepResearchSection(source, {
+        section_title: sectionTitle.trim(),
+        action,
+      });
+      if (resp.session_id) setSessionId(resp.session_id);
+      if (resp.canvas_id) setCanvasId(resp.canvas_id);
+      startStreamingJob(resp.job_id, true);
+      addToast(`已提交章节重启：${sectionTitle}`, 'success');
+    } catch (err) {
+      console.error('[DeepResearch] restart section failed:', err);
+      setIsStreaming(false);
+      setDeepResearchActive(false);
+      setPhase('confirm');
+      addToast('章节重启失败，请重试', 'error');
     }
   };
 
@@ -797,6 +941,8 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
     generatePlan,
     confirmAndRun,
     stopJob,
+    restartFromPhase,
+    restartSection,
     handleInsertOptimizationPrompt,
   };
 }

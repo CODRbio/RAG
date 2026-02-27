@@ -32,6 +32,8 @@ interface ConfirmPhaseProps {
   onSkipRefineReviewChange: (v: boolean) => void;
   skipClaimGeneration: boolean;
   onSkipClaimGenerationChange: (v: boolean) => void;
+  maxSections: number;
+  onMaxSectionsChange: (v: number) => void;
   keepPreviousJobId: boolean;
   onKeepPreviousJobIdChange: (v: boolean) => void;
   userContext: string;
@@ -64,6 +66,8 @@ export function ConfirmPhase({
   onSkipRefineReviewChange,
   skipClaimGeneration,
   onSkipClaimGenerationChange,
+  maxSections,
+  onMaxSectionsChange,
   keepPreviousJobId,
   onKeepPreviousJobIdChange,
   userContext,
@@ -230,6 +234,43 @@ export function ConfirmPhase({
           <Plus size={12} /> Add section
         </button>
         <div className="text-xs text-gray-500">可拖拽左侧图标调整章节顺序。</div>
+      </div>
+
+      {/* Max Sections */}
+      <div className="bg-gray-50 border border-gray-200 rounded-lg p-3 space-y-2">
+        <div className="flex items-center justify-between">
+          <div className="text-sm font-medium text-gray-700">Max Sections (章节数量)</div>
+          <span className="text-xs text-indigo-600 font-medium">{maxSections} 节</span>
+        </div>
+        <div className="flex items-center gap-3">
+          <input
+            type="range"
+            min={2}
+            max={6}
+            step={1}
+            value={maxSections}
+            onChange={(e) => onMaxSectionsChange(parseInt(e.target.value, 10))}
+            className="flex-1 accent-indigo-500"
+          />
+          <div className="flex gap-1">
+            {[2, 3, 4, 5, 6].map((n) => (
+              <button
+                key={n}
+                onClick={() => onMaxSectionsChange(n)}
+                className={`w-6 h-6 text-[10px] rounded border transition-colors ${
+                  maxSections === n
+                    ? 'bg-indigo-500 text-white border-indigo-500'
+                    : 'bg-white text-gray-600 border-gray-300 hover:border-indigo-300'
+                }`}
+              >
+                {n}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="text-[10px] text-gray-500">
+          生成大纲时建议的章节数量，实际章节可在下方编辑调整。
+        </div>
       </div>
 
       {/* Research Depth */}

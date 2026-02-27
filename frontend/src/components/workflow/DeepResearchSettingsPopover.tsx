@@ -1,6 +1,7 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useMemo } from 'react';
 import { Settings, X, HelpCircle } from 'lucide-react';
 import { useConfigStore } from '../../stores';
+import { listLLMProviders, listAllLiveModels, type LLMProviderInfo } from '../../api/ingest';
 
 /** Hover tooltip with delay, matching Sidebar HelpTooltip pattern */
 function Tip({ content, children }: { content: string; children: React.ReactNode }) {
@@ -29,29 +30,23 @@ function Tip({ content, children }: { content: string; children: React.ReactNode
   );
 }
 
-/**
- * Per-step model options for Deep Research.
- * value = "provider::model" or "" for default.
- */
-const STEP_MODEL_OPTIONS = [
-  { value: '', label: 'Default (global model)' },
-  // Sonar (search-optimized)
-  { value: 'sonar::sonar', label: 'sonar (search)' },
-  { value: 'sonar::sonar-pro', label: 'sonar-pro (search)' },
-  { value: 'sonar::sonar-reasoning-pro', label: 'sonar-reasoning-pro' },
-  // DeepSeek
-  { value: 'deepseek::deepseek-chat', label: 'deepseek-chat' },
-  { value: 'deepseek-thinking::deepseek-reasoner', label: 'deepseek-reasoner (thinking)' },
-  // Claude
-  { value: 'claude::claude-sonnet-4-5', label: 'claude-sonnet-4.5' },
-  { value: 'claude::claude-haiku-4-5', label: 'claude-haiku-4.5' },
-  { value: 'claude-thinking::claude-sonnet-4-5', label: 'claude-sonnet-4.5 (thinking)' },
-  // Gemini
-  { value: 'gemini::gemini-pro-latest', label: 'gemini-pro' },
-  { value: 'gemini::gemini-flash-latest', label: 'gemini-flash' },
-  // Kimi
-  { value: 'kimi::kimi-k2.5', label: 'kimi-k2.5' },
-];
+interface StepModelOption { value: string; label: string; }
+
+function providerSuffix(id: string): string {
+  const parts = id.split('-').slice(1);
+  return parts.length ? ` (${parts.join('-')})` : '';
+}
+
+function buildStepModelOptions(providers: LLMProviderInfo[]): StepModelOption[] {
+  const opts: StepModelOption[] = [{ value: '', label: 'Default (global model)' }];
+  for (const p of providers) {
+    const suffix = providerSuffix(p.id);
+    for (const modelKey of p.models) {
+      opts.push({ value: `${p.id}::${modelKey}`, label: `${modelKey}${suffix}` });
+    }
+  }
+  return opts;
+}
 
 const RESEARCH_STEPS = ['scope', 'plan', 'research', 'evaluate', 'write', 'verify', 'synthesize'] as const;
 
@@ -63,6 +58,30 @@ interface Props {
 export function DeepResearchSettingsPopover({ open, onClose }: Props) {
   const { deepResearchDefaults, updateDeepResearchDefaults, setDeepResearchStepModel } = useConfigStore();
   const popoverRef = useRef<HTMLDivElement>(null);
+  const [llmProviders, setLlmProviders] = useState<LLMProviderInfo[]>([]);
+
+  useEffect(() => {
+    listLLMProviders()
+      .then((data) => {
+        if (!data.providers?.length) return;
+        setLlmProviders(data.providers);
+        // Async enrich with live model IDs
+        listAllLiveModels().then((live) => {
+          const platformModels = live.platforms ?? {};
+          setLlmProviders((prev) =>
+            prev.map((p) => {
+              const platform = p.platform ?? p.id.split('-')[0];
+              const liveEntry = platformModels[platform];
+              if (liveEntry?.models?.length) return { ...p, models: liveEntry.models };
+              return p;
+            }),
+          );
+        }).catch(() => {});
+      })
+      .catch(() => {});
+  }, []);
+
+  const stepModelOptions = useMemo(() => buildStepModelOptions(llmProviders), [llmProviders]);
 
   // Close on outside click
   useEffect(() => {
@@ -160,6 +179,25 @@ export function DeepResearchSettingsPopover({ open, onClose }: Props) {
           </select>
         </div>
 
+        {/* Gap Query Intent */}
+        <div>
+          <label className="flex items-center gap-1 text-[11px] font-medium text-gray-600 mb-1">
+            Gap Query Intent
+            <Tip content="Controls review preference for Round 2+ gap queries: Broad (default) avoids strict review bias; Prefer review lightly adds review intent; Reviews only applies strict review constraints where supported.">
+              <HelpCircle size={11} />
+            </Tip>
+          </label>
+          <select
+            value={deepResearchDefaults.gapQueryIntent}
+            onChange={(e) => updateDeepResearchDefaults({ gapQueryIntent: e.target.value as 'broad' | 'review_pref' | 'reviews_only' })}
+            className="w-full border border-gray-200 rounded-lg px-2.5 py-1.5 text-[11px] bg-white text-gray-900 focus:ring-2 focus:ring-indigo-500 outline-none"
+          >
+            <option value="broad">Broad (default)</option>
+            <option value="review_pref">Prefer review (soft)</option>
+            <option value="reviews_only">Reviews only (strict)</option>
+          </select>
+        </div>
+
         {/* Per-step Models */}
         <div>
           <label className="flex items-center gap-1 text-[11px] font-medium text-gray-600 mb-1.5">
@@ -177,7 +215,7 @@ export function DeepResearchSettingsPopover({ open, onClose }: Props) {
                   onChange={(e) => setDeepResearchStepModel(step, e.target.value)}
                   className="border border-gray-200 rounded-md px-1.5 py-1 text-[10px] bg-white text-gray-900 focus:ring-1 focus:ring-indigo-400 outline-none"
                 >
-                  {STEP_MODEL_OPTIONS.map((opt) => (
+                  {stepModelOptions.map((opt) => (
                     <option key={`${step}-${opt.value}`} value={opt.value}>{opt.label}</option>
                   ))}
                 </select>
@@ -217,6 +255,30 @@ export function DeepResearchSettingsPopover({ open, onClose }: Props) {
             className="accent-indigo-500"
           />
         </label>
+
+        {/* Max Sections */}
+        <div>
+          <label className="flex items-center gap-1 text-[11px] font-medium text-gray-600 mb-1.5">
+            Max Sections (大纲章节数)
+            <Tip content="控制生成大纲的最大章节数量。建议 2-6 节，默认 4 节。较少的章节适合聚焦性研究，较多章节适合全面综述。">
+              <HelpCircle size={11} />
+            </Tip>
+          </label>
+          <div className="flex items-center gap-3">
+            <input
+              type="range"
+              min={2}
+              max={6}
+              step={1}
+              value={deepResearchDefaults.maxSections}
+              onChange={(e) => updateDeepResearchDefaults({ maxSections: parseInt(e.target.value, 10) })}
+              className="flex-1 accent-indigo-500"
+            />
+            <span className="text-[11px] font-medium text-indigo-600 w-6 text-center">
+              {deepResearchDefaults.maxSections}
+            </span>
+          </div>
+        </div>
       </div>
 
       {/* Footer */}

@@ -107,7 +107,7 @@
 - `confirmed_outline`、`confirmed_brief`
 - `output_language`、`step_models`、`step_model_strict`
 - `skip_draft_review`、`skip_refine_review`
-- 检索参数（`web_providers`、`local_top_k`、`final_top_k` 等）
+- 检索参数（`web_providers`、`local_top_k`、`step_top_k`、`write_top_k` 等）
 
 **研究深度（`depth`）：**
 - `lite`：快速探索（~5-15 min）

@@ -10,24 +10,25 @@ Known gaps: {gaps_block}
 User materials: {temp_block}
 {user_context_block}
 
-{bilingual_instruction}
-
 Category A — RECALL queries ({recall_budget} queries):
 Purpose: cast a wide net. Short keyword phrases (3-6 words).
 Use synonyms, abbreviations, alternative naming conventions, different research schools.
 Style: keyword phrases — suited for scholar / semantic / ncbi / google and local vector search.
 Example: "deep-sea mussel symbiosis immune" / "Bathymodiolus innate immunity"
+{bilingual_academic_instruction}
 
 Category B — PRECISION queries ({precision_budget} queries):
 Purpose: find specific evidence. Longer keyword phrases (6-12 words) with
 method/technique, data type, model organism, time period, or mechanism constraints.
 Style: keyword phrases — suited for scholar / ncbi.
 Example: "Bathymodiolus transcriptome toll-like receptor signaling pathway 2020-2024"
+{bilingual_academic_instruction}
 
 Category C — DISCOVERY queries ({discovery_budget} query per language):
 Purpose: surface background knowledge and fill conceptual gaps via conversational engines.
 Style: full natural-language questions — suited for tavily and local vector search.
 Example: "What are the key immune mechanisms in deep-sea mussel symbiosis?"
+{bilingual_discovery_instruction}
 
 Format (strict, no numbering):
 RECALL:

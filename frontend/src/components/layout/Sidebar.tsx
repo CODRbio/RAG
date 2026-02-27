@@ -1,10 +1,9 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   Layers,
   Shield,
   Cpu,
-  Network,
   Filter,
   Globe,
   Database,
@@ -20,13 +19,16 @@ import {
   DownloadCloud,
   CloudCheck,
   HelpCircle,
+  Telescope,
+  Square,
 } from 'lucide-react';
 import { useAuthStore, useConfigStore, useUIStore, useToastStore, useChatStore, useCanvasStore } from '../../stores';
 import { checkHealth } from '../../api/health';
-import { listSessions, deleteSession } from '../../api/chat';
+import { listSessions, deleteSession, listDeepResearchJobs, cancelDeepResearchJob } from '../../api/chat';
 import { getModelStatus, syncModels } from '../../api/models';
 import { exportCanvas, getCanvas } from '../../api/canvas';
-import type { SessionListItem } from '../../types';
+import type { SessionListItem, DeepResearchJobInfo, ResearchDashboardData } from '../../types';
+import { DEEP_RESEARCH_JOB_KEY, DEEP_RESEARCH_ARCHIVED_JOBS_KEY } from '../workflow/deep-research/types';
 
 interface SidebarProps {
   onStartResize: () => void;
@@ -104,6 +106,8 @@ export function Sidebar({ onStartResize }: SidebarProps) {
     updateWebSourceParam,
     setQueryOptimizer,
     setMaxQueriesPerProvider,
+    toggleSourceSerpapi,
+    setSerpapiRatio,
     setAgentMode,
   } = useConfigStore();
 
@@ -111,16 +115,67 @@ export function Sidebar({ onStartResize }: SidebarProps) {
     sidebarWidth,
     isSidebarOpen,
     setShowSettingsModal,
+    setCanvasOpen,
   } = useUIStore();
 
-  const { loadSession, isLoadingSession, sessionId: currentSessionId } = useChatStore();
-  const { setCanvas, setCanvasContent, clearCanvas, setIsLoading: setCanvasLoading } = useCanvasStore();
+  const {
+    loadSession,
+    isLoadingSession,
+    sessionId: currentSessionId,
+    setShowDeepResearchDialog,
+    setDeepResearchTopic,
+    setResearchDashboard,
+    setSessionId,
+    setCanvasId,
+  } = useChatStore();
+  const { setCanvas, setCanvasContent, clearCanvas, setIsLoading: setCanvasLoading, setActiveStage } = useCanvasStore();
 
   const [showQuerySettings, setShowQuerySettings] = useState(false);
   const [chatHistory, setChatHistory] = useState<SessionListItem[]>([]);
+  const [backgroundJobs, setBackgroundJobs] = useState<DeepResearchJobInfo[]>([]);
+  const [stoppingJobId, setStoppingJobId] = useState<string | null>(null);
   const [isLoadingSessions, setIsLoadingSessions] = useState(false);
+  const [isLoadingJobs, setIsLoadingJobs] = useState(false);
   const [isSyncingModels, setIsSyncingModels] = useState(false);
   const [modelStatusSummary, setModelStatusSummary] = useState<string | null>(null);
+
+  // 加载后台 Deep Research 任务（运行中 + 近期完成）
+  const loadBackgroundJobs = useCallback(async () => {
+    if (dbStatus !== 'connected') return;
+    setIsLoadingJobs(true);
+    try {
+      const jobs = await listDeepResearchJobs(15);
+      const raw = localStorage.getItem(DEEP_RESEARCH_ARCHIVED_JOBS_KEY);
+      const archived: string[] = raw ? (JSON.parse(raw) || []).filter((x: unknown) => typeof x === 'string') : [];
+      const filtered = jobs.filter((j) => !archived.includes(j.job_id));
+      const runnable = ['pending', 'running', 'cancelling', 'waiting_review'];
+      const sorted = filtered.sort((a, b) => {
+        const aRunning = runnable.includes(a.status);
+        const bRunning = runnable.includes(b.status);
+        if (aRunning !== bRunning) return aRunning ? -1 : 1;
+        return (b.updated_at || 0) - (a.updated_at || 0);
+      });
+      setBackgroundJobs(sorted);
+    } catch (error) {
+      console.error('[Sidebar] Failed to load background jobs:', error);
+    } finally {
+      setIsLoadingJobs(false);
+    }
+  }, [dbStatus]);
+
+  useEffect(() => {
+    loadBackgroundJobs();
+  }, [loadBackgroundJobs]);
+
+  // 有运行中任务时定期刷新状态
+  const hasRunningJob = backgroundJobs.some((j) =>
+    ['pending', 'running', 'cancelling', 'waiting_review'].includes(j.status),
+  );
+  useEffect(() => {
+    if (!hasRunningJob || dbStatus !== 'connected') return;
+    const t = setInterval(loadBackgroundJobs, 15000);
+    return () => clearInterval(t);
+  }, [hasRunningJob, dbStatus, loadBackgroundJobs]);
 
   // 加载会话历史
   useEffect(() => {
@@ -178,6 +233,92 @@ export function Sidebar({ onStartResize }: SidebarProps) {
     } catch (error) {
       addToast(t('sidebar.loadSessionFailed'), 'error');
     }
+  };
+
+  const handleRestoreBackgroundJob = async (job: DeepResearchJobInfo) => {
+    const runnable = ['pending', 'running', 'cancelling', 'waiting_review'];
+    try {
+      localStorage.setItem(DEEP_RESEARCH_JOB_KEY, job.job_id);
+      setDeepResearchTopic(job.topic || '');
+      setResearchDashboard((job.result_dashboard as unknown as ResearchDashboardData) || null);
+      setSessionId(job.session_id || null);
+      setCanvasId(job.canvas_id || null);
+      if (job.session_id) {
+        await loadSession(job.session_id);
+      } else {
+        setSessionId(null);
+        setCanvasId(job.canvas_id || null);
+      }
+      if (!job.session_id && job.canvas_id) {
+        clearCanvas();
+        setCanvasLoading(true);
+        try {
+          const canvasPromise = getCanvas(job.canvas_id).catch(() => null);
+          const exportPromise = exportCanvas(job.canvas_id, 'markdown').catch(() => null);
+          const [canvasData, exportResp] = await Promise.all([canvasPromise, exportPromise]);
+          if (canvasData) {
+            setCanvas(canvasData);
+            setActiveStage(canvasData.stage || 'explore');
+          }
+          if (exportResp?.content) setCanvasContent(exportResp.content);
+        } catch (err) {
+          console.error('[Sidebar] Failed to load canvas for job:', err);
+        } finally {
+          setCanvasLoading(false);
+        }
+      }
+      setShowDeepResearchDialog(true);
+      setCanvasOpen(true);
+      addToast(
+        runnable.includes(job.status)
+          ? t('sidebar.bgJobRestoredRunning')
+          : t('sidebar.bgJobRestored'),
+        'success',
+      );
+    } catch (error) {
+      addToast(t('sidebar.bgJobRestoreFailed'), 'error');
+      console.error('[Sidebar] Restore background job failed:', error);
+    }
+  };
+
+  const archiveBackgroundJob = (jobId: string) => {
+    try {
+      const raw = localStorage.getItem(DEEP_RESEARCH_ARCHIVED_JOBS_KEY);
+      const ids: string[] = raw ? (JSON.parse(raw) || []).filter((x: unknown) => typeof x === 'string') : [];
+      const next = [jobId, ...ids.filter((id) => id !== jobId)].slice(0, 20);
+      localStorage.setItem(DEEP_RESEARCH_ARCHIVED_JOBS_KEY, JSON.stringify(next));
+      setBackgroundJobs((prev) => prev.filter((j) => j.job_id !== jobId));
+      if (localStorage.getItem(DEEP_RESEARCH_JOB_KEY) === jobId) {
+        localStorage.removeItem(DEEP_RESEARCH_JOB_KEY);
+      }
+    } catch (err) {
+      console.error('[Sidebar] archive job failed:', err);
+    }
+  };
+
+  const handleStopBackgroundJob = async (e: React.MouseEvent, jobId: string) => {
+    e.stopPropagation();
+    if (stoppingJobId) return;
+    if (!window.confirm(t('sidebar.confirmStopBgJob'))) return;
+    try {
+      setStoppingJobId(jobId);
+      await cancelDeepResearchJob(jobId);
+      addToast(t('sidebar.bgJobStopRequested'), 'info');
+      await loadBackgroundJobs();
+    } catch (err) {
+      addToast(t('sidebar.bgJobStopFailed'), 'error');
+    } finally {
+      setStoppingJobId(null);
+    }
+  };
+
+  const handleDeleteBackgroundJob = (e: React.MouseEvent, job: DeepResearchJobInfo) => {
+    e.stopPropagation();
+    const terminal = ['done', 'error', 'cancelled'].includes(job.status);
+    if (!terminal) return;
+    if (!window.confirm(t('sidebar.confirmDeleteBgJob'))) return;
+    archiveBackgroundJob(job.job_id);
+    addToast(t('sidebar.bgJobDeleted'), 'success');
   };
 
   const handleConnect = async () => {
@@ -376,44 +517,20 @@ export function Sidebar({ onStartResize }: SidebarProps) {
                 />
               </div>}
 
-              {/* HippoRAG Toggle - 只在启用时显示 */}
-              {ragConfig.enabled && <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <Network size={14} className="text-purple-400" />
-                  <span className="text-sm text-slate-300">{t('sidebar.hippoRAG')}</span>
-                  <HelpTooltip content={t('sidebar.hippoRAGHelp')}>
-                    <HelpCircle size={12} />
-                  </HelpTooltip>
+              {/* Reranker 当前模式只读提示 — 完整配置请前往高级设置 */}
+              {ragConfig.enabled && (
+                <div className="flex items-center justify-between text-[10px] text-slate-500">
+                  <div className="flex items-center gap-1.5">
+                    <Filter size={11} className="text-slate-600" />
+                    <span>{t('sidebar.colbertReranker')}</span>
+                  </div>
+                  <span className="font-mono bg-slate-900 border border-slate-700 px-1.5 py-0.5 rounded text-slate-400">
+                    {ragConfig.enableReranker
+                      ? (localStorage.getItem('adv_reranker_mode') || 'cascade')
+                      : 'bge_only'}
+                  </span>
                 </div>
-                <input
-                  id="hippo-rag"
-                  name="hippo-rag"
-                  type="checkbox"
-                  checked={ragConfig.enableHippoRAG}
-                  onChange={(e) =>
-                    updateRagConfig({ enableHippoRAG: e.target.checked })
-                  }
-                  className="accent-purple-500 w-4 h-4 cursor-pointer"
-                />
-              </div>}
-
-              {/* Reranker Toggle - 只在启用时显示 */}
-              {ragConfig.enabled && <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <Filter size={14} className="text-amber-400" />
-                  <span className="text-sm text-slate-300">{t('sidebar.colbertReranker')}</span>
-                </div>
-                <input
-                  id="reranker"
-                  name="reranker"
-                  type="checkbox"
-                  checked={ragConfig.enableReranker}
-                  onChange={(e) =>
-                    updateRagConfig({ enableReranker: e.target.checked })
-                  }
-                  className="accent-amber-500 w-4 h-4 cursor-pointer"
-                />
-              </div>}
+              )}
             </div>
           </section>
         )}
@@ -425,45 +542,100 @@ export function Sidebar({ onStartResize }: SidebarProps) {
               <Layers size={14} /> {t('sidebar.mergeParams')}
             </div>
             <div className="bg-slate-900/30 rounded-xl p-3 border border-slate-700/50 space-y-3 shadow-inner">
-              {/* Final Top-K */}
+              {/* Step Top-K */}
               <div>
                 <div className="flex items-center justify-between text-[10px] text-slate-500 mb-1">
-                  <span>{t('sidebar.finalTopK')}</span>
+                  <span>{t('sidebar.stepTopK')}</span>
                   <div className="flex items-center gap-2">
                     <span className="font-mono bg-slate-950 px-1.5 py-0.5 rounded border border-slate-700 text-sky-400">
-                      {ragConfig.finalTopK ?? 10}
+                      {ragConfig.stepTopK ?? 10}
                     </span>
                     <input
-                      id="final-topk-num"
-                      name="final-topk-num"
+                      id="step-topk-num"
+                      name="step-topk-num"
                       type="number"
                       min="1"
                       max="200"
                       step="1"
-                      value={ragConfig.finalTopK ?? 10}
+                      value={ragConfig.stepTopK ?? 10}
                       onChange={(e) =>
-                        updateRagConfig({ finalTopK: Math.max(1, Number(e.target.value)) })
+                        updateRagConfig({ stepTopK: Math.max(1, Number(e.target.value)) })
                       }
                       className="w-16 text-[10px] bg-slate-950 border border-slate-700 text-slate-300 rounded px-1 py-0.5 focus:border-sky-500 focus:outline-none"
-                      title={t('sidebar.finalTopKDesc')}
+                      title={t('sidebar.stepTopKDesc')}
                     />
                   </div>
                 </div>
                 <input
-                  id="final-topk-range"
-                  name="final-topk-range"
+                  id="step-topk-range"
+                  name="step-topk-range"
                   type="range"
                   min="1"
                   max="60"
                   step="1"
-                  value={Math.min(ragConfig.finalTopK ?? 10, 60)}
+                  value={Math.min(ragConfig.stepTopK ?? 10, 60)}
                   onChange={(e) =>
-                    updateRagConfig({ finalTopK: Number(e.target.value) })
+                    updateRagConfig({ stepTopK: Number(e.target.value) })
                   }
                   className="w-full accent-amber-500 h-1.5 bg-slate-700 rounded-lg appearance-none cursor-pointer"
                 />
                 <div className="text-[9px] text-slate-600 mt-0.5">
-                  {t('sidebar.finalTopKDesc')}
+                  {t('sidebar.stepTopKDesc')}
+                </div>
+              </div>
+
+              {/* Write Top-K */}
+              <div>
+                <div className="flex items-center justify-between text-[10px] text-slate-500 mb-1">
+                  <span>{t('sidebar.writeTopK')}</span>
+                  <div className="flex items-center gap-2">
+                    <span className="font-mono bg-slate-950 px-1.5 py-0.5 rounded border border-slate-700 text-sky-400">
+                      {ragConfig.writeTopK ?? 15}
+                    </span>
+                    <input
+                      id="write-topk-num"
+                      name="write-topk-num"
+                      type="number"
+                      min={Math.ceil((ragConfig.stepTopK ?? 10) * 1.5)}
+                      max="300"
+                      step="1"
+                      value={ragConfig.writeTopK ?? 15}
+                      onChange={(e) =>
+                        updateRagConfig({
+                          writeTopK: Math.max(
+                            Math.ceil((ragConfig.stepTopK ?? 10) * 1.5),
+                            Number(e.target.value),
+                          ),
+                        })
+                      }
+                      className="w-16 text-[10px] bg-slate-950 border border-slate-700 text-slate-300 rounded px-1 py-0.5 focus:border-sky-500 focus:outline-none"
+                      title={t('sidebar.writeTopKDesc')}
+                    />
+                  </div>
+                </div>
+                <input
+                  id="write-topk-range"
+                  name="write-topk-range"
+                  type="range"
+                  min={Math.ceil((ragConfig.stepTopK ?? 10) * 1.5)}
+                  max="120"
+                  step="1"
+                  value={Math.min(
+                    Math.max(ragConfig.writeTopK ?? 15, Math.ceil((ragConfig.stepTopK ?? 10) * 1.5)),
+                    120,
+                  )}
+                  onChange={(e) =>
+                    updateRagConfig({
+                      writeTopK: Math.max(
+                        Math.ceil((ragConfig.stepTopK ?? 10) * 1.5),
+                        Number(e.target.value),
+                      ),
+                    })
+                  }
+                  className="w-full accent-violet-500 h-1.5 bg-slate-700 rounded-lg appearance-none cursor-pointer"
+                />
+                <div className="text-[9px] text-slate-600 mt-0.5">
+                  {t('sidebar.writeTopKDesc')}
                 </div>
               </div>
 
@@ -671,11 +843,79 @@ export function Sidebar({ onStartResize }: SidebarProps) {
                             <div className="text-[9px] text-slate-600 mt-1">
                               {t('sidebar.webTopKDesc')}
                             </div>
+
+                            {/* SerpAPI sub-toggle (google / scholar only) */}
+                            {(source.id === 'google' || source.id === 'scholar') && (
+                              <div className="mt-2 pt-2 border-t border-slate-700/30">
+                                <label className="flex items-center justify-between cursor-pointer">
+                                  <div className="flex items-center gap-1.5">
+                                    <span className="text-[10px] text-slate-400">{t('sidebar.useSerpapi')}</span>
+                                    <HelpTooltip content={t('sidebar.useSerpapiHelp')}>
+                                      <HelpCircle size={10} />
+                                    </HelpTooltip>
+                                  </div>
+                                  <input
+                                    id={`serpapi-toggle-${source.id}`}
+                                    name={`serpapi-toggle-${source.id}`}
+                                    type="checkbox"
+                                    checked={source.useSerpapi ?? false}
+                                    onChange={() => toggleSourceSerpapi(source.id)}
+                                    className="accent-amber-500 w-3.5 h-3.5 cursor-pointer"
+                                  />
+                                </label>
+                              </div>
+                            )}
                           </div>
                         )}
                       </div>
                     ))}
                   </div>
+
+                  {/* SerpAPI Ratio — shown when any source has useSerpapi */}
+                  {webSearchConfig.sources.some((s) => s.useSerpapi) && (() => {
+                    // discrete steps: value (stored ×100) → label
+                    const STEPS: { value: number; label: string; title: string }[] = [
+                      { value: 0,   label: '0%',   title: 'All Playwright' },
+                      { value: 25,  label: '25%',  title: '1 SerpAPI per 4 (SPPP…)' },
+                      { value: 33,  label: '33%',  title: '1 SerpAPI per 3 (SPP…)' },
+                      { value: 50,  label: '50%',  title: 'Alternating (SP SP…)' },
+                      { value: 67,  label: '67%',  title: '2 SerpAPI per 3 (SSP…)' },
+                      { value: 75,  label: '75%',  title: '3 SerpAPI per 4 (SSSP…)' },
+                      { value: 100, label: '100%', title: 'All SerpAPI' },
+                    ];
+                    const cur = webSearchConfig.serpapiRatio ?? 50;
+                    return (
+                      <div className="p-3 border-t border-slate-700/30">
+                        <div className="flex items-center gap-1.5 text-[10px] text-slate-400 mb-2">
+                          <span>{t('sidebar.serpapiRatio')}</span>
+                          <HelpTooltip content={t('sidebar.serpapiRatioHelp')}>
+                            <HelpCircle size={10} />
+                          </HelpTooltip>
+                        </div>
+                        <div className="grid grid-cols-7 gap-0.5">
+                          {STEPS.map((s) => (
+                            <button
+                              key={s.value}
+                              type="button"
+                              title={s.title}
+                              onClick={() => setSerpapiRatio(s.value)}
+                              className={`text-[9px] py-1 rounded transition-colors ${
+                                cur === s.value
+                                  ? 'bg-amber-600/70 text-amber-200 font-bold'
+                                  : 'bg-slate-800 text-slate-500 hover:bg-slate-700 hover:text-slate-300'
+                              }`}
+                            >
+                              {s.label}
+                            </button>
+                          ))}
+                        </div>
+                        <div className="flex justify-between text-[8px] text-slate-600 mt-1">
+                          <span>← Playwright</span>
+                          <span>SerpAPI →</span>
+                        </div>
+                      </div>
+                    );
+                  })()}
                 </div>
               )}
 
@@ -683,7 +923,7 @@ export function Sidebar({ onStartResize }: SidebarProps) {
               {webSearchConfig.enabled && (
                 <div className="bg-slate-900/30 border border-slate-700/50 rounded-xl p-3 animate-in slide-in-from-top-2 duration-200 space-y-3">
                   <div className="text-[10px] font-bold text-slate-500 uppercase">
-                    Query Enhancement
+                    {t('sidebar.queryEnhancement')}
                   </div>
                   
                   {/* 查询优化器 */}
@@ -977,6 +1217,85 @@ export function Sidebar({ onStartResize }: SidebarProps) {
               <div className="text-[10px] text-slate-600 text-center">
                 {t('sidebar.defaultCacheDir')}: <code className="font-mono text-slate-500">~/Hug</code>
               </div>
+            </div>
+          </section>
+        )}
+
+        {/* 后台调研（运行中 + 近期任务，可恢复视图） */}
+        {isSidebarOpen && (
+          <section>
+            <div className="flex items-center gap-2 mb-4 text-sky-500/80 font-semibold text-xs uppercase tracking-wider pl-1">
+              <Telescope size={14} /> {t('sidebar.backgroundResearch')}
+              {isLoadingJobs && <Loader2 size={12} className="animate-spin" />}
+            </div>
+            <div className="space-y-2 max-h-36 overflow-y-auto pr-1 scrollbar-thin mb-6">
+              {backgroundJobs.length === 0 && !isLoadingJobs && (
+                <div className="text-xs text-slate-600 text-center py-3">{t('sidebar.noBackgroundJobs')}</div>
+              )}
+              {backgroundJobs.map((job) => {
+                const running = ['pending', 'running', 'cancelling', 'waiting_review'].includes(job.status);
+                const terminal = ['done', 'error', 'cancelled'].includes(job.status);
+                const isStopping = stoppingJobId === job.job_id;
+                const canStop = ['pending', 'running', 'waiting_review'].includes(job.status) && !isStopping;
+                const canDelete = terminal;
+                return (
+                  <div
+                    key={job.job_id}
+                    className="group p-2 rounded-lg hover:bg-slate-800/50 cursor-pointer text-sm relative transition-colors border border-transparent"
+                    onClick={() => handleRestoreBackgroundJob(job)}
+                  >
+                    <div className="flex justify-between items-start">
+                      <span className="font-medium truncate flex-1 text-slate-300 group-hover:text-sky-200">
+                        {job.topic || t('sidebar.unnamedResearch')}
+                      </span>
+                      {running && (
+                        <span className="flex-shrink-0 w-2 h-2 rounded-full bg-emerald-400 animate-pulse" title={job.status} />
+                      )}
+                    </div>
+                    <div className="text-[10px] text-slate-500 flex items-center gap-1 mt-1">
+                      <Clock size={10} />
+                      {new Date((job.updated_at || 0) * 1000).toLocaleString('zh-CN', {
+                        month: '2-digit',
+                        day: '2-digit',
+                        hour: '2-digit',
+                        minute: '2-digit',
+                      })}
+                      <span className="ml-2 text-slate-700">|</span>
+                      <span className="ml-1 capitalize">{job.status}</span>
+                    </div>
+                    {(canStop || canDelete) && (
+                      <div
+                        className="absolute right-1 top-1 hidden group-hover:flex gap-1 bg-slate-900 border border-slate-700 p-1 rounded shadow-lg z-10"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        {canStop && (
+                          <button
+                            className="p-1 hover:text-amber-400 text-slate-500 transition-colors"
+                            title={t('sidebar.stopBgJob')}
+                            onClick={(e) => handleStopBackgroundJob(e, job.job_id)}
+                            disabled={isStopping}
+                          >
+                            {isStopping ? (
+                              <Loader2 size={12} className="animate-spin" />
+                            ) : (
+                              <Square size={12} />
+                            )}
+                          </button>
+                        )}
+                        {canDelete && (
+                          <button
+                            className="p-1 hover:text-red-400 text-slate-500 transition-colors"
+                            title={t('sidebar.deleteBgJob')}
+                            onClick={(e) => handleDeleteBackgroundJob(e, job)}
+                          >
+                            <Trash2 size={12} />
+                          </button>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           </section>
         )}

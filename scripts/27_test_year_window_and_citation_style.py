@@ -64,7 +64,7 @@ def _check_chat_year_window(
         "year_start": year_start,
         "year_end": year_end,
         "local_top_k": 6,
-        "final_top_k": 6,
+        "step_top_k": 6,
     }
     data = _post_json(base, "/chat", payload, timeout=timeout)
     sid = data.get("session_id") or ""
@@ -108,7 +108,7 @@ def _check_start_year_window(base: str, timeout: int, year_start: int, year_end:
         "year_start": year_start,
         "year_end": year_end,
         "local_top_k": 8,
-        "final_top_k": 12,
+        "step_top_k": 12,
     }
     data = _post_json(base, "/deep-research/start", payload, timeout=timeout)
     outline = data.get("outline") or []

@@ -136,8 +136,12 @@ export interface EnrichmentOptions {
 
 export interface LLMProviderInfo {
   id: string;
+  platform?: string;
   default_model: string;
   models: string[];
+  supports_image?: boolean;
+  registry_key?: string | null;
+  label?: string;
 }
 
 export interface LLMProvidersResponse {
@@ -153,8 +157,77 @@ export interface LLMProvidersResponse {
   };
 }
 
+export interface ProviderTemplate {
+  name: string;
+  label: string;
+  default_base_url: string;
+  supports_image: boolean;
+  env_key_hint: string;
+}
+
+export interface RemoteModelInfo {
+  id: string;
+  owned_by?: string;
+  supports_image?: boolean;
+  extra?: Record<string, unknown>;
+}
+
+export interface FetchModelsResponse {
+  provider: string;
+  registry_key: string;
+  models: RemoteModelInfo[];
+  count: number;
+}
+
 export async function listLLMProviders(): Promise<LLMProvidersResponse> {
   const res = await client.get<LLMProvidersResponse>('/llm/providers');
+  return res.data;
+}
+
+export interface LiveModelsResponse {
+  platforms: Record<string, { models: string[]; count: number; error?: string }>;
+}
+
+export async function listAllLiveModels(noCache = false): Promise<LiveModelsResponse> {
+  const url = noCache ? '/llm/models?no_cache=true' : '/llm/models';
+  const res = await client.get<LiveModelsResponse>(url);
+  return res.data;
+}
+
+export async function listProviderRegistry(): Promise<{ providers: ProviderTemplate[] }> {
+  const res = await client.get<{ providers: ProviderTemplate[] }>('/llm/providers/registry');
+  return res.data;
+}
+
+export interface UltraLiteProviderOption {
+  id: string;
+  label: string;
+  default_model: string;
+  platform: string;
+}
+
+export interface UltraLiteProvidersResponse {
+  providers: UltraLiteProviderOption[];
+  default: string | null;
+}
+
+export async function listUltraLiteProviders(noCache = false): Promise<UltraLiteProvidersResponse> {
+  const url = noCache ? '/llm/ultra_lite_providers?no_cache=true' : '/llm/ultra_lite_providers';
+  const res = await client.get<UltraLiteProvidersResponse>(url);
+  return res.data;
+}
+
+export async function fetchProviderModels(
+  providerName: string,
+  options?: { apiKey?: string; baseUrl?: string; noCache?: boolean },
+): Promise<FetchModelsResponse> {
+  const params = new URLSearchParams();
+  if (options?.apiKey) params.set('api_key', options.apiKey);
+  if (options?.baseUrl) params.set('base_url', options.baseUrl);
+  if (options?.noCache) params.set('no_cache', 'true');
+  const qs = params.toString();
+  const url = `/llm/providers/${encodeURIComponent(providerName)}/models${qs ? `?${qs}` : ''}`;
+  const res = await client.get<FetchModelsResponse>(url);
   return res.data;
 }
 

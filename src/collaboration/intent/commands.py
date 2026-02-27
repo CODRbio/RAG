@@ -170,7 +170,7 @@ def _generate_focused_query(
                 {"role": "system", "content": system_content},
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=64,
+
         )
         text = (resp.get("final_text") or "").strip()
     except Exception:

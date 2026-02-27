@@ -44,6 +44,7 @@ class CiteKeyGenerator:
         self.hash_length = hash_length or settings.citation.hash_length
         self.max_authors = max_authors or settings.citation.author_date_max_authors
         self._numeric_counter = len(self.existing_keys) + 1
+        self._web_counter = 0
 
     def generate(self, citation: Citation) -> str:
         """根据配置的格式生成 cite_key。"""
@@ -69,48 +70,77 @@ class CiteKeyGenerator:
         return key
 
     def _author_date_key(self, c: Citation) -> str:
-        """生成作者年份键：Smith2023，重复时 Smith2023a, Smith2023b..."""
+        """Generate academic-style cite_key: Wang, 2018 / Wang and Li, 2015 / Wang et al., 2011.
+
+        Web sources lacking author+year metadata get sequential Web1, Web2, ...
+        """
+        # Web sources with no academic metadata → dedicated sequential key, skip dedup
+        if self._is_web_source(c):
+            return self._next_web_key()
+
         base = self._extract_author_year(c)
         if base not in self.existing_keys:
             self.existing_keys.add(base)
             return base
-        # 添加后缀 a-z
         for suffix in "abcdefghijklmnopqrstuvwxyz":
             key = f"{base}{suffix}"
             if key not in self.existing_keys:
                 self.existing_keys.add(key)
                 return key
-        # 用尽26个字母，fallback 到 base_xxxx
         fallback = f"{base}_{hashlib.sha256(c.id.encode()).hexdigest()[:4]}"
         self.existing_keys.add(fallback)
         return fallback
 
-    def _extract_author_year(self, c: Citation) -> str:
-        """提取作者姓氏 + 年份，如 Smith2023 或 SmithJones2023。"""
-        authors = c.authors or []
-        year_part = str(c.year) if c.year else ""
+    def _is_web_source(self, c: Citation) -> bool:
+        """Detect web-only sources with no meaningful academic metadata."""
+        has_authors = bool(c.authors and any(str(a).strip() for a in c.authors))
+        has_year = c.year is not None
+        has_url = bool(c.url)
+        return has_url and not has_authors and not has_year
 
-        if not authors:
-            # 无作者信息，使用标题首词
+    def _next_web_key(self) -> str:
+        self._web_counter += 1
+        key = f"Web{self._web_counter}"
+        while key in self.existing_keys:
+            self._web_counter += 1
+            key = f"Web{self._web_counter}"
+        self.existing_keys.add(key)
+        return key
+
+    def _extract_author_year(self, c: Citation) -> str:
+        """Build academic-convention cite key.
+
+        1 author:  Wang, 2018
+        2 authors: Wang and Li, 2015
+        3+ authors: Wang et al., 2011
+        """
+        authors = c.authors or []
+        year_part = str(c.year) if c.year else "n.d."
+
+        if not authors or not any(str(a).strip() for a in authors):
             if c.title:
                 first_word = re.split(r"\s+", c.title.strip())[0]
-                first_word = self._normalize_name(first_word)[:10]
-                return f"{first_word}{year_part}" if first_word else f"Anon{year_part}"
-            return f"Anon{year_part}"
+                first_word = self._normalize_name(first_word)[:12]
+                return f"{first_word}, {year_part}" if first_word else f"Anon, {year_part}"
+            return f"Anon, {year_part}"
 
-        # 提取作者姓氏
         surnames = []
-        for author in authors[: self.max_authors]:
+        for author in authors:
             surname = self._extract_surname(author)
             if surname:
                 surnames.append(surname)
 
-        if len(authors) > self.max_authors:
-            author_part = "".join(surnames) + "EtAl"
-        else:
-            author_part = "".join(surnames)
+        if not surnames:
+            return f"Anon, {year_part}"
 
-        return f"{author_part}{year_part}" if author_part else f"Anon{year_part}"
+        if len(surnames) == 1:
+            author_part = surnames[0]
+        elif len(surnames) == 2:
+            author_part = f"{surnames[0]} and {surnames[1]}"
+        else:
+            author_part = f"{surnames[0]} et al."
+
+        return f"{author_part}, {year_part}"
 
     def _extract_surname(self, author: str) -> str:
         """从作者全名提取姓氏（支持中英文）。"""

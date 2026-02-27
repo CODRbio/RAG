@@ -95,15 +95,30 @@ export function RetrievalDebugPanel({ summary }: Props) {
                     const COLORS: Record<string, string> = {
                       local: 'bg-blue-100 text-blue-700',
                       tavily: 'bg-violet-100 text-violet-700',
+                      serpapi: 'bg-green-100 text-green-700',
+                      serpapi_scholar: 'bg-emerald-100 text-emerald-700',
+                      serpapi_google: 'bg-lime-100 text-lime-700',
                       google: 'bg-orange-100 text-orange-700',
                       scholar: 'bg-emerald-100 text-emerald-700',
                       semantic: 'bg-yellow-100 text-yellow-700',
+                      semantic_snippet: 'bg-amber-100 text-amber-700',
+                      semantic_bulk: 'bg-yellow-200 text-yellow-800',
                       ncbi: 'bg-pink-100 text-pink-700',
                       web: 'bg-gray-200 text-gray-600',
                     };
                     const LABELS: Record<string, string> = {
-                      local: '本地', tavily: 'Tavily', google: 'Google',
-                      scholar: 'Scholar', semantic: 'Semantic', ncbi: 'PubMed', web: '网络',
+                      local: '本地',
+                      tavily: 'Tavily',
+                      serpapi: 'SerpAPI',
+                      serpapi_scholar: 'SerpAPI Scholar',
+                      serpapi_google: 'SerpAPI Google',
+                      google: 'Google',
+                      scholar: 'Scholar',
+                      semantic: 'Semantic',
+                      semantic_snippet: 'Semantic Snippet',
+                      semantic_bulk: 'Semantic Bulk',
+                      ncbi: 'PubMed',
+                      web: '网络',
                     };
                     return (
                       <span key={src} className={`px-2 py-0.5 rounded-full ${COLORS[src] || 'bg-gray-200 text-gray-600'}`}>

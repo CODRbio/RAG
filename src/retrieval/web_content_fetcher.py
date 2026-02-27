@@ -303,6 +303,8 @@ class WebContentFetcher:
             return None
 
         try:
+            from src.utils.aiohttp_tls_patch import apply_aiohttp_tls_in_tls_patch
+            apply_aiohttp_tls_in_tls_patch()
             import aiohttp
             import trafilatura
 
@@ -563,7 +565,7 @@ class WebContentFetcher:
                     {"role": "system", "content": _pm.render("web_content_fetch_decide_system.txt")},
                     {"role": "user", "content": prompt},
                 ],
-                max_tokens=512,
+
                 response_model=_FetchDecisionResponse,
             )
             parsed: Optional[_FetchDecisionResponse] = resp.get("parsed_object")

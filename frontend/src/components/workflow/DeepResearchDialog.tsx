@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { Telescope, Loader2, X, ChevronRight, Square } from 'lucide-react';
 import { useChatStore, useConfigStore, useToastStore } from '../../stores';
 import { useDeepResearchTask } from './deep-research/useDeepResearchTask';
@@ -25,11 +25,13 @@ export function DeepResearchDialog() {
     clarificationQuestions,
     isStreaming,
     setDeepResearchActive,
+    deepResearchActive,
   } = useChatStore();
   const { selectedProvider, selectedModel } = useConfigStore();
   const addToast = useToastStore((s) => s.addToast);
 
   const task = useDeepResearchTask();
+  const autoClarifyTriggeredRef = useRef(false);
 
   // UI-only form state shared across generatePlan and confirmAndRun
   const [answers, setAnswers] = useState<Record<string, string>>({});
@@ -48,6 +50,7 @@ export function DeepResearchDialog() {
   const [skipDraftReview, setSkipDraftReview] = useState(false);
   const [skipRefineReview, setSkipRefineReview] = useState(false);
   const [skipClaimGeneration, setSkipClaimGeneration] = useState(false);
+  const [maxSections, setMaxSections] = useState<number>(4);
   const [keepPreviousJobId, setKeepPreviousJobId] = useState(true);
   const [userContext, setUserContext] = useState('');
   const [userContextMode, setUserContextMode] = useState<'supporting' | 'direct_injection'>('supporting');
@@ -92,9 +95,38 @@ export function DeepResearchDialog() {
     setOutputLanguage(defaults.outputLanguage);
     setStepModelStrict(defaults.stepModelStrict);
     setSkipClaimGeneration(defaults.skipClaimGeneration);
+    setMaxSections(defaults.maxSections);
     setStepModels({ ...defaults.stepModels });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showDeepResearchDialog]);
+
+  // Auto-clarify on first open for entries that only open dialog
+  // (e.g. Canvas "Start Deep Research"), so user doesn't need manual regenerate.
+  useEffect(() => {
+    if (!showDeepResearchDialog) {
+      autoClarifyTriggeredRef.current = false;
+      return;
+    }
+    if (autoClarifyTriggeredRef.current) return;
+    if (task.phase !== 'clarify') return;
+    if (task.activeJobId || deepResearchActive) return;
+    if (task.isClarifying || isStreaming) return;
+    if (clarificationQuestions.length > 0) return;
+    const topic = (deepResearchTopic || '').trim();
+    if (!topic) return;
+    autoClarifyTriggeredRef.current = true;
+    void task.runClarify(topic);
+  }, [
+    showDeepResearchDialog,
+    task.phase,
+    task.activeJobId,
+    task.isClarifying,
+    deepResearchActive,
+    isStreaming,
+    clarificationQuestions.length,
+    deepResearchTopic,
+    task,
+  ]);
 
   const modelOptions = useMemo(() => {
     const current = selectedModel ? `${selectedProvider}::${selectedModel}` : '';
@@ -113,6 +145,7 @@ export function DeepResearchDialog() {
     outputLanguage,
     stepModels,
     stepModelStrict,
+    maxSections,
   });
 
   const handleGeneratePlan = () => task.generatePlan(buildPlanParams());
@@ -262,48 +295,125 @@ export function DeepResearchDialog() {
           )}
 
           {task.phase === 'confirm' && (
-            <ConfirmPhase
-              outlineDraft={task.outlineDraft}
-              onOutlineChange={(idx, value) =>
-                task.setOutlineDraft((prev) => prev.map((item, i) => (i === idx ? value : item)))
-              }
-              onOutlineAdd={() => task.setOutlineDraft((prev) => [...prev, ''])}
-              onOutlineRemove={(idx) => task.setOutlineDraft((prev) => prev.filter((_, i) => i !== idx))}
-              onOutlineMove={(from, to) => {
-                task.setOutlineDraft((prev) => {
-                  if (from === to || from < 0 || to < 0 || from >= prev.length || to >= prev.length) return prev;
-                  const next = [...prev];
-                  const [moved] = next.splice(from, 1);
-                  next.splice(to, 0, moved);
-                  return next;
-                });
-              }}
-              briefDraft={task.briefDraft}
-              initialStats={task.initialStats}
-              outputLanguage={outputLanguage}
-              onOutputLanguageChange={setOutputLanguage}
-              stepModels={stepModels}
-              onStepModelChange={(step, value) => setStepModels((prev) => ({ ...prev, [step]: value }))}
-              stepModelStrict={stepModelStrict}
-              onStepModelStrictChange={setStepModelStrict}
-              modelOptions={modelOptions}
-              depth={depth}
-              onDepthChange={setDepth}
-              skipDraftReview={skipDraftReview}
-              onSkipDraftReviewChange={setSkipDraftReview}
-              skipRefineReview={skipRefineReview}
-              onSkipRefineReviewChange={setSkipRefineReview}
-              skipClaimGeneration={skipClaimGeneration}
-              onSkipClaimGenerationChange={setSkipClaimGeneration}
-              keepPreviousJobId={keepPreviousJobId}
-              onKeepPreviousJobIdChange={setKeepPreviousJobId}
-              userContext={userContext}
-              onUserContextChange={setUserContext}
-              userContextMode={userContextMode}
-              onUserContextModeChange={setUserContextMode}
-              tempDocuments={tempDocuments}
-              onTempDocumentsChange={setTempDocuments}
-            />
+            <div className="space-y-3">
+              <ConfirmPhase
+                outlineDraft={task.outlineDraft}
+                onOutlineChange={(idx, value) =>
+                  task.setOutlineDraft((prev) => prev.map((item, i) => (i === idx ? value : item)))
+                }
+                onOutlineAdd={() => task.setOutlineDraft((prev) => [...prev, ''])}
+                onOutlineRemove={(idx) => task.setOutlineDraft((prev) => prev.filter((_, i) => i !== idx))}
+                onOutlineMove={(from, to) => {
+                  task.setOutlineDraft((prev) => {
+                    if (from === to || from < 0 || to < 0 || from >= prev.length || to >= prev.length) return prev;
+                    const next = [...prev];
+                    const [moved] = next.splice(from, 1);
+                    next.splice(to, 0, moved);
+                    return next;
+                  });
+                }}
+                briefDraft={task.briefDraft}
+                initialStats={task.initialStats}
+                outputLanguage={outputLanguage}
+                onOutputLanguageChange={setOutputLanguage}
+                stepModels={stepModels}
+                onStepModelChange={(step, value) => setStepModels((prev) => ({ ...prev, [step]: value }))}
+                stepModelStrict={stepModelStrict}
+                onStepModelStrictChange={setStepModelStrict}
+                modelOptions={modelOptions}
+                depth={depth}
+                onDepthChange={setDepth}
+                skipDraftReview={skipDraftReview}
+                onSkipDraftReviewChange={setSkipDraftReview}
+                skipRefineReview={skipRefineReview}
+                onSkipRefineReviewChange={setSkipRefineReview}
+                skipClaimGeneration={skipClaimGeneration}
+                onSkipClaimGenerationChange={setSkipClaimGeneration}
+                maxSections={maxSections}
+                onMaxSectionsChange={setMaxSections}
+                keepPreviousJobId={keepPreviousJobId}
+                onKeepPreviousJobIdChange={setKeepPreviousJobId}
+                userContext={userContext}
+                onUserContextChange={setUserContext}
+                userContextMode={userContextMode}
+                onUserContextModeChange={setUserContextMode}
+                tempDocuments={tempDocuments}
+                onTempDocumentsChange={setTempDocuments}
+              />
+              <div className="border border-gray-200 rounded-lg p-3 bg-gray-50 space-y-2">
+                <div className="text-xs font-medium text-gray-700">Restart from major stage</div>
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    onClick={() => task.restartFromPhase('plan')}
+                    className="px-2 py-1 border rounded text-xs text-indigo-700 hover:bg-indigo-50"
+                  >
+                    Restart from Plan
+                  </button>
+                  <button
+                    onClick={() => task.restartFromPhase('research')}
+                    className="px-2 py-1 border rounded text-xs text-indigo-700 hover:bg-indigo-50"
+                  >
+                    Restart from Research
+                  </button>
+                  <button
+                    onClick={() => task.restartFromPhase('generate_claims')}
+                    className="px-2 py-1 border rounded text-xs text-indigo-700 hover:bg-indigo-50"
+                  >
+                    Restart from Claims
+                  </button>
+                  <button
+                    onClick={() => task.restartFromPhase('write')}
+                    className="px-2 py-1 border rounded text-xs text-indigo-700 hover:bg-indigo-50"
+                  >
+                    Restart from Writing
+                  </button>
+                  <button
+                    onClick={() => task.restartFromPhase('verify')}
+                    className="px-2 py-1 border rounded text-xs text-indigo-700 hover:bg-indigo-50"
+                  >
+                    Restart from Verify
+                  </button>
+                  <button
+                    onClick={() => task.restartFromPhase('review_gate')}
+                    className="px-2 py-1 border rounded text-xs text-indigo-700 hover:bg-indigo-50"
+                  >
+                    Restart from Review Gate
+                  </button>
+                  <button
+                    onClick={() => task.restartFromPhase('synthesize')}
+                    className="px-2 py-1 border rounded text-xs text-indigo-700 hover:bg-indigo-50"
+                  >
+                    Restart from Synthesize
+                  </button>
+                </div>
+                {task.outlineDraft.length > 0 && (
+                  <div className="space-y-1">
+                    <div className="text-xs font-medium text-gray-600">Restart specific outline section</div>
+                    <div className="space-y-1">
+                      {task.outlineDraft.map((sectionTitle) => (
+                        <div key={`restart-${sectionTitle}`} className="flex items-center justify-between gap-2 text-xs">
+                          <span className="text-gray-700 truncate">{sectionTitle}</span>
+                          <div className="flex items-center gap-1 shrink-0">
+                            <button
+                              onClick={() => task.restartSection(sectionTitle, 'research')}
+                              className="px-2 py-1 border rounded text-blue-700 hover:bg-blue-50"
+                            >
+                              Re-research
+                            </button>
+                            <button
+                              onClick={() => task.restartSection(sectionTitle, 'write')}
+                              className="px-2 py-1 border rounded text-amber-700 hover:bg-amber-50"
+                            >
+                              Re-write
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
           )}
 
           {task.phase === 'running' && (

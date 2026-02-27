@@ -45,7 +45,7 @@ export interface Source {
   snippet?: string;
   path?: string;
   type?: 'local' | 'web';
-  provider?: string;  // local | tavily | google | scholar | semantic | ncbi
+  provider?: string;  // local | tavily | google | scholar | semantic | semantic_snippet | semantic_bulk | ncbi | serpapi | serpapi_scholar | serpapi_google
   bbox?: number[];
   page_num?: number | null;
 }
@@ -104,7 +104,8 @@ export interface ChatRequest {
   collection?: string;
   search_mode: 'local' | 'web' | 'hybrid' | 'none';
   web_providers?: string[];
-  web_source_configs?: Record<string, { topK: number; threshold: number }>;  // 每个搜索源的独立配置
+  web_source_configs?: Record<string, { topK: number; threshold: number; useSerpapi?: boolean }>;
+  serpapi_ratio?: number;  // SerpAPI 轮询比例 0-1（仅当 google/scholar 启用 useSerpapi 时生效）
   use_query_optimizer?: boolean;  // 是否启用查询优化器
   query_optimizer_max_queries?: number; // 每个搜索引擎最多生成的查询数
   use_query_expansion?: boolean;  // 兼容字段（已弃用）
@@ -112,8 +113,9 @@ export interface ChatRequest {
   local_threshold?: number;  // 本地检索的相似度阈值 (0-1)
   year_start?: number;  // 年份窗口起始（硬过滤）
   year_end?: number;  // 年份窗口结束（硬过滤）
-  final_top_k?: number;  // 最终保留的文档数（local + web 合并重排后）
+  step_top_k?: number;  // 每步检索保留的文档数（local + web 合并重排后）
   llm_provider?: string;  // LLM 提供商: deepseek | openai | gemini | claude | kimi 等
+  ultra_lite_provider?: string;  // 长文本压缩等超轻量任务用的 provider（如 openai-mini, gemini-flash）
   model_override?: string;  // 覆盖默认模型，如 claude-opus-4-6
   mode?: ChatMode;  // 执行模式: chat（默认）| deep_research
   use_content_fetcher?: 'auto' | 'force' | 'off';  // 是否对网络搜索结果做全文抓取（None 用后端默认）
@@ -122,6 +124,7 @@ export interface ChatRequest {
   clarification_answers?: Record<string, string>;
   output_language?: 'auto' | 'en' | 'zh';
   step_models?: Record<string, string | null | undefined>;
+  reranker_mode?: 'bge_only' | 'colbert_only' | 'cascade';  // 重排序模式，None 使用服务端默认
 }
 
 export interface ChatCitation {
@@ -248,12 +251,14 @@ export interface DeepResearchRequest {
   web_source_configs?: Record<string, { topK: number; threshold: number }>;
   use_query_optimizer?: boolean;
   query_optimizer_max_queries?: number;
+  gap_query_intent?: 'broad' | 'review_pref' | 'reviews_only';
   local_top_k?: number;
   local_threshold?: number;
   year_start?: number;
   year_end?: number;
-  final_top_k?: number;
+  step_top_k?: number;
   llm_provider?: string;
+  ultra_lite_provider?: string;
   model_override?: string;
   output_language?: 'auto' | 'en' | 'zh';
   step_models?: Record<string, string | null | undefined>;
@@ -266,21 +271,28 @@ export interface DeepResearchStartRequest {
   user_id?: string;
   collection?: string;
   search_mode: 'local' | 'web' | 'hybrid';
+  max_sections?: number;
   clarification_answers?: Record<string, string>;
   output_language?: 'auto' | 'en' | 'zh';
   step_models?: Record<string, string | null | undefined>;
   step_model_strict?: boolean;
   web_providers?: string[];
-  web_source_configs?: Record<string, { topK: number; threshold: number }>;
+  web_source_configs?: Record<string, { topK: number; threshold: number; useSerpapi?: boolean }>;
+  serpapi_ratio?: number;
   use_query_optimizer?: boolean;
   query_optimizer_max_queries?: number;
+  use_content_fetcher?: 'auto' | 'force' | 'off';
+  gap_query_intent?: 'broad' | 'review_pref' | 'reviews_only';
   local_top_k?: number;
   local_threshold?: number;
   year_start?: number;
   year_end?: number;
-  final_top_k?: number;
+  step_top_k?: number;
+  write_top_k?: number;
   llm_provider?: string;
+  ultra_lite_provider?: string;
   model_override?: string;
+  reranker_mode?: 'bge_only' | 'colbert_only' | 'cascade';
 }
 
 export interface DeepResearchStartResponse {
@@ -308,16 +320,22 @@ export interface DeepResearchConfirmRequest {
   step_models?: Record<string, string | null | undefined>;
   step_model_strict?: boolean;
   web_providers?: string[];
-  web_source_configs?: Record<string, { topK: number; threshold: number }>;
+  web_source_configs?: Record<string, { topK: number; threshold: number; useSerpapi?: boolean }>;
+  serpapi_ratio?: number;
   use_query_optimizer?: boolean;
   query_optimizer_max_queries?: number;
+  use_content_fetcher?: 'auto' | 'force' | 'off';
+  gap_query_intent?: 'broad' | 'review_pref' | 'reviews_only';
   local_top_k?: number;
   local_threshold?: number;
   year_start?: number;
   year_end?: number;
-  final_top_k?: number;
+  step_top_k?: number;
+  write_top_k?: number;
   llm_provider?: string;
+  ultra_lite_provider?: string;
   model_override?: string;
+  reranker_mode?: 'bge_only' | 'colbert_only' | 'cascade';
   user_context?: string;
   user_context_mode?: 'supporting' | 'direct_injection';
   user_documents?: Array<{ name: string; content: string }>;
@@ -327,6 +345,8 @@ export interface DeepResearchConfirmRequest {
   skip_draft_review?: boolean;
   skip_refine_review?: boolean;
   skip_claim_generation?: boolean;
+  // 大纲章节数
+  max_sections?: number;
 }
 
 export interface DeepResearchSubmitResponse {
@@ -336,12 +356,21 @@ export interface DeepResearchSubmitResponse {
   canvas_id: string;
 }
 
+export interface DeepResearchRestartPhaseRequest {
+  phase: 'plan' | 'research' | 'generate_claims' | 'write' | 'verify' | 'review_gate' | 'synthesize';
+}
+
+export interface DeepResearchRestartSectionRequest {
+  section_title: string;
+  action: 'research' | 'write';
+}
+
 export interface DeepResearchJobInfo {
   job_id: string;
   topic: string;
   session_id: string;
   canvas_id: string;
-  status: 'pending' | 'running' | 'cancelling' | 'done' | 'error' | 'cancelled' | string;
+  status: 'pending' | 'running' | 'cancelling' | 'waiting_review' | 'done' | 'error' | 'cancelled' | string;
   current_stage: string;
   message: string;
   error_message: string;
@@ -534,13 +563,15 @@ export interface WebSource {
   enabled: boolean;
   topK: number;
   threshold: number;
+  useSerpapi?: boolean;
 }
 
 export interface RagConfig {
   enabled: boolean;  // 是否启用本地 RAG 检索
   localTopK: number;
   localThreshold: number;  // 相似度阈值 (0-1)
-  finalTopK: number;  // 最终保留的文档数（local + web 合并重排后）
+  stepTopK: number;  // 每步检索保留的文档数（local + web 合并重排后）
+  writeTopK: number;  // 最终撰写阶段证据保留数量（Deep Research）
   yearStart?: number | null; // 全局年份过滤起始
   yearEnd?: number | null; // 全局年份过滤结束
   enableHippoRAG: boolean;
@@ -555,6 +586,7 @@ export interface WebSearchConfig {
   queryOptimizer: boolean;   // 查询优化器（针对不同搜索引擎优化查询格式）
   maxQueriesPerProvider: number; // 每个搜索引擎每种语言的查询数
   contentFetcherMode: 'auto' | 'force' | 'off';  // 全文抓取模式
+  serpapiRatio: number; // SerpAPI 轮询比例 0-100（仅当 google/scholar 开启 useSerpapi 时生效）
 }
 
 // ============================================================
@@ -569,6 +601,10 @@ export interface DeepResearchDefaults {
   stepModelStrict: boolean;
   stepModels: Record<string, string>;
   skipClaimGeneration: boolean;
+  maxSections: number;
+  gapQueryIntent: 'broad' | 'review_pref' | 'reviews_only';
+  /** 长文本压缩等超轻量任务用的 provider（高级配置中选择，与拉取模型列表比对） */
+  ultra_lite_provider?: string | null;
 }
 
 // ============================================================
@@ -655,6 +691,7 @@ export interface ResearchSectionStatus {
   coverage_score: number;
   source_count: number;
   gaps: string[];
+  evidence_scarce?: boolean;
 }
 
 export interface ResearchDashboardData {

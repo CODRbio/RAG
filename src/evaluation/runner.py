@@ -150,7 +150,7 @@ def _generate_answer(
         {"role": "system", "content": _pm.render("evaluation_system.txt")},
         {"role": "user", "content": _pm.render("evaluation_user.txt", context=context, keys_str=keys_str, query=query)},
     ]
-    resp = llm_client.chat(messages, model=model_override, max_tokens=800)
+    resp = llm_client.chat(messages, model=model_override)
     return (resp.get("final_text") or "").strip()
 
 

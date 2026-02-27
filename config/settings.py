@@ -70,7 +70,7 @@ class CollectionSettings:
     life: str = os.getenv("COLLECTION_LIFE", "deepsea_life")
     ocean: str = os.getenv("COLLECTION_OCEAN", "deepsea_ocean")
     env: str = os.getenv("COLLECTION_ENV", "deepsea_env")
-    global_: str = os.getenv("COLLECTION_GLOBAL", "deepsea_global")
+    global_: str = os.getenv("COLLECTION_GLOBAL", "DeepSea_symbiosis")
 
     def get(self, domain: str) -> str:
         mapping = {"life": self.life, "ocean": self.ocean, "env": self.env}
@@ -113,6 +113,7 @@ class SearchSettings:
     rrf_dense_weight: float = float(os.getenv("RRF_DENSE_WEIGHT", "0.6"))
     rrf_sparse_weight: float = float(os.getenv("RRF_SPARSE_WEIGHT", "0.4"))
     rerank_input_k: int = int(os.getenv("RERANK_INPUT_K", "100"))
+    # 请求未传 step_top_k 时，rerank 阶段默认保留条数（与前端 stepTopK 同义，仅作服务端默认）
     rerank_output_k: int = int(os.getenv("RERANK_OUTPUT_K", "20"))
     per_doc_cap: int = int(os.getenv("PER_DOC_CAP", "5"))
     # ColBERT 精排：bge_only | colbert_only | cascade
@@ -154,6 +155,15 @@ class GoogleSearchConfig:
 
 
 @dataclass
+class SerpAPIConfig:
+    """SerpAPI 搜索配置（Google Scholar / Google Web API）"""
+    enabled: bool = False
+    api_key: str = ""
+    max_results: int = 10
+    timeout_seconds: int = 30
+
+
+@dataclass
 class SemanticScholarConfig:
     """Semantic Scholar API 配置（通过 ai4scholar 代理）"""
     enabled: bool = False
@@ -186,6 +196,9 @@ class ContentFetcherConfig:
     cache_enabled: bool = True
     cache_ttl_seconds: int = 3600
     max_concurrent: int = 5
+    compress_long_fulltext: bool = True
+    compress_word_threshold: int = 300
+    compress_max_output_words: int = 400
 
 
 @dataclass
@@ -211,14 +224,21 @@ _LLM_ENV_KEYS = {
     "gemini": "GEMINI_API_KEY",
     "claude": "ANTHROPIC_API_KEY",
     "kimi": "KIMI_API_KEY",
+    "qwen": "QWEN_API_KEY",
+    "perplexity": "PERPLEXITY_API_KEY",
+    "sonar": "PERPLEXITY_API_KEY",
 }
 
 # 各 provider 默认 base_url / model（config 未填时回退）
 _LLM_DEFAULTS = {
     "openai": {"base_url": "https://api.openai.com/v1", "default_model": "gpt-4o"},
     "deepseek": {"base_url": "https://api.deepseek.com/v1", "default_model": "deepseek-chat"},
-    "gemini": {"base_url": "https://generativelanguage.googleapis.com/v1beta", "default_model": "gemini-1.5-pro"},
-    "claude": {"base_url": "https://api.anthropic.com", "default_model": "claude-sonnet-4-20250514"},
+    "gemini": {"base_url": "https://generativelanguage.googleapis.com/v1beta/openai", "default_model": "gemini-2.5-flash"},
+    "claude": {"base_url": "https://api.anthropic.com", "default_model": "claude-sonnet-4-5-20250929"},
+    "kimi": {"base_url": "https://api.moonshot.ai/v1", "default_model": "kimi-k2.5"},
+    "qwen": {"base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "default_model": "qwen-plus"},
+    "perplexity": {"base_url": "https://api.perplexity.ai", "default_model": "sonar-pro"},
+    "sonar": {"base_url": "https://api.perplexity.ai", "default_model": "sonar-pro"},
 }
 
 
@@ -226,15 +246,73 @@ def _llm_from_config() -> Dict[str, Any]:
     return (_RAW_CONFIG.get("llm") or {})
 
 
+def _llm_platform_raw(name: str) -> Dict[str, Any]:
+    return (_llm_from_config().get("platforms") or {}).get(name) or {}
+
+
 def _llm_provider_raw(name: str) -> Dict[str, Any]:
     return (_llm_from_config().get("providers") or {}).get(name) or {}
 
 
+def _resolve_api_key_for_provider(name: str, provider_raw: Dict[str, Any]) -> str:
+    """
+    解析 provider 的 api_key，优先级:
+      1) 环境变量 RAG_LLM__{PROVIDER}__API_KEY
+      2) 兼容旧环境变量 (OPENAI_API_KEY 等)
+      3) provider 级 JSON 里的 api_key
+      4) platform 级 api_key（通过 provider.platform 引用）
+    """
+    normalized = name.upper().replace("-", "_")
+    env_key = f"RAG_LLM__{normalized}__API_KEY"
+    api_key = os.getenv(env_key)
+    if not api_key:
+        legacy_key = _LLM_ENV_KEYS.get(name)
+        if not legacy_key and "-" in name:
+            base_name = name.split("-")[0]
+            legacy_key = _LLM_ENV_KEYS.get(base_name)
+        api_key = (os.getenv(legacy_key) if legacy_key else None)
+    if not api_key:
+        api_key = provider_raw.get("api_key") or ""
+    if not api_key:
+        platform_name = provider_raw.get("platform", "")
+        if platform_name:
+            plat = _llm_platform_raw(platform_name)
+            # platform 级也走环境变量
+            plat_normalized = platform_name.upper().replace("-", "_")
+            plat_env = f"RAG_LLM__{plat_normalized}__API_KEY"
+            api_key = os.getenv(plat_env) or ""
+            if not api_key:
+                plat_legacy = _LLM_ENV_KEYS.get(platform_name)
+                api_key = (os.getenv(plat_legacy) if plat_legacy else None) or ""
+            if not api_key:
+                api_key = plat.get("api_key", "")
+    return api_key
+
+
+def _resolve_base_url_for_provider(name: str, provider_raw: Dict[str, Any]) -> str:
+    """
+    解析 provider 的 base_url，优先级:
+      1) provider 级 JSON
+      2) platform 级 JSON
+      3) _LLM_DEFAULTS 硬编码回退
+    """
+    base_url = provider_raw.get("base_url", "")
+    if not base_url:
+        platform_name = provider_raw.get("platform", "")
+        if platform_name:
+            plat = _llm_platform_raw(platform_name)
+            base_url = plat.get("base_url", "")
+    if not base_url:
+        defaults = _LLM_DEFAULTS.get(name) or {}
+        base_url = defaults.get("base_url", "")
+    return base_url
+
+
 class LLMSettings:
     """
-    LLM 配置：config/rag_config.json 中 llm.providers 支持 openai / deepseek / gemini / claude。
-    环境变量覆盖 api_key：OPENAI_API_KEY, DEEPSEEK_API_KEY, GEMINI_API_KEY, ANTHROPIC_API_KEY。
-    脚本可通过参数 --llm / --model 指定本次使用的 provider 和模型。
+    LLM 配置：config/rag_config.json 中 llm.platforms 定义平台凭据，
+    llm.providers 定义具体变体。
+    环境变量覆盖 api_key：OPENAI_API_KEY, DEEPSEEK_API_KEY, GEMINI_API_KEY, ANTHROPIC_API_KEY 等。
     """
 
     def __init__(self):
@@ -246,44 +324,31 @@ class LLMSettings:
 
     def get_provider(self, name: str) -> Dict[str, Any]:
         """
-        按 provider 名（openai / deepseek / gemini / claude / kimi 等）返回配置：
-        - api_key/base_url
-        - default_model + models（支持一个 provider 多模型）
-        - params（provider 额外参数）
-        环境变量优先覆盖 api_key。支持变体名匹配环境变量（如 kimi-thinking 找 KIMI_API_KEY）。
+        按 provider 名返回完整配置（api_key/base_url 自动从 platform 继承）。
         """
         raw = _llm_provider_raw(name)
         defaults = _LLM_DEFAULTS.get(name) or {}
 
-        # 环境变量查找逻辑：
-        # 1) RAG_LLM__{PROVIDER}__API_KEY（优先）
-        # 2) 兼容旧变量名（如 OPENAI_API_KEY）
-        normalized = name.upper().replace("-", "_")
-        env_key = f"RAG_LLM__{normalized}__API_KEY"
-        api_key = os.getenv(env_key)
-        if not api_key:
-            legacy_key = _LLM_ENV_KEYS.get(name)
-            if not legacy_key and "-" in name:
-                base_name = name.split("-")[0]
-                legacy_key = _LLM_ENV_KEYS.get(base_name)
-            api_key = (os.getenv(legacy_key) if legacy_key else None)
-        api_key = api_key or raw.get("api_key") or ""
+        api_key = _resolve_api_key_for_provider(name, raw)
+        base_url = _resolve_base_url_for_provider(name, raw)
+
         models = raw.get("models") or {}
         if isinstance(models, list):
             models = {m: m for m in models}
         default_model = (
             raw.get("default_model")
-            or raw.get("model")  # 兼容旧字段
+            or raw.get("model")
             or defaults.get("default_model")
             or defaults.get("model")
             or ""
         )
         return {
             "api_key": api_key,
-            "base_url": raw.get("base_url") or defaults.get("base_url") or "",
+            "base_url": base_url,
             "default_model": default_model,
             "models": models,
             "params": raw.get("params") or {},
+            "platform": raw.get("platform", ""),
         }
 
     def resolve_model(self, provider: str, model_override: str | None = None) -> str:
@@ -360,6 +425,10 @@ def _web_search_from_config() -> Dict[str, Any]:
 
 def _google_search_from_config() -> Dict[str, Any]:
     return (_RAW_CONFIG.get("google_search") or {})
+
+
+def _serpapi_from_config() -> Dict[str, Any]:
+    return (_RAW_CONFIG.get("serpapi") or {})
 
 
 def _api_from_config() -> Dict[str, Any]:
@@ -541,6 +610,13 @@ class Settings:
             max_results=min(int(g.get("max_results", 5)), 20),
             user_data_dir=g.get("user_data_dir"),
         )
+        sp = _serpapi_from_config()
+        self.serpapi = SerpAPIConfig(
+            enabled=bool(sp.get("enabled", False)),
+            api_key=(sp.get("api_key") or "").strip(),
+            max_results=min(int(sp.get("max_results", 10)), 20),
+            timeout_seconds=int(sp.get("timeout_seconds", 30)),
+        )
         ss = _semantic_scholar_from_config()
         self.semantic_scholar = SemanticScholarConfig(
             enabled=bool(ss.get("enabled", False)),
@@ -569,6 +645,9 @@ class Settings:
             cache_enabled=bool(cf.get("cache_enabled", True)),
             cache_ttl_seconds=int(cf.get("cache_ttl_seconds", 3600)),
             max_concurrent=int(cf.get("max_concurrent", 5)),
+            compress_long_fulltext=bool(cf.get("compress_long_fulltext", True)),
+            compress_word_threshold=int(cf.get("compress_word_threshold", 300)),
+            compress_max_output_words=int(cf.get("compress_max_output_words", 400)),
         )
         a = _api_from_config()
         self.api = ApiSettings(

@@ -1,23 +1,18 @@
 {
+  "_comment": "复制此文件为 rag_config.local.json，填入真实 API Key。platforms 级配置会自动继承到所有同平台的 provider 变体（-thinking / -vision 等），无需重复填写。",
   "debug": false,
   "database": {
     "url": "sqlite:///data/rag.db"
   },
   "llm": {
-    "providers": {
-      "openai": { "api_key": "sk-xxx" },
-      "openai-thinking": { "api_key": "sk-xxx" },
-      "deepseek": { "api_key": "sk-xxx" },
-      "deepseek-thinking": { "api_key": "sk-xxx" },
-      "gemini": { "api_key": "AIzxxx" },
-      "gemini-thinking": { "api_key": "AIzxxx" },
-      "gemini-vision": { "api_key": "AIzxxx" },
-      "claude": { "api_key": "sk-ant-xxx" },
-      "claude-thinking": { "api_key": "sk-ant-xxx" },
-      "kimi": { "api_key": "sk-xxx" },
-      "kimi-vision": { "api_key": "sk-xxx" },
-      "kimi-thinking": { "api_key": "sk-xxx" },
-      "sonar": { "api_key": "pplx-xxx" }
+    "platforms": {
+      "openai":     { "api_key": "sk-proj-xxx" },
+      "deepseek":   { "api_key": "sk-xxx" },
+      "gemini":     { "api_key": "AIzxxx" },
+      "claude":     { "api_key": "sk-ant-xxx" },
+      "kimi":       { "api_key": "sk-xxx" },
+      "perplexity": { "api_key": "pplx-xxx" },
+      "qwen":       { "api_key": "sk-xxx" }
     }
   },
   "web_search": {
@@ -32,5 +27,8 @@
   "content_fetcher": {
     "brightdata_api_key": "",
     "brightdata_zone": ""
+  },
+  "auth": {
+    "secret_key": "<set-a-strong-random-value-for-jwt-signing>"
   }
 }

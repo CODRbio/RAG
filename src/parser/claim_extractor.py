@@ -252,7 +252,7 @@ class ClaimExtractor:
                         {"role": "system", "content": _pm.render("claim_extraction_system.txt")},
                         {"role": "user", "content": prompt},
                     ],
-                    max_tokens=2000,
+
                     response_model=_ClaimListResponse,
                 )
                 parsed: Optional[_ClaimListResponse] = resp.get("parsed_object")

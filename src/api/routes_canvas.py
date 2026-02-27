@@ -663,7 +663,7 @@ def canvas_ai_edit(canvas_id: str, body: CanvasAIEditRequest) -> CanvasAIEditRes
     ]
 
     try:
-        resp = client.chat(messages, max_tokens=2000)
+        resp = client.chat(messages)
         edited_text = (resp.get("final_text") or "").strip()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LLM 调用失败: {e}")

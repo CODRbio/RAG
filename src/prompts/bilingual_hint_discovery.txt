@@ -1,0 +1,5 @@
+LANGUAGE RULE (topic is in Chinese — DISCOVERY ENGINE queries):
+For Discovery category (targeting tavily / general web):
+Generate one Chinese natural-language question AND one English question per budget slot.
+Chinese questions reach Chinese-language web resources; English questions reach global.
+---

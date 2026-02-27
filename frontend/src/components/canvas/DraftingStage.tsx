@@ -1,9 +1,20 @@
 import { FileText, BookOpen, AlertTriangle, ChevronDown, ChevronUp, Send, CheckCircle2, RefreshCw } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
-import { listSectionReviews, submitSectionReview, submitGapSupplement, listGapSupplements } from '../../api/chat';
+import {
+  listSectionReviews,
+  submitSectionReview,
+  submitGapSupplement,
+  listGapSupplements,
+  restartDeepResearchPhase,
+  restartDeepResearchSection,
+} from '../../api/chat';
 import { useToastStore } from '../../stores';
 import { useChatStore } from '../../stores';
 import type { Canvas, GapSupplement } from '../../types';
+import {
+  DEEP_RESEARCH_JOB_KEY,
+  DEEP_RESEARCH_ARCHIVED_JOBS_KEY,
+} from '../workflow/deep-research/types';
 
 interface DraftingStageProps {
   canvas: Canvas;
@@ -24,13 +35,81 @@ export function DraftingStage({ canvas }: DraftingStageProps) {
   const [supplementType, setSupplementType] = useState<'material' | 'direct_info'>('direct_info');
   const [supplementText, setSupplementText] = useState('');
   const [supplementSubmitting, setSupplementSubmitting] = useState(false);
+  const [restarting, setRestarting] = useState(false);
   const addToast = useToastStore((s) => s.addToast);
   const researchDashboard = useChatStore((s) => s.researchDashboard);
   const setShowDeepResearchDialog = useChatStore((s) => s.setShowDeepResearchDialog);
   const setDeepResearchTopic = useChatStore((s) => s.setDeepResearchTopic);
+  const setDeepResearchActive = useChatStore((s) => s.setDeepResearchActive);
 
   const sortedOutline = [...(outline || [])].sort((a, b) => a.order - b.order);
-  const activeJobId = localStorage.getItem('deep_research_active_job_id') || '';
+
+  const resolveSourceJobId = (): string | null => {
+    const active = localStorage.getItem(DEEP_RESEARCH_JOB_KEY);
+    if (active && active.trim()) return active.trim();
+    try {
+      const raw = localStorage.getItem(DEEP_RESEARCH_ARCHIVED_JOBS_KEY);
+      const parsed = raw ? JSON.parse(raw) : [];
+      if (Array.isArray(parsed) && parsed.length > 0 && typeof parsed[0] === 'string') {
+        return parsed[0];
+      }
+    } catch {
+      // noop
+    }
+    return null;
+  };
+
+  const activeJobId = resolveSourceJobId() || '';
+
+  const afterRestartSubmitted = (jobId: string) => {
+    localStorage.setItem(DEEP_RESEARCH_JOB_KEY, jobId);
+    setDeepResearchTopic(canvas.topic || canvas.working_title || 'Deep Research');
+    setDeepResearchActive(true);
+    setShowDeepResearchDialog(true);
+  };
+
+  const handleRestartPhase = async (
+    phase: 'plan' | 'research' | 'generate_claims' | 'write' | 'verify' | 'review_gate' | 'synthesize',
+  ) => {
+    const sourceJobId = resolveSourceJobId();
+    if (!sourceJobId) {
+      addToast('未找到可重启任务，请先完成一次 Deep Research', 'warning');
+      return;
+    }
+    setRestarting(true);
+    try {
+      const resp = await restartDeepResearchPhase(sourceJobId, { phase });
+      afterRestartSubmitted(resp.job_id);
+      addToast(`已提交阶段重启：${phase}`, 'success');
+    } catch (err) {
+      console.error('[DraftingStage] restart phase failed:', err);
+      addToast('阶段重启失败，请重试', 'error');
+    } finally {
+      setRestarting(false);
+    }
+  };
+
+  const handleRestartSection = async (sectionTitle: string, action: 'research' | 'write') => {
+    const sourceJobId = resolveSourceJobId();
+    if (!sourceJobId) {
+      addToast('未找到可重启任务，请先完成一次 Deep Research', 'warning');
+      return;
+    }
+    setRestarting(true);
+    try {
+      const resp = await restartDeepResearchSection(sourceJobId, {
+        section_title: sectionTitle,
+        action,
+      });
+      afterRestartSubmitted(resp.job_id);
+      addToast(`已提交章节重启：${sectionTitle}`, 'success');
+    } catch (err) {
+      console.error('[DraftingStage] restart section failed:', err);
+      addToast('章节重启失败，请重试', 'error');
+    } finally {
+      setRestarting(false);
+    }
+  };
 
   const toggleSection = (id: string) => {
     setExpandedSections((prev) => {
@@ -114,7 +193,7 @@ export function DraftingStage({ canvas }: DraftingStageProps) {
   }, [activeJobId]);
 
   const handleSubmitReview = async (sectionId: string, action: 'approve' | 'revise', feedback: string = '') => {
-    const jobId = localStorage.getItem('deep_research_active_job_id') || '';
+    const jobId = localStorage.getItem(DEEP_RESEARCH_JOB_KEY) || '';
     if (!jobId) {
       addToast('未检测到活跃任务，无法提交审核', 'error');
       return;
@@ -182,7 +261,7 @@ export function DraftingStage({ canvas }: DraftingStageProps) {
       addToast('请输入要补充的资料或观点', 'error');
       return;
     }
-    const jobId = localStorage.getItem('deep_research_active_job_id') || '';
+    const jobId = localStorage.getItem(DEEP_RESEARCH_JOB_KEY) || '';
     const effectiveGap = (supplementGapText || 'Section-level supplement').trim();
     if (!jobId) {
       const payload = [
@@ -252,7 +331,7 @@ export function DraftingStage({ canvas }: DraftingStageProps) {
   };
 
   const handleApproveAllSections = async () => {
-    const jobId = localStorage.getItem('deep_research_active_job_id') || '';
+    const jobId = localStorage.getItem(DEEP_RESEARCH_JOB_KEY) || '';
     if (!jobId) {
       addToast('未检测到活跃任务，无法批量通过', 'error');
       return;
@@ -299,6 +378,36 @@ export function DraftingStage({ canvas }: DraftingStageProps) {
 
   return (
     <div className="p-4 space-y-3 overflow-y-auto h-full">
+      <div className="bg-[var(--bg-surface)] rounded-lg p-3 border border-[var(--border-subtle)]">
+        <div className="flex items-center gap-2 mb-2">
+          <RefreshCw size={13} className="text-indigo-500" />
+          <span className="text-xs text-[var(--text-tertiary)] font-medium">Draft 阶段重启</span>
+        </div>
+        <div className="flex flex-wrap gap-1.5">
+          <button
+            disabled={restarting}
+            onClick={() => void handleRestartPhase('research')}
+            className="px-2 py-1 text-[10px] border rounded text-indigo-700 hover:bg-indigo-50 disabled:opacity-50"
+          >
+            完全重做（全部章节）
+          </button>
+          <button
+            disabled={restarting}
+            onClick={() => void handleRestartPhase('generate_claims')}
+            className="px-2 py-1 text-[10px] border rounded text-indigo-700 hover:bg-indigo-50 disabled:opacity-50"
+          >
+            重新提炼+改写（全部章节）
+          </button>
+          <button
+            disabled={restarting}
+            onClick={() => void handleRestartPhase('verify')}
+            className="px-2 py-1 text-[10px] border rounded text-indigo-700 hover:bg-indigo-50 disabled:opacity-50"
+          >
+            重新核对验证（全部章节）
+          </button>
+        </div>
+      </div>
+
       <div className="bg-[var(--bg-surface)] rounded-lg p-3 border border-[var(--border-subtle)]">
         <div className="flex items-center justify-between">
           <span className="text-xs text-[var(--text-tertiary)]">章节进度</span>
@@ -389,6 +498,22 @@ export function DraftingStage({ canvas }: DraftingStageProps) {
 
             {hasDraft && isExpanded && (
               <div className="border-t border-[var(--border-subtle)]">
+                <div className="px-3 py-2 border-b border-[var(--border-subtle)] bg-[var(--bg-muted)] flex items-center gap-2">
+                  <button
+                    disabled={restarting}
+                    onClick={() => void handleRestartSection(section.title, 'research')}
+                    className="px-2 py-0.5 text-[10px] border rounded text-blue-700 hover:bg-blue-50 disabled:opacity-50"
+                  >
+                    重新研究+改写此章
+                  </button>
+                  <button
+                    disabled={restarting}
+                    onClick={() => void handleRestartSection(section.title, 'write')}
+                    className="px-2 py-0.5 text-[10px] border rounded text-amber-700 hover:bg-amber-50 disabled:opacity-50"
+                  >
+                    仅重写此章（跳过研究）
+                  </button>
+                </div>
                 <div className="px-3 py-2">
                   <pre className="text-xs text-[var(--text-primary)] whitespace-pre-wrap font-sans leading-relaxed">
                     {draft.content_md}

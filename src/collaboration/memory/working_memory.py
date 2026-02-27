@@ -102,7 +102,7 @@ def generate_working_memory_summary(canvas_id: str, config_path=None) -> str:
                 {"role": "system", "content": _pm.render("working_memory_progress_system.txt")},
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=256,
+
         )
         summary = (resp.get("final_text") or "").strip()
     except Exception:

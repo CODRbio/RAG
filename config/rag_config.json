@@ -6,156 +6,57 @@
   "llm": {
     "default": "deepseek", 
     "dry_run": false,
-    "providers": {
+    "platforms": {
       "openai": {
         "api_key": "sk-xxx",
-        "base_url": "https://api.openai.com/v1",
-        "default_model": "gpt-5.2",
-        "models": {
-          "gpt-5-mini": "gpt-5-mini",
-          "gpt-5.2": "gpt-5.2"
-        },
-        "params": {}
-      },
-      "openai-thinking": {
-        "api_key": "sk-xxx",
-        "base_url": "https://api.openai.com/v1",
-        "default_model": "gpt-5.2",
-        "models": {
-          "gpt-5.2": "gpt-5.2"
-        },
-        "params": {
-          "reasoning_effort": "high"
-        }
+        "base_url": "https://api.openai.com/v1"
       },
       "deepseek": {
         "api_key": "sk-xxx",
-        "base_url": "https://api.deepseek.com/v1",
-        "default_model": "deepseek-chat",
-        "models": {
-          "deepseek-chat": "deepseek-chat"
-        },
-        "params": {}
-      },
-      "deepseek-thinking": {
-        "api_key": "sk-xxx",
-        "base_url": "https://api.deepseek.com/v1",
-        "default_model": "deepseek-reasoner",
-        "models": {
-          "deepseek-reasoner": "deepseek-reasoner"
-        },
-        "params": {}
+        "base_url": "https://api.deepseek.com/v1"
       },
       "gemini": {
         "api_key": "AIzxxx",
-        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
-        "default_model": "gemini-pro-latest",
-        "models": {
-          "gemini-pro-latest": "gemini-pro-latest",
-          "gemini-flash-latest": "gemini-flash-latest"
-        },
-        "params": {}
-      },
-      "gemini-thinking": {
-        "api_key": "AIzxxx",
-        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
-        "default_model": "gemini-flash-latest",
-        "default_model_note": "修改默认模型：将 default_model 改为 models 里的 key（如 gemini-pro-latest）",
-        "models": {
-          "gemini-pro-latest": "gemini-pro-latest",
-          "gemini-flash-latest": "gemini-flash-latest"
-        },
-        "params": {
-          "reasoning_effort": "high"
-        }
-      },
-      "gemini-vision": {
-        "api_key": "AIzxxx",
-        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
-        "default_model": "gemini-2.5-flash",
-        "models": {
-          "gemini-pro-latest": "gemini-pro-latest",
-          "gemini-flash-latest": "gemini-flash-latest",
-          "gemini-2.5-flash": "gemini-2.5-flash"
-        },
-        "params": {
-          "temperature": 0.2,
-          "max_tokens": 8192
-        }
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai"
       },
       "claude": {
         "api_key": "sk-ant-xxx",
-        "base_url": "https://api.anthropic.com",
-        "default_model": "claude-sonnet-4-5",
-        "models": {
-          "claude-sonnet-4-5": "claude-sonnet-4-5-20250929",
-          "claude-haiku-4-5": "claude-haiku-4-5-20251001",
-          "claude-opus-4-6": "claude-opus-4-6-20260205"
-        },
-        "params": {}
-      },
-      "claude-thinking": {
-        "api_key": "sk-ant-xxx",
-        "base_url": "https://api.anthropic.com",
-        "default_model": "claude-sonnet-4-5",
-        "models": {
-          "claude-sonnet-4-5": "claude-sonnet-4-5-20250929",
-          "claude-haiku-4-5": "claude-haiku-4-5-20251001",
-          "claude-opus-4-6": "claude-opus-4-6-20260205"
-        },
-        "params": {
-          "thinking": {
-            "type": "enabled",
-            "budget_tokens": 8000
-          },
-          "max_tokens": 16000
-        }
+        "base_url": "https://api.anthropic.com"
       },
       "kimi": {
         "api_key": "sk-xxx",
-        "base_url": "https://api.moonshot.ai/v1",
-        "default_model": "kimi-k2.5",
-        "models": {
-          "kimi-k2.5": "kimi-k2.5"
-        },
-        "params": {}
+        "base_url": "https://api.moonshot.ai/v1"
       },
-      "kimi-vision": {
-        "api_key": "sk-xxx",
-        "base_url": "https://api.moonshot.ai/v1",
-        "default_model": "kimi-k2.5",
-        "models": {
-          "kimi-k2.5": "kimi-k2.5"
-        },
-        "params": {
-          "response_format": {
-            "type": "json_object"
-          }
-        }
-      },
-      "kimi-thinking": {
-        "api_key": "sk-xxx",
-        "base_url": "https://api.moonshot.ai/v1",
-        "default_model": "kimi-k2.5",
-        "models": {
-          "kimi-k2.5": "kimi-k2.5"
-        },
-        "params": {
-          "enable_reasoning": true,
-          "reasoning_effort": "high"
-        }
-      },
-      "sonar": {
+      "perplexity": {
         "api_key": "",
-        "base_url": "https://api.perplexity.ai",
-        "default_model": "sonar-pro",
-        "models": {
-          "sonar": "sonar",
-          "sonar-pro": "sonar-pro",
-          "sonar-reasoning-pro": "sonar-reasoning-pro"
-        },
-        "params": {}
+        "base_url": "https://api.perplexity.ai"
+      },
+      "qwen": {
+        "api_key": "sk-xxx",
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1"
       }
+    },
+    "_providers_note": "模型列表由前端实时从平台 API 拉取。default_model 仅在无 UI 选择时托底。params 用于 thinking 等参数注入。",
+    "providers": {
+      "openai":           { "platform": "openai",     "default_model": "gpt-5.2"                },
+      "openai-thinking":  { "platform": "openai",     "default_model": "gpt-5.2",               "params": { "reasoning_effort": "high" } },
+      "openai-mini":      { "platform": "openai",     "default_model": "gpt-5-mini"            },
+      "deepseek":         { "platform": "deepseek",   "default_model": "deepseek-chat"          },
+      "deepseek-thinking":{ "platform": "deepseek",   "default_model": "deepseek-reasoner",     "params": { "thinking": { "type": "enabled" } } },
+      "gemini":           { "platform": "gemini",     "default_model": "gemini-3.1-pro-preview" },
+      "gemini-thinking":  { "platform": "gemini",     "default_model": "gemini-3.1-pro-preview","params": { "reasoning_effort": "high" } },
+      "gemini-vision":    { "platform": "gemini",     "default_model": "gemini-3.1-pro-preview","params": { "temperature": 0.2 } },
+      "gemini-flash":     { "platform": "gemini",     "default_model": "gemini-flash-latest"   },
+      "claude":           { "platform": "claude",     "default_model": "claude-sonnet-4-6"      },
+      "claude-thinking":  { "platform": "claude",     "default_model": "claude-sonnet-4-6",     "params": { "thinking": { "type": "enabled", "budget_tokens": 10000 } } },
+      "claude-haiku":     { "platform": "claude",     "default_model": "claude-haiku-4-5"      },
+      "kimi":             { "platform": "kimi",       "default_model": "kimi-k2.5"              },
+      "kimi-vision":      { "platform": "kimi",       "default_model": "kimi-k2.5"              },
+      "kimi-thinking":    { "platform": "kimi",       "default_model": "kimi-k2.5",             "params": { "thinking": { "type": "enabled" } } },
+      "sonar":            { "platform": "perplexity", "default_model": "sonar-pro"               },
+      "qwen":             { "platform": "qwen",       "default_model": "qwen3.5-plus"            },
+      "qwen-vision":      { "platform": "qwen",       "default_model": "qwen3.5-plus"            },
+      "qwen-thinking":    { "platform": "qwen",       "default_model": "qwen3.5-plus",           "params": { "enable_thinking": true } }
     }
   },
   "parser": {
@@ -237,6 +138,12 @@
     "max_results": 5,
     "user_data_dir": null
   },
+  "serpapi": {
+    "enabled": false,
+    "api_key": "",
+    "max_results": 10,
+    "timeout_seconds": 30
+  },
   "semantic_scholar": {
     "enabled": false,
     "api_key": "",
@@ -261,7 +168,10 @@
     "brightdata_zone": "",
     "cache_enabled": true,
     "cache_ttl_seconds": 3600,
-    "max_concurrent": 5
+    "max_concurrent": 5,
+    "compress_long_fulltext": true,
+    "compress_word_threshold": 300,
+    "compress_max_output_words": 400
   },
   "api": {
     "host": "127.0.0.1",
@@ -303,6 +213,7 @@
         "precision_queries_per_section": 2,
         "search_top_k_first": 18,
         "search_top_k_gap": 10,
+        "search_top_k_eval": 20,
         "search_top_k_write": 10,
         "verification_k": 12,
         "self_correction_trigger_coverage": 0.75,
@@ -331,6 +242,7 @@
         "precision_queries_per_section": 4,
         "search_top_k_first": 30,
         "search_top_k_gap": 15,
+        "search_top_k_eval": 40,
         "search_top_k_write": 12,
         "verification_k": 16,
         "self_correction_trigger_coverage": 0.78,

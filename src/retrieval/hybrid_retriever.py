@@ -23,12 +23,14 @@ from dataclasses import dataclass
 from pymilvus import AnnSearchRequest, RRFRanker
 
 from config.settings import settings
-from src.indexing.milvus_ops import milvus
+from src.indexing.milvus_ops import milvus, MilvusOps
 from src.indexing.embedder import embedder
 from src.graph.hippo_rag import HippoRAG, get_hippo_rag
 from src.graph.entity_extractor import ExtractorConfig
 from src.log import get_logger
 from src.utils.cache import TTLCache, _make_key, get_cache
+
+logger = get_logger(__name__)
 
 try:
     from src.retrieval.dedup import dedup_and_diversify
@@ -80,54 +82,174 @@ def weighted_rrf(
     return sorted(scores.items(), key=lambda x: -x[1])
 
 
+def _embedding_pre_filter(
+    query: str,
+    candidates: List[Dict],
+    keep_k: int,
+) -> List[Dict]:
+    """Fast bi-encoder pre-filter: encode query + docs with BGE-M3, rank by
+    cosine similarity, return the top *keep_k* candidates.
+
+    Used as a funnel to shrink large candidate sets (200+) before feeding
+    them to the expensive cross-encoder.  ~3-7 s for 200 docs on MPS.
+    """
+    import numpy as np
+
+    docs = [c.get("content") or "" for c in candidates]
+    valid = [(i, d) for i, d in enumerate(docs) if d.strip()]
+    if not valid or len(valid) <= keep_k:
+        logger.debug("embedding_pre_filter: %d candidates ≤ keep_k=%d, no filter needed", len(candidates), keep_k)
+        return candidates[:keep_k]
+
+    valid_indices, valid_docs = zip(*valid)
+    t0 = time.perf_counter()
+    try:
+        query_dense = embedder.encode([query])["dense"][0]
+        q_norm = np.linalg.norm(query_dense)
+        if q_norm < 1e-10:
+            logger.warning("embedding_pre_filter: zero-norm query vector, returning head slice")
+            return candidates[:keep_k]
+        query_unit = query_dense / q_norm
+
+        doc_dense = embedder.encode(list(valid_docs))["dense"]
+    except Exception as e:
+        logger.error("embedding_pre_filter: encode failed (%s), returning head slice", e, exc_info=True)
+        return candidates[:keep_k]
+
+    scored: List[Tuple[int, float]] = []
+    for j, orig_idx in enumerate(valid_indices):
+        d_norm = np.linalg.norm(doc_dense[j])
+        sim = float(np.dot(query_unit, doc_dense[j] / d_norm)) if d_norm > 1e-10 else 0.0
+        scored.append((orig_idx, sim))
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    logger.info(
+        "embedding_pre_filter: %d → %d candidates in %.0f ms (top_sim=%.4f)",
+        len(candidates), keep_k, elapsed_ms,
+        scored[0][1] if scored else 0.0,
+    )
+    return [candidates[idx] for idx, _ in scored[:keep_k]]
+
+
 def _rerank_candidates(
     query: str,
     candidates: List[Dict],
     top_k: int,
+    reranker_mode: Optional[str] = None,
+    cascade_bge_k: Optional[int] = None,
 ) -> List[Dict]:
-    """
-    按 settings.search.reranker_mode 做精排，返回带 score 的 hit 列表。
-    支持 bge_only | colbert_only | cascade。需 use_colbert_reranker=true 时 ColBERT 才生效。
+    """Cross-encoder reranking with an embedding funnel for large input sets.
+
+    The funnel threshold is derived dynamically from the caller's *top_k* and
+    ``settings.search.rerank_input_k`` (config / UI controllable).  When the
+    candidate count exceeds that threshold the bi-encoder pre-filter narrows
+    the set so the cross-encoder runs on a bounded number of documents.
+
+    Supports bge_only | colbert_only | cascade.
+    Priority: reranker_mode param > settings.search.reranker_mode.
+    When cascade_bge_k is set (e.g. from UI step_top_k), cascade uses it as
+    the BGE-stage output size instead of config colbert_top_k.
     """
     if not candidates:
+        logger.debug("_rerank_candidates: empty candidates, skipping")
         return []
-    docs = [c.get("content") or "" for c in candidates]
+
+    t_total = time.perf_counter()
+    cfg_input_k = getattr(settings.search, "rerank_input_k", 100)
+    funnel_k = max(cfg_input_k, top_k * 3)
     use_colbert = getattr(settings.search, "use_colbert_reranker", False)
-    mode = getattr(settings.search, "reranker_mode", "bge_only") if use_colbert else "bge_only"
-    colbert_top_k = getattr(settings.search, "colbert_top_k", 30)
+    # Per-request mode overrides global settings; ColBERT modes are only effective
+    # when use_colbert_reranker is enabled or the request explicitly asks for colbert.
+    if reranker_mode:
+        if reranker_mode in ("colbert_only", "cascade") and not use_colbert:
+            # ColBERT not available server-side → downgrade to bge_only
+            mode = "bge_only"
+        else:
+            mode = reranker_mode
+    else:
+        mode = getattr(settings.search, "reranker_mode", "bge_only") if use_colbert else "bge_only"
+    colbert_top_k = cascade_bge_k if cascade_bge_k is not None else getattr(settings.search, "colbert_top_k", 30)
 
-    if mode == "colbert_only" and colbert_reranker is not None:
-        try:
-            reranked = colbert_reranker.rerank(query, docs, top_k=min(top_k * 2, len(docs)))
-            return [
-                {**candidates[r.index], "score": r.score}
-                for r in reranked
-            ][:top_k]
-        except Exception:
-            # ColBERT 不可用/加载失败时，回退到 BGE
-            pass
+    logger.info(
+        "rerank_start: candidates=%d top_k=%d mode=%s (requested=%s) funnel_k=%d",
+        len(candidates), top_k, mode, reranker_mode or "default", funnel_k,
+    )
 
-    if mode == "cascade" and colbert_reranker is not None:
+    # ── Funnel: shrink large sets before cross-encoder ──
+    n_before_funnel = len(candidates)
+    if len(candidates) > funnel_k:
+        candidates = _embedding_pre_filter(query, candidates, funnel_k)
+        logger.info(
+            "rerank_funnel: %d → %d (rerank_input_k=%d, top_k=%d)",
+            n_before_funnel, len(candidates), cfg_input_k, top_k,
+        )
+
+    docs = [c.get("content") or "" for c in candidates]
+
+    # ── colbert_only ──
+    if mode == "colbert_only" and colbert_reranker is not None and colbert_reranker.available:
+        logger.info("rerank_colbert_only: %d docs → top_k=%d", len(docs), top_k)
+        t = time.perf_counter()
+        reranked = colbert_reranker.rerank(query, docs, top_k=min(top_k * 2, len(docs)))
+        if reranked:
+            result = [{**candidates[r.index], "score": r.score} for r in reranked][:top_k]
+            logger.info("rerank_colbert_only: done in %.0f ms, returned %d", (time.perf_counter() - t) * 1000, len(result))
+            return result
+        logger.warning("rerank_colbert_only: empty result (%.0f ms) — falling back to BGE",
+                       (time.perf_counter() - t) * 1000)
+
+    # ── cascade: BGE → ColBERT ──
+    if mode == "cascade" and colbert_reranker is not None and colbert_reranker.available:
         bge_k = min(colbert_top_k, len(docs))
-        bge_out = embedder.rerank(query, docs, top_k=bge_k)
-        bge_candidates = [candidates[r.index] for r in bge_out]
-        bge_docs = [c.get("content") or "" for c in bge_candidates]
+        logger.info("rerank_cascade: BGE %d docs → top %d, then ColBERT → top_k=%d", len(docs), bge_k, top_k)
+        t_bge = time.perf_counter()
         try:
+            bge_out = embedder.rerank(query, docs, top_k=bge_k)
+        except Exception as e:
+            logger.error("rerank_cascade BGE failed (%.0f ms): %s — falling back to bge_only",
+                         (time.perf_counter() - t_bge) * 1000, e, exc_info=True)
+            # fall through to bge_only below
+        else:
+            logger.info("rerank_cascade BGE done in %.0f ms, got %d results",
+                        (time.perf_counter() - t_bge) * 1000, len(bge_out))
+            bge_candidates = [candidates[r.index] for r in bge_out]
+            bge_docs = [c.get("content") or "" for c in bge_candidates]
+            t_col = time.perf_counter()
             colbert_out = colbert_reranker.rerank(query, bge_docs, top_k=min(top_k * 2, len(bge_docs)))
-            return [
-                {**bge_candidates[r.index], "score": r.score}
-                for r in colbert_out
-            ][:top_k]
-        except Exception:
-            # ColBERT 不可用/加载失败时，回退到 BGE
-            pass
+            if colbert_out:
+                result = [{**bge_candidates[r.index], "score": r.score} for r in colbert_out][:top_k]
+                logger.info(
+                    "rerank_cascade ColBERT done in %.0f ms, returned %d (total %.0f ms)",
+                    (time.perf_counter() - t_col) * 1000, len(result),
+                    (time.perf_counter() - t_total) * 1000,
+                )
+                return result
+            # ColBERT returned empty (unavailable or runtime error) — use BGE results
+            logger.warning(
+                "rerank_cascade ColBERT returned empty (%.0f ms) — falling back to BGE result",
+                (time.perf_counter() - t_col) * 1000,
+            )
+            result = [{**candidates[r.index], "score": r.score} for r in bge_out][:top_k]
+            logger.info("rerank_cascade fallback: returning %d BGE results", len(result))
+            return result
 
-    # bge_only 或 ColBERT 不可用时
-    reranked = embedder.rerank(query, docs, top_k=min(top_k * 2, len(docs)))
-    return [
-        {**candidates[r.index], "score": r.score}
-        for r in reranked
-    ][:top_k]
+    # ── bge_only (default / fallback) ──
+    logger.info("rerank_bge_only: %d docs → top_k=%d", len(docs), top_k)
+    t_bge = time.perf_counter()
+    try:
+        reranked = embedder.rerank(query, docs, top_k=min(top_k * 2, len(docs)))
+        result = [{**candidates[r.index], "score": r.score} for r in reranked][:top_k]
+        logger.info(
+            "rerank_bge_only done in %.0f ms, returned %d (total %.0f ms)",
+            (time.perf_counter() - t_bge) * 1000, len(result),
+            (time.perf_counter() - t_total) * 1000,
+        )
+        return result
+    except Exception as e:
+        logger.error("rerank_bge_only failed (%.0f ms): %s — returning head slice",
+                     (time.perf_counter() - t_bge) * 1000, e, exc_info=True)
+        return candidates[:top_k]
 
 
 @dataclass
@@ -139,6 +261,9 @@ class RetrievalConfig:
     graph_weight: float = 0.3  # hybrid 模式下图检索权重
     year_start: Optional[int] = None  # 年份窗口起始（硬过滤）
     year_end: Optional[int] = None  # 年份窗口结束（硬过滤）
+    reranker_mode: Optional[str] = None  # 覆盖全局 reranker_mode：bge_only | colbert_only | cascade
+    colbert_top_k: Optional[int] = None  # cascade 时 BGE 阶段输出数，由 UI step_top_k 穿透时使用
+    step_top_k: Optional[int] = None  # 每步检索最终保留数；未设时继承 settings.rerank_output_k
 
 
 class HybridRetriever:
@@ -147,6 +272,8 @@ class HybridRetriever:
 
     整合向量检索和 HippoRAG 图检索
     """
+
+    _year_field_cache: Dict[str, bool] = {}
 
     def __init__(self, graph_path: Optional[Path] = None):
         self.hippo: Optional[HippoRAG] = None
@@ -161,6 +288,30 @@ class HybridRetriever:
             )
             if perf else None
         )
+
+    def _guard_year_expr(self, collection: str, year_expr: str) -> Optional[str]:
+        """Return year_expr only if the collection supports 'year' filtering."""
+        if collection not in self._year_field_cache:
+            has_year = False
+            try:
+                schema = milvus.client.describe_collection(collection)
+                has_year = any(f.get("name") == "year" for f in (schema.get("fields") or []))
+            except Exception:
+                pass
+            if not has_year:
+                try:
+                    probe = milvus.client.query(
+                        collection_name=collection, filter="year >= 0",
+                        output_fields=["chunk_id"], limit=1,
+                    )
+                    has_year = len(probe) > 0
+                except Exception:
+                    pass
+            self._year_field_cache[collection] = has_year
+        if not self._year_field_cache[collection]:
+            self.logger.info("collection '%s' has no 'year' field; skipping year filter", collection)
+            return None
+        return year_expr
 
     def _build_extractor_config(self) -> ExtractorConfig:
         cfg = settings.graph_entity_extraction
@@ -196,6 +347,9 @@ class HybridRetriever:
         year_start: Optional[int] = None,
         year_end: Optional[int] = None,
         diagnostics: Optional[Dict] = None,
+        reranker_mode: Optional[str] = None,
+        cascade_bge_k: Optional[int] = None,
+        step_top_k: Optional[int] = None,
     ) -> List[Dict]:
         """
         纯向量检索（Dense + Sparse + Weighted RRF + Rerank）
@@ -209,12 +363,13 @@ class HybridRetriever:
         dense_recall_k = getattr(settings.search, "dense_recall_k", 80)
         sparse_recall_k = getattr(settings.search, "sparse_recall_k", 80)
         rerank_input_k = getattr(settings.search, "rerank_input_k", 100)
+        # 请求未传 step_top_k 时继承此默认（与 UI stepTopK 同义）
         rerank_output_k = getattr(settings.search, "rerank_output_k", 10)
         w_dense = getattr(settings.search, "rrf_dense_weight", 0.6)
         w_sparse = getattr(settings.search, "rrf_sparse_weight", 0.4)
         per_doc_cap = getattr(settings.search, "per_doc_cap", 3)
 
-        cache_key = _make_key("retrieval_vector", query, collection, top_k, rerank, year_start, year_end)
+        cache_key = _make_key("retrieval_vector", query, collection, top_k, rerank, year_start, year_end, step_top_k)
         if self._vector_cache:
             cached = self._vector_cache.get(cache_key)
             if cached is not None:
@@ -234,17 +389,22 @@ class HybridRetriever:
         ]
 
         # Stage 1: 分离召回（可选并行 + 超时）
+        year_expr = MilvusOps.build_year_expr(year_start=year_start, year_end=year_end) or None
+        if year_expr:
+            year_expr = self._guard_year_expr(collection, year_expr)
         dense_req = AnnSearchRequest(
             data=[dense_vec.tolist()],
             anns_field="dense_vector",
             param={"metric_type": "COSINE", "params": {"nprobe": 16}},
             limit=dense_recall_k,
+            expr=year_expr,
         )
         sparse_req = AnnSearchRequest(
             data=[sparse_dict],
             anns_field="sparse_vector",
             param={"metric_type": "IP"},
             limit=sparse_recall_k,
+            expr=year_expr,
         )
         timeout_s = getattr(settings, "perf_retrieval", None)
         timeout_s = getattr(timeout_s, "timeout_seconds", 60) if timeout_s else 60
@@ -258,8 +418,6 @@ class HybridRetriever:
                 ranker=RRFRanker(k=settings.search.rrf_k),
                 limit=dense_recall_k,
                 output_fields=output_fields,
-                year_start=year_start,
-                year_end=year_end,
             )
 
         def _do_sparse():
@@ -269,8 +427,6 @@ class HybridRetriever:
                 ranker=RRFRanker(k=settings.search.rrf_k),
                 limit=sparse_recall_k,
                 output_fields=output_fields,
-                year_start=year_start,
-                year_end=year_end,
             )
 
         dense_res, sparse_res = None, None
@@ -327,19 +483,24 @@ class HybridRetriever:
         fusion_ms = (time.perf_counter() - t_fusion) * 1000
 
         # Stage 3: Rerank（bge_only | colbert_only | cascade）
+        # 输出条数：请求 step_top_k 优先，否则继承 config rerank_output_k
+        rerank_output_limit = step_top_k if step_top_k is not None else rerank_output_k
         t_rerank = time.perf_counter()
         reranked = False
         if rerank and candidates:
             docs = [c["content"] for c in candidates if c.get("content")]
             if docs:
-                hits = _rerank_candidates(query, candidates, top_k=min(rerank_output_k * 2, len(candidates)))
+                hits = _rerank_candidates(
+                    query, candidates, top_k=min(rerank_output_limit, len(candidates)),
+                    reranker_mode=reranker_mode, cascade_bge_k=cascade_bge_k,
+                )
                 hits = dedup_and_diversify(hits, per_doc_cap=per_doc_cap)
-                out = hits[:top_k]
+                out = hits[:step_top_k] if step_top_k is not None else hits[:top_k]
                 reranked = True
         rerank_ms = (time.perf_counter() - t_rerank) * 1000
 
         if not reranked:
-            out = candidates[:top_k]
+            out = candidates[:step_top_k] if step_top_k is not None else candidates[:top_k]
 
         # 填充诊断信息
         if diagnostics is not None:
@@ -400,6 +561,9 @@ class HybridRetriever:
         year_start: Optional[int] = None,
         year_end: Optional[int] = None,
         diagnostics: Optional[Dict] = None,
+        reranker_mode: Optional[str] = None,
+        cascade_bge_k: Optional[int] = None,
+        step_top_k: Optional[int] = None,
     ) -> List[Dict]:
         """
         混合检索（向量 + 图融合）
@@ -414,6 +578,8 @@ class HybridRetriever:
             year_start=year_start,
             year_end=year_end,
             diagnostics=diagnostics,
+            cascade_bge_k=cascade_bge_k,
+            step_top_k=step_top_k,
         )
 
         # 2. 条件触发 HippoRAG（多实体+关系词时融合图检索）
@@ -433,12 +599,17 @@ class HybridRetriever:
         if rerank and fused_hits:
             hits_with_content = [h for h in fused_hits if h.get("content")]
             if hits_with_content:
-                rerank_output_k = getattr(settings.search, "rerank_output_k", 10)
-                fused_hits = _rerank_candidates(query, hits_with_content, top_k=min(rerank_output_k * 2, len(hits_with_content)))
+                # 请求未传 step_top_k 时继承 config rerank_output_k
+                default_output_k = getattr(settings.search, "rerank_output_k", 10)
+                rerank_limit = step_top_k if step_top_k is not None else default_output_k
+                fused_hits = _rerank_candidates(
+                    query, hits_with_content, top_k=min(rerank_limit, len(hits_with_content)),
+                    reranker_mode=reranker_mode, cascade_bge_k=cascade_bge_k,
+                )
                 per_doc_cap = getattr(settings.search, "per_doc_cap", 3)
                 fused_hits = dedup_and_diversify(fused_hits, per_doc_cap=per_doc_cap)
 
-        return fused_hits[:top_k]
+        return fused_hits[:step_top_k] if step_top_k is not None else fused_hits[:top_k]
 
     def retrieve(
         self,
@@ -471,6 +642,9 @@ class HybridRetriever:
                 config.year_start,
                 config.year_end,
                 diagnostics=diagnostics,
+                reranker_mode=config.reranker_mode,
+                cascade_bge_k=config.colbert_top_k,
+                step_top_k=config.step_top_k,
             )
         elif config.mode == "graph":
             return self.retrieve_graph(query, config.top_k)
@@ -484,6 +658,9 @@ class HybridRetriever:
                 config.year_start,
                 config.year_end,
                 diagnostics=diagnostics,
+                reranker_mode=config.reranker_mode,
+                cascade_bge_k=config.colbert_top_k,
+                step_top_k=config.step_top_k,
             )
 
 

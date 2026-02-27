@@ -170,7 +170,7 @@ def compress_trajectory(
                 {"role": "user", "content": prompt},
             ],
             model=model,
-            max_tokens=1500,
+
         )
         summary = (resp.get("final_text") or "").strip()
     except Exception as e:

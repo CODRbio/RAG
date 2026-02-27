@@ -184,7 +184,7 @@ def compare_papers(body: CompareRequest) -> CompareResponse:
                 {"role": "user", "content": prompt},
             ],
             model=body.model_override or None,
-            max_tokens=3000,
+
             response_model=_CompareLLMResponse,
         )
         parsed: Optional[_CompareLLMResponse] = resp.get("parsed_object")

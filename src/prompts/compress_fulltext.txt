@@ -1,0 +1,12 @@
+User question or topic: {query}
+
+Source: {title}
+URL: {url}
+
+Full text below. Extract the main points most relevant to the question: key conclusions, data, mechanisms, and any important limitations or uncertainties. Output must be at most 400 words. Do not add anything that is not in the source.
+
+---
+{full_text}
+---
+
+Summarized evidence (plain text, at most 400 words):

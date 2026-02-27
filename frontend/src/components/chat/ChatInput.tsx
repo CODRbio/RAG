@@ -139,17 +139,21 @@ export function ChatInput() {
     setIsStreaming(true);
     setWorkflowStep('explore');
 
-    // 构建检索参数
+    try {
+      // 构建检索参数
     const enabledProviders = webSearchConfig.sources
       .filter((s) => s.enabled)
       .map((s) => s.id);
 
-    const webSourceConfigs: Record<string, { topK: number; threshold: number }> = {};
+    const webSourceConfigs: Record<string, { topK: number; threshold: number; useSerpapi?: boolean }> = {};
     webSearchConfig.sources.forEach((source) => {
       if (source.enabled) {
-        webSourceConfigs[source.id] = { topK: source.topK, threshold: source.threshold };
+        const cfg: { topK: number; threshold: number; useSerpapi?: boolean } = { topK: source.topK, threshold: source.threshold };
+        if (source.useSerpapi) cfg.useSerpapi = true;
+        webSourceConfigs[source.id] = cfg;
       }
     });
+    const hasAnySerpapi = webSearchConfig.sources.some((s) => s.enabled && s.useSerpapi);
 
     const localEnabled = ragConfig.enabled ?? true;
     const webEnabled = webSearchConfig.enabled && enabledProviders.length > 0;
@@ -178,18 +182,25 @@ export function ChatInput() {
       search_mode: searchMode,
       mode,
       llm_provider: selectedProvider || undefined,
+      ultra_lite_provider: deepResearchDefaults.ultra_lite_provider || undefined,
       model_override: selectedModel || undefined,
       web_providers: (searchMode !== 'none' && webEnabled) ? enabledProviders : undefined,
       web_source_configs: (searchMode !== 'none' && webEnabled && Object.keys(webSourceConfigs).length > 0) ? webSourceConfigs : undefined,
+      serpapi_ratio: (searchMode !== 'none' && webEnabled && hasAnySerpapi) ? (webSearchConfig.serpapiRatio ?? 50) / 100 : undefined,
       use_query_optimizer: (searchMode !== 'none' && webEnabled) ? queryOptimizerEnabled : undefined,
       query_optimizer_max_queries: (searchMode !== 'none' && webEnabled) ? maxQueries : undefined,
       local_top_k: (searchMode !== 'none' && localEnabled) ? ragConfig.localTopK : undefined,
       local_threshold: (searchMode !== 'none' && localEnabled) ? (ragConfig.localThreshold ?? undefined) : undefined,
       year_start: ragConfig.yearStart ?? undefined,
       year_end: ragConfig.yearEnd ?? undefined,
-      final_top_k: (searchMode !== 'none') ? (ragConfig.finalTopK ?? 10) : undefined,
+      step_top_k: (searchMode !== 'none') ? (ragConfig.stepTopK ?? 10) : undefined,
       use_content_fetcher: (searchMode !== 'none' && webEnabled) ? webSearchConfig.contentFetcherMode : undefined,
       agent_mode: ragConfig.agentMode ?? 'standard',
+      reranker_mode: searchMode !== 'none'
+        ? (ragConfig.enableReranker
+          ? ((localStorage.getItem('adv_reranker_mode') || 'cascade') as 'bge_only' | 'colbert_only' | 'cascade')
+          : 'bge_only')
+        : undefined,
     };
 
     if (import.meta.env.DEV) {
@@ -295,6 +306,11 @@ export function ChatInput() {
       addToast(t('chat.sendFailed'), 'error');
       appendToLastMessage('\n\n' + t('chat.requestError'));
     } finally {
+      setIsStreaming(false);
+    }
+    } catch (err) {
+      console.error('[ChatInput] handleSend error (e.g. missing store field):', err);
+      addToast(t('chat.sendFailed'), 'error');
       setIsStreaming(false);
     }
   };

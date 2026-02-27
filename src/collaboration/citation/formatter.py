@@ -35,55 +35,58 @@ def format_bibtex(citations: List[Citation]) -> str:
     return "\n\n".join(lines) if lines else ""
 
 
+def _format_authors_full(authors: List[str]) -> str:
+    """Format author list for reference list (full names, APA-like).
+
+    1 author:  Wang, X.
+    2 authors: Wang, X. and Li, Y.
+    3+ authors: Wang, X., Li, Y., and Zhang, Z.
+    """
+    if not authors:
+        return "Anonymous"
+
+    def _one(author: str) -> str:
+        parts = [p for p in str(author or "").replace(",", " ").split() if p]
+        if not parts:
+            return ""
+        if len(parts) == 1:
+            return parts[0]
+        last = parts[-1]
+        initials = " ".join(f"{p[0].upper()}." for p in parts[:-1] if p)
+        return f"{last}, {initials}" if initials else last
+
+    formatted = [_one(a) for a in authors if str(a or "").strip()]
+    formatted = [a for a in formatted if a]
+    if not formatted:
+        return "Anonymous"
+    if len(formatted) == 1:
+        return formatted[0]
+    if len(formatted) == 2:
+        return f"{formatted[0]} and {formatted[1]}"
+    return f"{', '.join(formatted[:-1])}, and {formatted[-1]}"
+
+
 def format_reference_list(
     citations: List[Citation],
     use_cite_key: bool = True,
     style: Literal["apa", "ieee", "numeric", "custom"] = "custom",
 ) -> str:
-    """
-    输出参考文献段落。
+    """Output reference list in academic format.
+
+    Default (custom) style produces APA-like entries:
+      [Wang et al., 2011] Wang, X., Li, Y., and Zhang, Z. (2011). Title. URL
 
     Args:
-        citations: 引用列表
-        use_cite_key: 是否使用 cite_key 作为标签（否则使用数字序号）
-        style: 格式风格
-            - "apa": APA-like
-            - "ieee": IEEE-like
-            - "numeric": 数字序号（兼容旧参数，等同 IEEE 标签风格）
-            - "custom": 自定义格式（默认，使用 cite_key）
-
-    Returns:
-        格式化的参考文献文本
+        citations: citation objects (ordered by first appearance)
+        use_cite_key: use cite_key as label; False falls back to numeric
+        style: apa | ieee | numeric | custom
     """
-    def _format_authors_apa(authors: List[str]) -> str:
-        if not authors:
-            return "Anonymous"
-
-        def _one(author: str) -> str:
-            parts = [p for p in str(author or "").replace(",", " ").split() if p]
-            if not parts:
-                return ""
-            if len(parts) == 1:
-                return parts[0]
-            last = parts[-1]
-            initials = " ".join(f"{p[0].upper()}." for p in parts[:-1] if p)
-            return f"{last}, {initials}" if initials else last
-
-        normalized = [_one(a) for a in authors if str(a or "").strip()]
-        normalized = [a for a in normalized if a]
-        if not normalized:
-            return "Anonymous"
-        if len(normalized) == 1:
-            return normalized[0]
-        if len(normalized) == 2:
-            return f"{normalized[0]} & {normalized[1]}"
-        return f"{', '.join(normalized[:-1])}, & {normalized[-1]}"
+    import re as _re
 
     lines = []
     for i, c in enumerate(citations, 1):
-        author_part = ", ".join(c.authors) if c.authors else "Anonymous"
         year_part = f"{c.year}" if c.year else "n.d."
-        title_part = c.title or "(无标题)"
+        title_part = c.title or "(Untitled)"
         doi_norm = _normalize_doi(c.doi)
         link_part = c.url or (f"https://doi.org/{doi_norm}" if doi_norm else "")
 
@@ -92,19 +95,24 @@ def format_reference_list(
         else:
             label = c.cite_key or c.id or str(i)
 
+        # Web-only sources (Web1, Web2, ...) — compact format: just title + URL
+        is_web_key = bool(_re.fullmatch(r"Web\d+", label, _re.IGNORECASE))
+        if is_web_key:
+            if link_part:
+                lines.append(f"[{label}] {title_part}. {link_part}")
+            else:
+                lines.append(f"[{label}] {title_part}.")
+            continue
+
+        author_full = _format_authors_full(c.authors or [])
+        link_suffix = f" {link_part}" if link_part else ""
+
         if style == "apa":
-            apa_authors = _format_authors_apa(c.authors or [])
-            suffix = f" {link_part}" if link_part else ""
-            lines.append(f"{apa_authors} ({year_part}). {title_part}.{suffix}")
+            lines.append(f"{author_full} ({year_part}). {title_part}.{link_suffix}")
         elif style in ("ieee", "numeric"):
-            year_suffix = f", {year_part}" if c.year else ""
-            link_suffix = f", {link_part}" if link_part else ""
-            lines.append(f"[{label}] {author_part}, \"{title_part}\"{year_suffix}{link_suffix}.")
+            lines.append(f"[{label}] {author_full}, \"{title_part}\", {year_part}.{link_suffix}")
         else:
-            # 自定义风格
-            link_suffix = f" {link_part}" if link_part else ""
-            year_suffix = f" ({c.year})" if c.year else ""
-            lines.append(f"[{label}] {author_part}{year_suffix}. {title_part}.{link_suffix}")
+            lines.append(f"[{label}] {author_full} ({year_part}). {title_part}.{link_suffix}")
 
     return "\n\n".join(lines) if lines else ""
 
@@ -160,51 +168,34 @@ def format_ris(citations: List[Citation]) -> str:
 
 
 def format_inline_citation(cite_key: str, style: Literal["bracket", "parenthetical"] = "bracket") -> str:
-    """
-    格式化行内引用标记。
+    """Format in-text citation marker.
 
-    Args:
-        cite_key: 引用键
-        style: 格式风格
-            - "bracket": [Smith2023]
-            - "parenthetical": (Smith, 2023)
-
-    Returns:
-        格式化的引用标记
+    With the new academic cite_key format (e.g., "Wang et al., 2011"),
+    bracket style produces: [Wang et al., 2011]
+    parenthetical style produces: (Wang et al., 2011)
     """
     if style == "parenthetical":
-        # 尝试解析 author_date 格式
-        import re
-        match = re.match(r"^([A-Za-z]+)(\d{4})([a-z]?)$", cite_key)
-        if match:
-            author, year, suffix = match.groups()
-            return f"({author}, {year}{suffix})"
         return f"({cite_key})"
     return f"[{cite_key}]"
 
 
 def citations_to_markdown_list(citations: List[Citation]) -> str:
-    """
-    将引用列表转换为 Markdown 列表格式。
-
-    Returns:
-        Markdown 格式的引用列表
-    """
+    """Convert citation list to Markdown bullet format with hyperlinked titles."""
     lines = []
     for c in citations:
         key = c.cite_key or c.id
-        author_part = ", ".join(c.authors) if c.authors else "佚名"
+        author_full = _format_authors_full(c.authors or [])
         year_part = f" ({c.year})" if c.year else ""
-        title_part = c.title or "(无标题)"
-        
-        # 带链接的标题
+        title_part = c.title or "(Untitled)"
+
         if c.url:
             title_md = f"[{title_part}]({c.url})"
         elif c.doi:
-            title_md = f"[{title_part}](https://doi.org/{c.doi})"
+            doi_norm = _normalize_doi(c.doi)
+            title_md = f"[{title_part}](https://doi.org/{doi_norm})" if doi_norm else title_part
         else:
             title_md = title_part
-        
-        lines.append(f"- **[{key}]** {author_part}{year_part}. {title_md}")
-    
+
+        lines.append(f"- **[{key}]** {author_full}{year_part}. {title_md}")
+
     return "\n".join(lines) if lines else ""

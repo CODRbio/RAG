@@ -13,7 +13,8 @@ Current user question:
 CRITICAL RULES:
 - The query MUST target the CURRENT question, not background topics.
 - Use background only to replace unresolved references.
-- Output 3-8 precise academic keywords.
+- Distill to core entities/concepts; do NOT copy full user sentences.
+- Output 3-8 precise academic keywords (noun-focused, high-information terms).
 - Avoid generic suffixes: review, survey, overview.
 - Use {language_instruction}.
 - Output ONLY the query string.

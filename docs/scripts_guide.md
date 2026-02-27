@@ -2,6 +2,8 @@
 
 本文档按使用场景组织 `scripts/` 下脚本，帮助快速定位执行顺序与用途。
 
+**说明**：所有功能与选项以 **UI 前端为主**；脚本为**默认/辅助**手段（环境检查、单点测试、流水线等），正式使用请通过前端界面。
+
 更新时间：2026-02-19
 
 ## 一、环境与基础设施
@@ -37,6 +39,7 @@
 | `05_test_rag.py` | RAG 端到端测试 |
 | `07_test_web_search.py` | Tavily 网络搜索测试 |
 | `09_test_google_search.py` | Google / Scholar 搜索测试 |
+| `test_serpapi.py` | SerpAPI（Scholar + Google Web）命令行辅助测试；正式使用以前端 UI 为主 |
 | `10_test_multiturn.py` | 多轮对话测试 |
 | `11_test_llm_providers.py` | LLM provider 切换测试 |
 | `12_test_workflow_stage.py` | 工作流状态测试 |

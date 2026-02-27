@@ -5,6 +5,10 @@ FastAPI 应用入口 - 多轮对话 API
 import asyncio
 from contextlib import asynccontextmanager
 
+# 在 Python < 3.11 下启用 aiohttp HTTPS 代理 (TLS-in-TLS)，避免 RuntimeWarning 与请求失败
+from src.utils.aiohttp_tls_patch import apply_aiohttp_tls_in_tls_patch
+apply_aiohttp_tls_in_tls_patch()
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 

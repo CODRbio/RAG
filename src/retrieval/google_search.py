@@ -39,6 +39,7 @@ import os
 import platform
 import random
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -57,6 +58,61 @@ logger = get_logger(__name__)
 _shared_browser_manager: Optional["_BrowserManager"] = None
 _shared_browser_last_used: float = 0.0
 _shared_browser_lock = asyncio.Lock()
+# Cross-job guard for Chromium profile operations.
+_browser_profile_lock = threading.Lock()
+
+
+class _ProfileLockGuard:
+    async def __aenter__(self):
+        await asyncio.to_thread(_browser_profile_lock.acquire)
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        _browser_profile_lock.release()
+        return False
+
+
+_profile_lock_guard = _ProfileLockGuard()
+
+
+def _cleanup_stale_singleton_lock(user_data_dir: str) -> None:
+    """Remove a stale Chromium ``SingletonLock`` if the owning process is dead.
+
+    Chromium creates a symlink ``SingletonLock`` whose target is
+    ``<hostname>-<pid>``.  If the process crashed without cleanup, the
+    lock file prevents any new instance from using the same profile.
+    """
+    lock_path = os.path.join(user_data_dir, "SingletonLock")
+    if not os.path.lexists(lock_path):
+        return
+    try:
+        target = os.readlink(lock_path)
+        parts = target.rsplit("-", 1)
+        if len(parts) == 2:
+            pid = int(parts[1])
+            os.kill(pid, 0)  # raises OSError if process is dead
+            return  # process still alive — do not remove
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        os.unlink(lock_path)
+        logger.info("Removed stale Chromium SingletonLock: %s", lock_path)
+    except OSError:
+        pass
+
+
+async def _close_shared_browser_if_exists() -> None:
+    """Close the global shared browser (if any) to free the profile directory."""
+    async with _profile_lock_guard:
+        async with _shared_browser_lock:
+            global _shared_browser_manager, _shared_browser_last_used
+            if _shared_browser_manager is not None:
+                try:
+                    await _shared_browser_manager.close()
+                except Exception:
+                    pass
+                _shared_browser_manager = None
+                _shared_browser_last_used = 0
 
 
 async def _get_or_create_shared_browser_manager(
@@ -72,36 +128,37 @@ async def _get_or_create_shared_browser_manager(
         return None, None
     
     max_idle = getattr(perf, "max_idle_seconds", 300) or 300
-    async with _shared_browser_lock:
-        global _shared_browser_manager, _shared_browser_last_used
-        now = time.monotonic()
-        if _shared_browser_manager is not None:
-            if (now - _shared_browser_last_used) > max_idle:
-                try:
-                    await _shared_browser_manager.close()
-                except Exception:
-                    pass
-                _shared_browser_manager = None
-            else:
-                _shared_browser_last_used = now
-                if _shared_browser_manager.browsers:
-                    return _shared_browser_manager, _shared_browser_manager.browsers[0]
-                try:
-                    await _shared_browser_manager.close()
-                except Exception:
-                    pass
-                _shared_browser_manager = None
-        manager = _BrowserManager(timeout=timeout)
-        context = await manager.launch_persistent_browser(
-            user_data_dir=user_data_dir,
-            headless=headless,
-            proxy=proxy,
-            stealth_mode=True,
-            extension_path=extension_path,
-        )
-        _shared_browser_manager = manager
-        _shared_browser_last_used = time.monotonic()
-        return manager, context
+    async with _profile_lock_guard:
+        async with _shared_browser_lock:
+            global _shared_browser_manager, _shared_browser_last_used
+            now = time.monotonic()
+            if _shared_browser_manager is not None:
+                if (now - _shared_browser_last_used) > max_idle:
+                    try:
+                        await _shared_browser_manager.close()
+                    except Exception:
+                        pass
+                    _shared_browser_manager = None
+                else:
+                    _shared_browser_last_used = now
+                    if _shared_browser_manager.browsers:
+                        return _shared_browser_manager, _shared_browser_manager.browsers[0]
+                    try:
+                        await _shared_browser_manager.close()
+                    except Exception:
+                        pass
+                    _shared_browser_manager = None
+            manager = _BrowserManager(timeout=timeout)
+            context = await manager.launch_persistent_browser(
+                user_data_dir=user_data_dir,
+                headless=headless,
+                proxy=proxy,
+                stealth_mode=True,
+                extension_path=extension_path,
+            )
+            _shared_browser_manager = manager
+            _shared_browser_last_used = time.monotonic()
+            return manager, context
 
 
 # ============================================================
@@ -422,7 +479,9 @@ class _BrowserManager:
     ):
         """启动持久化浏览器实例"""
         await self._ensure_playwright()
-        
+
+        _cleanup_stale_singleton_lock(user_data_dir)
+
         # 自动检测显示模式
         if headless is None:
             use_headed, display_mode = _ensure_display()
@@ -867,13 +926,14 @@ class GoogleSearcher:
                 context = shared_ctx
             else:
                 browser_manager = _BrowserManager(timeout=timeout)
-                context = await browser_manager.launch_persistent_browser(
-                    user_data_dir=self._get_user_data_dir(),
-                    headless=headless,
-                    proxy=proxy,
-                    stealth_mode=True,
-                    extension_path=self._get_extension_path()
-                )
+                async with _profile_lock_guard:
+                    context = await browser_manager.launch_persistent_browser(
+                        user_data_dir=self._get_user_data_dir(),
+                        headless=headless,
+                        proxy=proxy,
+                        stealth_mode=True,
+                        extension_path=self._get_extension_path()
+                    )
 
             page = await context.new_page()
             page.set_default_timeout(timeout)
@@ -974,7 +1034,8 @@ class GoogleSearcher:
                 except Exception:
                     pass
             if browser_manager and not reuse_browser:
-                await browser_manager.close()
+                async with _profile_lock_guard:
+                    await browser_manager.close()
             elif browser_manager and reuse_browser:
                 global _shared_browser_last_used
                 _shared_browser_last_used = time.monotonic()
@@ -1034,17 +1095,31 @@ class GoogleSearcher:
         browser_manager = None
         context = None
         page = None
+        reuse_browser = getattr(getattr(settings, "perf_google_search", None), "browser_reuse", True)
+        using_shared_browser = False
         
         try:
-            # 启动浏览器（只启动一次）
-            browser_manager = _BrowserManager(timeout=timeout)
-            context = await browser_manager.launch_persistent_browser(
+            shared_mgr, shared_ctx = await _get_or_create_shared_browser_manager(
+                timeout=timeout,
                 user_data_dir=user_data_dir,
                 headless=headless,
                 proxy=proxy,
-                stealth_mode=True,
-                extension_path=self._get_extension_path()
+                extension_path=self._get_extension_path(),
             )
+            if shared_mgr is not None and shared_ctx is not None:
+                browser_manager = shared_mgr
+                context = shared_ctx
+                using_shared_browser = True
+            else:
+                browser_manager = _BrowserManager(timeout=timeout)
+                async with _profile_lock_guard:
+                    context = await browser_manager.launch_persistent_browser(
+                        user_data_dir=user_data_dir,
+                        headless=headless,
+                        proxy=proxy,
+                        stealth_mode=True,
+                        extension_path=self._get_extension_path()
+                    )
             
             page = await context.new_page()
             page.set_default_timeout(timeout)
@@ -1153,13 +1228,16 @@ class GoogleSearcher:
                     await page.close()
                 except Exception:
                     pass
-            # 关闭浏览器（批量搜索完成后始终关闭）
-            if browser_manager:
+            if browser_manager and (not reuse_browser or not using_shared_browser):
                 try:
-                    await browser_manager.close()
+                    async with _profile_lock_guard:
+                        await browser_manager.close()
                     logger.info("Scholar 批量搜索：浏览器已关闭")
                 except Exception as e:
                     logger.warning(f"关闭浏览器时出错: {e}")
+            elif browser_manager and reuse_browser and using_shared_browser:
+                global _shared_browser_last_used
+                _shared_browser_last_used = time.monotonic()
 
     async def search_google(
         self,
@@ -1211,13 +1289,14 @@ class GoogleSearcher:
                 context = shared_ctx
             else:
                 browser_manager = _BrowserManager(timeout=timeout)
-                context = await browser_manager.launch_persistent_browser(
-                    user_data_dir=self._get_user_data_dir(),
-                    headless=headless,
-                    proxy=proxy,
-                    stealth_mode=True,
-                    extension_path=self._get_extension_path()
-                )
+                async with _profile_lock_guard:
+                    context = await browser_manager.launch_persistent_browser(
+                        user_data_dir=self._get_user_data_dir(),
+                        headless=headless,
+                        proxy=proxy,
+                        stealth_mode=True,
+                        extension_path=self._get_extension_path()
+                    )
 
             page = await context.new_page()
             page.set_default_timeout(timeout)
@@ -1281,7 +1360,8 @@ class GoogleSearcher:
                 except Exception:
                     pass
             if browser_manager and not reuse_browser:
-                await browser_manager.close()
+                async with _profile_lock_guard:
+                    await browser_manager.close()
             elif browser_manager and reuse_browser:
                 global _shared_browser_last_used
                 _shared_browser_last_used = time.monotonic()
@@ -1337,17 +1417,31 @@ class GoogleSearcher:
         browser_manager = None
         context = None
         page = None
+        reuse_browser = getattr(getattr(settings, "perf_google_search", None), "browser_reuse", True)
+        using_shared_browser = False
         
         try:
-            # 启动浏览器（只启动一次）
-            browser_manager = _BrowserManager(timeout=timeout)
-            context = await browser_manager.launch_persistent_browser(
+            shared_mgr, shared_ctx = await _get_or_create_shared_browser_manager(
+                timeout=timeout,
                 user_data_dir=user_data_dir,
                 headless=headless,
                 proxy=proxy,
-                stealth_mode=True,
-                extension_path=self._get_extension_path()
+                extension_path=self._get_extension_path(),
             )
+            if shared_mgr is not None and shared_ctx is not None:
+                browser_manager = shared_mgr
+                context = shared_ctx
+                using_shared_browser = True
+            else:
+                browser_manager = _BrowserManager(timeout=timeout)
+                async with _profile_lock_guard:
+                    context = await browser_manager.launch_persistent_browser(
+                        user_data_dir=user_data_dir,
+                        headless=headless,
+                        proxy=proxy,
+                        stealth_mode=True,
+                        extension_path=self._get_extension_path()
+                    )
             
             page = await context.new_page()
             page.set_default_timeout(timeout)
@@ -1430,13 +1524,16 @@ class GoogleSearcher:
                     await page.close()
                 except Exception:
                     pass
-            # 关闭浏览器（批量搜索完成后始终关闭）
-            if browser_manager:
+            if browser_manager and (not reuse_browser or not using_shared_browser):
                 try:
-                    await browser_manager.close()
+                    async with _profile_lock_guard:
+                        await browser_manager.close()
                     logger.info("Google 批量搜索：浏览器已关闭")
                 except Exception as e:
                     logger.warning(f"关闭浏览器时出错: {e}")
+            elif browser_manager and reuse_browser and using_shared_browser:
+                global _shared_browser_last_used
+                _shared_browser_last_used = time.monotonic()
 
     def _build_scholar_url(
         self, 
@@ -1700,29 +1797,28 @@ class GoogleSearcher:
 async def cleanup_shared_browser():
     """清理全局共享的浏览器实例。在程序退出或测试完成后调用。"""
     global _shared_browser_manager, _shared_browser_last_used
-    async with _shared_browser_lock:
-        if _shared_browser_manager is not None:
-            try:
-                await _shared_browser_manager.close()
-                logger.info("共享浏览器实例已关闭")
-            except Exception as e:
-                logger.warning(f"关闭共享浏览器时出错: {e}")
-            finally:
-                _shared_browser_manager = None
-                _shared_browser_last_used = 0
+    async with _profile_lock_guard:
+        async with _shared_browser_lock:
+            if _shared_browser_manager is not None:
+                try:
+                    await _shared_browser_manager.close()
+                    logger.info("共享浏览器实例已关闭")
+                except Exception as e:
+                    logger.warning(f"关闭共享浏览器时出错: {e}")
+                finally:
+                    _shared_browser_manager = None
+                    _shared_browser_last_used = 0
 
 
 def cleanup_shared_browser_sync():
     """同步版本的清理函数（在非异步上下文中使用）"""
+    from src.retrieval.unified_web_search import _get_bg_loop
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            asyncio.ensure_future(cleanup_shared_browser())
-        else:
-            loop.run_until_complete(cleanup_shared_browser())
-    except RuntimeError:
-        # 没有事件循环，创建新的
-        asyncio.run(cleanup_shared_browser())
+        bg = _get_bg_loop()
+        fut = asyncio.run_coroutine_threadsafe(cleanup_shared_browser(), bg)
+        fut.result(timeout=10)
+    except Exception:
+        pass
 
 
 # 注册退出时自动清理

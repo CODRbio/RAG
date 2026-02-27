@@ -15,6 +15,23 @@ from src.log import get_logger
 logger = get_logger(__name__)
 
 
+def _init_hf_cache_env() -> None:
+    """Align HuggingFace cache env with project conventions.
+
+    - If HF_HOME is unset, default to MODEL_CACHE_ROOT (or ~/Hug)
+    - If HF_HUB_CACHE is unset, default to $HF_HOME/hub
+    This keeps model-sync behavior consistent with runtime start.sh behavior.
+    """
+    model_cache_root = os.path.expanduser(os.getenv("MODEL_CACHE_ROOT", "~/Hug"))
+    if not os.getenv("HF_HOME"):
+        os.environ["HF_HOME"] = model_cache_root
+    if not os.getenv("HF_HUB_CACHE"):
+        os.environ["HF_HUB_CACHE"] = str(Path(os.environ["HF_HOME"]).expanduser() / "hub")
+
+
+_init_hf_cache_env()
+
+
 @dataclass
 class ModelStatusItem:
     name: str
@@ -38,6 +55,11 @@ class ModelSyncItem:
     resolved_path: Optional[str] = None
 
 
+def _get_hf_hub_cache_dir() -> str:
+    """Return cache dir used by huggingface_hub snapshots (HF_HOME/hub)."""
+    return str(Path(os.getenv("HF_HUB_CACHE", "")).expanduser())
+
+
 def _get_model_targets() -> List[tuple[str, str, str]]:
     """返回需要管理的模型列表：(name, model_id, cache_dir)."""
     targets = [
@@ -45,8 +67,14 @@ def _get_model_targets() -> List[tuple[str, str, str]]:
         ("bge_reranker", settings.model.reranker_model, settings.model.reranker_cache_dir or ""),
     ]
     if settings.search.use_colbert_reranker:
+        hf_hub_cache = _get_hf_hub_cache_dir()
         targets.append(
-            ("colbert", settings.search.colbert_model, settings.model.colbert_cache_dir or "")
+            # ColBERT (ragatouille) uses huggingface_hub/transformers cache semantics
+            ("colbert", settings.search.colbert_model, hf_hub_cache)
+        )
+        # ColBERT model depends on this remote-code repo at runtime.
+        targets.append(
+            ("colbert_runtime_code", "jinaai/xlm-roberta-flash-implementation", hf_hub_cache)
         )
     return targets
 

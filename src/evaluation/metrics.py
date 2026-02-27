@@ -11,6 +11,12 @@ from typing import Iterable, List, Tuple
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+|[\u4e00-\u9fff]")
 _CITE_RE = re.compile(r"\[([^\]]+)\]")
+_LEGACY_MULTI_TOKEN_RE = re.compile(r"^[a-z0-9_.:/-]+$", re.IGNORECASE)
+_AUTHOR_DATE_KEY_RE = re.compile(
+    r"^[A-Za-z\u4e00-\u9fff].{2,80},\s*(?:\d{4}|n\.d\.)[a-z]?$",
+    re.IGNORECASE,
+)
+_WEB_KEY_RE = re.compile(r"^web\d+$", re.IGNORECASE)
 
 
 def tokenize(text: str) -> List[str]:
@@ -71,17 +77,26 @@ def _lcs_length(a: List[str], b: List[str]) -> int:
 
 
 def extract_citations(text: str) -> List[str]:
-    """
-    从回答中抽取 [xxx] 形式的引用标记。
-    支持 [A; B] / [A, B] / [A B]
+    """Extract [xxx] citation markers from text.
+
+    Handles both legacy keys ([Smith2023], [a3f7b2c9], [1,2]) and academic keys
+    ([Wang et al., 2011]). Prefer semicolon splitting for academic style, while
+    preserving backward compatibility for legacy comma/space-delimited keys.
     """
     out: List[str] = []
     for block in _CITE_RE.findall(text or ""):
-        parts = re.split(r"[;,/|\s]+", block.strip())
-        for p in parts:
-            key = p.strip()
-            if key:
-                out.append(key)
+        for seg in [s.strip() for s in block.split(";") if s.strip()]:
+            # Keep author-date and WebN keys intact; commas/spaces are part of the key.
+            if _AUTHOR_DATE_KEY_RE.fullmatch(seg) or _WEB_KEY_RE.fullmatch(seg):
+                out.append(seg)
+                continue
+
+            # Legacy style: [1,2], [hash1 hash2], [smith2023|li2021]
+            legacy_parts = [p.strip() for p in re.split(r"[,|\s]+", seg) if p.strip()]
+            if len(legacy_parts) >= 2 and all(_LEGACY_MULTI_TOKEN_RE.fullmatch(p) for p in legacy_parts):
+                out.extend(legacy_parts)
+            else:
+                out.append(seg)
     return out
 
 

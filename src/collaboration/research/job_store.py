@@ -15,6 +15,7 @@ from sqlmodel import Session, select
 from src.db.engine import get_engine
 from src.db.models import (
     DeepResearchJob,
+    DRCheckpoint,
     DRGapSupplement,
     DRInsight,
     DRJobEvent,
@@ -104,6 +105,89 @@ def list_jobs(limit: int = 20, status: Optional[str] = None) -> List[Dict[str, A
             stmt = select(DeepResearchJob).order_by(DeepResearchJob.created_at.desc()).limit(limit)
         rows = session.exec(stmt).all()
     return [r.to_dict() for r in rows]
+
+
+# ── Checkpoints ───────────────────────────────────────────────────────────────
+
+def save_checkpoint(
+    job_id: str,
+    phase: str,
+    state_dict: Dict[str, Any],
+    section_title: str = "",
+) -> Dict[str, Any]:
+    now = time.time()
+    normalized_phase = (phase or "").strip().lower()
+    normalized_section = (section_title or "").strip()
+    payload = json.dumps(state_dict or {}, ensure_ascii=False, default=str)
+    with Session(get_engine()) as session:
+        row = session.get(DRCheckpoint, (job_id, normalized_phase, normalized_section))
+        if row is None:
+            row = DRCheckpoint(
+                job_id=job_id,
+                phase=normalized_phase,
+                section_title=normalized_section,
+                state_json=payload,
+                created_at=now,
+            )
+        else:
+            row.state_json = payload
+            row.created_at = now
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+    return {
+        "job_id": row.job_id,
+        "phase": row.phase,
+        "section_title": row.section_title,
+        "state": row.get_state(),
+        "created_at": row.created_at,
+    }
+
+
+def load_checkpoint(
+    job_id: str,
+    phase: Optional[str] = None,
+    section_title: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    with Session(get_engine()) as session:
+        stmt = select(DRCheckpoint).where(DRCheckpoint.job_id == job_id)
+        if phase is not None:
+            stmt = stmt.where(DRCheckpoint.phase == phase.strip().lower())
+        if section_title is not None:
+            stmt = stmt.where(DRCheckpoint.section_title == section_title.strip())
+        stmt = stmt.order_by(DRCheckpoint.created_at.desc()).limit(1)
+        row = session.exec(stmt).first()
+    if row is None:
+        return None
+    return {
+        "job_id": row.job_id,
+        "phase": row.phase,
+        "section_title": row.section_title,
+        "state": row.get_state(),
+        "created_at": row.created_at,
+    }
+
+
+def list_checkpoints(job_id: str) -> List[Dict[str, Any]]:
+    with Session(get_engine()) as session:
+        stmt = (
+            select(DRCheckpoint)
+            .where(DRCheckpoint.job_id == job_id)
+            .order_by(DRCheckpoint.created_at.desc())
+        )
+        rows = session.exec(stmt).all()
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        out.append(
+            {
+                "job_id": row.job_id,
+                "phase": row.phase,
+                "section_title": row.section_title,
+                "state": row.get_state(),
+                "created_at": row.created_at,
+            }
+        )
+    return out
 
 
 def list_events(job_id: str, after_id: int = 0, limit: int = 500) -> List[Dict[str, Any]]:

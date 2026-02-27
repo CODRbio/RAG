@@ -16,10 +16,54 @@ from typing import Any, Dict, List, Optional, Tuple
 from config.settings import settings
 from src.retrieval.evidence import EvidenceChunk, EvidencePack
 from src.retrieval.dedup import cross_source_dedup
+from src.retrieval.fulltext_compressor import compress_fulltext_hits_sync
 from src.retrieval.hybrid_retriever import HybridRetriever, RetrievalConfig, _rerank_candidates
 from src.retrieval.unified_web_search import unified_web_searcher
 
 logger = logging.getLogger(__name__)
+
+
+def _embedding_rerank(
+    query: str,
+    candidates: List[Dict[str, Any]],
+    top_k: int,
+) -> List[Dict[str, Any]]:
+    """Fast embedding-based reranking via BGE-M3 cosine similarity.
+
+    Uses the already-loaded BGE-M3 bi-encoder to batch-encode documents and
+    rank by dense cosine similarity with the query.  ~3-7 s for 200 docs on
+    MPS vs ~45 s for cross-encoder — an order of magnitude faster while
+    still providing genuine semantic ranking (unlike raw API score sort).
+    """
+    import numpy as np
+    from src.indexing.embedder import embedder
+
+    if not candidates:
+        return []
+
+    docs = [c.get("content") or "" for c in candidates]
+    valid = [(i, d) for i, d in enumerate(docs) if d.strip()]
+    if not valid:
+        return candidates[:top_k]
+
+    valid_indices, valid_docs = zip(*valid)
+
+    query_dense = embedder.encode([query])["dense"][0]
+    q_norm = np.linalg.norm(query_dense)
+    if q_norm < 1e-10:
+        return candidates[:top_k]
+    query_unit = query_dense / q_norm
+
+    doc_dense = embedder.encode(list(valid_docs))["dense"]
+
+    scored: List[tuple] = []
+    for j, orig_idx in enumerate(valid_indices):
+        d_norm = np.linalg.norm(doc_dense[j])
+        sim = float(np.dot(query_unit, doc_dense[j] / d_norm)) if d_norm > 1e-10 else 0.0
+        scored.append((orig_idx, sim))
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return [{**candidates[idx], "score": sc} for idx, sc in scored[:top_k]]
 
 # ── Observability ──
 try:
@@ -201,6 +245,38 @@ def _hit_to_chunk(hit: Dict[str, Any], source_type: str, query: str) -> Evidence
     )
 
 
+def _compress_web_fulltext(
+    web_hits: List[Dict[str, Any]],
+    query: str,
+    filters: Optional[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Compress long full-text web hits (rerank 后、转 chunk 前). On failure return unchanged."""
+    if not web_hits:
+        return web_hits
+    cfg = getattr(settings, "content_fetcher", None)
+    if not cfg or not getattr(cfg, "compress_long_fulltext", True):
+        return web_hits
+    try:
+        from src.llm.llm_manager import get_manager
+        ultra_lite = (filters or {}).get("ultra_lite_provider")
+        llm_client = get_manager().get_ultra_lite_client(ultra_lite)
+    except Exception as e:
+        logger.debug("fulltext compressor: no LLM client, skip: %s", e)
+        return web_hits
+    try:
+        compress_fulltext_hits_sync(
+            web_hits,
+            query,
+            llm_client,
+            word_threshold=getattr(cfg, "compress_word_threshold", 300),
+            max_output_words=getattr(cfg, "compress_max_output_words", 400),
+            max_concurrent=getattr(cfg, "max_concurrent", 5),
+        )
+    except Exception as e:
+        logger.warning("fulltext compression failed, using original content: %s", e)
+    return web_hits
+
+
 def _coerce_year(value: Any) -> Optional[int]:
     if value is None or value == "":
         return None
@@ -257,9 +333,22 @@ class RetrievalService:
             EvidencePack
         """
         k = top_k if top_k is not None else self.top_k
-        final_top_k = (filters or {}).get("final_top_k")
-        result_limit = final_top_k if final_top_k is not None else k
-        
+        step_top_k = (filters or {}).get("step_top_k")
+        ui_reranker_mode = (filters or {}).get("reranker_mode") or None
+        result_limit = step_top_k if step_top_k is not None else k
+        _cascade_bge_k = (filters or {}).get("colbert_top_k") or (filters or {}).get("step_top_k")
+        logger.debug(
+            "[service.search] query=%r mode=%s top_k=%s → k=%d | step_top_k=%s → result_limit=%d"
+            " | reranker_mode=%s | web_providers=%s | year=%s~%s | optimizer=%s | serpapi_ratio=%s",
+            query[:60], mode, top_k, k,
+            step_top_k, result_limit,
+            ui_reranker_mode,
+            ",".join((filters or {}).get("web_providers") or []) or "none",
+            (filters or {}).get("year_start"), (filters or {}).get("year_end"),
+            (filters or {}).get("use_query_optimizer"),
+            (filters or {}).get("serpapi_ratio"),
+        )
+
         sources_used: List[str] = []
         all_chunks: List[EvidenceChunk] = []
         total_candidates = 0
@@ -285,6 +374,8 @@ class RetrievalService:
                 rerank=True,
                 year_start=year_start,
                 year_end=year_end,
+                reranker_mode=ui_reranker_mode,
+                step_top_k=(filters or {}).get("step_top_k"),
             )
             return self.retriever.retrieve(query, self.collection, config, diagnostics=diag)
 
@@ -292,19 +383,20 @@ class RetrievalService:
             web_providers = (filters or {}).get("web_providers")
             if web_providers is not None and len(web_providers) == 0:
                 return []
+            # Chat 时前端传 web_source_configs：每个 provider 在各组查询下使用该 provider 的 topK
             web_source_configs = (filters or {}).get("web_source_configs") or {}
             use_query_expansion = (filters or {}).get("use_query_expansion")
             use_query_optimizer = (filters or {}).get("use_query_optimizer")
             query_optimizer_max_queries = (filters or {}).get("query_optimizer_max_queries")
             _llm_provider = (filters or {}).get("llm_provider")
             _model_override = (filters or {}).get("model_override")
-            # 参数级联：根据 final_top_k 自动放大 per-provider 采集量
-            _final = (filters or {}).get("final_top_k") or k
+            # 无 web_source_configs 时用 step_top_k 推导统一上限；有则各 provider 用自身 topK
+            _final = (filters or {}).get("step_top_k") or k
             _n_providers = max(len(web_providers or []), 1)
             _n_queries = query_optimizer_max_queries or 3
             _auto_per_provider = max(5, math.ceil(_final * 3.5 / (_n_providers * _n_queries)))
             logger.info(
-                "web search params: providers=%s auto_per_provider=%s final_top_k=%s llm=%s/%s",
+                "web search params: providers=%s auto_per_provider=%s step_top_k=%s llm=%s/%s",
                 web_providers,
                 _auto_per_provider,
                 _final,
@@ -312,13 +404,16 @@ class RetrievalService:
                 _model_override,
             )
             use_content_fetcher = (filters or {}).get("use_content_fetcher")
+            _queries_per_provider = (filters or {}).get("web_queries_per_provider")
+            _semantic_query_map = (filters or {}).get("semantic_query_map")
+            _serpapi_ratio = (filters or {}).get("serpapi_ratio")
 
-            # 为 Lazy Fetching 预判构建 LLM 客户端（仅智能模式 use_content_fetcher=None 或 'auto'）
+            # 为 Lazy Fetching 预判构建 LLM 客户端（仅智能模式 use_content_fetcher=None 或 'auto'，使用 lite 降级）
             _llm_client = None
             if use_content_fetcher in (None, "auto"):
                 try:
                     from src.llm.llm_manager import get_manager
-                    _llm_client = get_manager().get_client(_llm_provider or "deepseek")
+                    _llm_client = get_manager().get_lite_client(_llm_provider or "deepseek")
                 except Exception as _e:
                     logger.debug("Lazy Fetching LLM 客户端初始化失败，降级全量抓取: %s", _e)
 
@@ -337,6 +432,9 @@ class RetrievalService:
                 llm_client=_llm_client,
                 year_start=year_start,
                 year_end=year_end,
+                queries_per_provider=_queries_per_provider,
+                semantic_query_map=_semantic_query_map,
+                serpapi_ratio=_serpapi_ratio,
             )
             web_ms = (time.perf_counter() - t_web) * 1000
             # 收集 web provider 诊断
@@ -355,12 +453,25 @@ class RetrievalService:
 
         # 获取阈值过滤参数和最终保留数量
         local_threshold = (filters or {}).get("local_threshold")
+        skip_rerank = bool((filters or {}).get("skip_rerank"))
 
         if mode == "hybrid":
             local_hits: List[Dict[str, Any]] = []
             web_hits: List[Dict[str, Any]] = []
+            local_config = RetrievalConfig(
+                mode="hybrid",
+                top_k=actual_recall,
+                rerank=not skip_rerank,
+                year_start=year_start,
+                year_end=year_end,
+                reranker_mode=ui_reranker_mode,
+                step_top_k=(filters or {}).get("step_top_k"),
+            )
             with ThreadPoolExecutor(max_workers=2) as ex:
-                fl = ex.submit(_do_local)
+                fl = ex.submit(
+                    self.retriever.retrieve,
+                    query, self.collection, local_config, diagnostics=diag,
+                )
                 fw = ex.submit(_do_web)
                 try:
                     local_hits = fl.result(timeout=timeout_s)
@@ -392,14 +503,27 @@ class RetrievalService:
                 dedup_removed = web_before - len(web_hits)
                 if dedup_removed > 0:
                     diag["cross_source_dedup"] = {"removed": dedup_removed, "remaining": len(web_hits)}
-            # Web 结果 rerank（多语言 ColBERT 支持中英文）
+            # Web 结果排序：cross-encoder 精排 or embedding 快排
             if web_hits:
-                try:
-                    web_hits = _rerank_candidates(
-                        query, web_hits, top_k=min(k, len(web_hits))
-                    )
-                except Exception as e:
-                    logger.warning("web rerank failed: %s", e)
+                _web_top_k = min(k, len(web_hits))
+                if skip_rerank:
+                    try:
+                        web_hits = _embedding_rerank(query, web_hits, top_k=_web_top_k)
+                    except Exception as e:
+                        logger.warning("embedding rerank failed: %s", e)
+                        web_hits = web_hits[:_web_top_k]
+                else:
+                    try:
+                        web_hits = _rerank_candidates(
+                            query, web_hits, top_k=_web_top_k, reranker_mode=ui_reranker_mode,
+                        )
+                    except Exception as e:
+                        logger.warning("web cross-encoder rerank failed, falling back to embedding: %s", e)
+                        try:
+                            web_hits = _embedding_rerank(query, web_hits, top_k=_web_top_k)
+                        except Exception:
+                            web_hits = web_hits[:_web_top_k]
+            web_hits = _compress_web_fulltext(web_hits, query, filters)
             for h in web_hits:
                 if "web" not in sources_used:
                     sources_used.append("web")
@@ -409,9 +533,11 @@ class RetrievalService:
                 config = RetrievalConfig(
                     mode="hybrid",
                     top_k=actual_recall,
-                    rerank=True,
+                    rerank=not skip_rerank,
                     year_start=year_start,
                     year_end=year_end,
+                    reranker_mode=ui_reranker_mode,
+                    step_top_k=(filters or {}).get("step_top_k"),
                 )
                 hits = self.retriever.retrieve(query, self.collection, config, diagnostics=diag)
                 total_candidates += len(hits) * 2
@@ -432,6 +558,7 @@ class RetrievalService:
             elif mode == "web":
                 try:
                     web_providers = (filters or {}).get("web_providers")
+                    # 各 provider 使用 web_source_configs 中该 provider 的 topK
                     web_source_configs = (filters or {}).get("web_source_configs") or {}
                     use_query_expansion = (filters or {}).get("use_query_expansion")
                     use_query_optimizer = (filters or {}).get("use_query_optimizer")
@@ -439,18 +566,20 @@ class RetrievalService:
                     _llm_provider = (filters or {}).get("llm_provider")
                     _model_override = (filters or {}).get("model_override")
                     # 参数级联
-                    _final = (filters or {}).get("final_top_k") or k
+                    _final = (filters or {}).get("step_top_k") or k
                     _n_providers = max(len(web_providers or []), 1)
                     _n_queries = query_optimizer_max_queries or 3
                     _auto_per_provider = max(5, math.ceil(_final * 3.5 / (_n_providers * _n_queries)))
                     _use_content_fetcher = (filters or {}).get("use_content_fetcher")
+                    _semantic_query_map = (filters or {}).get("semantic_query_map")
+                    _serpapi_ratio = (filters or {}).get("serpapi_ratio")
 
-                    # 为 Lazy Fetching 预判构建 LLM 客户端（仅智能模式 _use_content_fetcher=None 或 'auto'）
+                    # 为 Lazy Fetching 预判构建 LLM 客户端（仅智能模式 _use_content_fetcher=None 或 'auto'，使用 lite 降级）
                     _llm_client = None
                     if _use_content_fetcher in (None, "auto"):
                         try:
                             from src.llm.llm_manager import get_manager
-                            _llm_client = get_manager().get_client(_llm_provider or "deepseek")
+                            _llm_client = get_manager().get_lite_client(_llm_provider or "deepseek")
                         except Exception as _e:
                             logger.debug("Lazy Fetching LLM 客户端初始化失败，降级全量抓取: %s", _e)
 
@@ -468,17 +597,32 @@ class RetrievalService:
                         llm_client=_llm_client,
                         year_start=year_start,
                         year_end=year_end,
+                        semantic_query_map=_semantic_query_map,
+                        serpapi_ratio=_serpapi_ratio,
                     )
                     total_candidates += len(web_hits)
                     sources_used.append("web")
-                    # Web 结果 rerank
+                    # Web 结果排序
                     if web_hits:
-                        try:
-                            web_hits = _rerank_candidates(
-                                query, web_hits, top_k=min(result_limit, len(web_hits))
-                            )
-                        except Exception as e:
-                            logger.warning("web rerank failed: %s", e)
+                        _web_top_k = min(result_limit, len(web_hits))
+                        if skip_rerank:
+                            try:
+                                web_hits = _embedding_rerank(query, web_hits, top_k=_web_top_k)
+                            except Exception as e:
+                                logger.warning("embedding rerank failed: %s", e)
+                                web_hits = web_hits[:_web_top_k]
+                        else:
+                            try:
+                                web_hits = _rerank_candidates(
+                                    query, web_hits, top_k=_web_top_k, reranker_mode=ui_reranker_mode,
+                                )
+                            except Exception as e:
+                                logger.warning("web cross-encoder rerank failed, falling back to embedding: %s", e)
+                                try:
+                                    web_hits = _embedding_rerank(query, web_hits, top_k=_web_top_k)
+                                except Exception:
+                                    web_hits = web_hits[:_web_top_k]
+                    web_hits = _compress_web_fulltext(web_hits, query, filters)
                     for h in web_hits:
                         all_chunks.append(_hit_to_chunk(h, "web", query))
                 except Exception:
@@ -493,8 +637,8 @@ class RetrievalService:
             obs_metrics.retrieval_duration_seconds.labels(mode=mode).observe(elapsed_s)
             obs_metrics.retrieval_chunks_returned.labels(mode=mode).observe(len(all_chunks))
 
-        # 使用 final_top_k 作为最终保留数量，否则使用 k
-        result_limit = final_top_k if final_top_k is not None else k
+        # 使用 step_top_k 作为最终保留数量，否则使用 k
+        result_limit = step_top_k if step_top_k is not None else k
         
         return EvidencePack(
             query=query,

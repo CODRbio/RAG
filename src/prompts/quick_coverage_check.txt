@@ -1,0 +1,34 @@
+You are an evidence sufficiency evaluator. For EACH gap listed below, determine whether the new evidence provides a SUBSTANTIVE answer — not just a mention of the topic.
+
+Section: {section_title}
+Known information gaps:
+{gaps_block}
+
+New evidence (may contain full-text chunks — scan thoroughly for concrete data, mechanisms, or conclusions):
+{evidence_summary}
+
+For EACH gap, output ONE JSON object with these exact fields:
+
+- "gap": the gap text (copy exactly)
+- "extracted_answer": 请简要摘录能直接填补该 Gap 的实质性内容。它可以是具体数据、核心机制、明确的结论、或详细的定性解释。注意：如果检索到的文本仅仅是"提到了"该话题（例如"本文研究了..."、"探讨了...的影响"）而没有给出具体的解答细节，请务必填 null。/ Copy the specific data, mechanism, explicit conclusion, or detailed qualitative explanation that DIRECTLY fills this gap. If the evidence merely MENTIONS the topic (e.g. "this paper studied X", "explored the effect of Y") without giving concrete details, you MUST set this to null.
+- "addressed": 严格规则：只要 extracted_answer 成功提取了实质性解答（无论定性还是定量），即为 true。如果只是空泛的预告或提及，必须为 false。/ STRICT RULE: true ONLY when extracted_answer contains substantive content. Surface-level mentions or topic previews → false.
+
+Return a JSON array containing one object per gap. No other text outside the JSON array.
+
+Example of a CORRECT response (gap is substantively answered):
+[
+  {{
+    "gap": "drug X cure rate in clinical trials",
+    "extracted_answer": "Phase III trial: 73% cure rate (95% CI 68–78%) after 12 weeks",
+    "addressed": true
+  }}
+]
+
+Example of an INCORRECT response you must NOT produce (topic mentioned, not answered):
+[
+  {{
+    "gap": "drug X cure rate in clinical trials",
+    "extracted_answer": "This study investigated the therapeutic efficacy of drug X",
+    "addressed": true
+  }}
+]

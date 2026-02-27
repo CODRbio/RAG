@@ -6,144 +6,57 @@
   "llm": {
     "default": "claude",
     "dry_run": false,
-    "providers": {
+    "platforms": {
       "openai": {
         "api_key": "sk-proj-xxx",
-        "base_url": "https://api.openai.com/v1",
-        "default_model": "gpt-5.2",
-        "models": {
-          "gpt-5-mini": "gpt-5-mini",
-          "gpt-5.2": "gpt-5.2"
-        },
-        "params": {}
-      },
-      "openai-thinking": {
-        "api_key": "sk-proj-xxx",
-        "base_url": "https://api.openai.com/v1",
-        "default_model": "gpt-5.2",
-        "models": {
-          "gpt-5.2": "gpt-5.2"
-        },
-        "params": {
-          "reasoning_effort": "high"
-        }
+        "base_url": "https://api.openai.com/v1"
       },
       "deepseek": {
         "api_key": "sk-xxx",
-        "base_url": "https://api.deepseek.com/v1",
-        "default_model": "deepseek-chat",
-        "models": {
-          "deepseek-chat": "deepseek-chat"
-        },
-        "params": {}
-      },
-      "deepseek-thinking": {
-        "api_key": "sk-xxx",
-        "base_url": "https://api.deepseek.com/v1",
-        "default_model": "deepseek-reasoner",
-        "models": {
-          "deepseek-reasoner": "deepseek-reasoner"
-        },
-        "params": {}
+        "base_url": "https://api.deepseek.com/v1"
       },
       "gemini": {
         "api_key": "AIzxxx",
-        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
-        "default_model": "gemini-pro-latest",
-        "models": {
-          "gemini-pro-latest": "gemini-pro-latest",
-          "gemini-flash-latest": "gemini-flash-latest"
-        },
-        "params": {}
-      },
-      "gemini-thinking": {
-        "api_key": "AIzxxx",
-        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
-        "default_model": "gemini-pro-latest",
-        "models": {
-          "gemini-pro-latest": "gemini-pro-latest",
-          "gemini-flash-latest": "gemini-flash-latest"
-        },
-        "params": {
-          "reasoning_effort": "high"
-        }
-      },
-      "gemini-vision": {
-        "api_key": "AIzxxx",
-        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
-        "default_model": "gemini-2.5-flash",
-        "models": {
-          "gemini-pro-latest": "gemini-pro-latest",
-          "gemini-flash-latest": "gemini-flash-latest",
-          "gemini-2.5-flash": "gemini-2.5-flash"
-        },
-        "params": {
-          "temperature": 0.2,
-          "max_tokens": 8192
-        }
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai"
       },
       "claude": {
         "api_key": "sk-ant-xxx",
-        "base_url": "https://api.anthropic.com",
-        "default_model": "claude-sonnet-4-5",
-        "models": {
-          "claude-sonnet-4-5": "claude-sonnet-4-5-20250929",
-          "claude-haiku-4-5": "claude-haiku-4-5-20251001",
-          "claude-opus-4-5": "claude-opus-4-5-20251101"
-        },
-        "params": {}
-      },
-      "claude-thinking": {
-        "api_key": "sk-ant-xxx",
-        "base_url": "https://api.anthropic.com",
-        "default_model": "claude-sonnet-4-5",
-        "models": {
-          "claude-sonnet-4-5": "claude-sonnet-4-5-20250929",
-          "claude-haiku-4-5": "claude-haiku-4-5-20251001",
-          "claude-opus-4-5": "claude-opus-4-5-20251101"
-        },
-        "params": {
-          "thinking": {
-            "type": "enabled",
-            "budget_tokens": 16000
-          },
-          "max_tokens": 32000
-        }
+        "base_url": "https://api.anthropic.com"
       },
       "kimi": {
         "api_key": "sk-xxx",
-        "base_url": "https://api.moonshot.ai/v1",
-        "default_model": "kimi-k2.5",
-        "models": {
-          "kimi-k2.5": "kimi-k2.5"
-        },
-        "params": {}
+        "base_url": "https://api.moonshot.cn/v1"
       },
-      "kimi-vision": {
-        "api_key": "sk-xxx",
-        "base_url": "https://api.moonshot.ai/v1",
-        "default_model": "kimi-k2.5",
-        "models": {
-          "kimi-k2.5": "kimi-k2.5"
-        },
-        "params": {
-          "response_format": {
-            "type": "json_object"
-          }
-        }
+      "perplexity": {
+        "api_key": "pplx-xxx",
+        "base_url": "https://api.perplexity.ai"
       },
-      "kimi-thinking": {
+      "qwen": {
         "api_key": "sk-xxx",
-        "base_url": "https://api.moonshot.ai/v1",
-        "default_model": "kimi-k2.5",
-        "models": {
-          "kimi-k2.5": "kimi-k2.5"
-        },
-        "params": {
-          "enable_reasoning": true,
-          "reasoning_effort": "high"
-        }
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1"
       }
+    },
+    "_providers_note": "模型列表由前端实时从平台 API 拉取。default_model 仅在无 UI 选择时托底。params 用于 thinking 等参数注入。",
+    "providers": {
+      "openai":           { "platform": "openai",     "default_model": "gpt-5.2"                },
+      "openai-thinking":  { "platform": "openai",     "default_model": "gpt-5.2",               "params": { "reasoning_effort": "high" } },
+      "openai-mini":      { "platform": "openai",     "default_model": "gpt-5-mini"            },
+      "deepseek":         { "platform": "deepseek",   "default_model": "deepseek-chat"          },
+      "deepseek-thinking":{ "platform": "deepseek",   "default_model": "deepseek-reasoner",     "params": { "thinking": { "type": "enabled" } } },
+      "gemini":           { "platform": "gemini",     "default_model": "gemini-3.1-pro-preview" },
+      "gemini-thinking":  { "platform": "gemini",     "default_model": "gemini-3.1-pro-preview","params": { "reasoning_effort": "high" } },
+      "gemini-vision":    { "platform": "gemini",     "default_model": "gemini-3.1-pro-preview","params": { "temperature": 0.2 } },
+      "gemini-flash":     { "platform": "gemini",     "default_model": "gemini-flash-latest"   },
+      "claude":           { "platform": "claude",     "default_model": "claude-sonnet-4-6"      },
+      "claude-thinking":  { "platform": "claude",     "default_model": "claude-sonnet-4-6",     "params": { "thinking": { "type": "enabled", "budget_tokens": 10000 } } },
+      "claude-haiku":     { "platform": "claude",     "default_model": "claude-haiku-4-5"      },
+      "kimi":             { "platform": "kimi",       "default_model": "kimi-k2.5"              },
+      "kimi-vision":      { "platform": "kimi",       "default_model": "kimi-k2.5"              },
+      "kimi-thinking":    { "platform": "kimi",       "default_model": "kimi-k2.5",             "params": { "thinking": { "type": "enabled" } } },
+      "sonar":            { "platform": "perplexity", "default_model": "sonar-pro"               },
+      "qwen":             { "platform": "qwen",       "default_model": "qwen3.5-plus"            },
+      "qwen-vision":      { "platform": "qwen",       "default_model": "qwen3.5-plus"            },
+      "qwen-thinking":    { "platform": "qwen",       "default_model": "qwen3.5-plus",           "params": { "enable_thinking": true } }
     }
   },
   "parser": {
@@ -178,16 +91,16 @@
     "table_rows_per_chunk": 10
   },
   "search": {
-    "top_k": 10,
-    "rerank_top_k": 5,
+    "top_k": 20,
+    "rerank_top_k": 20,
     "rrf_k": 60,
     "dense_recall_k": 80,
     "sparse_recall_k": 80,
     "rrf_dense_weight": 0.6,
     "rrf_sparse_weight": 0.4,
     "rerank_input_k": 100,
-    "rerank_output_k": 10,
-    "per_doc_cap": 3,
+    "rerank_output_k": 20,
+    "per_doc_cap": 5,
     "reranker_mode": "cascade",
     "use_colbert_reranker": true,
     "colbert_model": "jinaai/jina-colbert-v2",
@@ -207,6 +120,23 @@
     "query_expansion_llm": "deepseek",
     "max_queries": 4
   },
+  "google_search": {
+    "enabled": true,
+    "scholar_enabled": true,
+    "google_enabled": false,
+    "extension_path": "extra_tools/CapSolverExtension",
+    "headless": null,
+    "proxy": null,
+    "timeout": 60000,
+    "max_results": 5,
+    "user_data_dir": null
+  },
+  "serpapi": {
+    "enabled": false,
+    "api_key": "",
+    "max_results": 10,
+    "timeout_seconds": 30
+  },
   "semantic_scholar": {
     "enabled": false,
     "api_key": "",
@@ -216,7 +146,6 @@
   },
   "ncbi": {
     "_comment": "NCBI PubMed E-Utilities（免费，api_key 可选——填写后速率从 3 req/s 提升至 10 req/s）",
-    "_api_key_note": "在 https://www.ncbi.nlm.nih.gov/account/ 注册后可在账号设置中申请 API Key",
     "enabled": true,
     "api_key": "",
     "max_results": 5,

@@ -18,6 +18,7 @@ import {
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useCanvasStore, useToastStore } from '../../stores';
+import { useChatStore } from '../../stores';
 import {
   aiEditCanvas,
   createSnapshot,
@@ -29,7 +30,12 @@ import {
   updateCanvas,
 } from '../../api/canvas';
 import { listInsights, updateInsightStatus } from '../../api/chat';
+import { restartDeepResearchPhase } from '../../api/chat';
 import type { Canvas, Annotation, ResearchInsight, InsightType, InsightStatus } from '../../types';
+import {
+  DEEP_RESEARCH_JOB_KEY,
+  DEEP_RESEARCH_ARCHIVED_JOBS_KEY,
+} from '../workflow/deep-research/types';
 
 interface RefineStageProps {
   canvas: Canvas;
@@ -66,6 +72,9 @@ export function RefineStage({ canvas }: RefineStageProps) {
     removeDirective,
   } = useCanvasStore();
   const addToast = useToastStore((s) => s.addToast);
+  const setShowDeepResearchDialog = useChatStore((s) => s.setShowDeepResearchDialog);
+  const setDeepResearchTopic = useChatStore((s) => s.setDeepResearchTopic);
+  const setDeepResearchActive = useChatStore((s) => s.setDeepResearchActive);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [selection, setSelection] = useState<{
@@ -88,6 +97,7 @@ export function RefineStage({ canvas }: RefineStageProps) {
   const [isLoadingSnapshots, setIsLoadingSnapshots] = useState(false);
   const [lockedRanges, setLockedRanges] = useState<LockedRange[]>([]);
   const [activeLockedId, setActiveLockedId] = useState<string | null>(null);
+  const [restarting, setRestarting] = useState(false);
 
   // Research Insights
   const [showInsights, setShowInsights] = useState(false);
@@ -171,6 +181,43 @@ export function RefineStage({ canvas }: RefineStageProps) {
   }, {} as Record<InsightType, ResearchInsight[]>);
 
   const openInsightsCount = insights.filter((i) => i.status === 'open').length;
+
+  const resolveSourceJobId = (): string | null => {
+    const active = localStorage.getItem(DEEP_RESEARCH_JOB_KEY);
+    if (active && active.trim()) return active.trim();
+    try {
+      const raw = localStorage.getItem(DEEP_RESEARCH_ARCHIVED_JOBS_KEY);
+      const parsed = raw ? JSON.parse(raw) : [];
+      if (Array.isArray(parsed) && parsed.length > 0 && typeof parsed[0] === 'string') {
+        return parsed[0];
+      }
+    } catch {
+      // noop
+    }
+    return null;
+  };
+
+  const handleRestartSynthesize = async () => {
+    const sourceJobId = resolveSourceJobId();
+    if (!sourceJobId) {
+      addToast('未找到可重启任务，请先完成一次 Deep Research', 'warning');
+      return;
+    }
+    setRestarting(true);
+    try {
+      const resp = await restartDeepResearchPhase(sourceJobId, { phase: 'synthesize' });
+      localStorage.setItem(DEEP_RESEARCH_JOB_KEY, resp.job_id);
+      setDeepResearchTopic(canvas.topic || canvas.working_title || 'Deep Research');
+      setDeepResearchActive(true);
+      setShowDeepResearchDialog(true);
+      addToast('已提交综合重启', 'success');
+    } catch (err) {
+      console.error('[RefineStage] restart synthesize failed:', err);
+      addToast('综合重启失败，请重试', 'error');
+    } finally {
+      setRestarting(false);
+    }
+  };
 
   const loadSnapshots = useCallback(async () => {
     if (!canvas?.id) return;
@@ -546,6 +593,14 @@ export function RefineStage({ canvas }: RefineStageProps) {
         </div>
 
         <div className="flex items-center gap-1">
+          <button
+            onClick={handleRestartSynthesize}
+            disabled={restarting}
+            className="px-2 py-1.5 rounded text-xs border border-indigo-300 text-indigo-700 hover:bg-indigo-50 disabled:opacity-50 cursor-pointer"
+            title="重新执行最终综合（synthesize）"
+          >
+            {restarting ? '提交中...' : '重新综合'}
+          </button>
           <button
             onClick={handleRefineFull}
             disabled={isFullRefining || isAIEditing || !canvasContent.trim()}

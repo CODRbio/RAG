@@ -1,5 +1,13 @@
-import { Target, FlaskConical, HelpCircle, Ban, BookOpen, Rocket, Clock, Edit3 } from 'lucide-react';
+import { useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { Target, FlaskConical, HelpCircle, Ban, BookOpen, Rocket, Clock, Edit3, RotateCcw } from 'lucide-react';
 import type { Canvas } from '../../types';
+import { restartDeepResearchPhase } from '../../api/chat';
+import { useChatStore, useToastStore } from '../../stores';
+import {
+  DEEP_RESEARCH_JOB_KEY,
+  DEEP_RESEARCH_ARCHIVED_JOBS_KEY,
+} from '../workflow/deep-research/types';
 
 interface ExploreStageProps {
   canvas: Canvas;
@@ -10,7 +18,50 @@ interface ExploreStageProps {
  * 展示研究简报的各个板块：Goal / Hypothesis / Questions / Exclusions / Sources / Action Plan
  */
 export function ExploreStage({ canvas }: ExploreStageProps) {
+  const { t } = useTranslation();
+  const addToast = useToastStore((s) => s.addToast);
+  const { setDeepResearchTopic, setShowDeepResearchDialog, setDeepResearchActive } = useChatStore();
+  const [restarting, setRestarting] = useState(false);
   const brief = canvas.research_brief;
+
+  const resolveSourceJobId = (): string | null => {
+    const active = localStorage.getItem(DEEP_RESEARCH_JOB_KEY);
+    if (active && active.trim()) return active.trim();
+    try {
+      const raw = localStorage.getItem(DEEP_RESEARCH_ARCHIVED_JOBS_KEY);
+      const parsed = raw ? JSON.parse(raw) : [];
+      if (Array.isArray(parsed) && parsed.length > 0 && typeof parsed[0] === 'string') {
+        return parsed[0];
+      }
+    } catch {
+      // noop
+    }
+    return null;
+  };
+
+  const handleRestart = async (
+    phase: 'plan' | 'research' | 'generate_claims' | 'write' | 'verify' | 'review_gate' | 'synthesize',
+  ) => {
+    const sourceJobId = resolveSourceJobId();
+    if (!sourceJobId) {
+      addToast('未找到可重启任务，请先完成一次 Deep Research', 'warning');
+      return;
+    }
+    setRestarting(true);
+    try {
+      const resp = await restartDeepResearchPhase(sourceJobId, { phase });
+      localStorage.setItem(DEEP_RESEARCH_JOB_KEY, resp.job_id);
+      setDeepResearchTopic(canvas.topic || canvas.working_title || '');
+      setDeepResearchActive(true);
+      setShowDeepResearchDialog(true);
+      addToast(`已提交阶段重启：${phase}`, 'success');
+    } catch (err) {
+      console.error('[ExploreStage] restart phase failed:', err);
+      addToast('阶段重启失败，请重试', 'error');
+    } finally {
+      setRestarting(false);
+    }
+  };
 
   if (!brief) {
     return (
@@ -162,6 +213,22 @@ export function ExploreStage({ canvas }: ExploreStageProps) {
 
   return (
     <div className="p-4 space-y-3 overflow-y-auto h-full">
+      <div className="bg-[var(--bg-surface)] rounded-lg p-3 border border-[var(--border-subtle)]">
+        <div className="flex items-center gap-2 mb-2">
+          <RotateCcw size={13} className="text-indigo-500" />
+          <span className="text-xs text-[var(--text-tertiary)] font-medium">{t('research.restartStageTitle', '重启执行')}</span>
+        </div>
+        <div className="flex flex-wrap gap-1.5">
+          <button
+            disabled={restarting}
+            onClick={() => void handleRestart('plan')}
+            className="px-2 py-1 text-[10px] border rounded text-indigo-700 hover:bg-indigo-50 disabled:opacity-50"
+          >
+            {t('research.restartExploreStage', '重新探索（重建简报与大纲）')}
+          </button>
+        </div>
+      </div>
+
       {/* Topic Header */}
       <div className="bg-[var(--bg-surface)] rounded-lg p-4 border border-[var(--border-subtle)]">
         <div className="flex items-center gap-2 mb-2">

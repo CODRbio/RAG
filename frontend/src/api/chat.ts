@@ -11,6 +11,8 @@ import type {
   DeepResearchStartResponse,
   DeepResearchConfirmRequest,
   DeepResearchSubmitResponse,
+  DeepResearchRestartPhaseRequest,
+  DeepResearchRestartSectionRequest,
   DeepResearchJobInfo,
   DeepResearchJobEvent,
   GapSupplement,
@@ -75,6 +77,19 @@ export async function deepResearchSubmit(data: DeepResearchConfirmRequest): Prom
 export async function getDeepResearchJob(jobId: string): Promise<DeepResearchJobInfo> {
   const res = await client.get<DeepResearchJobInfo>(`/deep-research/jobs/${encodeURIComponent(jobId)}`);
   return res.data;
+}
+
+/**
+ * 列出 Deep Research 后台任务（用于恢复视图）
+ */
+export async function listDeepResearchJobs(
+  limit: number = 20,
+  status?: string,
+): Promise<DeepResearchJobInfo[]> {
+  const params: Record<string, string | number> = { limit };
+  if (status) params.status = status;
+  const res = await client.get<DeepResearchJobInfo[]>('/deep-research/jobs', { params });
+  return res.data || [];
 }
 
 export async function listDeepResearchJobEvents(
@@ -147,6 +162,47 @@ export async function* streamDeepResearchEvents(
 export async function cancelDeepResearchJob(jobId: string): Promise<{ ok: boolean; job_id: string; status: string }> {
   const res = await client.post<{ ok: boolean; job_id: string; status: string }>(
     `/deep-research/jobs/${encodeURIComponent(jobId)}/cancel`,
+  );
+  return res.data;
+}
+
+export async function restartDeepResearchPhase(
+  jobId: string,
+  data: DeepResearchRestartPhaseRequest,
+): Promise<DeepResearchSubmitResponse> {
+  const res = await client.post<DeepResearchSubmitResponse>(
+    `/deep-research/jobs/${encodeURIComponent(jobId)}/restart-phase`,
+    data,
+    { timeout: 30000 },
+  );
+  return res.data;
+}
+
+export async function restartDeepResearchSection(
+  jobId: string,
+  data: DeepResearchRestartSectionRequest,
+): Promise<DeepResearchSubmitResponse> {
+  const res = await client.post<DeepResearchSubmitResponse>(
+    `/deep-research/jobs/${encodeURIComponent(jobId)}/restart-section`,
+    data,
+    { timeout: 30000 },
+  );
+  return res.data;
+}
+
+export async function optimizeSectionEvidence(
+  jobId: string,
+  data: {
+    section_title: string;
+    web_providers?: string[];
+    web_source_configs?: Record<string, { topK: number; threshold: number }>;
+    use_content_fetcher?: 'auto' | 'force' | 'off';
+  },
+): Promise<{ section_title: string; new_chunks: number; sources_used: string[] }> {
+  const res = await client.post<{ section_title: string; new_chunks: number; sources_used: string[] }>(
+    `/deep-research/jobs/${encodeURIComponent(jobId)}/optimize-evidence`,
+    data,
+    { timeout: 120000 },
   );
   return res.data;
 }

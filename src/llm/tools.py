@@ -32,6 +32,11 @@ logger = get_logger(__name__)
 _agent_chunks_local = threading.local()
 
 
+def set_tool_collection(collection: Optional[str]) -> None:
+    """Set the Milvus collection for search_local/search_web in this thread."""
+    _agent_chunks_local.collection = collection or None
+
+
 def start_agent_chunk_collector() -> None:
     """Activate the per-thread chunk collector (call before react_loop)."""
     _agent_chunks_local.chunks = []
@@ -420,7 +425,8 @@ _SEARCH_NCBI_SCHEMA = {
 
 def _handle_search_local(query: str, top_k: int = 10, **_) -> str:
     from src.retrieval.service import get_retrieval_service
-    svc = get_retrieval_service()
+    col = getattr(_agent_chunks_local, "collection", None)
+    svc = get_retrieval_service(collection=col)
     pack = svc.search(query=query, mode="local", top_k=top_k)
     _collect_chunks(pack.chunks[:min(top_k, 15)])
     return pack.to_context_string(max_chunks=min(top_k, 15))
@@ -428,7 +434,8 @@ def _handle_search_local(query: str, top_k: int = 10, **_) -> str:
 
 def _handle_search_web(query: str, top_k: int = 10, **_) -> str:
     from src.retrieval.service import get_retrieval_service
-    svc = get_retrieval_service()
+    col = getattr(_agent_chunks_local, "collection", None)
+    svc = get_retrieval_service(collection=col)
     pack = svc.search(query=query, mode="web", top_k=top_k)
     _collect_chunks(pack.chunks[:min(top_k, 15)])
     return pack.to_context_string(max_chunks=min(top_k, 15))

@@ -29,13 +29,13 @@ class ResearchBrief:
 class SectionStatus:
     """章节状态"""
     title: str
-    status: str = "pending"  # pending | researching | completing | writing | reviewing | done
+    status: str = "pending"  # pending | researching | writing | reviewing | done
     coverage_score: float = 0.0  # 0-1，信息充分度
     source_count: int = 0
     gaps: List[str] = field(default_factory=list)  # 该章节的信息缺口
     research_rounds: int = 0  # 该章节已执行的研究轮次（用于 per-section 限制）
     evidence_scarce: bool = False  # 检索证据不足（用于写作降级与最终限制说明）
-    completion_round_done: bool = False  # True after Completion Round ran (prevents re-scheduling)
+    verify_rewrite_count: int = 0  # verify SEVERE 打回重做的次数（用于 verify-rewrite 循环限制）
 
 
 @dataclass
@@ -181,7 +181,7 @@ class ResearchDashboard:
                     "gaps": s.gaps,
                     "research_rounds": s.research_rounds,
                     "evidence_scarce": s.evidence_scarce,
-                    "completion_round_done": s.completion_round_done,
+                    "verify_rewrite_count": s.verify_rewrite_count,
                 }
                 for s in self.sections
             ],

@@ -17,6 +17,7 @@ import { OutlineStage } from './OutlineStage';
 import { DraftingStage } from './DraftingStage';
 import { RefineStage } from './RefineStage';
 import type { CanvasStage } from '../../types';
+import { DEEP_RESEARCH_JOB_KEY } from '../workflow/deep-research/types';
 
 interface CanvasPanelProps {
   onStartResize: () => void;
@@ -119,6 +120,7 @@ export function CanvasPanel({ onStartResize }: CanvasPanelProps) {
 
   // 渲染对应阶段的内容
   const renderStageContent = () => {
+    const hasWakeableJob = Boolean(localStorage.getItem(DEEP_RESEARCH_JOB_KEY));
     // 如果没有 canvas 数据，显示可操作的空状态
     if (!canvas) {
       return (
@@ -138,6 +140,15 @@ export function CanvasPanel({ onStartResize }: CanvasPanelProps) {
               <Telescope size={14} />
               {t('canvas.startDeepResearch')}
             </button>
+            {hasWakeableJob && (
+              <button
+                onClick={() => setShowDeepResearchDialog(true)}
+                className="flex items-center justify-center gap-2 px-4 py-2.5 border border-indigo-500/30 bg-indigo-900/20 text-indigo-300 text-xs font-medium rounded-lg hover:bg-indigo-900/35 transition-colors"
+              >
+                <Telescope size={14} />
+                {t('chat.wakeTask')}
+              </button>
+            )}
             <button
               onClick={handleCreateEmptyCanvas}
               disabled={isCreating}

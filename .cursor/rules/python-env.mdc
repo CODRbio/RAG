@@ -1,0 +1,25 @@
+---
+description: Use conda env deepsea-rag for all Python/test commands
+globs:
+alwaysApply: true
+---
+
+# Python / Test environment rule (MUST FOLLOW)
+
+- This repo uses the Conda environment: `deepsea-rag`.
+- **All test commands must run inside that env.** Do not run tests in `base`.
+
+## How to run tests (preferred)
+- Use `conda run -n deepsea-rag` to avoid relying on shell activation:
+  - `conda run -n deepsea-rag python -m pytest`
+  - `conda run -n deepsea-rag python -m pytest -q`
+  - `conda run -n deepsea-rag python -m pytest tests/test_xxx.py -q`
+
+## How to run python / pip (preferred)
+- `conda run -n deepsea-rag python ...`
+- `conda run -n deepsea-rag python -m pip ...`
+
+## Important
+- Never run `pytest`, `python`, or `pip` without ensuring they are executed in `deepsea-rag`.
+- If you need to install deps for debugging, do it via:
+  - `conda run -n deepsea-rag python -m pip install <pkg>`

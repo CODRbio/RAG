@@ -411,6 +411,10 @@ class DeepResearchJob(SQLModel, table=True):
         back_populates="job",
         sa_relationship_kwargs={"cascade": "all, delete-orphan"},
     )
+    checkpoints: List["DRCheckpoint"] = Relationship(
+        back_populates="job",
+        sa_relationship_kwargs={"cascade": "all, delete-orphan"},
+    )
 
     def to_dict(self) -> Dict[str, Any]:
         d = self.model_dump()
@@ -521,6 +525,28 @@ class DRInsight(SQLModel, table=True):
     created_at: float = Field(default_factory=_now_ts, sa_column=Column(Float, nullable=False))
 
     job: Optional[DeepResearchJob] = Relationship(back_populates="insights")
+
+
+class DRCheckpoint(SQLModel, table=True):
+    __tablename__ = "deep_research_checkpoints"
+    __table_args__ = (
+        Index("idx_dr_checkpoints_job_created", "job_id", "created_at"),
+        Index("idx_dr_checkpoints_job_phase", "job_id", "phase"),
+    )
+
+    job_id: str = Field(foreign_key="deep_research_jobs.job_id", primary_key=True)
+    phase: str = Field(primary_key=True)
+    section_title: str = Field(default="", primary_key=True)
+    state_json: str = Field(default="{}", sa_column=Column(Text, nullable=False, server_default="{}"))
+    created_at: float = Field(default_factory=_now_ts, sa_column=Column(Float, nullable=False))
+
+    job: Optional[DeepResearchJob] = Relationship(back_populates="checkpoints")
+
+    def get_state(self) -> Dict[str, Any]:
+        try:
+            return json.loads(self.state_json or "{}")
+        except Exception:
+            return {}
 
 
 # ──────────────────────────────────────────────────────────────────────────────

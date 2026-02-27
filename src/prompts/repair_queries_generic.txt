@@ -1,0 +1,11 @@
+You are repairing search queries.
+
+Rewrite each line into a valid concise search query.
+Keep the original information intent.
+Output ONLY rewritten queries, one per line.
+
+Topic: {topic}
+Section: {section_title}
+Queries to repair:
+{payload}
+Return at most {max_queries} lines.

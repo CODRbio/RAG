@@ -149,6 +149,10 @@ def _sanitize_query(provider: str, q: str) -> str:
     return text
 
 
+# Engines that do not support Chinese meaningfully; always use English queries only.
+_ENGLISH_ONLY_ENGINES = frozenset({"ncbi", "semantic", "scholar"})
+
+
 class SmartQueryOptimizer:
     """
     LLM 驱动的智能查询优化器。
@@ -182,7 +186,7 @@ class SmartQueryOptimizer:
                 if not manager.is_available(llm_provider):
                     logger.warning(f"Smart optimizer: requested provider {llm_provider} not available, fallback")
                     return self._get_llm_client()  # 回退到默认
-                return manager.get_client(llm_provider)
+                return manager.get_lite_client(llm_provider)
             except Exception as e:
                 logger.warning(f"Smart optimizer: failed to use provider {llm_provider}: {e}")
                 return self._get_llm_client()  # 回退到默认
@@ -198,7 +202,7 @@ class SmartQueryOptimizer:
             if not manager.is_available(provider):
                 logger.warning(f"Smart optimizer: LLM provider {provider} not available")
                 return None
-            self._llm_client = manager.get_client(provider)
+            self._llm_client = manager.get_lite_client(provider)
             return self._llm_client
         except Exception as e:
             logger.warning(f"Smart optimizer: failed to load LLM client: {e}")
@@ -248,30 +252,28 @@ class SmartQueryOptimizer:
         provider_list = ", ".join(providers)
         bilingual_instruction = ""
         if bilingual and is_zh_input:
-            bilingual_instruction = (
-                f" The input is Chinese. You MUST generate exactly {max_per} Chinese queries and "
-                f"{max_per} English queries for each **selected** engine. "
-                "Return them separately under keys \"zh\" and \"en\" for each engine."
-            )
+            eng_only = [p for p in providers if p.strip().lower() in _ENGLISH_ONLY_ENGINES]
+            zh_en = [p for p in providers if p.strip().lower() not in _ENGLISH_ONLY_ENGINES]
+            parts = []
+            if eng_only:
+                parts.append(
+                    f"For {', '.join(eng_only)}: output a plain array of {max_per} English query strings only (no Chinese)."
+                )
+            if zh_en:
+                parts.append(
+                    f"For {', '.join(zh_en)}: output an object with keys \"zh\" and \"en\", each an array of {max_per} queries."
+                )
+            bilingual_instruction = " " + " ".join(parts) if parts else ""
 
-        # ── 代价感知路由模式 ─────────────────────────────────────────────────
-        if auto_route:
-            prompt = _pm.render(
-                "optimizer_auto_route.txt",
-                query=query,
-                provider_list=provider_list,
-                bilingual_instruction=bilingual_instruction,
-                max_per=max_per,
-            )
-        # ── 普通优化模式（尊重前端选择）────────────────────────────────────────
-        else:
-            prompt = _pm.render(
-                "optimizer_normal.txt",
-                query=query,
-                provider_list=provider_list,
-                bilingual_instruction=bilingual_instruction,
-                max_per=max_per,
-            )
+        # 代价感知路由 (auto_route=True) 当前未使用：统一用 get_routing_plan()；
+        # 此处保留分支但复用 optimizer_normal（原 optimizer_auto_route.txt 已移至 prompts/backup）。
+        prompt = _pm.render(
+            "optimizer_normal.txt",
+            query=query,
+            provider_list=provider_list,
+            bilingual_instruction=bilingual_instruction,
+            max_per=max_per,
+        )
 
         try:
             resp = client.chat(
@@ -280,7 +282,7 @@ class SmartQueryOptimizer:
                     {"role": "user", "content": prompt},
                 ],
                 model=model_override or None,
-                max_tokens=800,
+
                 response_model=_DynamicQueryResponse,
             )
             parsed_resp: Optional[_DynamicQueryResponse] = resp.get("parsed_object")
@@ -303,6 +305,7 @@ class SmartQueryOptimizer:
             out: Dict[str, List[str]] = {}
             for p in target_providers:
                 raw = data.get(p)
+                p_lower = p.strip().lower()
                 if bilingual and is_zh_input:
                     if isinstance(raw, dict):
                         zh = _normalize_list(raw.get("zh"))
@@ -312,19 +315,21 @@ class SmartQueryOptimizer:
                         zh = [q for q in items if _is_chinese(q)]
                         en = [q for q in items if not _is_chinese(q)]
 
-                    if not zh:
-                        zh = [query]
                     if not en:
                         en = [_fallback_en_query(p, query)]
-
-                    while len(zh) < max_per:
-                        zh.append(zh[-1])
                     while len(en) < max_per:
                         en.append(en[-1])
-
-                    zh = zh[:max_per]
                     en = en[:max_per]
-                    out[p] = [_sanitize_query(p, q) for q in (zh + en)]
+
+                    if p_lower in _ENGLISH_ONLY_ENGINES:
+                        out[p] = [_sanitize_query(p, q) for q in en]
+                    else:
+                        if not zh:
+                            zh = [query]
+                        while len(zh) < max_per:
+                            zh.append(zh[-1])
+                        zh = zh[:max_per]
+                        out[p] = [_sanitize_query(p, q) for q in (zh + en)]
                 else:
                     queries = _normalize_list(raw)[:max_per]
                     if not queries:
@@ -372,10 +377,18 @@ class SmartQueryOptimizer:
 
         bilingual_note = ""
         if is_zh:
-            bilingual_note = (
-                f" Input is Chinese. For each selected engine, generate {max_per} Chinese queries "
-                f"AND {max_per} English queries. Return them as {{\"zh\": [...], \"en\": [...]}} objects."
-            )
+            eng_only = [x for x in candidate_providers if str(x).strip().lower() in _ENGLISH_ONLY_ENGINES]
+            zh_en = [x for x in candidate_providers if str(x).strip().lower() not in _ENGLISH_ONLY_ENGINES]
+            parts = []
+            if eng_only:
+                parts.append(
+                    f"For {', '.join(eng_only)} use a plain array of English queries only."
+                )
+            if zh_en:
+                parts.append(
+                    f"For {', '.join(zh_en)} use {{\"zh\": [...], \"en\": [...]}}."
+                )
+            bilingual_note = " " + " ".join(parts) if parts else ""
 
         provider_list = ", ".join(candidate_providers)
         prompt = _pm.render(
@@ -393,7 +406,7 @@ class SmartQueryOptimizer:
                     {"role": "user", "content": prompt},
                 ],
                 model=model_override or None,
-                max_tokens=700,
+
                 response_model=_RoutingPlanLLMResponse,
             )
             parsed_plan: Optional[_RoutingPlanLLMResponse] = resp.get("parsed_object")
@@ -434,6 +447,7 @@ class SmartQueryOptimizer:
                         raw_fallback.pop(k, None)
 
             def _parse_engine_queries(raw: Any, engine: str) -> List[str]:
+                eng_norm = engine.strip().lower()
                 if is_zh:
                     if isinstance(raw, dict):
                         zh = _normalize_list(raw.get("zh"))
@@ -442,12 +456,14 @@ class SmartQueryOptimizer:
                         items = _normalize_list(raw)
                         zh = [q for q in items if _is_chinese(q)]
                         en = [q for q in items if not _is_chinese(q)]
-                    if not zh:
-                        zh = [query]
                     if not en:
                         en = [_fallback_en_query(engine, query)]
-                    zh = (zh * max_per)[:max_per]
                     en = (en * max_per)[:max_per]
+                    if eng_norm in _ENGLISH_ONLY_ENGINES:
+                        return [_sanitize_query(engine, q) for q in en]
+                    if not zh:
+                        zh = [query]
+                    zh = (zh * max_per)[:max_per]
                     return [_sanitize_query(engine, q) for q in (zh + en)]
                 else:
                     qs = _normalize_list(raw)[:max_per]

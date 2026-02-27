@@ -305,7 +305,7 @@ class SessionMemory:
                     {"role": "system", "content": _pm.render("session_memory_summarize_system.txt")},
                     {"role": "user", "content": prompt},
                 ],
-                max_tokens=200,
+
             )
             text = (resp.get("final_text") or "").strip()
             if text:
