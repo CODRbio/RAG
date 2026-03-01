@@ -1,4 +1,4 @@
-import client, { streamChat } from './client';
+import client, { getWithRetry, streamChat } from './client';
 import type {
   ChatRequest,
   ChatResponse,
@@ -9,11 +9,14 @@ import type {
   IntentDetectResponse,
   ClarifyResponse,
   DeepResearchStartRequest,
-  DeepResearchStartResponse,
+  DeepResearchStartAsyncResponse,
+  DeepResearchStartStatusResponse,
   DeepResearchConfirmRequest,
   DeepResearchSubmitResponse,
   DeepResearchRestartPhaseRequest,
   DeepResearchRestartSectionRequest,
+  DeepResearchRestartIncompleteSectionsRequest,
+  DeepResearchRestartWithOutlineRequest,
   DeepResearchJobInfo,
   DeepResearchJobEvent,
   GapSupplement,
@@ -45,8 +48,14 @@ export async function clarifyForDeepResearch(data: {
   search_mode?: string;
   llm_provider?: string;
   model_override?: string;
+  prelim_provider?: string;
+  prelim_model?: string;
 }): Promise<ClarifyResponse> {
-  const res = await client.post<ClarifyResponse>('/deep-research/clarify', data);
+  const res = await client.post<ClarifyResponse>('/deep-research/clarify', data, {
+    // Clarify may include provider calls (e.g., preliminary Perplexity + main clarify LLM).
+    // Keep aligned with deepResearchStart to avoid frontend-side premature timeout.
+    timeout: 600000,
+  });
   return res.data;
 }
 
@@ -146,15 +155,25 @@ export async function cancelTask(taskId: string): Promise<{ success: boolean; me
   return res.data;
 }
 
-export async function deepResearchStart(data: DeepResearchStartRequest): Promise<DeepResearchStartResponse> {
-  const res = await client.post<DeepResearchStartResponse>(
+/** Submit the start phase job; returns a job_id immediately (non-blocking). */
+export async function deepResearchStart(
+  data: DeepResearchStartRequest
+): Promise<DeepResearchStartAsyncResponse> {
+  const res = await client.post<DeepResearchStartAsyncResponse>(
     '/deep-research/start',
     data,
-    {
-      // Phase-1 deep research may run hybrid retrieval + planning,
-      // which can exceed the global 60s default timeout.
-      timeout: 300000,
-    }
+    { timeout: 30000 }
+  );
+  return res.data;
+}
+
+/** Poll start-phase job status. Returns outline/brief once status === 'done'. */
+export async function getDeepResearchStartStatus(
+  jobId: string
+): Promise<DeepResearchStartStatusResponse> {
+  const res = await client.get<DeepResearchStartStatusResponse>(
+    `/deep-research/start/${encodeURIComponent(jobId)}/status`,
+    { timeout: 15000 }
   );
   return res.data;
 }
@@ -253,9 +272,14 @@ export async function* streamDeepResearchEvents(
   }
 }
 
-export async function cancelDeepResearchJob(jobId: string): Promise<{ ok: boolean; job_id: string; status: string }> {
+export async function cancelDeepResearchJob(
+  jobId: string,
+  force = false,
+): Promise<{ ok: boolean; job_id: string; status: string }> {
   const res = await client.post<{ ok: boolean; job_id: string; status: string }>(
     `/deep-research/jobs/${encodeURIComponent(jobId)}/cancel`,
+    undefined,
+    force ? { params: { force: true } } : undefined,
   );
   return res.data;
 }
@@ -292,6 +316,33 @@ export async function restartDeepResearchSection(
   return res.data;
 }
 
+export async function restartDeepResearchIncompleteSections(
+  jobId: string,
+  data: DeepResearchRestartIncompleteSectionsRequest,
+): Promise<DeepResearchSubmitResponse> {
+  const res = await client.post<DeepResearchSubmitResponse>(
+    `/deep-research/jobs/${encodeURIComponent(jobId)}/restart-incomplete-sections`,
+    data,
+    { timeout: 30000 },
+  );
+  return res.data;
+}
+
+export async function restartDeepResearchWithOutline(
+  jobId: string,
+  data: DeepResearchRestartWithOutlineRequest,
+  sessionIdFallback?: string,
+): Promise<DeepResearchSubmitResponse> {
+  const params: Record<string, string> = {};
+  if (sessionIdFallback?.trim()) params.session_id_fallback = sessionIdFallback.trim();
+  const res = await client.post<DeepResearchSubmitResponse>(
+    `/deep-research/jobs/${encodeURIComponent(jobId)}/restart-with-outline`,
+    data,
+    { timeout: 30000, params: Object.keys(params).length ? params : undefined },
+  );
+  return res.data;
+}
+
 export async function optimizeSectionEvidence(
   jobId: string,
   data: {
@@ -323,12 +374,10 @@ export async function submitSectionReview(
 export async function listSectionReviews(
   jobId: string,
 ): Promise<Array<{ job_id: string; section_id: string; action: string; feedback?: string; created_at?: number }>> {
-  const res = await client.get<{
+  const res = await getWithRetry<{
     job_id: string;
     reviews: Array<{ job_id: string; section_id: string; action: string; feedback?: string; created_at?: number }>;
-  }>(
-    `/deep-research/jobs/${encodeURIComponent(jobId)}/reviews`,
-  );
+  }>(`/deep-research/jobs/${encodeURIComponent(jobId)}/reviews`);
   return res.data.reviews || [];
 }
 
@@ -356,7 +405,7 @@ export async function listGapSupplements(
 ): Promise<GapSupplement[]> {
   const params: Record<string, string> = {};
   if (sectionId) params.section_id = sectionId;
-  const res = await client.get<{ job_id: string; supplements: GapSupplement[] }>(
+  const res = await getWithRetry<{ job_id: string; supplements: GapSupplement[] }>(
     `/deep-research/jobs/${encodeURIComponent(jobId)}/gap-supplements`,
     { params },
   );

@@ -41,6 +41,9 @@ def _embedding_rerank(
     if not candidates:
         return []
 
+    logger.info("[retrieval] model_call embedding_rerank start candidates=%d top_k=%d", len(candidates), top_k)
+    t0 = time.perf_counter()
+
     docs = [c.get("content") or "" for c in candidates]
     valid = [(i, d) for i, d in enumerate(docs) if d.strip()]
     if not valid:
@@ -63,6 +66,8 @@ def _embedding_rerank(
         scored.append((orig_idx, sim))
 
     scored.sort(key=lambda x: x[1], reverse=True)
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    logger.info("[retrieval] model_call embedding_rerank done elapsed_ms=%.0f out=%d", elapsed_ms, min(top_k, len(scored)))
     return [{**candidates[idx], "score": sc} for idx, sc in scored[:top_k]]
 
 # ── Observability ──
@@ -302,6 +307,7 @@ def _normalize_year_window(filters: Optional[Dict[str, Any]]) -> tuple[Optional[
 _GAP_MIN_KEEP_RATIO: float = 0.25
 # Additive gap score boost as a fraction of the reranked score range.
 _GAP_SCORE_BOOST: float = 0.10
+_DEFAULT_RANK_POOL_MULTIPLIER: float = 2.0
 
 
 def fuse_pools_with_gap_protection(
@@ -312,32 +318,37 @@ def fuse_pools_with_gap_protection(
     *,
     gap_boost: float = _GAP_SCORE_BOOST,
     gap_min_keep: Optional[int] = None,
+    gap_ratio: Optional[float] = None,
+    rank_pool_multiplier: Optional[float] = None,
     reranker_mode: Optional[str] = None,
     skip_rerank: bool = False,
     diag: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
-    """Merge main and gap candidate pools with gap-quota protection.
+    """Merge main and gap pools with deterministic gap-quota protection.
 
     Algorithm:
       1. Tag all candidates with pool membership (_pool_tag: "main" | "gap").
-      2. Run ONE global rerank pass on the combined pool so cross-source ordering
-         is based on a single relevance scale.
-      3. Apply additive gap_boost to gap candidates: score += gap_boost * score_range.
-      4. Re-sort by boosted score.
-      5. Enforce gap_min_keep: if fewer than gap_min_keep gap items land in the top_k
-         slice, force-include the highest-scoring remaining gap candidates by swapping
-         out the lowest-scoring main candidates (preserving output length == top_k).
+      2. Run ONE global rerank pass on the combined pool (authority ranking).
+      3. Take top_k initial slice from this ranking.
+      4. Enforce gap_min_keep (or ceil(top_k * gap_ratio)): if gap quota is not met
+         in the initial top_k slice, backfill gap items from:
+         (a) ranked tail first, then (b) original unranked gap pool.
+      5. Replace the lowest-ranked main entries to keep output length == top_k.
       6. Strip internal tags and return.
 
     Args:
         main_candidates: primary pool hits (local dense + main web hits).
         gap_candidates:  gap/supplement pool hits (eval_supplement, gap-query hits).
         top_k:           final output count after fusion.
-        gap_boost:       fractional boost for gap candidate scores
-                         (relative to reranked score range). Default 0.10.
+        gap_boost:       kept for backward compatibility; no-op in deterministic mode.
         gap_min_keep:    guaranteed gap slots in top_k output.
-                         Defaults to ceil(top_k * _GAP_MIN_KEEP_RATIO) when
+                         Defaults to ceil(top_k * ratio) when
                          gap_candidates is non-empty; 0 otherwise.
+        gap_ratio:       ratio for computing default gap_min_keep when gap_min_keep is
+                         not provided. Defaults to _GAP_MIN_KEEP_RATIO.
+        rank_pool_multiplier:
+                         rerank pool expansion multiplier. Controls authority ranking
+                         depth: rerank_k ~= ceil(top_k * multiplier), bounded by n_total.
         reranker_mode:   reranker mode forwarded to _rerank_candidates.
         skip_rerank:     use fast embedding rerank instead of cross-encoder.
         diag:            optional diagnostics dict; updated in-place with pool stats.
@@ -352,6 +363,21 @@ def fuse_pools_with_gap_protection(
     if n_main == 0 and n_gap == 0:
         return []
 
+    n_total = n_main + n_gap
+    target_top_k = min(max(int(top_k), 1), n_total)
+    pool_multiplier = float(rank_pool_multiplier or _DEFAULT_RANK_POOL_MULTIPLIER)
+    if pool_multiplier <= 0:
+        pool_multiplier = _DEFAULT_RANK_POOL_MULTIPLIER
+    rerank_k = min(
+        max(int(math.ceil(target_top_k * pool_multiplier)), target_top_k + n_gap),
+        n_total,
+    )
+    logger.info(
+        "[retrieval] fuse_pools entry main=%d gap=%d top_k=%d total=%d rerank_k=%d "
+        "ratio=%s multiplier=%.2f skip_rerank=%s",
+        n_main, n_gap, target_top_k, n_total, rerank_k, gap_ratio, pool_multiplier, skip_rerank,
+    )
+
     # Tag all candidates with pool membership (copies dicts to avoid mutation)
     all_cands: List[Dict[str, Any]] = []
     for c in main_candidates:
@@ -359,10 +385,8 @@ def fuse_pools_with_gap_protection(
     for c in gap_candidates:
         all_cands.append({**c, "_pool_tag": "gap"})
 
-    n_total = len(all_cands)
-    rerank_k = min(max(top_k * 2, top_k + n_gap), n_total)
-
     # Global rerank — one pass covering all candidates from both pools
+    t_rerank = time.perf_counter()
     try:
         if skip_rerank:
             reranked = _embedding_rerank(query, all_cands, top_k=rerank_k)
@@ -376,72 +400,99 @@ def fuse_pools_with_gap_protection(
             all_cands, key=lambda x: float(x.get("score", 0.0)), reverse=True
         )[:rerank_k]
 
+    rerank_elapsed_ms = (time.perf_counter() - t_rerank) * 1000
+    logger.info(
+        "[retrieval] fuse_pools rerank done skip_rerank=%s elapsed_ms=%.0f out=%d",
+        skip_rerank, rerank_elapsed_ms, len(reranked) if reranked else 0,
+    )
+
     if not reranked:
-        # Strip tags and return head slice
-        return [{k: v for k, v in c.items() if k != "_pool_tag"} for c in all_cands[:top_k]]
+        # Fallback to deterministic score sort for full pool when global rerank returns empty.
+        reranked = sorted(
+            all_cands, key=lambda x: float(x.get("score", 0.0)), reverse=True
+        )[:rerank_k]
 
-    # Compute score range for proportional gap boost
-    scores = [float(c.get("score", 0.0)) for c in reranked]
-    score_max = max(scores)
-    score_min = min(scores)
-    score_range = score_max - score_min
-    # When all scores are identical, use a small absolute boost so gap items
-    # are still distinguishable.
-    boost_abs = gap_boost * score_range if score_range > 1e-9 else gap_boost * 0.05
-
-    # Apply boost to gap candidates and re-sort
-    boosted: List[Dict[str, Any]] = []
-    for c in reranked:
-        if c.get("_pool_tag") == "gap":
-            boosted.append({**c, "score": float(c.get("score", 0.0)) + boost_abs})
-        else:
-            boosted.append(c)
-    boosted.sort(key=lambda x: float(x.get("score", 0.0)), reverse=True)
+    def _cand_key(item: Dict[str, Any], idx: int) -> str:
+        return str(item.get("chunk_id") or (item.get("metadata") or {}).get("chunk_id") or f"idx::{idx}")
 
     # Resolve effective gap quota
     effective_min_keep: int = 0
+    desired_min_keep: Optional[int] = None
     if n_gap > 0:
         if gap_min_keep is not None:
-            effective_min_keep = gap_min_keep
+            effective_min_keep = max(0, min(int(gap_min_keep), n_gap, target_top_k))
         else:
-            effective_min_keep = max(1, math.ceil(top_k * _GAP_MIN_KEEP_RATIO))
-        effective_min_keep = min(effective_min_keep, n_gap, top_k)
+            ratio = _GAP_MIN_KEEP_RATIO if gap_ratio is None else max(0.0, float(gap_ratio))
+            desired_min_keep = math.ceil(target_top_k * ratio) if ratio > 0 else 0
+            effective_min_keep = min(desired_min_keep, n_gap, target_top_k)
+        if desired_min_keep is not None and n_gap < desired_min_keep:
+            logger.warning(
+                "[fuse_pools] gap pool too small: desired_quota=%d but only %d gap candidates available"
+                " — using %d as effective quota (top_k=%d)",
+                desired_min_keep, n_gap, effective_min_keep, target_top_k,
+            )
 
-    # Gap quota enforcement: force-include top gap items if quota not met in top_k
-    top_slice = boosted[:top_k]
+    # Gap quota enforcement: force-include gap items if quota not met in top_k.
+    # Preference order: ranked tail first, then unranked original gap pool.
+    top_slice = reranked[:target_top_k]
+    ranked_ids = {_cand_key(c, i) for i, c in enumerate(reranked)}
+    gap_backfill_ranked = 0
+    gap_backfill_unranked = 0
+    gap_deficit_before_fill = 0
     if effective_min_keep > 0:
         gap_in_top = [c for c in top_slice if c.get("_pool_tag") == "gap"]
         gap_deficit = effective_min_keep - len(gap_in_top)
+        gap_deficit_before_fill = max(gap_deficit, 0)
         if gap_deficit > 0:
-            top_ids = {
-                str(c.get("chunk_id") or (c.get("metadata") or {}).get("chunk_id") or i)
-                for i, c in enumerate(top_slice)
-            }
-            gap_reserve = [
-                c for c in boosted[top_k:]
-                if c.get("_pool_tag") == "gap"
+            selected_ids = {_cand_key(c, i) for i, c in enumerate(top_slice)}
+            ranked_gap_reserve = [
+                c for i, c in enumerate(reranked[target_top_k:], start=target_top_k)
+                if c.get("_pool_tag") == "gap" and _cand_key(c, i) not in selected_ids
             ]
-            forced = gap_reserve[:gap_deficit]
+            forced: List[Dict[str, Any]] = ranked_gap_reserve[:gap_deficit]
+            gap_backfill_ranked = len(forced)
+            if len(forced) < gap_deficit:
+                forced_ids = {_cand_key(c, i) for i, c in enumerate(forced)}
+                ranked_or_selected_ids = selected_ids.union(forced_ids).union(ranked_ids)
+                unranked_gap_reserve = [
+                    c for i, c in enumerate(all_cands)
+                    if c.get("_pool_tag") == "gap" and _cand_key(c, i) not in ranked_or_selected_ids
+                ]
+                needed = gap_deficit - len(forced)
+                extra = unranked_gap_reserve[:needed]
+                gap_backfill_unranked = len(extra)
+                forced.extend(extra)
             if forced:
                 # Replace lowest-scoring main candidates to keep length == top_k
                 main_in_top = [i for i, c in enumerate(top_slice) if c.get("_pool_tag") == "main"]
                 drop_indices = set(main_in_top[-len(forced):]) if main_in_top else set()
                 top_slice = [c for i, c in enumerate(top_slice) if i not in drop_indices]
                 top_slice.extend(forced)
-                top_slice.sort(key=lambda x: float(x.get("score", 0.0)), reverse=True)
 
     out = top_slice
+    gap_in_output = sum(1 for c in out if c.get("_pool_tag") == "gap")
+    if effective_min_keep > 0 and gap_in_output < effective_min_keep:
+        logger.warning(
+            "[fuse_pools] gap quota not met after backfill:"
+            " wanted=%d in_output=%d (n_gap=%d top_k=%d)",
+            effective_min_keep, gap_in_output, n_gap, target_top_k,
+        )
 
     # Strip _pool_tag (keep _source_type and other internal keys for callers)
     clean = [{k: v for k, v in c.items() if k != "_pool_tag"} for c in out]
 
     if diag is not None:
-        gap_in_output = sum(1 for c in out if c.get("_pool_tag") == "gap")
         diag["pool_fusion"] = {
             "main_in": n_main,
             "gap_in": n_gap,
             "total_reranked": len(reranked),
-            "gap_boost_abs": round(boost_abs, 5),
+            "rank_pool_k": rerank_k,
+            "rank_pool_multiplier": round(pool_multiplier, 3),
+            "gap_ratio": (None if gap_ratio is None else float(gap_ratio)),
+            "gap_deficit_before_fill": gap_deficit_before_fill,
+            "gap_backfill_ranked": gap_backfill_ranked,
+            "gap_backfill_unranked": gap_backfill_unranked,
+            "gap_boost_abs": 0.0,
             "gap_min_keep": effective_min_keep,
             "gap_in_output": gap_in_output,
             "output_count": len(clean),
@@ -489,7 +540,7 @@ class RetrievalService:
         step_top_k = (filters or {}).get("step_top_k")
         ui_reranker_mode = (filters or {}).get("reranker_mode") or None
         result_limit = step_top_k if step_top_k is not None else k
-        _cascade_bge_k = (filters or {}).get("colbert_top_k") or (filters or {}).get("step_top_k")
+        _cascade_bge_k = (filters or {}).get("colbert_top_k") or None  # only explicit override
         logger.debug(
             "[service.search] query=%r mode=%s top_k=%s → k=%d | step_top_k=%s → result_limit=%d"
             " | reranker_mode=%s | web_providers=%s | year=%s~%s | optimizer=%s | serpapi_ratio=%s",
@@ -510,7 +561,11 @@ class RetrievalService:
 
         # Amplify retrieval pool so that the reranker always operates on a
         # sufficiently large candidate set, regardless of the caller's top_k.
-        actual_recall = max(80, result_limit * 4)
+        #
+        # NOTE: Each stage already has its own top_k budgets (including per-provider
+        # web limits). We keep a modest amplification here to preserve reranker
+        # headroom without inflating cross-encoder cost too aggressively.
+        actual_recall = max(80, result_limit * 2)
         year_start, year_end = _normalize_year_window(filters)
 
         # 诊断信息收集
@@ -531,6 +586,10 @@ class RetrievalService:
                 step_top_k=(filters or {}).get("step_top_k"),
             )
             return self.retriever.retrieve(query, self.collection, config, diagnostics=diag)
+
+        # Shared list written by _do_web thread; main thread reads this on soft-wait timeout
+        # so we keep whatever phase (provider search or enrichment) completed before the deadline.
+        _partial_web_hits: List[Dict[str, Any]] = []
 
         def _do_web() -> List[Dict[str, Any]]:
             web_providers = (filters or {}).get("web_providers")
@@ -570,8 +629,17 @@ class RetrievalService:
                 except Exception as _e:
                     logger.debug("Lazy Fetching LLM 客户端初始化失败，降级全量抓取: %s", _e)
 
+            logger.info(
+                "[retrieval] web_search start query_len=%d providers=%s max_per_provider=%s",
+                len(query), web_providers, _auto_per_provider,
+            )
             t_web = time.perf_counter()
-            results = unified_web_searcher.search_sync(
+
+            # ── Phase 1: provider search only (fast, no content_fetcher) ──────────────
+            # Results are written to _partial_web_hits immediately so the main thread
+            # can use them even if Phase 2 (content enrichment) is still running at
+            # soft-wait timeout time.
+            raw_hits = unified_web_searcher.search_sync(
                 query,
                 providers=web_providers,
                 source_configs=web_source_configs,
@@ -581,15 +649,61 @@ class RetrievalService:
                 query_optimizer_max_queries=query_optimizer_max_queries,
                 llm_provider=_llm_provider,
                 model_override=_model_override,
-                use_content_fetcher=use_content_fetcher,
-                llm_client=_llm_client,
+                use_content_fetcher="off",   # skip fetcher here; done in Phase 2 below
+                llm_client=None,
                 year_start=year_start,
                 year_end=year_end,
                 queries_per_provider=_queries_per_provider,
                 semantic_query_map=_semantic_query_map,
                 serpapi_ratio=_serpapi_ratio,
             )
+            phase1_ms = (time.perf_counter() - t_web) * 1000
+            # Make snippets available to main thread right now
+            _partial_web_hits[:] = raw_hits
+            logger.info(
+                "[retrieval] web_phase1_done hits=%d elapsed_ms=%.0f (snippets now in partial_web_hits)",
+                len(raw_hits), phase1_ms,
+            )
+
+            # ── Phase 2: content_fetcher enrichment (slow, optional) ─────────────────
+            # Runs on the same persistent _bg_loop so aiohttp connections are consistent
+            # with Phase 1.  enrich_results modifies each hit dict IN-PLACE via
+            # asyncio.gather, so _partial_web_hits (which holds the same dict objects)
+            # is updated incrementally as each URL fetch completes — no batching.
+            # If the outer soft-wait fires mid-enrichment, the main thread reads
+            # _partial_web_hits and gets: fully-enriched hits for completed fetches,
+            # original snippets for the rest.  Nothing is discarded.
+            results = raw_hits
+            if use_content_fetcher not in ("off", False):
+                fetcher = unified_web_searcher._get_content_fetcher()
+                if fetcher:
+                    try:
+                        from src.retrieval.unified_web_search import _get_bg_loop as _get_unified_bg_loop
+                        import asyncio as _asyncio
+                        logger.info("[retrieval] web_phase2_start content_fetcher hits=%d", len(raw_hits))
+                        _enrich_future = _asyncio.run_coroutine_threadsafe(
+                            fetcher.enrich_results(
+                                raw_hits,
+                                query=query,
+                                llm_client=_llm_client,
+                                use_content_fetcher=use_content_fetcher,
+                            ),
+                            _get_unified_bg_loop(),
+                        )
+                        results = _enrich_future.result()   # blocks _do_web thread; main thread reads _partial_web_hits on timeout
+                        phase2_ms = (time.perf_counter() - t_web) * 1000
+                        full_count = sum(1 for h in results if (h.get("metadata") or {}).get("content_type") == "full_text")
+                        sufficient_count = sum(1 for h in results if (h.get("metadata") or {}).get("content_type") == "snippet_sufficient")
+                        logger.info(
+                            "[retrieval] web_phase2_done full=%d sufficient=%d total=%d elapsed_ms=%.0f",
+                            full_count, sufficient_count, len(results), phase2_ms,
+                        )
+                    except Exception as _e:
+                        logger.warning("[retrieval] web_phase2 content_fetcher failed, keeping phase1 snippets: %s", _e)
+
             web_ms = (time.perf_counter() - t_web) * 1000
+            logger.info("[retrieval] web_search done hits=%d elapsed_ms=%.0f", len(results), web_ms)
+
             # 收集 web provider 诊断
             wp_diag: Dict[str, Any] = {}
             for h in results:
@@ -598,7 +712,6 @@ class RetrievalService:
                     wp_diag[prov] = {"count": 0, "time_ms": round(web_ms, 1)}
                 wp_diag[prov]["count"] += 1
             diag["web_providers"] = wp_diag
-            # content_fetcher 统计（由 enrich_results 添加到 metadata）
             enriched = sum(1 for h in results if (h.get("metadata") or {}).get("content_type") == "full_text")
             if enriched > 0:
                 diag["content_fetcher"] = {"enriched": enriched, "total": len(results)}
@@ -616,6 +729,9 @@ class RetrievalService:
             # a rich pool to work with; final truncation to result_limit is done
             # by fuse_pools_with_gap_protection after merging with web results.
             local_recall_k = min(actual_recall, max(result_limit * 2, 20))
+            # cascade BGE stage: only explicit colbert_top_k filter is a manual override.
+            # step_top_k flows as top_k into _rerank_candidates which auto-applies ceil(top_k*1.5).
+            cascade_bge_k = (filters or {}).get("colbert_top_k") or None
             local_config = RetrievalConfig(
                 mode="hybrid",
                 top_k=actual_recall,
@@ -623,14 +739,28 @@ class RetrievalService:
                 year_start=year_start,
                 year_end=year_end,
                 reranker_mode=ui_reranker_mode,
+                colbert_top_k=cascade_bge_k,
                 step_top_k=local_recall_k,
             )
 
-            # ── Soft-wait: local gets a hard timeout; web gets an extended budget
-            # so slow providers (Scholar browser) can complete rather than being
-            # silently dropped.  Threads are not killed on timeout — they finish
-            # in the background as I/O-bound work naturally completes.
-            soft_wait_s = min(timeout_s * 5, 300)
+            logger.info(
+                "[retrieval] hybrid start result_limit=%s local_recall_k=%s timeout_s=%s skip_rerank=%s",
+                result_limit, local_recall_k, timeout_s, skip_rerank,
+            )
+
+            # ── Timeout logic: we do not "require" local; we run local + web in parallel.
+            # Local gets a hard timeout so a stuck vector/graph DB does not block the whole request.
+            # Web gets a longer soft-wait (web_soft_wait_seconds) because provider search + content_fetcher
+            # can take many minutes. Threads are not killed on timeout — they keep running in background.
+            web_soft_cap_s = getattr(
+                getattr(settings, "perf_retrieval", None), "web_soft_wait_seconds", 500
+            ) or 500
+            soft_wait_s = min(timeout_s * 5, web_soft_cap_s)
+            logger.info(
+                "[retrieval] hybrid branches: local (hard timeout=%ds) | web = provider_search + content_fetcher "
+                "(fulltext fetch, two-phase with partial fallback); soft_wait=%ds for web (cap=%ds)",
+                timeout_s, soft_wait_s, web_soft_cap_s,
+            )
 
             ex = ThreadPoolExecutor(max_workers=2)
             fl = ex.submit(
@@ -642,6 +772,8 @@ class RetrievalService:
             t_parallel_start = time.perf_counter()
             try:
                 local_hits = fl.result(timeout=timeout_s)
+                local_elapsed_ms = (time.perf_counter() - t_parallel_start) * 1000
+                logger.info("[retrieval] local done hits=%d elapsed_ms=%.0f", len(local_hits), local_elapsed_ms)
             except FuturesTimeoutError:
                 diag["local_timeout"] = {"timeout_s": timeout_s}
                 logger.warning("[hybrid] local retrieval timed out after %.0fs", timeout_s)
@@ -654,12 +786,35 @@ class RetrievalService:
             try:
                 web_hits = fw.result(timeout=web_wait_s)
                 web_elapsed_ms = (time.perf_counter() - t_web_start) * 1000
+                logger.info("[retrieval] web done hits=%d elapsed_ms=%.0f", len(web_hits), web_elapsed_ms)
                 if web_elapsed_ms > timeout_s * 1000:
                     diag["soft_wait_ms"] = round(web_elapsed_ms)
                     logger.info("[hybrid] web soft-wait completed in %.0fms", web_elapsed_ms)
             except FuturesTimeoutError:
-                diag["web_timeout"] = {"soft_wait_s": round(web_wait_s, 1)}
-                logger.warning("[hybrid] web retrieval soft-wait timed out after %.0fs", web_wait_s)
+                # Best-effort: use whatever phase completed before the deadline.
+                # Phase 1 (provider snippets) is written to _partial_web_hits as soon as it
+                # finishes (~40s); Phase 2 (content_fetcher) updates it when done. On timeout
+                # we pick up whichever phase made it in time — never discard everything.
+                web_hits = list(_partial_web_hits)
+                if web_hits:
+                    diag["web_partial"] = {
+                        "hits": len(web_hits),
+                        "soft_wait_s": round(web_wait_s, 1),
+                        "note": "soft-wait timed out; using best-effort partial hits (snippets or partially enriched)",
+                    }
+                    logger.info(
+                        "[hybrid] web soft-wait timed out after %.0fs; using %d partial hits "
+                        "(phase1 snippets or partial enrichment)",
+                        web_wait_s, len(web_hits),
+                    )
+                else:
+                    diag["web_timeout"] = {"soft_wait_s": round(web_wait_s, 1)}
+                    diag["fusion_notes"] = "local_only_after_web_timeout"
+                    logger.warning(
+                        "[hybrid] web soft-wait timed out after %.0fs with no partial hits yet "
+                        "(phase1 provider search still running); proceeding with local only",
+                        web_wait_s,
+                    )
             except Exception as e:
                 logger.warning("[hybrid] web retrieval failed: %s", e)
             finally:
@@ -695,6 +850,10 @@ class RetrievalService:
                 dedup_removed = web_before - len(web_hits)
                 if dedup_removed > 0:
                     diag["cross_source_dedup"] = {"removed": dedup_removed, "remaining": len(web_hits)}
+                    logger.info(
+                        "[retrieval] cross_source_dedup removed=%d remaining=%d",
+                        dedup_removed, len(web_hits),
+                    )
 
             # ── Tag web hits with source type, compress fulltext ──
             web_main: List[Dict[str, Any]] = []
@@ -704,6 +863,19 @@ class RetrievalService:
                 if "web" not in sources_used:
                     sources_used.append("web")
             web_main = _compress_web_fulltext(web_main, query, filters)
+
+            main_total = len(local_main) + len(web_main)
+            if main_total == len(local_main) and diag.get("web_timeout"):
+                logger.info(
+                    "[retrieval] fuse_pre main=%d web=0 total=%d result_limit=%d — web soft-wait timed out, "
+                    "using local only; 'candidates=%d' at rerank = local retrieval count (upstream of final chunks)",
+                    len(local_main), main_total, result_limit, main_total,
+                )
+            else:
+                logger.info(
+                    "[retrieval] fuse_pre main=%d web=%d total=%d result_limit=%d",
+                    len(local_main), len(web_main), main_total, result_limit,
+                )
 
             # ── Global fusion: single ranked pool → top result_limit ──
             # Local + web are merged and globally reranked in one pass so
@@ -719,6 +891,8 @@ class RetrievalService:
                 skip_rerank=skip_rerank,
                 diag=diag,
             )
+
+            logger.info("[retrieval] fuse_done fused=%d", len(fused_hits))
 
             for h in fused_hits:
                 source_type = h.get("_source_type", "dense")
@@ -824,6 +998,11 @@ class RetrievalService:
                     pass
 
         retrieval_time_ms = (time.perf_counter() - t0) * 1000
+        result_limit_final = step_top_k if step_top_k is not None else k
+        logger.info(
+            "[retrieval] search_done mode=%s chunks=%d result_limit=%s total_ms=%.0f",
+            mode, len(all_chunks), result_limit_final, retrieval_time_ms,
+        )
 
         # ── Observability: 记录检索指标 ──
         if obs_metrics:

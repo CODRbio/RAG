@@ -1,0 +1,88 @@
+---
+description: Guard rails for editing the retrieval service and DR agent pool-rerank logic
+globs: src/retrieval/service.py,src/collaboration/research/agent.py
+alwaysApply: false
+---
+
+# Retrieval Service & DR Agent Edit Guard
+
+## Hybrid Search Path in `service.py`
+
+The hybrid block inside `RetrievalService.search()` must follow this structure:
+
+```python
+# 1. Parallel retrieval with soft-wait
+ex = ThreadPoolExecutor(max_workers=2)
+fl = ex.submit(self.retriever.retrieve, ...)   # local
+fw = ex.submit(_do_web)                         # web
+
+local_hits = fl.result(timeout=timeout_s)       # hard timeout
+web_hits   = fw.result(timeout=web_wait_s)      # soft-wait (5× timeout_s)
+ex.shutdown(wait=False)                         # do not block
+
+# 2. Threshold filter + source-type tagging
+for h in local_hits:
+    h["_source_type"] = "graph" | "dense"
+
+# 3. Cross-source dedup (web vs local)
+web_hits = cross_source_dedup(local_chunks_for_dedup, web_hits)
+
+# 4. ONE global fusion call — this is the ONLY place truncation happens
+fused = fuse_pools_with_gap_protection(
+    query, main_candidates=local_main + web_main, gap_candidates=[],
+    top_k=result_limit, ...
+)
+
+# 5. Convert to EvidenceChunk
+for h in fused:
+    source_type = h.get("_source_type", "dense")
+    all_chunks.append(_hit_to_chunk(h, source_type, query))
+```
+
+**Never add a second `[:result_limit]` cut inside the hybrid block.**
+The final `all_chunks[:result_limit]` at the bottom of `search()` is a safety guard for `local`/`web` modes only; it is a no-op for `hybrid`.
+
+## `_rerank_section_pool_chunks` in `agent.py`
+
+Must split candidates by `pool_source` before calling fusion:
+
+```python
+# ✅ CORRECT
+if pool_source in _DR_GAP_POOL_SOURCES:   # {"eval_supplement"}
+    gap_candidates.append(cand)
+else:
+    main_candidates.append(cand)
+
+fused = fuse_pools_with_gap_protection(
+    query, main_candidates, gap_candidates, top_k=..., reranker_mode=...
+)
+```
+
+```python
+# ❌ WRONG — loses gap protection
+fused = _rerank_candidates(query, main_candidates + gap_candidates, top_k=...)
+```
+
+## `fuse_pools_with_gap_protection` signature (do not change)
+
+```python
+def fuse_pools_with_gap_protection(
+    query: str,
+    main_candidates: List[Dict[str, Any]],
+    gap_candidates: List[Dict[str, Any]],
+    top_k: int,
+    *,
+    gap_boost: float = _GAP_SCORE_BOOST,      # 0.10
+    gap_min_keep: Optional[int] = None,        # ceil(top_k * 0.25) when gap present
+    reranker_mode: Optional[str] = None,
+    skip_rerank: bool = False,
+    diag: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]: ...
+```
+
+The function is imported in `agent.py` via:
+```python
+from src.retrieval.service import fuse_pools_with_gap_protection
+```
+
+Changing its return type or removing the `_pool_tag` stripping will break both callers.

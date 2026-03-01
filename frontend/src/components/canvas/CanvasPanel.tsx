@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   FileEdit,
@@ -8,15 +8,18 @@ import {
   Loader2,
   Plus,
   Telescope,
+  Play,
+  RotateCcw,
 } from 'lucide-react';
 import { useCanvasStore, useChatStore, useUIStore, useToastStore } from '../../stores';
 import { createCanvas, exportCanvasDocx, getCanvasCitations } from '../../api/canvas';
+import { getDeepResearchJob, listDeepResearchJobs } from '../../api/chat';
 import { StageStepper } from './StageStepper';
 import { ExploreStage } from './ExploreStage';
 import { OutlineStage } from './OutlineStage';
 import { DraftingStage } from './DraftingStage';
 import { RefineStage } from './RefineStage';
-import type { CanvasStage } from '../../types';
+import type { CanvasStage, DeepResearchJobInfo } from '../../types';
 import { DEEP_RESEARCH_JOB_KEY } from '../workflow/deep-research/types';
 
 interface CanvasPanelProps {
@@ -34,10 +37,52 @@ export function CanvasPanel({ onStartResize }: CanvasPanelProps) {
     setCanvas,
     setActiveStage,
   } = useCanvasStore();
-  const { workflowStep, sessionId, setCanvasId, setShowDeepResearchDialog } = useChatStore();
-  const { canvasWidth, setCanvasOpen } = useUIStore();
+  const {
+    workflowStep,
+    sessionId,
+    canvasId: chatCanvasId,
+    setCanvasId,
+    setShowDeepResearchDialog,
+    setDeepResearchTopic,
+    setDeepResearchActive,
+    setSessionId,
+    setResearchDashboard,
+    deepResearchActive,
+  } = useChatStore();
+  const { canvasWidth, setCanvasOpen, requestSessionListRefresh } = useUIStore();
   const addToast = useToastStore((s) => s.addToast);
   const [isCreating, setIsCreating] = useState(false);
+  const [associatedJob, setAssociatedJob] = useState<DeepResearchJobInfo | null>(null);
+
+  const loadAssociatedJob = useCallback(async () => {
+    if (!canvas?.id) { setAssociatedJob(null); return; }
+    const savedJobId = localStorage.getItem(DEEP_RESEARCH_JOB_KEY);
+    if (savedJobId) {
+      try {
+        const job = await getDeepResearchJob(savedJobId);
+        if (job.canvas_id === canvas.id) { setAssociatedJob(job); return; }
+      } catch { /* noop */ }
+    }
+    try {
+      const jobs = await listDeepResearchJobs(5);
+      const match = jobs.find((j) => j.canvas_id === canvas.id);
+      if (match) setAssociatedJob(match);
+      else setAssociatedJob(null);
+    } catch { setAssociatedJob(null); }
+  }, [canvas?.id]);
+
+  useEffect(() => { loadAssociatedJob(); }, [loadAssociatedJob]);
+
+  const handleResumeJob = () => {
+    if (!associatedJob) return;
+    localStorage.setItem(DEEP_RESEARCH_JOB_KEY, associatedJob.job_id);
+    setDeepResearchTopic(associatedJob.topic || '');
+    if (associatedJob.session_id) setSessionId(associatedJob.session_id);
+    if (associatedJob.canvas_id) setCanvasId(associatedJob.canvas_id);
+    setDeepResearchActive(true);
+    setShowDeepResearchDialog(true);
+    requestSessionListRefresh();
+  };
 
   const downloadBlob = (blob: Blob, filename: string) => {
     const url = URL.createObjectURL(blob);
@@ -236,6 +281,42 @@ export function CanvasPanel({ onStartResize }: CanvasPanelProps) {
           onStageClick={(stage) => setActiveStage(stage)}
         />
       )}
+
+      {/* Resume Banner — shows when canvas has an associated job that can be continued */}
+      {canvas && associatedJob && !deepResearchActive && (() => {
+        const runnable = ['planning', 'pending', 'running', 'waiting_review'].includes(associatedJob.status);
+        const stoppedWithProgress = ['cancelled', 'error'].includes(associatedJob.status)
+          && (canvas.stage === 'drafting' || canvas.stage === 'outline');
+        if (!runnable && !stoppedWithProgress) return null;
+        return (
+          <div className="mx-3 mt-2 mb-1 px-3 py-2 rounded-lg border flex items-center justify-between gap-2 text-xs animate-in slide-in-from-top-2 duration-200"
+            style={{
+              borderColor: runnable ? 'rgba(52,211,153,0.3)' : 'rgba(251,191,36,0.3)',
+              background: runnable ? 'rgba(52,211,153,0.05)' : 'rgba(251,191,36,0.05)',
+            }}
+          >
+            <div className="flex items-center gap-2 min-w-0">
+              {runnable && <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse flex-shrink-0" />}
+              <span className={`truncate ${runnable ? 'text-emerald-300' : 'text-amber-300'}`}>
+                {runnable
+                  ? `${t('canvas.jobRunning')}: ${associatedJob.message || associatedJob.current_stage || associatedJob.status}`
+                  : t('canvas.jobStopped')}
+              </span>
+            </div>
+            <button
+              onClick={handleResumeJob}
+              className={`flex items-center gap-1 px-2.5 py-1 rounded-md font-medium whitespace-nowrap transition-colors ${
+                runnable
+                  ? 'bg-emerald-600/80 text-white hover:bg-emerald-500'
+                  : 'bg-amber-600/80 text-white hover:bg-amber-500'
+              }`}
+            >
+              {runnable ? <Play size={12} /> : <RotateCcw size={12} />}
+              {runnable ? t('canvas.resumeMonitoring') : t('canvas.continueWork')}
+            </button>
+          </div>
+        );
+      })()}
 
       {/* Stage Content */}
       <div className="flex-1 overflow-hidden bg-slate-900/50">

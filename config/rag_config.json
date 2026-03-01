@@ -104,7 +104,11 @@
     "reranker_mode": "cascade",
     "use_colbert_reranker": true,
     "colbert_model": "jinaai/jina-colbert-v2",
-    "colbert_top_k": 30
+    "colbert_top_k": 30,
+    "chat_gap_ratio": 0.2,
+    "research_gap_ratio": 0.25,
+    "chat_rank_pool_multiplier": 3.0,
+    "research_rank_pool_multiplier": 3.0
   },
   "web_search": {
     "enabled": true,
@@ -168,6 +172,10 @@
     "brightdata_zone": "",
     "cache_enabled": true,
     "cache_ttl_seconds": 3600,
+    "disk_cache_enabled": true,
+    "disk_cache_ttl_seconds": 2592000,
+    "disk_cache_promote_threshold": 3,
+    "disk_cache_dir": "data/cache",
     "max_concurrent": 5,
     "compress_long_fulltext": true,
     "compress_word_threshold": 300,
@@ -291,6 +299,7 @@
   "performance": {
     "retrieval": {
       "timeout_seconds": 60,
+      "web_soft_wait_seconds": 500,
       "cache_enabled": false,
       "cache_ttl_seconds": 3600,
       "parallel_dense_sparse": true,

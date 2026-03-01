@@ -38,6 +38,16 @@ from src.collaboration.research.trajectory import (
 from src.log import get_logger
 from src.retrieval.fulltext_compressor import compress_evidence_text_sync
 from src.utils.prompt_manager import PromptManager
+from src.utils.context_limits import (
+    summarize_if_needed,
+    cap_and_log,
+    DR_USER_CONTEXT_MAX_CHARS,
+    DR_SECTION_EVIDENCE_MAX_CHARS,
+    FINAL_INTEGRATION_MAX_CHARS,
+    PRELIMINARY_KNOWLEDGE_MAX_CHARS,
+    PLAN_CONTEXT_MAX_CHARS,
+    PLAN_CONTEXT_SUMMARIZE_TO,
+)
 
 logger = get_logger(__name__)
 _pm = PromptManager()
@@ -122,7 +132,7 @@ _GAP_ENGINE_ALL_KEYS = frozenset({
     "semantic_umbrella", "semantic_ai4scholar_relevance",
     "semantic_ai4scholar_bulk", "meta",
 })
-_MAX_QUERY_CHARS = 300
+_MAX_QUERY_CHARS = 2500
 
 def _topic_is_chinese(topic: str) -> bool:
     """Return True if topic contains CJK characters (Chinese input detected)."""
@@ -610,6 +620,7 @@ class DeepResearchState(TypedDict, total=False):
     model_override: Optional[str]
     output_language: str
     clarification_answers: Dict[str, str]
+    preliminary_knowledge: str
     user_context: str
     user_context_mode: str
     user_documents: List[Dict[str, str]]
@@ -719,6 +730,7 @@ def _serializable_checkpoint_state(state: DeepResearchState) -> Dict[str, Any]:
         "max_iterations": int(state.get("max_iterations") or 0),
         "output_language": str(state.get("output_language") or "auto"),
         "clarification_answers": dict(state.get("clarification_answers") or {}),
+        "preliminary_knowledge": str(state.get("preliminary_knowledge") or ""),
         "user_context": str(state.get("user_context") or ""),
         "user_context_mode": str(state.get("user_context_mode") or "supporting"),
         "user_documents": list(state.get("user_documents") or []),
@@ -837,6 +849,7 @@ def reconstruct_state_from_checkpoint(
         "model_override": model_override if model_override is not None else state_data.get("model_override"),
         "output_language": str(state_data.get("output_language") or "auto"),
         "clarification_answers": dict(state_data.get("clarification_answers") or {}),
+        "preliminary_knowledge": str(state_data.get("preliminary_knowledge") or ""),
         "user_context": str(state_data.get("user_context") or ""),
         "user_context_mode": str(state_data.get("user_context_mode") or "supporting"),
         "user_documents": list(state_data.get("user_documents") or []),
@@ -1144,17 +1157,35 @@ def _sync_outline_status_to_canvas(state: DeepResearchState) -> None:
 
 
 def _language_instruction(state: DeepResearchState) -> str:
+    """Generate explicit language instruction based on output_language setting.
+
+    Priority:
+    1. If output_language is 'zh' or 'en', use that explicitly
+    2. If output_language is 'auto', detect from topic language
+    3. Default to English if detection fails
+    """
     lang = (state.get("output_language") or "auto").strip().lower()
     if lang == "zh":
         return "\n\nIMPORTANT: Write the output in Chinese (中文)."
     if lang == "en":
         return "\n\nIMPORTANT: Write the output in English."
-    return ""
+    # auto mode: detect from topic
+    dashboard = state.get("dashboard")
+    topic = dashboard.brief.topic if dashboard else ""
+    is_zh = bool(re.search(r"[\u4e00-\u9fff]", topic or ""))
+    if is_zh:
+        return "\n\nIMPORTANT: Write the output in Chinese (中文)."
+    return "\n\nIMPORTANT: Write the output in English."
 
 
-def _build_user_context_block(state: DeepResearchState, max_chars: int = 2500) -> str:
-    """Build optional user-supplied temporary context block."""
+def _build_user_context_block(state: DeepResearchState, max_chars: int = DR_USER_CONTEXT_MAX_CHARS) -> str:
+    """Build optional user-supplied temporary context block. Over max_chars (default 40k) is summarized via ultra_lite."""
     chunks: List[str] = []
+    prelim = (state.get("preliminary_knowledge") or "").strip()
+    if prelim:
+        chunks.append(
+            "Preliminary Research Overview (background knowledge from web, treat as starting context):\n" + prelim
+        )
     user_context = (state.get("user_context") or "").strip()
     mode = (state.get("user_context_mode") or "supporting").strip().lower()
     if user_context:
@@ -1179,35 +1210,39 @@ def _build_user_context_block(state: DeepResearchState, max_chars: int = 2500) -
     if not chunks:
         return ""
     text = "\n\n".join(chunks).strip()
-    if len(text) > max_chars:
-        text = text[:max_chars]
+    ultra_lite_provider = (state.get("filters") or {}).get("ultra_lite_provider")
+    text = summarize_if_needed(
+        text, max_chars,
+        ultra_lite_provider=ultra_lite_provider,
+        purpose="dr_user_context",
+    )
     return "\n\nAdditional temporary context:\n" + text
 
 
 def _compute_effective_write_k(preset: Dict[str, Any], filters: Optional[Dict[str, Any]]) -> int:
-    """Compute adaptive write retrieval window with a safety cap."""
+    """Compute per-section write evidence window with a safety cap.
+
+    write_top_k = per-output-unit evidence cap (one DR section = one unit).
+    If explicitly provided, use it (capped). Otherwise derive from step_top_k * 1.5 or preset.
+    """
     preset_write_k = int(preset.get("search_top_k_write", 12))
     write_k_cap = int(preset.get("search_top_k_write_max", 60))
     if write_k_cap <= 0:
         write_k_cap = 60
-    # Keep cap sane: never below the preset floor.
     write_k_cap = max(write_k_cap, preset_write_k)
 
     ui_write_k = 0
-    ui_write_k_raw = (filters or {}).get("write_top_k")
     try:
-        ui_write_k = int(ui_write_k_raw or 0)
+        ui_write_k = int((filters or {}).get("write_top_k") or 0)
     except (TypeError, ValueError):
         ui_write_k = 0
 
     if ui_write_k > 0:
-        effective_write_k = max(preset_write_k, ui_write_k)
-        return min(effective_write_k, write_k_cap)
+        return min(max(preset_write_k, ui_write_k), write_k_cap)
 
     ui_step_k = 0
-    ui_step_k_raw = (filters or {}).get("step_top_k")
     try:
-        ui_step_k = int(ui_step_k_raw or 0)
+        ui_step_k = int((filters or {}).get("step_top_k") or 0)
     except (TypeError, ValueError):
         ui_step_k = 0
 
@@ -1327,6 +1362,11 @@ def _accumulate_section_pool(
             seen_ids.add(cid)
 
 
+# pool_source values that represent gap-targeted evidence; these candidates get
+# a relevance score boost and guaranteed quota in the final top-k selection.
+_DR_GAP_POOL_SOURCES: frozenset = frozenset({"eval_supplement"})
+
+
 def _rerank_section_pool_chunks(
     query: str,
     pool_chunks: List[Any],
@@ -1334,16 +1374,38 @@ def _rerank_section_pool_chunks(
     *,
     reranker_mode: Optional[str] = None,
 ) -> List[Any]:
-    """Rerank section pool chunks via retrieval reranker and keep top-k."""
+    """Rerank section pool chunks with gap-pool protection.
+
+    Chunks whose pool_source is in _DR_GAP_POOL_SOURCES (currently
+    "eval_supplement") are treated as gap candidates: they receive a relevance
+    score boost and a guaranteed minimum quota in the final top-k output via
+    fuse_pools_with_gap_protection.  All other chunks go into the main pool.
+
+    Returns the top-k original chunk objects (EvidenceChunk or dict) ordered
+    by fused relevance score.
+    """
     if not pool_chunks:
         return []
+
+    # Lazy imports — avoids circular dependencies at module load time
+    try:
+        from src.retrieval.service import fuse_pools_with_gap_protection
+        _has_fusion = True
+    except Exception:
+        _has_fusion = False
     try:
         from src.retrieval.hybrid_retriever import _rerank_candidates
+        _has_reranker = True
     except Exception:
+        _has_reranker = False
+
+    if not _has_fusion and not _has_reranker:
         return list(pool_chunks[:top_k])
 
-    candidates: List[Dict[str, Any]] = []
+    main_candidates: List[Dict[str, Any]] = []
+    gap_candidates: List[Dict[str, Any]] = []
     by_chunk_id: Dict[str, Any] = {}
+
     for idx, chunk in enumerate(pool_chunks):
         text = str(chunk.get("text") if isinstance(chunk, dict) else getattr(chunk, "text", "") or "")
         if not text.strip():
@@ -1358,6 +1420,7 @@ def _rerank_section_pool_chunks(
             provider = chunk.get("provider")
             score = float(chunk.get("score", 0.0) or 0.0)
             source_type = str(chunk.get("source_type", "") or "")
+            pool_source = str(chunk.get("pool_source", "") or "")
         else:
             chunk_id = str(getattr(chunk, "chunk_id", "") or f"pool::{idx}")
             doc_id = str(getattr(chunk, "doc_id", "") or "")
@@ -1368,6 +1431,8 @@ def _rerank_section_pool_chunks(
             provider = getattr(chunk, "provider", None)
             score = float(getattr(chunk, "score", 0.0) or 0.0)
             source_type = str(getattr(chunk, "source_type", "") or "")
+            pool_source = str(getattr(chunk, "pool_source", "") or "")
+
         meta = {
             "chunk_id": chunk_id,
             "doc_id": doc_id,
@@ -1379,28 +1444,61 @@ def _rerank_section_pool_chunks(
             "provider": provider,
             "score": score,
         }
-        candidates.append(
-            {
-                "chunk_id": chunk_id,
-                "content": text,
-                "score": score,
-                "source": "web" if source_type == "web" else "dense",
-                "metadata": meta,
-            }
-        )
+        cand = {
+            "chunk_id": chunk_id,
+            "content": text,
+            "score": score,
+            "source": "web" if source_type == "web" else "dense",
+            "metadata": meta,
+        }
+        if pool_source in _DR_GAP_POOL_SOURCES:
+            gap_candidates.append(cand)
+        else:
+            main_candidates.append(cand)
         by_chunk_id[chunk_id] = chunk
 
-    if not candidates:
+    all_candidates = main_candidates + gap_candidates
+    if not all_candidates:
         return list(pool_chunks[:top_k])
 
-    reranked = _rerank_candidates(
-        query=query,
-        candidates=candidates,
-        top_k=min(max(top_k, 1), len(candidates)),
-        reranker_mode=reranker_mode,
-    )
+    # Global fusion with gap protection
+    fused: List[Dict[str, Any]] = []
+    if _has_fusion:
+        try:
+            fused = fuse_pools_with_gap_protection(
+                query=query,
+                main_candidates=main_candidates,
+                gap_candidates=gap_candidates,
+                top_k=min(max(top_k, 1), len(all_candidates)),
+                gap_ratio=float(getattr(settings.search, "research_gap_ratio", 0.25)),
+                rank_pool_multiplier=float(getattr(settings.search, "research_rank_pool_multiplier", 3.0)),
+                reranker_mode=reranker_mode,
+            )
+        except Exception as e:
+            logger.warning(
+                "_rerank_section_pool_chunks fusion failed (%s); falling back to plain rerank", e
+            )
+
+    # Fallback: plain rerank without gap protection
+    if not fused:
+        if _has_reranker:
+            try:
+                fused = _rerank_candidates(
+                    query=query,
+                    candidates=all_candidates,
+                    top_k=min(max(top_k, 1), len(all_candidates)),
+                    reranker_mode=reranker_mode,
+                )
+            except Exception:
+                fused = sorted(
+                    all_candidates, key=lambda x: float(x.get("score", 0.0)), reverse=True
+                )
+        else:
+            fused = all_candidates
+
+    # Map fused raw dicts back to original chunk objects
     out: List[Any] = []
-    for item in reranked:
+    for item in fused:
         meta = item.get("metadata") or {}
         cid = str(item.get("chunk_id") or meta.get("chunk_id") or "")
         chunk = by_chunk_id.get(cid)
@@ -1585,12 +1683,13 @@ def _generate_refined_queries(
 
     # Build evidence summary from real retrieved evidence; fallback to collected_chunks.
     preset = state.get("depth_preset") or get_depth_preset(state.get("depth", DEFAULT_DEPTH))
-    eval_top_k = int(preset.get("search_top_k_eval", 20))
+    eval_top_k = int(state.get("filters", {}).get("step_top_k") or preset.get("search_top_k_eval", 20))
     evidence_summary = ""
     try:
         svc = _get_retrieval_svc(state)
         ref_filters = dict(state.get("filters") or {})
         ref_filters["use_query_optimizer"] = False
+        ref_filters["reranker_mode"] = "bge_only"
         pack = svc.search(
             query=f"{topic} {section.title}",
             mode=state.get("search_mode", "hybrid"),
@@ -1884,7 +1983,7 @@ def _generate_section_queries(
             section_title=section.title,
             gaps_block=gaps_block,
             temp_block=temp_block,
-            user_context_block=_build_user_context_block(state, max_chars=1200),
+            user_context_block=_build_user_context_block(state),
             recall_budget=recall_budget,
             precision_budget=precision_budget,
             discovery_budget=discovery_budget,
@@ -2122,22 +2221,38 @@ def _record_insight(
 
 def scoping_node(state: DeepResearchState) -> DeepResearchState:
     """Phase 1: 范围界定 — 生成 Research Brief"""
+    t_scope_start = time.perf_counter()
+    topic = state["topic"]
+    logger.info(
+        "[scoping_node] begin | topic=%r prelim_chars=%d clarify_answers=%d",
+        topic[:80],
+        len((state.get("preliminary_knowledge") or "").strip()),
+        len(state.get("clarification_answers") or {}),
+    )
     _ensure_not_cancelled(state)
     _tick_cost_monitor(state, "scope")
     # 生成大纲使用 full client，不降级
     client, model_override = _resolve_step_client_and_model(state, "scope")
-    topic = state["topic"]
     clarification = state.get("clarification_answers") or {}
     clarification_lines = [f"- {k}: {v}" for k, v in clarification.items() if v]
     clarification_block = "\n".join(clarification_lines) if clarification_lines else "(none)"
+    prelim_raw = (state.get("preliminary_knowledge") or "").strip()
+    prelim_block = prelim_raw[:PRELIMINARY_KNOWLEDGE_MAX_CHARS] if prelim_raw else "(none)"
 
     prompt = _pm.render(
         "scope_research.txt",
         topic=topic,
         clarification_block=clarification_block,
+        preliminary_knowledge_block=prelim_block,
     )
 
     try:
+        t_scope_llm_start = time.perf_counter()
+        logger.info(
+            "[scoping_node] calling LLM | model=%s prompt_chars=%d",
+            model_override or "(default)",
+            len(prompt),
+        )
         resp = client.chat(
             messages=[
                 {"role": "system", "content": "You are a research planning expert. Return JSON only."},
@@ -2146,6 +2261,11 @@ def scoping_node(state: DeepResearchState) -> DeepResearchState:
             model=model_override,
 
             response_model=_ScopingResponse,
+        )
+        logger.info(
+            "[scoping_node] LLM response received | elapsed_ms=%.0f final_text_len=%d",
+            (time.perf_counter() - t_scope_llm_start) * 1000.0,
+            len(resp.get("final_text") or ""),
         )
         parsed: Optional[_ScopingResponse] = resp.get("parsed_object")
         if parsed is None:
@@ -2175,12 +2295,25 @@ def scoping_node(state: DeepResearchState) -> DeepResearchState:
     trajectory = state.get("trajectory") or ResearchTrajectory(topic=topic)
     state["trajectory"] = trajectory
     _emit_progress(state, "scope_done", {"topic": topic, "scope": brief.scope, "key_questions": brief.key_questions})
+    logger.info(
+        "[scoping_node] done | elapsed_ms=%.0f key_questions=%d scope_len=%d",
+        (time.perf_counter() - t_scope_start) * 1000.0,
+        len(brief.key_questions or []),
+        len(brief.scope or ""),
+    )
 
     return state
 
 
 def plan_node(state: DeepResearchState) -> DeepResearchState:
     """Phase 2: 规划 — 生成大纲并初始化 Dashboard"""
+    t_plan_start = time.perf_counter()
+    logger.info(
+        "[plan_node] begin | topic=%r search_mode=%s max_sections=%s",
+        (state.get("topic") or "")[:80],
+        state.get("search_mode", "hybrid"),
+        state.get("max_sections"),
+    )
     _ensure_not_cancelled(state)
     _tick_cost_monitor(state, "plan")
     client, model_override = _resolve_step_client_and_model(state, "plan")
@@ -2197,22 +2330,20 @@ def plan_node(state: DeepResearchState) -> DeepResearchState:
     dr_filters["use_query_optimizer"] = True
     # Research phase: force bge_only for speed; write nodes use the UI's reranker_mode.
     dr_filters["reranker_mode"] = "bge_only"
-    # strip step_top_k so it doesn't override plan_top_k and inflate
-    # _auto_per_provider / actual_recall inside service.search().
-    stripped_step_top_k = dr_filters.pop("step_top_k", None)
-    # Respect the UI-supplied local_top_k if present; default 15 for a lightweight survey.
-    ui_local_top_k = dr_filters.pop("local_top_k", None)
-    plan_top_k = int(ui_local_top_k) if ui_local_top_k else 15
+    # Use same step_top_k / local_top_k as rest of pipeline (no hidden override).
+    step_top_k = dr_filters.get("step_top_k")
+    local_top_k = dr_filters.get("local_top_k")
+    plan_top_k = int(step_top_k or local_top_k or 15)
     logger.info(
-        "[plan_node] background retrieval: mode=%s top_k=%d (ui=%s) max_sections=%d "
-        "stripped_step_top_k=%s providers=%s",
+        "[plan_node] background retrieval: mode=%s top_k=%d (step_top_k=%s local_top_k=%s) max_sections=%d providers=%s",
         state.get("search_mode", "hybrid"),
         plan_top_k,
-        ui_local_top_k,
+        step_top_k,
+        local_top_k,
         max_sections,
-        stripped_step_top_k,
         dr_filters.get("web_providers"),
     )
+    t_retrieval_start = time.perf_counter()
     pack = svc.search(
         query=dashboard.brief.topic,
         mode=state.get("search_mode", "hybrid"),
@@ -2222,9 +2353,10 @@ def plan_node(state: DeepResearchState) -> DeepResearchState:
     _accumulate_evidence_chunks(state, pack.chunks)
     context = pack.to_context_string(max_chunks=plan_top_k)
     logger.info(
-        "[plan_node] background retrieval done: chunks=%d context_chars=%d",
+        "[plan_node] background retrieval done: chunks=%d context_chars=%d elapsed_ms=%.0f",
         len(pack.chunks),
         len(context),
+        (time.perf_counter() - t_retrieval_start) * 1000.0,
     )
 
     # Track trajectory
@@ -2238,13 +2370,27 @@ def plan_node(state: DeepResearchState) -> DeepResearchState:
     ))
     dashboard.total_sources += len(pack.chunks)
 
-    # Generate outline
+    # Generate outline: preliminary knowledge has its own cap;
+    # retrieval context keeps up to 30k chars, then summarizes to <=10k.
+    prelim_raw = (state.get("preliminary_knowledge") or "").strip()
+    prelim_block = prelim_raw[:PRELIMINARY_KNOWLEDGE_MAX_CHARS] if prelim_raw else "(none)"
+    ultra_lite_provider = (state.get("filters") or {}).get("ultra_lite_provider")
+    if len(context) > PLAN_CONTEXT_MAX_CHARS:
+        context_for_prompt = summarize_if_needed(
+            context,
+            PLAN_CONTEXT_SUMMARIZE_TO,
+            ultra_lite_provider=ultra_lite_provider,
+            purpose="plan_context",
+        )
+    else:
+        context_for_prompt = context
     prompt = _pm.render(
         "plan_outline.txt",
         topic=dashboard.brief.topic,
         scope=dashboard.brief.scope,
         key_questions=", ".join(dashboard.brief.key_questions),
-        context=context[:3000],
+        preliminary_knowledge_block=prelim_block,
+        context=context_for_prompt,
         max_sections=max_sections,
     )
 
@@ -2254,6 +2400,7 @@ def plan_node(state: DeepResearchState) -> DeepResearchState:
         len(prompt),
         max_sections,
     )
+    t_plan_llm_start = time.perf_counter()
     try:
         resp = client.chat(
             messages=[
@@ -2267,10 +2414,11 @@ def plan_node(state: DeepResearchState) -> DeepResearchState:
         # may produce an empty final_text when the answer is in the reasoning field.
         raw = (resp.get("final_text") or resp.get("reasoning_text") or "").strip()
         logger.info(
-            "[plan_node] LLM outline response: final_text_len=%d reasoning_text_len=%d raw_len=%d",
+            "[plan_node] LLM outline response: final_text_len=%d reasoning_text_len=%d raw_len=%d elapsed_ms=%.0f",
             len(resp.get("final_text") or ""),
             len(resp.get("reasoning_text") or ""),
             len(raw),
+            (time.perf_counter() - t_plan_llm_start) * 1000.0,
         )
     except Exception as e:
         logger.warning("[plan_node] LLM call for outline generation failed: %s", e)
@@ -2384,6 +2532,12 @@ def plan_node(state: DeepResearchState) -> DeepResearchState:
         "phase": "plan",
         "message": "Outline generated — checkpoint saved.",
     })
+    logger.info(
+        "[plan_node] done | elapsed_ms=%.0f sections=%d total_sources=%d",
+        (time.perf_counter() - t_plan_start) * 1000.0,
+        len(sections),
+        dashboard.total_sources,
+    )
 
     return state
 
@@ -2440,12 +2594,13 @@ def _quick_coverage_check(
 
     # Build evidence summary from real retrieved evidence (like evaluate_node).
     preset = state.get("depth_preset") or get_depth_preset(state.get("depth", DEFAULT_DEPTH))
-    eval_top_k = int(preset.get("search_top_k_eval", 20))
+    eval_top_k = int(state.get("filters", {}).get("step_top_k") or preset.get("search_top_k_eval", 20))
     evidence_summary = ""
     try:
         svc = _get_retrieval_svc(state)
         qcc_filters = dict(state.get("filters") or {})
         qcc_filters["use_query_optimizer"] = False
+        qcc_filters["reranker_mode"] = "bge_only"
         pack = svc.search(
             query=f"{dashboard.brief.topic} {section.title}",
             mode=state.get("search_mode", "hybrid"),
@@ -2901,7 +3056,7 @@ def evaluate_node(state: DeepResearchState) -> DeepResearchState:
 
     # Build findings context from per-section evidence pool first; fallback to retrieval.
     preset = state.get("depth_preset") or get_depth_preset(state.get("depth", DEFAULT_DEPTH))
-    eval_top_k = int(preset.get("search_top_k_eval", 20))
+    eval_top_k = int(state.get("filters", {}).get("step_top_k") or preset.get("search_top_k_eval", 20))
     findings = ""
     query_text = f"{dashboard.brief.topic} {section.title}"
     eval_filters = dict(state.get("filters") or {})
@@ -2916,7 +3071,9 @@ def evaluate_node(state: DeepResearchState) -> DeepResearchState:
             reranker_mode=eval_filters.get("reranker_mode"),
         )
         pool_pack = _build_pack_from_chunks(query_text, reranked_pool)
-        findings = (pool_pack.to_context_string(max_chunks=eval_top_k) or "")[:80000]
+        findings = cap_and_log(
+            pool_pack.to_context_string(max_chunks=eval_top_k) or "", purpose="evaluate_findings"
+        )
     if not findings.strip():
         try:
             svc = _get_retrieval_svc(state)
@@ -2926,7 +3083,9 @@ def evaluate_node(state: DeepResearchState) -> DeepResearchState:
                 top_k=eval_top_k,
                 filters=eval_filters,
             )
-            findings = (pack.to_context_string(max_chunks=eval_top_k) or "")[:80000]
+            findings = cap_and_log(
+                pack.to_context_string(max_chunks=eval_top_k) or "", purpose="evaluate_findings"
+            )
         except Exception as e:
             logger.debug("evaluate evidence retrieval failed: %s", e)
 
@@ -2991,7 +3150,7 @@ def evaluate_node(state: DeepResearchState) -> DeepResearchState:
             svc = _get_retrieval_svc(state)
             supplement_filters = dict(eval_filters)
             supplement_filters["reranker_mode"] = "bge_only"
-            supplement_top_k = min(eval_top_k, 10)
+            supplement_top_k = max(5, int(eval_top_k * 0.2))
             for gap in (section.gaps or [])[:3]:
                 gap_q = f"{dashboard.brief.topic} {section.title} {str(gap).strip()}"
                 gap_pack = svc.search(
@@ -3108,7 +3267,7 @@ def generate_claims_node(state: DeepResearchState) -> DeepResearchState:
     user_content = _pm.render(
         "generate_claims.txt",
         section_title=section.title,
-        evidence=evidence_str[:80000],
+        evidence=cap_and_log(evidence_str or "", purpose="generate_claims"),
     )
     try:
         resp = client.chat(
@@ -3150,11 +3309,12 @@ def write_node(state: DeepResearchState) -> DeepResearchState:
 
     section.status = "writing"
 
-    # 收集上下文
+    # 收集上下文（用于 write 系统消息；超 70k 则 ultra_lite 总结）
     context_parts = [dashboard.to_system_prompt()]
     if trajectory.compressed_summaries:
         context_parts.append("\n".join(trajectory.compressed_summaries[-2:]))
     context = "\n\n".join(context_parts)
+    ultra_lite_provider = (state.get("filters") or {}).get("ultra_lite_provider")
 
     # Retrieve section context — adaptive write-stage top_k
     # 每个大纲内结合材料写作：使用 UI 穿透的 reranker_mode（含 cascade），不在此处覆盖
@@ -3294,17 +3454,29 @@ def write_node(state: DeepResearchState) -> DeepResearchState:
             "(e.g., 'A single study [ref:xxxx] suggests...' or 'Preliminary evidence from [ref:xxxx] indicates...').\n"
             "- Actively look for converging evidence from different authors/studies to strengthen conclusions.\n"
         )
+        evidence_limited = summarize_if_needed(
+            evidence_str or "", DR_SECTION_EVIDENCE_MAX_CHARS,
+            ultra_lite_provider=ultra_lite_provider, purpose="dr_section_evidence",
+        )
+        verification_limited = summarize_if_needed(
+            verification_evidence_str or "", DR_SECTION_EVIDENCE_MAX_CHARS,
+            ultra_lite_provider=ultra_lite_provider, purpose="dr_section_verification",
+        )
+        context_limited = summarize_if_needed(
+            context, DR_SECTION_EVIDENCE_MAX_CHARS,
+            ultra_lite_provider=ultra_lite_provider, purpose="dr_section_context",
+        )
         prompt = _pm.render(
             "write_section.txt",
             section_title=section.title,
             language_instruction=_language_instruction(state),
-            user_context_block=_build_user_context_block(state, max_chars=1800),
+            user_context_block=_build_user_context_block(state),
             triangulation_block=triangulation_block,
             caution_block=caution_block,
             quantitative_block=quantitative_block,
             claims_block=claims_block,
-            evidence=evidence_str[:4000],
-            verification_evidence=verification_evidence_str[:3500],
+            evidence=evidence_limited,
+            verification_evidence=verification_limited,
             temp_context=temp_context if temp_context else "(none)",
             supplement_block=supplement_block,
         )
@@ -3318,7 +3490,7 @@ def write_node(state: DeepResearchState) -> DeepResearchState:
                         " When numeric comparisons are needed, use tools to compute instead of guessing."
                         " You follow the principle that a single-source claim must never be presented as established fact;"
                         " always triangulate across multiple independent references.\n"
-                        f"{context[:2000]}"
+                        f"{context_limited}"
                     ),
                 },
                 {"role": "user", "content": prompt},
@@ -4723,6 +4895,7 @@ def _build_initial_state(
     max_iterations: int = 30,
     output_language: str = "auto",
     clarification_answers: Optional[Dict[str, str]] = None,
+    preliminary_knowledge: str = "",
     user_context: str = "",
     user_context_mode: str = "supporting",
     user_documents: Optional[List[Dict[str, str]]] = None,
@@ -4770,6 +4943,7 @@ def _build_initial_state(
         "model_override": model_override,
         "output_language": output_language,
         "clarification_answers": clarification_answers or {},
+        "preliminary_knowledge": preliminary_knowledge or "",
         "user_context": user_context or "",
         "user_context_mode": user_context_mode or "supporting",
         "user_documents": user_documents or [],
@@ -4810,14 +4984,24 @@ def start_deep_research(
     search_mode: str = "hybrid",
     filters: Optional[Dict[str, Any]] = None,
     clarification_answers: Optional[Dict[str, str]] = None,
+    preliminary_knowledge: str = "",
     output_language: str = "auto",
     model_override: Optional[str] = None,
     step_models: Optional[Dict[str, Optional[str]]] = None,
     step_model_strict: bool = False,
     max_iterations: int = 30,
     max_sections: int = 4,
+    progress_callback: Optional[Callable[[str, str, int], None]] = None,
 ) -> Dict[str, Any]:
     """Phase 1 only: scope + plan. Return outline and brief for confirmation."""
+    def _emit(stage: str, message: str, percent: int) -> None:
+        if progress_callback:
+            try:
+                progress_callback(stage, message, percent)
+            except Exception:
+                pass
+
+    t_start_phase1 = time.perf_counter()
     _f = filters or {}
     logger.info(
         "[DR start] ▶ topic=%r | session=%s | search_mode=%s | model=%s"
@@ -4842,8 +5026,9 @@ def start_deep_research(
         max_iterations=max_iterations,
         output_language=output_language,
         clarification_answers=clarification_answers,
-        step_models=step_models,
-        step_model_strict=step_model_strict,
+        preliminary_knowledge=preliminary_knowledge,
+        step_models=None,  # Start phase: scope+plan always use the UI default model
+        step_model_strict=False,
         max_sections=max_sections,
     )
 
@@ -4854,9 +5039,18 @@ def start_deep_research(
     _register_runtime_llm_client(rid, llm_client)
 
     try:
+        _emit("scoping", "正在分析研究范围和主题...", 10)
+        t_scope = time.perf_counter()
         state = scoping_node(state)
+        logger.info("[DR start] scope phase finished | elapsed_ms=%.0f", (time.perf_counter() - t_scope) * 1000.0)
+        _emit("retrieval", "正在检索相关文献和资源...", 35)
+        t_plan = time.perf_counter()
         state = plan_node(state)
+        logger.info("[DR start] plan phase finished | elapsed_ms=%.0f", (time.perf_counter() - t_plan) * 1000.0)
+        _emit("planning", "正在生成研究大纲框架...", 65)
         dashboard = state["dashboard"]
+        _emit("finalizing", "正在完善研究规划...", 90)
+        logger.info("[DR start] phase-1 finished | elapsed_ms=%.0f", (time.perf_counter() - t_start_phase1) * 1000.0)
         return {
             "topic": topic,
             "session_id": state.get("session_id", ""),
@@ -4953,6 +5147,7 @@ def prepare_deep_research_runtime(
     output_language: str = "auto",
     step_models: Optional[Dict[str, Optional[str]]] = None,
     step_model_strict: bool = False,
+    preliminary_knowledge: str = "",
     user_context: str = "",
     user_context_mode: str = "supporting",
     user_documents: Optional[List[Dict[str, str]]] = None,
@@ -4987,6 +5182,7 @@ def prepare_deep_research_runtime(
         model_override=model_override,
         max_iterations=max_iterations,
         output_language=output_language,
+        preliminary_knowledge=preliminary_knowledge,
         user_context=user_context,
         user_context_mode=user_context_mode,
         user_documents=user_documents,
@@ -5422,10 +5618,11 @@ def optimize_section_evidence(
         for q in refined:
             f = dict(effective_filters)
             f["web_providers"] = t3_providers
+            f["reranker_mode"] = "bge_only"  # 强制使用 bge_only 加快速度
             if ui_source_configs:
                 f["web_source_configs"] = ui_source_configs
             f["use_content_fetcher"] = _resolve_fetcher(ui_fetcher, t3_providers)
-            default_k = int(preset.get("default_per_provider_top_k", 15))
+            default_k = int(effective_filters.get("step_top_k") or preset.get("default_per_provider_top_k", 15))
             pack = svc.search(query=q, mode=search_mode, top_k=default_k, filters=f)
             all_chunks.extend(pack.chunks)
             all_sources.update(pack.sources_used)

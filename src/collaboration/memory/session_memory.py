@@ -16,6 +16,7 @@ from src.db.engine import get_engine
 from src.db.models import ChatSession, Turn as TurnRow
 from src.log import get_logger
 from src.utils.prompt_manager import PromptManager
+from src.utils.context_limits import SESSION_MEMORY_TURN_MAX_CHARS
 
 _pm = PromptManager()
 logger = get_logger(__name__)
@@ -363,7 +364,7 @@ class SessionMemory:
 
         recent_turns = self.turns[self.summary_at_turn:current_count]
         turns_text = "\n".join(
-            f"{'User' if t.role == 'user' else 'Assistant'}: {(t.content or '')[:200]}"
+            f"{'User' if t.role == 'user' else 'Assistant'}: {(t.content or '')[:SESSION_MEMORY_TURN_MAX_CHARS]}"
             for t in recent_turns
         )
         if ultra_lite:

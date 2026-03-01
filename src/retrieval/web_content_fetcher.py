@@ -42,7 +42,7 @@ from urllib.parse import urlparse
 from pydantic import BaseModel, Field
 
 from src.log import get_logger
-from src.utils.cache import TTLCache, _make_key, get_cache
+from src.utils.cache import DiskCache, TTLCache, _make_key, get_cache, get_disk_cache
 from src.utils.prompt_manager import PromptManager
 
 _pm = PromptManager()
@@ -205,8 +205,13 @@ class WebContentFetcher:
     brightdata_zone: str = ""
     cache_enabled: bool = True
     cache_ttl_seconds: int = 3600
+    disk_cache_enabled: bool = True
+    disk_cache_ttl_seconds: int = 2592000   # 30 days; entries promoted to permanent after promote_threshold hits
+    disk_cache_promote_threshold: int = 3   # hits within TTL window before entry becomes permanent
+    disk_cache_dir: str = "data/cache"
     max_concurrent: int = 5
     _cache: Optional[TTLCache] = field(default=None, repr=False, init=False)
+    _disk_cache: Optional[DiskCache] = field(default=None, repr=False, init=False)
 
     def __post_init__(self):
         if self.cache_enabled:
@@ -215,6 +220,15 @@ class WebContentFetcher:
                 ttl_seconds=self.cache_ttl_seconds,
                 maxsize=512,
                 prefix="content_fetcher",
+            )
+        if self.disk_cache_enabled:
+            import os
+            db_path = os.path.join(self.disk_cache_dir, "web_content.db")
+            self._disk_cache = get_disk_cache(
+                enabled=True,
+                db_path=db_path,
+                ttl_seconds=self.disk_cache_ttl_seconds,
+                promote_threshold=self.disk_cache_promote_threshold,
             )
         self._inflight: Dict[str, asyncio.Future] = {}
 
@@ -234,6 +248,10 @@ class WebContentFetcher:
                     brightdata_zone=getattr(cfg, "brightdata_zone", ""),
                     cache_enabled=getattr(cfg, "cache_enabled", True),
                     cache_ttl_seconds=getattr(cfg, "cache_ttl_seconds", 3600),
+                    disk_cache_enabled=getattr(cfg, "disk_cache_enabled", True),
+                    disk_cache_ttl_seconds=getattr(cfg, "disk_cache_ttl_seconds", 2592000),
+                    disk_cache_promote_threshold=getattr(cfg, "disk_cache_promote_threshold", 3),
+                    disk_cache_dir=getattr(cfg, "disk_cache_dir", "data/cache"),
                     max_concurrent=getattr(cfg, "max_concurrent", 5),
                 )
         except Exception as e:
@@ -469,14 +487,25 @@ class WebContentFetcher:
         Returns:
             提取的正文文本，失败返回 None
         """
-        # ── 1. Fast path: TTLCache 命中直接返回 ──
+        cache_key = _make_key("content", url)
+
+        # ── L1: 内存 TTLCache（进程内，毫秒级）──
         if self._cache:
-            cached = self._cache.get(_make_key("content", url))
+            cached = self._cache.get(cache_key)
             if cached is not None:
-                logger.debug("周期内缓存命中: %s", url)
+                logger.debug("[content_cache] L1 hit: %s", url)
                 return cached
 
-        # ── 2. In-flight dedup: 同 URL 已有在途请求则等待 ──
+        # ── L2: 磁盘 SQLite 缓存（跨重启，秒级）──
+        if self._disk_cache:
+            disk_cached = self._disk_cache.get(cache_key)
+            if disk_cached is not None:
+                logger.info("[content_cache] L2 disk hit: %s", url)
+                if self._cache:
+                    self._cache.set(cache_key, disk_cached)   # 回填 L1
+                return disk_cached
+
+        # ── In-flight dedup: 同 URL 已有在途请求则等待 ──
         inflight = self._inflight.get(url)
         if inflight is not None:
             logger.debug("等待同 URL 在途请求: %s", url)
@@ -485,7 +514,7 @@ class WebContentFetcher:
             except Exception:
                 pass
 
-        # ── 3. 发起新请求，注册 Future 供其他协程复用 ──
+        # ── 发起新请求，注册 Future 供其他协程复用 ──
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[Optional[str]] = loop.create_future()
         self._inflight[url] = fut
@@ -500,9 +529,12 @@ class WebContentFetcher:
             if text and len(text) > self.max_content_length:
                 text = text[: self.max_content_length]
 
-            # 写入 TTLCache，后续同 URL 请求直接命中
-            if text and self._cache:
-                self._cache.set(_make_key("content", url), text)
+            if text:
+                if self._cache:
+                    self._cache.set(cache_key, text)        # 写 L1
+                if self._disk_cache:
+                    self._disk_cache.set(cache_key, text)   # 写 L2
+                    logger.debug("[content_cache] stored to disk: %s", url)
 
             if not fut.done():
                 fut.set_result(text)
@@ -560,6 +592,10 @@ class WebContentFetcher:
         prompt = _pm.render("web_content_fetch_decide.txt", query=query, items_text=items_text)
 
         try:
+            logger.info(
+                "[retrieval] model_call content_fetcher llm_fetch_decide candidates=%d",
+                len(candidates),
+            )
             resp = llm_client.chat(
                 messages=[
                     {"role": "system", "content": _pm.render("web_content_fetch_decide_system.txt")},
@@ -654,7 +690,7 @@ class WebContentFetcher:
             source = metadata.get("source", "")
             url = (metadata.get("url") or "").strip()
 
-            if not is_force and source not in ("scholar", "google"):
+            if not is_force and source not in ("scholar", "google", "serpapi_scholar", "serpapi_google"):
                 return
 
             if not url or not is_qualifying_url(url, only_academic=self.only_academic):

@@ -21,6 +21,7 @@ from src.collaboration.citation.manager import resolve_response_citations, sync_
 from src.collaboration.citation.formatter import format_reference_list
 from src.retrieval.service import RetrievalService, get_retrieval_service
 from src.utils.prompt_manager import PromptManager
+from src.utils.context_limits import summarize_if_needed, AUTO_COMPLETE_CONTEXT_MAX_CHARS
 
 _pm = PromptManager()
 
@@ -117,17 +118,16 @@ class AutoCompleteService:
                                    search_mode, filters, clarification_answers, output_language, step_models, t0)
         filters = filters or {}
         collection = (filters.get("collection") or "").strip() or None
-        retrieval = self.retrieval or get_retrieval_service(collection=collection, top_k=15)
+        step_top_k = filters.get("step_top_k") or 15
+        write_top_k = filters.get("write_top_k") or step_top_k
+        section_top_k = step_top_k
+        retrieval = self.retrieval or get_retrieval_service(collection=collection, top_k=step_top_k)
 
-        # 从 filters 取 top_k，Deep Research 默认更大
-        main_top_k = filters.get("step_top_k") or 15
-        section_top_k = max(main_top_k // 2, 10)
-
-        # 1. 检索主题资料（透传完整 filters）
+        # 1. 检索主题资料（透传完整 filters）；检索用 step_top_k，进 LLM 用 write_top_k
         pack = retrieval.search(
-            query=topic, mode=search_mode, top_k=main_top_k, filters=filters or None,
+            query=topic, mode=search_mode, top_k=step_top_k, filters=filters or None,
         )
-        context_str = pack.to_context_string(max_chunks=min(main_top_k, 20))
+        context_str = pack.to_context_string(max_chunks=write_top_k)
 
         # 2. 创建或获取画布
         if canvas_id:
@@ -177,7 +177,7 @@ class AutoCompleteService:
                 query=section_query, mode=search_mode,
                 top_k=section_top_k, filters=filters or None,
             )
-            section_context = section_pack.to_context_string(max_chunks=min(section_top_k, 15))
+            section_context = section_pack.to_context_string(max_chunks=write_top_k)
 
             content = self._generate_section(
                 topic=topic,
@@ -242,11 +242,14 @@ class AutoCompleteService:
             if lines:
                 answers_block = "\n用户补充信息：\n" + "\n".join(lines) + "\n"
 
+        context_limited = summarize_if_needed(
+            context, AUTO_COMPLETE_CONTEXT_MAX_CHARS, purpose="auto_complete_outline"
+        )
         prompt = _pm.render(
             "auto_complete_outline.txt",
             topic=topic,
             answers_block=answers_block,
-            context=context[:3000] if len(context) > 3000 else context,
+            context=context_limited,
         )
         try:
             resp = self.llm.chat(
@@ -275,10 +278,13 @@ class AutoCompleteService:
 
     def _generate_abstract(self, topic: str, context: str) -> str:
         """LLM 生成摘要"""
+        context_limited = summarize_if_needed(
+            context, AUTO_COMPLETE_CONTEXT_MAX_CHARS, purpose="auto_complete_abstract"
+        )
         prompt = _pm.render(
             "auto_complete_abstract.txt",
             topic=topic,
-            context=context[:2500] if len(context) > 2500 else context,
+            context=context_limited,
         )
         try:
             resp = self.llm.chat(

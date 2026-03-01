@@ -8,5 +8,6 @@ export * from './models';
 export * from './ingest';
 export * from './graph';
 export * from './compare';
+export * from './debug';
 export { default as client } from './client';
 export { streamChat } from './client';

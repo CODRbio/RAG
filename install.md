@@ -160,7 +160,7 @@ python scripts/03b_build_graph.py
 bash scripts/start.sh
 
 # 或只启动后端（支持热更新）
-python scripts/08_run_api.py --reload
+python scripts/08_run_api.py --workers 2
 
 # 或分别启动
 bash scripts/start.sh --backend-only
@@ -172,7 +172,7 @@ bash scripts/start.sh --frontend-only
 
 ### 生产部署建议（systemd）
 
-发布环境建议使用 `systemd` 托管服务，不建议使用 `start.sh`（其后端默认包含 `--reload`，更适合开发）。
+发布环境建议使用 `systemd` 托管服务。
 完整生产方案（含 Nginx 静态托管与 `/api` 反向代理）见 `docs/release_migration_ubuntu.md`。
 
 后端 service 示例：

@@ -624,19 +624,21 @@ def canvas_ai_edit(canvas_id: str, body: CanvasAIEditRequest) -> CanvasAIEditRes
     manager = get_manager(str(_CONFIG_PATH))
     client = manager.get_client()
 
-    # 可选：检索补充资料（用于 add_citations）
+    # 可选：检索补充资料（用于 add_citations）；query 用全文，参考资料预览用 500 字符
+    from src.utils.context_limits import CANVAS_REF_PREVIEW_MAX_CHARS
     retrieval_context = ""
     citations_added: list[str] = []
     if body.search_mode != "none" and action == "add_citations":
         try:
             from src.retrieval.service import get_retrieval_service
             svc = get_retrieval_service()
-            pack = svc.search(query=body.section_text[:200], mode=body.search_mode, top_k=5)
+            canvas_top_k = min(body.step_top_k or 15, 20)
+            pack = svc.search(query=body.section_text, mode=body.search_mode, top_k=canvas_top_k)
             if pack.chunks:
                 refs = []
                 for ch in pack.chunks:
                     cite_key = ch.chunk_id or ch.doc_id
-                    refs.append(f"[{cite_key}] {ch.text[:200]}")
+                    refs.append(f"[{cite_key}] {ch.text[:CANVAS_REF_PREVIEW_MAX_CHARS]}")
                     citations_added.append(cite_key)
                 retrieval_context = "\n\n可用参考资料：\n" + "\n".join(refs)
         except Exception:

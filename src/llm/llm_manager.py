@@ -669,7 +669,14 @@ class HTTPChatClient(BaseChatClient):
 
         # 结构化输出：为 OpenAI-compat 协议注入 JSON 模式
         if response_model is not None and not is_anthropic:
-            merged_params.setdefault("response_format", {"type": "json_object"})
+            is_perplexity = "api.perplexity.ai" in (self.config.base_url or "")
+            if is_perplexity:
+                merged_params.setdefault("response_format", {
+                    "type": "json_schema",
+                    "json_schema": {"schema": response_model.model_json_schema()},
+                })
+            else:
+                merged_params.setdefault("response_format", {"type": "json_object"})
 
         # 构建请求 payload
         if is_anthropic:

@@ -392,6 +392,7 @@ class DeepResearchJob(SQLModel, table=True):
     total_time_ms: float = Field(default=0.0, sa_column=Column(Float, nullable=False, server_default="0"))
     created_at: float = Field(default_factory=_now_ts, sa_column=Column(Float, nullable=False))
     updated_at: float = Field(default_factory=_now_ts, sa_column=Column(Float, nullable=False))
+    started_at: Optional[float] = Field(default=None, sa_column=Column(Float, nullable=True))
     finished_at: Optional[float] = Field(default=None, sa_column=Column(Float, nullable=True))
 
     events: List["DRJobEvent"] = Relationship(

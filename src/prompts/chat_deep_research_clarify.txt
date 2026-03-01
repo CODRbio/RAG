@@ -9,6 +9,11 @@ User's topic: "{message}"
 Conversation history:
 {history_block}
 
+Preliminary knowledge about this topic (if available; use it to ask domain-specific questions):
+{preliminary_knowledge_block}
+
+When preliminary knowledge is provided above, use it to ask targeted clarification questions: e.g. which sub-fields or controversies the user wants to emphasize, which boundaries to set, or what depth they need. This makes the review scope clearer. When no preliminary knowledge is given, base questions only on the topic and history.
+
 {language_instruction}
 
 Generate questions to clarify (priority from high to low):

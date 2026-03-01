@@ -615,7 +615,7 @@ def _run_ingest_job(job_id: str, cfg: dict) -> None:
                     if len(sample_texts_for_scope) >= max_scope_samples:
                         break
                     if t and isinstance(t, str) and t.strip():
-                        sample_texts_for_scope.append(t.strip()[:2000])
+                        sample_texts_for_scope.append(t.strip()[:4000])
             batch_size = 32
             total_batches = (len(texts) + batch_size - 1) // batch_size
             for bi, i in enumerate(range(0, len(texts), batch_size)):

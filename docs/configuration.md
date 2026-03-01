@@ -75,6 +75,11 @@ PDF 解析相关配置。
 - Dense/Sparse 召回参数
 - `reranker_mode`：重排模式（bge / colbert / cascade）
 - ColBERT 开关与模型配置
+- Gap 融合配置（Chat / Research 可独立）
+  - `chat_gap_ratio`：Chat gap 最低配额比例（默认 `0.2`）
+  - `research_gap_ratio`：Research gap 最低配额比例（默认 `0.25`）
+  - `chat_rank_pool_multiplier`：Chat 融合重排池放大倍数（默认 `3.0`）
+  - `research_rank_pool_multiplier`：Research 融合重排池放大倍数（默认 `3.0`）
 
 ### `web_search`
 
@@ -271,6 +276,46 @@ Deep Research 配置。
 - `unified_web_search`：统一网络搜索并发
   - `browser_providers_max_parallel`：浏览器类搜索并发数
 - `google_search`：Google 搜索超时
+
+---
+
+## 仅通过 config 生效的参数（未在 UI 暴露）
+
+以下参数**不在前端 UI 中展示**，只能通过 `config/rag_config.json`（或 `rag_config.local.json`）修改；修改后需重启服务生效。默认值以当前代码为准，下表供查阅与调优。
+
+### `performance.retrieval`（检索层）
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `timeout_seconds` | `60` | Hybrid 时 **local** 分支硬超时（秒），避免向量/图 DB 卡死拖住整次请求。 |
+| `web_soft_wait_seconds` | `500` | Hybrid 时对 **web** 分支（provider 搜索 + content_fetcher 拉正文）的最大等待秒数；超时后使用已完成的 Phase1 片段或部分富文本，不丢弃。 |
+| `cache_enabled` | `false` | 检索层内存缓存开关。 |
+| `cache_ttl_seconds` | `3600` | 检索层缓存 TTL（秒）。 |
+| `parallel_dense_sparse` | `true` | 是否并行执行 Dense / Sparse 召回。 |
+| `max_workers` | `4` | 检索并行 worker 数。 |
+
+### `content_fetcher`（URL 全文抓取）
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `cache_enabled` | `true` | 内存 L1 缓存开关。 |
+| `cache_ttl_seconds` | `3600` | L1 缓存 TTL（秒）。 |
+| `disk_cache_enabled` | `true` | 磁盘 L2 缓存（SQLite）开关；跨进程/重启复用。 |
+| `disk_cache_ttl_seconds` | `2592000` | L2 普通条目 TTL（秒），默认 30 天。 |
+| `disk_cache_promote_threshold` | `3` | 同一 URL 在 TTL 内命中次数达到该值后晋升为永久缓存，不再过期。 |
+| `disk_cache_dir` | `"data/cache"` | L2 数据库所在目录，库文件为 `web_content.db`。 |
+| `max_concurrent` | `5` | 并发抓取 URL 数。 |
+| `timeout_seconds` | `15` | 单 URL 抓取超时（秒）。 |
+| `compress_long_fulltext` / `compress_word_threshold` / `compress_max_output_words` | 见 `rag_config.json` | 长文压缩与截断。 |
+
+### 其他 performance 子块
+
+- `performance.llm`：`timeout_seconds`、`max_retries`、`retry_backoff`、`cache_*`、`max_concurrent_per_provider`
+- `performance.web_search`：`timeout_seconds`、`cache_*`
+- `performance.unified_web_search`：`max_parallel_providers`、`per_provider_timeout_seconds`、`browser_providers_max_parallel`
+- `performance.google_search`：`browser_reuse`、`max_idle_seconds`、`max_pages_per_browser`、`cache_*`
+
+以上默认值以 `config/settings.py` 及 `config/rag_config.json` 为准；若需覆盖，在 `performance` / `content_fetcher` 对应块中增加或修改键即可。
 
 ## 三、重要环境变量
 

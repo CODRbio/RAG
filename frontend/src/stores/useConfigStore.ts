@@ -86,6 +86,7 @@ export const useConfigStore = create<ConfigState>()(
         enableHippoRAG: false,
         enableReranker: true,
         agentMode: 'assist' as const,
+        maxIterations: 2,
         agentDebugMode: false,
       },
 
@@ -107,6 +108,8 @@ export const useConfigStore = create<ConfigState>()(
         yearStart: null,
         yearEnd: null,
         stepModelStrict: false,
+        preliminaryModel: 'sonar::sonar-reasoning-pro',
+        questionModel: '',
         skipClaimGeneration: false,
         maxSections: 4,
         gapQueryIntent: 'broad',
@@ -250,6 +253,7 @@ export const useConfigStore = create<ConfigState>()(
             // Migrate old enableAgent boolean to agentMode tri-state
             agentMode: (persisted.ragConfig as any)?.agentMode
               ?? ((persisted.ragConfig as any)?.enableAgent === false ? 'standard' : 'assist'),
+            maxIterations: (persisted.ragConfig as any)?.maxIterations ?? 2,
             agentDebugMode: persisted.ragConfig?.agentDebugMode ?? false,
           },
           webSearchConfig: {

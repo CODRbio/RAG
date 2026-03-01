@@ -233,7 +233,7 @@ if [ "$RUN_BACKEND" = true ]; then
   "${PY_CMD[@]}" -m uvicorn src.api.server:app \
     --host "$BACKEND_HOST" \
     --port "$BACKEND_PORT" \
-    --reload &
+    --workers 2 &
   PIDS+=($!)
   # 等待后端就绪
   echo -e "${CYAN}[start.sh] 等待后端就绪...${NC}"

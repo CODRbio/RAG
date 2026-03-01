@@ -1082,9 +1082,11 @@ class GoogleSearcher:
             queries_to_search.append(q)
         
         if not queries_to_search:
+            logger.info("[retrieval] playwright scholar_batch skip all_cached queries=%d", len(queries))
             logger.info(f"Scholar 批量搜索：所有 {len(queries)} 个查询都命中缓存")
             return all_results
         
+        logger.info("[retrieval] playwright scholar_batch start queries=%d cached=%d", len(queries_to_search), len(queries) - len(queries_to_search))
         logger.info(f"Scholar 批量搜索：{len(queries_to_search)} 个查询待执行，{len(queries) - len(queries_to_search)} 个命中缓存")
         
         timeout = self._config.get("timeout", 60000)
@@ -1215,6 +1217,7 @@ class GoogleSearcher:
                     logger.error(f"Scholar 批量搜索单个查询出错 (query={query!r}): {e}")
                     continue
             
+            logger.info("[retrieval] playwright scholar_batch done total_hits=%d", len(all_results))
             logger.info(f"Scholar 批量搜索完成，共 {len(all_results)} 条结果")
             return all_results
         
@@ -1404,9 +1407,11 @@ class GoogleSearcher:
             queries_to_search.append(q)
         
         if not queries_to_search:
+            logger.info("[retrieval] playwright google_batch skip all_cached queries=%d", len(queries))
             logger.info(f"Google 批量搜索：所有 {len(queries)} 个查询都命中缓存")
             return all_results
         
+        logger.info("[retrieval] playwright google_batch start queries=%d cached=%d", len(queries_to_search), len(queries) - len(queries_to_search))
         logger.info(f"Google 批量搜索：{len(queries_to_search)} 个查询待执行，{len(queries) - len(queries_to_search)} 个命中缓存")
         
         timeout = self._config.get("timeout", 60000)
@@ -1511,6 +1516,7 @@ class GoogleSearcher:
                     logger.error(f"Google 批量搜索单个查询出错 (query={query!r}): {e}")
                     continue
             
+            logger.info("[retrieval] playwright google_batch done total_hits=%d", len(all_results))
             logger.info(f"Google 批量搜索完成，共 {len(all_results)} 条结果")
             return all_results
         

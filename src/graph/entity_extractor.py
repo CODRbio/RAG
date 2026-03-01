@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from src.log import get_logger
+from src.utils.context_limits import summarize_if_needed, ENTITY_EXTRACTOR_MAX_CHARS
 
 logger = get_logger(__name__)
 
@@ -192,8 +193,11 @@ class EntityExtractor:
             return []
 
         try:
+            text_limited = summarize_if_needed(
+                text or "", ENTITY_EXTRACTOR_MAX_CHARS, purpose="entity_extract_gliner"
+            )
             raw_entities = model.predict_entities(
-                text[:4096],
+                text_limited,
                 labels,
                 threshold=self.config.gliner_threshold,
             )
@@ -260,9 +264,12 @@ class EntityExtractor:
         pm = PromptManager()
 
         entity_type_desc = self.ontology.describe_for_prompt()
+        text_limited = summarize_if_needed(
+            text or "", ENTITY_EXTRACTOR_MAX_CHARS, purpose="entity_extract_llm"
+        )
         prompt = pm.render(
             "hippo_entity_extract.txt",
-            text=text[:3000],
+            text=text_limited,
             entity_types=entity_type_desc,
         )
 

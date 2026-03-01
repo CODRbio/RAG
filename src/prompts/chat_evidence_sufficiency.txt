@@ -1,0 +1,23 @@
+Evaluate whether the retrieved evidence is sufficient to answer the user's question with consistent, substantive support.
+
+User question:
+{query}
+
+Retrieved evidence (synthesized from RAG):
+{evidence_context}
+
+Instructions:
+- Base your judgment on the evidence CONTENT: quality, consistency across sources, and whether it provides concrete/substantive support (data, mechanisms, conclusions), not only on the number of chunks or documents.
+- "Sufficient" means: the evidence can support a well-grounded answer; key claims would be backed by multiple sources or by clear factual content; there are no major contradictions or obvious gaps that would require additional search.
+- "Insufficient" when: evidence is thin, only superficially mentions the topic, sources disagree without resolution, or critical aspects of the question are clearly missing.
+- Be concise in reason (one short sentence when insufficient).
+
+Return JSON only:
+{{
+  "sufficient": true or false,
+  "coverage_score": 0.0-1.0,
+  "substantive_support": true or false,
+  "specificity_ok": true or false,
+  "consistency_ok": true or false,
+  "reason": "one short sentence; required when any of the three checks above is false"
+}}

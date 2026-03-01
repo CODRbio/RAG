@@ -1,0 +1,73 @@
+---
+description: Unified hybrid retrieval pool-fusion architecture — critical design invariants that must not be broken
+alwaysApply: true
+---
+
+# Retrieval Pool-Fusion Architecture
+
+## Core Invariant: One Global Rerank, One Truncation
+
+**NEVER** return evidence by concatenating local + web hits and slicing. The authoritative pattern is:
+
+```
+local hits (step_top_k * 2) ──┐
+                               ├─→ fuse_pools_with_gap_protection() ──→ top result_limit
+web hits (deduped)  ───────────┘       (ONE global rerank pass)
+```
+
+The function `fuse_pools_with_gap_protection` in `src/retrieval/service.py` is the **single source of truth** for this logic. Any ranking or truncation that happens before this call is a *within-source pre-filter only*; the final cut must happen inside this function.
+
+## Two-Pool Model
+
+| Pool | Chat hybrid | Deep Research |
+|------|-------------|---------------|
+| `main_candidates` | local dense + web hits | `pool_source ∈ {"research_round", "write_stage", …}` |
+| `gap_candidates` | *(empty — no gap queries in chat)* | `pool_source == "eval_supplement"` |
+
+`_DR_GAP_POOL_SOURCES` in `agent.py` controls which `pool_source` values map to the gap pool. **Do not remove `"eval_supplement"` from this set.**
+
+## Gap Protection Rules
+
+`fuse_pools_with_gap_protection` guarantees:
+
+1. **Boost**: gap candidates receive `+gap_boost × score_range` additive bonus so they are not crowded out by same-score main candidates.
+2. **Quota**: at least `ceil(top_k × 0.25)` gap slots are reserved in the output (override with `gap_min_keep`).
+3. Boost and quota fire only when `gap_candidates` is non-empty; calling with `gap_candidates=[]` is a safe no-op (just a global rerank).
+
+## Soft-Wait Timeout (Hybrid Mode)
+
+```
+local ──→ hard timeout (timeout_s, default 60 s)
+web   ──→ soft-wait   (min(timeout_s × 5, 300 s))
+```
+
+The web branch is **never silently dropped at 60 s**. Slow providers (Scholar browser ~145 s) get the full soft-wait budget. Diagnostics:
+
+- `diag["web_timeout"]` — web still timed out after soft-wait
+- `diag["soft_wait_ms"]` — how long we actually waited beyond timeout_s
+- `diag["pool_fusion"]` — main/gap counts, boost value, output count
+
+## TopK Semantics
+
+| Parameter | Meaning |
+|-----------|---------|
+| `local_top_k` | retrieval budget passed to `RetrievalService.search(top_k=...)` |
+| `step_top_k` | **per retrieval-call cap** after global fusion (`result_limit`). DR: each research round; Chat: the single main retrieval. |
+| `write_top_k` | **per-output-unit evidence cap** entering LLM. Chat: one Q&A → EvidenceSynthesizer(max_chunks=write_k); DR: one outline section → section pool rerank + fusion. None → Chat uses step_top_k; DR derives from preset/step_top_k. |
+
+`step_top_k` is applied at retrieval/fusion. `write_top_k` is applied when building LLM context (Chat: synthesizer cap; DR: section write rerank).
+
+## Key Files — What Not to Break
+
+| File | Critical section |
+|------|-----------------|
+| `src/retrieval/service.py` | `fuse_pools_with_gap_protection()`, hybrid mode block in `search()` |
+| `src/collaboration/research/agent.py` | `_rerank_section_pool_chunks()`, `_DR_GAP_POOL_SOURCES` constant |
+| `src/api/routes_chat.py` | step ⑤ retrieval log (includes `pool_fusion` diagnostics) |
+
+## DO NOT
+
+- Replace `fuse_pools_with_gap_protection` calls with `_rerank_candidates` alone (loses gap protection).
+- Remove the `ex.shutdown(wait=False)` pattern from hybrid mode (it enables the soft-wait).
+- Change `local_recall_k = min(actual_recall, max(result_limit * 2, 20))` to equal `result_limit` (starves the global reranker).
+- Remove `_DR_GAP_POOL_SOURCES` check in `_rerank_section_pool_chunks` (disables DR gap protection).

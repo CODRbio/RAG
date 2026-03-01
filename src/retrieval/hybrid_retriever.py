@@ -12,6 +12,7 @@ Stage 2: Weighted RRF Fusion (dense=0.6, sparse=0.4)
 Stage 3: Rerank (输入 80-120 -> 输出 10)
 """
 
+import math
 import os
 import time
 from collections import defaultdict
@@ -148,8 +149,11 @@ def _rerank_candidates(
 
     Supports bge_only | colbert_only | cascade.
     Priority: reranker_mode param > settings.search.reranker_mode.
-    When cascade_bge_k is set (e.g. from UI step_top_k), cascade uses it as
-    the BGE-stage output size instead of config colbert_top_k.
+    Cascade BGE stage sizing (1.5× rule):
+      - top_k = final desired output; comes from UI step_top_k (priority) or config rerank_output_k.
+      - BGE intermediate = ceil(top_k * 1.5): ColBERT always gets 50% more candidates than final target.
+      - cascade_bge_k = explicit manual override only (from colbert_top_k filter); skips the 1.5× rule.
+    This avoids both 100→30→80 bottleneck and flat top_k→top_k (no headroom for ColBERT).
     """
     if not candidates:
         logger.debug("_rerank_candidates: empty candidates, skipping")
@@ -157,7 +161,9 @@ def _rerank_candidates(
 
     t_total = time.perf_counter()
     cfg_input_k = getattr(settings.search, "rerank_input_k", 100)
-    funnel_k = max(cfg_input_k, top_k * 3)
+    # Keep funnel budget close to the requested rerank output size; stage-level
+    # budgets already bound candidate volume upstream.
+    funnel_k = max(cfg_input_k, top_k)
     use_colbert = getattr(settings.search, "use_colbert_reranker", False)
     # Per-request mode overrides global settings; ColBERT modes are only effective
     # when use_colbert_reranker is enabled or the request explicitly asks for colbert.
@@ -169,7 +175,14 @@ def _rerank_candidates(
             mode = reranker_mode
     else:
         mode = getattr(settings.search, "reranker_mode", "bge_only") if use_colbert else "bge_only"
-    colbert_top_k = cascade_bge_k if cascade_bge_k is not None else getattr(settings.search, "colbert_top_k", 30)
+    # Cascade BGE stage sizing: 1.5× rule
+    # top_k = final output (UI step_top_k takes priority over config rerank_output_k).
+    # BGE intermediate = ceil(top_k * 1.5) so ColBERT has headroom.
+    # cascade_bge_k = explicit manual override from colbert_top_k filter only.
+    if cascade_bge_k is not None:
+        colbert_top_k = cascade_bge_k
+    else:
+        colbert_top_k = math.ceil(top_k * 1.5)
 
     logger.info(
         "rerank_start: candidates=%d top_k=%d mode=%s (requested=%s) funnel_k=%d",
@@ -181,8 +194,8 @@ def _rerank_candidates(
     if len(candidates) > funnel_k:
         candidates = _embedding_pre_filter(query, candidates, funnel_k)
         logger.info(
-            "rerank_funnel: %d → %d (rerank_input_k=%d, top_k=%d)",
-            n_before_funnel, len(candidates), cfg_input_k, top_k,
+            "rerank_funnel: %d → %d (funnel_k=%d, top_k=%d)",
+            n_before_funnel, len(candidates), funnel_k, top_k,
         )
 
     docs = [c.get("content") or "" for c in candidates]
@@ -202,7 +215,10 @@ def _rerank_candidates(
     # ── cascade: BGE → ColBERT ──
     if mode == "cascade" and colbert_reranker is not None and colbert_reranker.available:
         bge_k = min(colbert_top_k, len(docs))
-        logger.info("rerank_cascade: BGE %d docs → top %d, then ColBERT → top_k=%d", len(docs), bge_k, top_k)
+        logger.info(
+            "rerank_cascade: BGE %d docs → top %d, then ColBERT → final top_k=%d",
+            len(docs), bge_k, top_k,
+        )
         t_bge = time.perf_counter()
         try:
             bge_out = embedder.rerank(query, docs, top_k=bge_k)
@@ -235,7 +251,13 @@ def _rerank_candidates(
             return result
 
     # ── bge_only (default / fallback) ──
-    logger.info("rerank_bge_only: %d docs → top_k=%d", len(docs), top_k)
+    # When candidates < top_k, we return all available (no truncation); the shortfall
+    # usually means hybrid web timed out and only local results were fused.
+    logger.info(
+        "rerank_bge_only: %d docs → top_k=%d%s",
+        len(docs), top_k,
+        " (all available, none trimmed)" if len(docs) < top_k else "",
+    )
     t_bge = time.perf_counter()
     try:
         reranked = embedder.rerank(query, docs, top_k=min(top_k * 2, len(docs)))
@@ -364,10 +386,15 @@ class HybridRetriever:
         sparse_recall_k = getattr(settings.search, "sparse_recall_k", 80)
         rerank_input_k = getattr(settings.search, "rerank_input_k", 100)
         # 请求未传 step_top_k 时继承此默认（与 UI stepTopK 同义）
-        rerank_output_k = getattr(settings.search, "rerank_output_k", 10)
+        rerank_output_k = getattr(settings.search, "rerank_output_k", 20)
         w_dense = getattr(settings.search, "rrf_dense_weight", 0.6)
         w_sparse = getattr(settings.search, "rrf_sparse_weight", 0.4)
         per_doc_cap = getattr(settings.search, "per_doc_cap", 3)
+
+        self.logger.info(
+            "[retrieval] local_vector start query_len=%d collection=%s dense_k=%d sparse_k=%d rerank_input_k=%d step_top_k=%s",
+            len(query), collection, dense_recall_k, sparse_recall_k, rerank_input_k, step_top_k,
+        )
 
         cache_key = _make_key("retrieval_vector", query, collection, top_k, rerank, year_start, year_end, step_top_k)
         if self._vector_cache:
@@ -377,6 +404,7 @@ class HybridRetriever:
                     diagnostics["cache_hit"] = True
                 return cached
 
+        self.logger.info("[retrieval] model_call embedder.encode query (vector recall)")
         emb = embedder.encode([query])
         dense_vec = emb["dense"][0]
         sparse_vec = emb["sparse"]._getrow(0)
@@ -469,6 +497,11 @@ class HybridRetriever:
         dense_hits = [_hit_to_doc(h) for h in (dense_res[0] if dense_res else [])]
         sparse_hits = [_hit_to_doc(h) for h in (sparse_res[0] if sparse_res else [])]
 
+        self.logger.info(
+            "[retrieval] local_vector recall_done dense=%d sparse=%d recall_ms=%.0f",
+            len(dense_hits), len(sparse_hits), recall_ms,
+        )
+
         # Stage 2: Weighted RRF
         t_fusion = time.perf_counter()
         fused = weighted_rrf(
@@ -481,6 +514,11 @@ class HybridRetriever:
             if cid in cid_to_doc:
                 candidates.append(cid_to_doc[cid])
         fusion_ms = (time.perf_counter() - t_fusion) * 1000
+
+        self.logger.info(
+            "[retrieval] local_vector fusion_done candidates=%d fusion_ms=%.0f",
+            len(candidates), fusion_ms,
+        )
 
         # Stage 3: Rerank（bge_only | colbert_only | cascade）
         # 输出条数：请求 step_top_k 优先，否则继承 config rerank_output_k
@@ -569,6 +607,10 @@ class HybridRetriever:
         混合检索（向量 + 图融合）
         条件触发 HippoRAG：多实体 + 关系类关键词时合并图检索结果
         """
+        self.logger.info(
+            "[retrieval] local_hybrid start query_len=%d collection=%s top_k=%s step_top_k=%s",
+            len(query), collection, top_k, step_top_k,
+        )
         # 1. 向量检索
         vector_hits = self.retrieve_vector(
             query,
@@ -581,6 +623,7 @@ class HybridRetriever:
             cascade_bge_k=cascade_bge_k,
             step_top_k=step_top_k,
         )
+        self.logger.info("[retrieval] local_hybrid vector_done hits=%d", len(vector_hits))
 
         # 2. 条件触发 HippoRAG（多实体+关系词时融合图检索）
         fused_hits = vector_hits
@@ -594,13 +637,14 @@ class HybridRetriever:
                     top_k=top_k * 2,
                     graph_weight=graph_weight
                 )
+                self.logger.info("[retrieval] local_hybrid graph_done fused=%d", len(fused_hits))
 
         # 3. Rerank（bge_only | colbert_only | cascade）
         if rerank and fused_hits:
             hits_with_content = [h for h in fused_hits if h.get("content")]
             if hits_with_content:
                 # 请求未传 step_top_k 时继承 config rerank_output_k
-                default_output_k = getattr(settings.search, "rerank_output_k", 10)
+                default_output_k = getattr(settings.search, "rerank_output_k", 20)
                 rerank_limit = step_top_k if step_top_k is not None else default_output_k
                 fused_hits = _rerank_candidates(
                     query, hits_with_content, top_k=min(rerank_limit, len(hits_with_content)),
@@ -609,7 +653,9 @@ class HybridRetriever:
                 per_doc_cap = getattr(settings.search, "per_doc_cap", 3)
                 fused_hits = dedup_and_diversify(fused_hits, per_doc_cap=per_doc_cap)
 
-        return fused_hits[:step_top_k] if step_top_k is not None else fused_hits[:top_k]
+        out = fused_hits[:step_top_k] if step_top_k is not None else fused_hits[:top_k]
+        self.logger.info("[retrieval] local_hybrid done out=%d", len(out))
+        return out
 
     def retrieve(
         self,
@@ -633,6 +679,10 @@ class HybridRetriever:
         if collection is None:
             collection = settings.collection.global_
 
+        self.logger.info(
+            "[retrieval] local retrieve start mode=%s collection=%s top_k=%s step_top_k=%s",
+            config.mode, collection, config.top_k, config.step_top_k,
+        )
         if config.mode == "vector":
             return self.retrieve_vector(
                 query,

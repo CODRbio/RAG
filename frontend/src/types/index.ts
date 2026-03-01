@@ -121,12 +121,15 @@ export interface ChatRequest {
   use_content_fetcher?: 'auto' | 'force' | 'off';  // 是否对网络搜索结果做全文抓取（None 用后端默认）
   use_agent?: boolean;  // [兼容旧字段] 是否启用 Agent，推荐使用 agent_mode
   agent_mode?: 'standard' | 'assist' | 'autonomous';  // Agent 执行模式
+  max_iterations?: number;  // Agent ReAct 最大迭代轮数，默认 2，仅 assist/autonomous 时生效
   clarification_answers?: Record<string, string>;
   output_language?: 'auto' | 'en' | 'zh';
   step_models?: Record<string, string | null | undefined>;
   reranker_mode?: 'bge_only' | 'colbert_only' | 'cascade';  // 重排序模式，None 使用服务端默认
   /** 本会话本地库偏好：no_local=本会话不用本地库，use=仍使用当前库（用于回复「查询与本地库范围不符」的提示） */
   session_preference_local_db?: 'no_local' | 'use';
+  /** 前端调试面板开启时传 true，本请求期间后端临时开启 DEBUG 级别日志 */
+  agent_debug_mode?: boolean;
 }
 
 export interface ChatCitation {
@@ -268,8 +271,10 @@ export interface ClarifyQuestion {
 
 export interface ClarifyResponse {
   questions: ClarifyQuestion[];
+  session_id?: string;
   suggested_topic: string;
   suggested_outline: string[];
+  preliminary_knowledge?: string;
   used_fallback?: boolean;
   fallback_reason?: string;
   llm_provider_used?: string;
@@ -333,6 +338,27 @@ export interface DeepResearchStartRequest {
   reranker_mode?: 'bge_only' | 'colbert_only' | 'cascade';
 }
 
+/** Returned immediately from POST /deep-research/start – poll status endpoint for result. */
+export interface DeepResearchStartAsyncResponse {
+  job_id: string;
+  session_id: string;
+}
+
+/** Polling response from GET /deep-research/start/{job_id}/status */
+export interface DeepResearchStartStatusResponse {
+  job_id: string;
+  status: 'running' | 'done' | 'error';
+  session_id: string;
+  error?: string;
+  canvas_id: string;
+  brief: Record<string, unknown>;
+  outline: string[];
+  initial_stats: Record<string, unknown>;
+  current_stage?: string;
+  progress?: number;
+}
+
+/** @deprecated kept for internal compatibility – use DeepResearchStartAsyncResponse */
 export interface DeepResearchStartResponse {
   session_id: string;
   canvas_id: string;
@@ -341,12 +367,11 @@ export interface DeepResearchStartResponse {
   initial_stats: Record<string, unknown>;
   used_fallback?: boolean;
   fallback_reason?: string;
-  llm_provider_used?: string;
-  llm_model_used?: string;
 }
 
 export interface DeepResearchConfirmRequest {
   topic: string;
+  planning_job_id?: string;
   session_id?: string;
   canvas_id?: string;
   user_id?: string;
@@ -403,12 +428,22 @@ export interface DeepResearchRestartSectionRequest {
   action: 'research' | 'write';
 }
 
+export interface DeepResearchRestartIncompleteSectionsRequest {
+  section_titles: string[];
+  action: 'research' | 'write';
+}
+
+export interface DeepResearchRestartWithOutlineRequest {
+  new_outline: string[];
+  action: 'research' | 'write';
+}
+
 export interface DeepResearchJobInfo {
   job_id: string;
   topic: string;
   session_id: string;
   canvas_id: string;
-  status: 'pending' | 'running' | 'cancelling' | 'waiting_review' | 'done' | 'error' | 'cancelled' | string;
+  status: 'planning' | 'pending' | 'running' | 'cancelling' | 'waiting_review' | 'done' | 'error' | 'cancelled' | string;
   current_stage: string;
   message: string;
   error_message: string;
@@ -418,6 +453,7 @@ export interface DeepResearchJobInfo {
   total_time_ms: number;
   created_at: number;
   updated_at: number;
+  started_at?: number | null;
   finished_at?: number | null;
 }
 
@@ -615,6 +651,7 @@ export interface RagConfig {
   enableHippoRAG: boolean;
   enableReranker: boolean;
   agentMode: 'standard' | 'assist' | 'autonomous';  // Agent 执行模式
+  maxIterations: number;  // Agent ReAct 最大迭代轮数，默认 2
   agentDebugMode: boolean;  // 是否显示 Agent 详细调试面板
 }
 
@@ -638,6 +675,10 @@ export interface DeepResearchDefaults {
   yearEnd: number | null;
   stepModelStrict: boolean;
   stepModels: Record<string, string>;
+  /** 初步研究专用模型，仅从 Perplexity 中选择；无空选项 */
+  preliminaryModel: string;
+  /** 提问模型，用于生成澄清问题；空则用全局选中模型 */
+  questionModel: string;
   skipClaimGeneration: boolean;
   maxSections: number;
   gapQueryIntent: 'broad' | 'review_pref' | 'reviews_only';

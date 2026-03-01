@@ -23,7 +23,7 @@ bash scripts/start.sh
 ### 仅 API
 
 ```bash
-python scripts/08_run_api.py --reload
+python scripts/08_run_api.py --workers 2
 ```
 
 ### Ubuntu 生产托管（systemd）

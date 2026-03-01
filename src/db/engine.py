@@ -112,3 +112,20 @@ def init_db() -> None:
     """
     from src.db import models as _models  # noqa: F401 — ensure all models are registered
     SQLModel.metadata.create_all(get_engine())
+    _ensure_schema_updates()
+
+
+def _ensure_schema_updates() -> None:
+    """Add columns introduced after initial table creation (idempotent)."""
+    import sqlalchemy as sa
+    engine = get_engine()
+    _add_column_if_missing = [
+        ("deep_research_jobs", "started_at", "REAL"),
+    ]
+    with engine.connect() as conn:
+        for table, col, col_type in _add_column_if_missing:
+            try:
+                conn.execute(sa.text(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}"))
+                conn.commit()
+            except Exception:
+                conn.rollback()

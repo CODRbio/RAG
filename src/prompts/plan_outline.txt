@@ -5,6 +5,9 @@ Research brief:
 - Scope: {scope}
 - Key questions: {key_questions}
 
+Preliminary knowledge about the topic (sub-fields, recent trends, open questions; use to structure the outline):
+{preliminary_knowledge_block}
+
 Initial retrieval context:
 {context}
 

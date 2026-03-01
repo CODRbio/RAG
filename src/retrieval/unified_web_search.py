@@ -32,6 +32,7 @@ import asyncio
 import atexit
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -396,6 +397,11 @@ class UnifiedWebSearcher:
         if not providers:
             return []
 
+        t0 = time.perf_counter()
+        logger.info(
+            "[retrieval] unified_web_search start query_len=%d providers=%s max_per_provider=%d",
+            len(query), providers, max_results_per_provider,
+        )
         logger.info(
             f"统一搜索: query={query!r}, providers={providers}, auto_route={is_auto_route}"
         )
@@ -415,6 +421,7 @@ class UnifiedWebSearcher:
 
         # ── 代价感知路由模式（auto） ────────────────────────────────────────────
         if is_auto_route and use_smart:
+            logger.info("[retrieval] model_call query_optimizer get_routing_plan")
             plan: RoutingPlan = smart_optimizer.get_routing_plan(
                 query,
                 providers,
@@ -470,6 +477,7 @@ class UnifiedWebSearcher:
         else:
             resolved_qpp: Dict[str, List[str]] = {}
             if use_smart:
+                logger.info("[retrieval] model_call query_optimizer optimize")
                 resolved_qpp = smart_optimizer.optimize(
                     query,
                     providers,
@@ -519,6 +527,7 @@ class UnifiedWebSearcher:
 
         if do_enrich and fetcher:
             try:
+                logger.info("[retrieval] content_fetcher start hits=%d", len(merged))
                 merged = await fetcher.enrich_results(
                     merged,
                     query=query,
@@ -534,12 +543,21 @@ class UnifiedWebSearcher:
                     if (h.get("metadata") or {}).get("content_type") == "snippet_sufficient"
                 )
                 logger.info(
+                    "[retrieval] content_fetcher done full=%d sufficient=%d total=%d",
+                    full_count, sufficient_count, len(merged),
+                )
+                logger.info(
                     f"全文抓取完成: {full_count} 条全文 / {sufficient_count} 条摘要已足够 / "
                     f"{len(merged)} 条总计"
                 )
             except Exception as e:
                 logger.warning(f"全文抓取失败，使用原始片段: {e}")
 
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        logger.info(
+            "[retrieval] unified_web_search done total=%d elapsed_ms=%.0f",
+            len(merged), elapsed_ms,
+        )
         return merged
     
     async def _search_tavily(
@@ -769,6 +787,12 @@ class UnifiedWebSearcher:
         """
         if not providers:
             return []
+
+        t_run = time.perf_counter()
+        logger.info(
+            "[retrieval] web_search _run_providers start providers=%s query_keys=%s",
+            providers, list(queries_per_provider.keys()) if queries_per_provider else [],
+        )
 
         # Chat 时每个 search engine provider 在各组查询下均使用该 provider 的 topK（来自 source_configs）
         def _get_max(p: str) -> int:
@@ -1051,6 +1075,11 @@ class UnifiedWebSearcher:
                 logger.error(f"搜索任务出错: {r}")
             elif isinstance(r, list):
                 hits.extend(r)
+        elapsed_ms = (time.perf_counter() - t_run) * 1000
+        logger.info(
+            "[retrieval] web_search _run_providers done total_hits=%d elapsed_ms=%.0f",
+            len(hits), elapsed_ms,
+        )
         return hits
 
     def search_sync(

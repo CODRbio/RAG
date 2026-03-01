@@ -3,7 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { Target, FlaskConical, HelpCircle, Ban, BookOpen, Rocket, Clock, Edit3, RotateCcw } from 'lucide-react';
 import type { Canvas } from '../../types';
 import { restartDeepResearchPhase } from '../../api/chat';
-import { useChatStore, useToastStore } from '../../stores';
+import { useChatStore, useToastStore, useUIStore } from '../../stores';
 import {
   DEEP_RESEARCH_JOB_KEY,
   DEEP_RESEARCH_ARCHIVED_JOBS_KEY,
@@ -20,7 +20,8 @@ interface ExploreStageProps {
 export function ExploreStage({ canvas }: ExploreStageProps) {
   const { t } = useTranslation();
   const addToast = useToastStore((s) => s.addToast);
-  const { setDeepResearchTopic, setShowDeepResearchDialog, setDeepResearchActive } = useChatStore();
+  const { setDeepResearchTopic, setShowDeepResearchDialog, setDeepResearchActive, setSessionId, setCanvasId } = useChatStore();
+  const { requestSessionListRefresh } = useUIStore();
   const [restarting, setRestarting] = useState(false);
   const brief = canvas.research_brief;
 
@@ -50,10 +51,13 @@ export function ExploreStage({ canvas }: ExploreStageProps) {
     setRestarting(true);
     try {
       const resp = await restartDeepResearchPhase(sourceJobId, { phase });
+      if (resp.session_id) setSessionId(resp.session_id);
+      if (resp.canvas_id) setCanvasId(resp.canvas_id);
       localStorage.setItem(DEEP_RESEARCH_JOB_KEY, resp.job_id);
       setDeepResearchTopic(canvas.topic || canvas.working_title || '');
       setDeepResearchActive(true);
       setShowDeepResearchDialog(true);
+      requestSessionListRefresh();
       addToast(`已提交阶段重启：${phase}`, 'success');
     } catch (err) {
       console.error('[ExploreStage] restart phase failed:', err);

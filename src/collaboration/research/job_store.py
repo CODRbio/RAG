@@ -30,16 +30,19 @@ def create_job(
     session_id: str = "",
     canvas_id: str = "",
     request_payload: Optional[Dict[str, Any]] = None,
+    job_id: Optional[str] = None,
+    status: str = "pending",
 ) -> Dict[str, Any]:
     now = time.time()
-    job_id = uuid.uuid4().hex
+    if not job_id:
+        job_id = uuid.uuid4().hex
     with Session(get_engine()) as session:
         row = DeepResearchJob(
             job_id=job_id,
             topic=topic,
             session_id=session_id,
             canvas_id=canvas_id,
-            status="pending",
+            status=status,
             request_json=json.dumps(request_payload or {}, ensure_ascii=False),
             created_at=now,
             updated_at=now,
@@ -108,15 +111,15 @@ def list_jobs(limit: int = 20, status: Optional[str] = None) -> List[Dict[str, A
 
 
 def delete_job(job_id: str) -> bool:
-    """删除单个 Deep Research 任务（及其关联的 events、reviews、resume_queue 等）。仅允许终态任务。"""
+    """删除单个 Deep Research 任务（及其关联的 events、reviews、resume_queue 等）。仅允许终态/规划态任务。"""
     with Session(get_engine()) as session:
         row = session.get(DeepResearchJob, job_id)
         if not row:
             return False
         status = (row.status or "").strip()
-        if status not in ("done", "error", "cancelled"):
+        if status not in ("done", "error", "cancelled", "planning"):
             return False
-        session.delete(row)  # cascade deletes events, section_reviews, resume_queue, gap_supplements, insights, checkpoints
+        session.delete(row)
         session.commit()
     return True
 

@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from src.log import get_logger
 from src.utils.prompt_manager import PromptManager
+from src.utils.context_limits import summarize_if_needed, CLAIM_VERIFICATION_MAX_CHARS
 
 logger = get_logger(__name__)
 _pm = PromptManager()
@@ -97,8 +98,9 @@ def extract_claims(
     llm_client: Any,
     model: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """从文本中提取事实性声明"""
-    prompt = _pm.render("extract_claims.txt", text=text[:4000])
+    """从文本中提取事实性声明。输入超 70k 字符时先经 ultra_lite 总结再提取。"""
+    text_limited = summarize_if_needed(text or "", CLAIM_VERIFICATION_MAX_CHARS, purpose="extract_claims")
+    prompt = _pm.render("extract_claims.txt", text=text_limited)
     try:
         resp = llm_client.chat(
             messages=[
@@ -167,8 +169,11 @@ def verify_claims(
         for i, c in enumerate(raw_claims)
     )
 
-    # Step 3: 用 LLM 验证
-    prompt = _pm.render("verify_claims.txt", claims=claims_text, evidence=citation_text[:3000])
+    # Step 3: 用 LLM 验证（evidence 超 70k 时先总结）
+    citation_limited = summarize_if_needed(
+        citation_text or "", CLAIM_VERIFICATION_MAX_CHARS, purpose="verify_claims_evidence"
+    )
+    prompt = _pm.render("verify_claims.txt", claims=claims_text, evidence=citation_limited)
     try:
         resp = llm_client.chat(
             messages=[

@@ -21,14 +21,16 @@ import {
   HelpCircle,
   Telescope,
   Square,
+  RefreshCw,
 } from 'lucide-react';
 import { useAuthStore, useConfigStore, useUIStore, useToastStore, useChatStore, useCanvasStore } from '../../stores';
 import { checkHealth } from '../../api/health';
 import { listSessions, deleteSession, listDeepResearchJobs, cancelDeepResearchJob, deleteDeepResearchJob } from '../../api/chat';
 import { getModelStatus, syncModels } from '../../api/models';
 import { exportCanvas, getCanvas } from '../../api/canvas';
+import { toggleDebug } from '../../api/debug';
 import type { SessionListItem, DeepResearchJobInfo, ResearchDashboardData } from '../../types';
-import { DEEP_RESEARCH_JOB_KEY, DEEP_RESEARCH_ARCHIVED_JOBS_KEY } from '../workflow/deep-research/types';
+import { DEEP_RESEARCH_JOB_KEY } from '../workflow/deep-research/types';
 
 interface SidebarProps {
   onStartResize: () => void;
@@ -143,20 +145,17 @@ export function Sidebar({ onStartResize }: SidebarProps) {
   const [isSyncingModels, setIsSyncingModels] = useState(false);
   const [modelStatusSummary, setModelStatusSummary] = useState<string | null>(null);
 
-  // 加载后台 Deep Research 任务（运行中 + 近期完成）
+  // 加载后台 Deep Research 任务：所有任务都显示，直到被显式删除
   const loadBackgroundJobs = useCallback(async () => {
     if (dbStatus !== 'connected') return;
     setIsLoadingJobs(true);
     try {
-      const jobs = await listDeepResearchJobs(15);
-      const raw = localStorage.getItem(DEEP_RESEARCH_ARCHIVED_JOBS_KEY);
-      const archived: string[] = raw ? (JSON.parse(raw) || []).filter((x: unknown) => typeof x === 'string') : [];
-      const filtered = jobs.filter((j) => !archived.includes(j.job_id));
-      const runnable = ['pending', 'running', 'cancelling', 'waiting_review'];
-      const sorted = filtered.sort((a, b) => {
-        const aRunning = runnable.includes(a.status);
-        const bRunning = runnable.includes(b.status);
-        if (aRunning !== bRunning) return aRunning ? -1 : 1;
+      const jobs = await listDeepResearchJobs(20);
+      const active = ['planning', 'pending', 'running', 'cancelling', 'waiting_review'];
+      const sorted = jobs.sort((a, b) => {
+        const aActive = active.includes(a.status);
+        const bActive = active.includes(b.status);
+        if (aActive !== bActive) return aActive ? -1 : 1;
         return (b.updated_at || 0) - (a.updated_at || 0);
       });
       setBackgroundJobs(sorted);
@@ -172,15 +171,24 @@ export function Sidebar({ onStartResize }: SidebarProps) {
     loadBackgroundJobs();
   }, [loadBackgroundJobs, sessionListRefreshKey]);
 
-  // 有运行中任务时定期刷新状态
+  // 有活跃任务时定期刷新状态
   const hasRunningJob = backgroundJobs.some((j) =>
-    ['pending', 'running', 'cancelling', 'waiting_review'].includes(j.status),
+    ['planning', 'pending', 'running', 'cancelling', 'waiting_review'].includes(j.status),
   );
   useEffect(() => {
     if (!hasRunningJob || dbStatus !== 'connected') return;
     const t = setInterval(loadBackgroundJobs, 15000);
     return () => clearInterval(t);
   }, [hasRunningJob, dbStatus, loadBackgroundJobs]);
+
+  // 前端开启 Debug 面板时同步到后端，使后端启用 debug 级别记录（JSONL + console）
+  const debugSyncedRef = useRef(false);
+  useEffect(() => {
+    if (ragConfig.agentDebugMode && !debugSyncedRef.current) {
+      debugSyncedRef.current = true;
+      toggleDebug(true).catch(() => {});
+    }
+  }, [ragConfig.agentDebugMode]);
 
   // 加载会话历史（新建会话/项目后 requestSessionListRefresh 会触发立即刷新，便于在排队/进行中看到）
   useEffect(() => {
@@ -243,7 +251,7 @@ export function Sidebar({ onStartResize }: SidebarProps) {
   };
 
   const handleRestoreBackgroundJob = async (job: DeepResearchJobInfo) => {
-    const runnable = ['pending', 'running', 'cancelling', 'waiting_review'];
+    const runnable = ['planning', 'pending', 'running', 'cancelling', 'waiting_review'];
     try {
       setActiveTab('chat'); // 恢复任务时切换到对话页，确保会话内容在对话窗显示
       localStorage.setItem(DEEP_RESEARCH_JOB_KEY, job.job_id);
@@ -315,18 +323,10 @@ export function Sidebar({ onStartResize }: SidebarProps) {
     }
   };
 
-  const archiveBackgroundJob = (jobId: string) => {
-    try {
-      const raw = localStorage.getItem(DEEP_RESEARCH_ARCHIVED_JOBS_KEY);
-      const ids: string[] = raw ? (JSON.parse(raw) || []).filter((x: unknown) => typeof x === 'string') : [];
-      const next = [jobId, ...ids.filter((id) => id !== jobId)].slice(0, 20);
-      localStorage.setItem(DEEP_RESEARCH_ARCHIVED_JOBS_KEY, JSON.stringify(next));
-      setBackgroundJobs((prev) => prev.filter((j) => j.job_id !== jobId));
-      if (localStorage.getItem(DEEP_RESEARCH_JOB_KEY) === jobId) {
-        localStorage.removeItem(DEEP_RESEARCH_JOB_KEY);
-      }
-    } catch (err) {
-      console.error('[Sidebar] archive job failed:', err);
+  const hideBackgroundJob = (jobId: string) => {
+    setBackgroundJobs((prev) => prev.filter((j) => j.job_id !== jobId));
+    if (localStorage.getItem(DEEP_RESEARCH_JOB_KEY) === jobId) {
+      localStorage.removeItem(DEEP_RESEARCH_JOB_KEY);
     }
   };
 
@@ -348,12 +348,12 @@ export function Sidebar({ onStartResize }: SidebarProps) {
 
   const handleDeleteBackgroundJob = async (e: React.MouseEvent, job: DeepResearchJobInfo) => {
     e.stopPropagation();
-    const terminal = ['done', 'error', 'cancelled'].includes(job.status);
-    if (!terminal) return;
+    const deletable = ['done', 'error', 'cancelled', 'planning'].includes(job.status);
+    if (!deletable) return;
     if (!window.confirm(t('sidebar.confirmDeleteBgJob'))) return;
     try {
       await deleteDeepResearchJob(job.job_id);
-      archiveBackgroundJob(job.job_id);
+      hideBackgroundJob(job.job_id);
       await loadBackgroundJobs();
       addToast(t('sidebar.bgJobDeleted'), 'success');
     } catch (err) {
@@ -432,9 +432,18 @@ export function Sidebar({ onStartResize }: SidebarProps) {
           <Layers size={24} />
         </div>
         {isSidebarOpen && (
-          <span className="font-bold text-xl tracking-tight whitespace-nowrap text-sky-100 drop-shadow-md">
+          <span className="font-bold text-xl tracking-tight whitespace-nowrap text-sky-100 drop-shadow-md flex-1">
             RAG Lab
           </span>
+        )}
+        {isSidebarOpen && (
+          <button
+            onClick={() => window.location.reload()}
+            className="p-1.5 text-slate-400 hover:text-sky-400 hover:bg-slate-800/50 rounded-lg transition-colors z-10"
+            title="Reload App (Recover from backend restart)"
+          >
+            <RefreshCw size={16} />
+          </button>
         )}
       </div>
 
@@ -676,6 +685,37 @@ export function Sidebar({ onStartResize }: SidebarProps) {
                 />
                 <div className="text-[9px] text-slate-600 mt-0.5">
                   {t('sidebar.writeTopKDesc')}
+                </div>
+              </div>
+
+              {/* Agent 最大迭代轮数 */}
+              <div>
+                <div className="flex items-center justify-between text-[10px] text-slate-500 mb-1">
+                  <span>{t('sidebar.maxIterations')}</span>
+                  <div className="flex items-center gap-2">
+                    <span className="font-mono bg-slate-950 px-1.5 py-0.5 rounded border border-slate-700 text-sky-400">
+                      {ragConfig.maxIterations ?? 2}
+                    </span>
+                    <input
+                      id="max-iterations-num"
+                      name="max-iterations-num"
+                      type="number"
+                      min={1}
+                      max={8}
+                      step={1}
+                      value={ragConfig.maxIterations ?? 2}
+                      onChange={(e) =>
+                        updateRagConfig({
+                          maxIterations: Math.min(8, Math.max(1, Number(e.target.value) || 2)),
+                        })
+                      }
+                      className="w-16 text-[10px] bg-slate-950 border border-slate-700 text-slate-300 rounded px-1 py-0.5 focus:border-sky-500 focus:outline-none"
+                      title={t('sidebar.maxIterationsDesc')}
+                    />
+                  </div>
+                </div>
+                <div className="text-[9px] text-slate-600 mt-0.5">
+                  {t('sidebar.maxIterationsDesc')}
                 </div>
               </div>
 
@@ -1148,7 +1188,9 @@ export function Sidebar({ onStartResize }: SidebarProps) {
                     type="checkbox"
                     checked={ragConfig.agentDebugMode ?? false}
                     onChange={(e) => {
-                      updateRagConfig({ agentDebugMode: e.target.checked });
+                      const checked = e.target.checked;
+                      updateRagConfig({ agentDebugMode: checked });
+                      toggleDebug(checked).catch(() => {});
                     }}
                     className="accent-purple-500 w-3.5 h-3.5 cursor-pointer"
                   />
@@ -1273,11 +1315,12 @@ export function Sidebar({ onStartResize }: SidebarProps) {
                 <div className="text-xs text-slate-600 text-center py-3">{t('sidebar.noBackgroundJobs')}</div>
               )}
               {backgroundJobs.map((job) => {
-                const running = ['pending', 'running', 'cancelling', 'waiting_review'].includes(job.status);
+                const active = ['planning', 'pending', 'running', 'cancelling', 'waiting_review'].includes(job.status);
+                const running = active;
                 const terminal = ['done', 'error', 'cancelled'].includes(job.status);
                 const isStopping = stoppingJobId === job.job_id;
                 const canStop = ['pending', 'running', 'waiting_review'].includes(job.status) && !isStopping;
-                const canDelete = terminal;
+                const canDelete = terminal || job.status === 'planning';
                 return (
                   <div
                     key={job.job_id}
@@ -1289,7 +1332,16 @@ export function Sidebar({ onStartResize }: SidebarProps) {
                         {job.topic || t('sidebar.unnamedResearch')}
                       </span>
                       {running && (
-                        <span className="flex-shrink-0 w-2 h-2 rounded-full bg-emerald-400 animate-pulse" title={job.status} />
+                        <span
+                          className={`flex-shrink-0 w-2 h-2 rounded-full animate-pulse ${
+                            job.status === 'planning'
+                              ? 'bg-amber-400'
+                              : job.status === 'waiting_review'
+                              ? 'bg-violet-400'
+                              : 'bg-emerald-400'
+                          }`}
+                          title={job.status}
+                        />
                       )}
                     </div>
                     <div className="text-[10px] text-slate-500 flex items-center gap-1 mt-1">
@@ -1301,7 +1353,23 @@ export function Sidebar({ onStartResize }: SidebarProps) {
                         minute: '2-digit',
                       })}
                       <span className="ml-2 text-slate-700">|</span>
-                      <span className="ml-1 capitalize">{job.status}</span>
+                      <span className={`ml-1 ${
+                        job.status === 'planning' ? 'text-amber-400' :
+                        job.status === 'running' ? 'text-emerald-400' :
+                        job.status === 'done' ? 'text-sky-400' :
+                        job.status === 'error' ? 'text-red-400' :
+                        job.status === 'cancelled' ? 'text-slate-400' :
+                        ''
+                      }`}>
+                        {job.status === 'planning' ? t('sidebar.statusPlanning') :
+                         job.status === 'pending' ? t('sidebar.statusPending') :
+                         job.status === 'running' ? t('sidebar.statusRunning') :
+                         job.status === 'waiting_review' ? t('sidebar.statusReview') :
+                         job.status === 'done' ? t('sidebar.statusDone') :
+                         job.status === 'error' ? t('sidebar.statusError') :
+                         job.status === 'cancelled' ? t('sidebar.statusCancelled') :
+                         job.status}
+                      </span>
                     </div>
                     {(canStop || canDelete) && (
                       <div

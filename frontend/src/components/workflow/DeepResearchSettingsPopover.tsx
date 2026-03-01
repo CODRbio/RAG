@@ -48,7 +48,26 @@ function buildStepModelOptions(providers: LLMProviderInfo[]): StepModelOption[] 
   return opts;
 }
 
-const RESEARCH_STEPS = ['scope', 'plan', 'research', 'evaluate', 'write', 'verify', 'synthesize'] as const;
+/** Only Perplexity — for 初步认知 (preliminary knowledge). */
+function buildPreliminaryModelOptions(providers: LLMProviderInfo[]): StepModelOption[] {
+  const allow = (id: string) => id === 'perplexity' || id.startsWith('perplexity-') || id === 'sonar' || id.startsWith('sonar-');
+  const opts: StepModelOption[] = [];
+  for (const p of providers) {
+    if (!allow(p.id)) continue;
+    const suffix = providerSuffix(p.id);
+    for (const modelKey of p.models) {
+      opts.push({ value: `${p.id}::${modelKey}`, label: `${modelKey}${suffix}` });
+    }
+  }
+  return opts;
+}
+
+const RESEARCH_STEPS = ['plan', 'research', 'evaluate', 'write', 'verify', 'synthesize'] as const;
+
+/** Display label for Per-step Models. */
+function stepDisplayLabel(step: string): string {
+  return step;
+}
 
 interface Props {
   open: boolean;
@@ -82,6 +101,7 @@ export function DeepResearchSettingsPopover({ open, onClose }: Props) {
   }, []);
 
   const stepModelOptions = useMemo(() => buildStepModelOptions(llmProviders), [llmProviders]);
+  const preliminaryModelOptions = useMemo(() => buildPreliminaryModelOptions(llmProviders), [llmProviders]);
 
   // Close on outside click
   useEffect(() => {
@@ -198,18 +218,56 @@ export function DeepResearchSettingsPopover({ open, onClose }: Props) {
           </select>
         </div>
 
+        {/* 初步研究 模型：仅 Perplexity，用于获取主题的初步认知（联网） */}
+        <div>
+          <label className="flex items-center gap-1 text-[11px] font-medium text-gray-600 mb-1">
+            初步研究 模型
+            <Tip content="仅从 Perplexity/Sonar 中选择，用于获取主题的初步认知（联网），再据此生成澄清问题。">
+              <HelpCircle size={11} />
+            </Tip>
+          </label>
+          <select
+            value={deepResearchDefaults.preliminaryModel}
+            onChange={(e) => updateDeepResearchDefaults({ preliminaryModel: e.target.value })}
+            className="w-full border border-gray-200 rounded-lg px-2.5 py-1.5 text-[11px] bg-white text-gray-900 focus:ring-2 focus:ring-indigo-500 outline-none mb-2"
+          >
+            {preliminaryModelOptions.map((opt) => (
+              <option key={opt.value} value={opt.value}>{opt.label}</option>
+            ))}
+          </select>
+        </div>
+
+        {/* 提问 模型：用于生成澄清问题 */}
+        <div>
+          <label className="flex items-center gap-1 text-[11px] font-medium text-gray-600 mb-1">
+            提问 模型
+            <Tip content="用于根据初步认知和聊天历史，生成后续的澄清问题。Default 使用全局模型。">
+              <HelpCircle size={11} />
+            </Tip>
+          </label>
+          <select
+            value={deepResearchDefaults.questionModel ?? ''}
+            onChange={(e) => updateDeepResearchDefaults({ questionModel: e.target.value })}
+            className="w-full border border-gray-200 rounded-lg px-2.5 py-1.5 text-[11px] bg-white text-gray-900 focus:ring-2 focus:ring-indigo-500 outline-none mb-2"
+          >
+            {stepModelOptions.map((opt) => (
+              <option key={opt.value} value={opt.value}>{opt.label}</option>
+            ))}
+          </select>
+        </div>
+
         {/* Per-step Models */}
         <div>
           <label className="flex items-center gap-1 text-[11px] font-medium text-gray-600 mb-1.5">
             Per-step Models
-            <Tip content="Assign different LLMs to each research step. E.g. use sonar-pro for scope/research (web search), claude for write/verify (quality). 'Default' uses the global model selected in the header.">
+            <Tip content="各研究步骤使用的模型。plan/research/write 等为后续步骤。'Default' 使用页头全局模型。">
               <HelpCircle size={11} />
             </Tip>
           </label>
           <div className="space-y-1 border border-gray-100 rounded-lg p-2.5 bg-gray-50">
             {RESEARCH_STEPS.map((step) => (
               <div key={step} className="grid grid-cols-[72px_1fr] items-center gap-1.5">
-                <span className="text-[10px] font-medium text-gray-500 uppercase">{step}</span>
+                <span className="text-[10px] font-medium text-gray-500 uppercase">{stepDisplayLabel(step)}</span>
                 <select
                   value={deepResearchDefaults.stepModels[step] || ''}
                   onChange={(e) => setDeepResearchStepModel(step, e.target.value)}

@@ -72,7 +72,7 @@ export function ChatInput() {
 
   /**
    * 触发 Deep Research 流程（打开澄清对话框）
-   * 使用 ⚙ 弹窗中持久化的 scope 模型来生成澄清问题。
+   * 澄清模型使用当前 UI 选中的 provider/model，避免被 step scope 覆盖。
    *
    * @param topic 必须显式传入主题，不从 inputValue 闭包读取，避免 React 并发模式下的值捕获问题
    */
@@ -86,22 +86,29 @@ export function ChatInput() {
     closeDRSettings(); // 关闭设置弹窗（如果打开的话）
     setDeepResearchTopic(researchTopic);
 
-    // Resolve clarify model from Deep Research persistent defaults
+    // Clarify uses Deep Research setting "提问 模型" and "初步研究 模型".
     const { deepResearchDefaults } = useConfigStore.getState();
-    const scopeModel = (deepResearchDefaults.stepModels.scope || '').trim();
-    let llmProvider: string | undefined;
-    let modelOverride: string | undefined;
-
-    if (scopeModel && scopeModel.includes('::')) {
-      const [p, m] = scopeModel.split('::', 2);
-      llmProvider = p || undefined;
-      modelOverride = m || undefined;
-    } else if (scopeModel) {
-      llmProvider = selectedProvider || undefined;
-      modelOverride = scopeModel || undefined;
-    } else {
-      llmProvider = selectedProvider || undefined;
-      modelOverride = selectedModel || undefined;
+    
+    const questModel = (deepResearchDefaults.questionModel ?? '').trim();
+    let llmProvider: string | undefined = selectedProvider || undefined;
+    let modelOverride: string | undefined = selectedModel || undefined;
+    if (questModel) {
+      const idx = questModel.indexOf('::');
+      if (idx > 0) {
+        llmProvider = questModel.slice(0, idx).trim() || undefined;
+        modelOverride = questModel.slice(idx + 2).trim() || undefined;
+      }
+    }
+    
+    const prelimModel = (deepResearchDefaults.preliminaryModel ?? '').trim();
+    let prelimProvider: string | undefined = undefined;
+    let prelimModelOverride: string | undefined = undefined;
+    if (prelimModel) {
+      const idx = prelimModel.indexOf('::');
+      if (idx > 0) {
+        prelimProvider = prelimModel.slice(0, idx).trim() || undefined;
+        prelimModelOverride = prelimModel.slice(idx + 2).trim() || undefined;
+      }
     }
 
     // 调用澄清问题生成 API
@@ -113,6 +120,8 @@ export function ChatInput() {
         search_mode: 'hybrid',
         llm_provider: llmProvider,
         model_override: modelOverride,
+        prelim_provider: prelimProvider,
+        prelim_model: prelimModelOverride,
       });
       const questions = result.questions || [];
       setClarificationQuestions(questions);
@@ -222,13 +231,16 @@ export function ChatInput() {
       year_start: ragConfig.yearStart ?? undefined,
       year_end: ragConfig.yearEnd ?? undefined,
       step_top_k: (searchMode !== 'none') ? (ragConfig.stepTopK ?? 10) : undefined,
+      write_top_k: (searchMode !== 'none') ? (ragConfig.writeTopK ?? 15) : undefined,
       use_content_fetcher: (searchMode !== 'none' && webEnabled) ? webSearchConfig.contentFetcherMode : undefined,
       agent_mode: ragConfig.agentMode ?? 'standard',
+      max_iterations: ragConfig.maxIterations ?? 2,
       reranker_mode: searchMode !== 'none'
         ? (ragConfig.enableReranker
           ? ((localStorage.getItem('adv_reranker_mode') || 'cascade') as 'bge_only' | 'colbert_only' | 'cascade')
           : 'bge_only')
         : undefined,
+      agent_debug_mode: ragConfig.agentDebugMode ?? false,
     };
 
     if (import.meta.env.DEV) {

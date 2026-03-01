@@ -8,10 +8,11 @@ import {
   listGapSupplements,
   restartDeepResearchPhase,
   restartDeepResearchSection,
+  restartDeepResearchIncompleteSections,
 } from '../../api/chat';
 import { exportCanvas, getCanvas, updateCanvas } from '../../api/canvas';
 import { useToastStore } from '../../stores';
-import { useChatStore, useCanvasStore } from '../../stores';
+import { useChatStore, useCanvasStore, useUIStore } from '../../stores';
 import type { Canvas, GapSupplement } from '../../types';
 import {
   DEEP_RESEARCH_JOB_KEY,
@@ -39,6 +40,7 @@ export function DraftingStage({ canvas }: DraftingStageProps) {
   const [supplementText, setSupplementText] = useState('');
   const [supplementSubmitting, setSupplementSubmitting] = useState(false);
   const [restarting, setRestarting] = useState(false);
+  const [bulkRestartingIncomplete, setBulkRestartingIncomplete] = useState(false);
   const [rescueRefineLoading, setRescueRefineLoading] = useState(false);
   const addToast = useToastStore((s) => s.addToast);
   const researchDashboard = useChatStore((s) => s.researchDashboard);
@@ -46,7 +48,10 @@ export function DraftingStage({ canvas }: DraftingStageProps) {
   const setDeepResearchTopic = useChatStore((s) => s.setDeepResearchTopic);
   const setDeepResearchActive = useChatStore((s) => s.setDeepResearchActive);
   const setWorkflowStep = useChatStore((s) => s.setWorkflowStep);
+  const setSessionId = useChatStore((s) => s.setSessionId);
+  const setCanvasId = useChatStore((s) => s.setCanvasId);
   const { setCanvas, setActiveStage, setCanvasContent } = useCanvasStore();
+  const { requestSessionListRefresh } = useUIStore();
 
   const sortedOutline = [...(outline || [])].sort((a, b) => a.order - b.order);
 
@@ -67,11 +72,14 @@ export function DraftingStage({ canvas }: DraftingStageProps) {
 
   const activeJobId = resolveSourceJobId() || '';
 
-  const afterRestartSubmitted = (jobId: string) => {
+  const afterRestartSubmitted = (jobId: string, sessionId?: string, canvasIdFromResp?: string) => {
+    if (sessionId) setSessionId(sessionId); // 确保 sameSession 检查通过，activeJobId 能被正确恢复
+    if (canvasIdFromResp) setCanvasId(canvasIdFromResp); // 确保进入画布时能找到正确的 canvasId
     localStorage.setItem(DEEP_RESEARCH_JOB_KEY, jobId);
     setDeepResearchTopic(canvas.topic || canvas.working_title || 'Deep Research');
     setDeepResearchActive(true);
     setShowDeepResearchDialog(true);
+    requestSessionListRefresh(); // 立即刷新侧边栏后台任务列表
   };
 
   const handleRestartPhase = async (
@@ -85,7 +93,7 @@ export function DraftingStage({ canvas }: DraftingStageProps) {
     setRestarting(true);
     try {
       const resp = await restartDeepResearchPhase(sourceJobId, { phase });
-      afterRestartSubmitted(resp.job_id);
+      afterRestartSubmitted(resp.job_id, resp.session_id, resp.canvas_id);
       addToast(`已提交阶段重启：${phase}`, 'success');
     } catch (err) {
       console.error('[DraftingStage] restart phase failed:', err);
@@ -107,13 +115,42 @@ export function DraftingStage({ canvas }: DraftingStageProps) {
         section_title: sectionTitle,
         action,
       });
-      afterRestartSubmitted(resp.job_id);
+      afterRestartSubmitted(resp.job_id, resp.session_id, resp.canvas_id);
       addToast(`已提交章节重启：${sectionTitle}`, 'success');
     } catch (err) {
       console.error('[DraftingStage] restart section failed:', err);
       addToast('章节重启失败，请重试', 'error');
     } finally {
       setRestarting(false);
+    }
+  };
+
+  const handleRestartIncompleteSections = async () => {
+    const sourceJobId = resolveSourceJobId();
+    if (!sourceJobId) {
+      addToast('未找到可重启任务，请先完成一次 Deep Research', 'warning');
+      return;
+    }
+    const incompleteTitles = sortedOutline
+      .filter((s) => !drafts[s.id]?.content_md)
+      .map((s) => s.title);
+    if (!incompleteTitles.length) {
+      addToast('所有章节均已有草稿，无需重启', 'info');
+      return;
+    }
+    setBulkRestartingIncomplete(true);
+    try {
+      const resp = await restartDeepResearchIncompleteSections(sourceJobId, {
+        section_titles: incompleteTitles,
+        action: 'research',
+      });
+      afterRestartSubmitted(resp.job_id, resp.session_id, resp.canvas_id);
+      addToast(`已提交 ${incompleteTitles.length} 个未完成章节的重启任务`, 'success');
+    } catch (err) {
+      console.error('[DraftingStage] restart incomplete sections failed:', err);
+      addToast('重启未完成章节失败，请重试', 'error');
+    } finally {
+      setBulkRestartingIncomplete(false);
     }
   };
 
@@ -144,6 +181,7 @@ export function DraftingStage({ canvas }: DraftingStageProps) {
 
   const citationMap = new Map((citation_pool || []).map((c) => [c.cite_key || c.id, c]));
   const draftedCount = Object.keys(drafts || {}).length;
+  const incompleteCount = sortedOutline.filter((s) => !drafts[s.id]?.content_md).length;
   const approvedCount = useMemo(
     () => sortedOutline.filter((s) => (reviewBySection[s.title]?.action || '').toLowerCase() === 'approve').length,
     [sortedOutline, reviewBySection],
@@ -459,6 +497,21 @@ export function DraftingStage({ canvas }: DraftingStageProps) {
             {draftedCount} / {sortedOutline.length}
           </span>
         </div>
+        {incompleteCount > 0 && (
+          <div className="mt-2">
+            <button
+              onClick={() => void handleRestartIncompleteSections()}
+              disabled={bulkRestartingIncomplete || restarting}
+              className="px-2.5 py-1 text-[11px] rounded-md border border-orange-500/50 text-orange-200 hover:bg-orange-900/30 disabled:opacity-50 cursor-pointer flex items-center gap-1"
+              title="对所有尚无草稿的章节重新触发研究+改写"
+            >
+              <RefreshCw size={10} className={bulkRestartingIncomplete ? 'animate-spin' : ''} />
+              {bulkRestartingIncomplete
+                ? '提交中...'
+                : `重启未完成章节 (${incompleteCount})`}
+            </button>
+          </div>
+        )}
         {!skip_draft_review && draftedCount > 0 && (
           <div className="mt-2 space-y-0.5">
             <div className="text-[10px] text-amber-200 font-medium">

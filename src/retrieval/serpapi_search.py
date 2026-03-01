@@ -146,15 +146,20 @@ class SerpAPISearcher:
         year_end: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         q = (query or "").strip()
-        if not q or not self.enabled:
+        if not q:
+            return []
+        if not self.enabled:
+            logger.info("[retrieval] serpapi scholar skip enabled=False")
             return []
         k = int(limit or self._config.get("max_results", 10))
         cache_key = _make_key("serpapi_scholar", q, k, year_start, year_end)
         if self._cache:
             cached = self._cache.get(cache_key)
             if cached is not None:
+                logger.info("[retrieval] serpapi scholar cache_hit query=%r hits=%d", q[:80], len(cached))
                 return cached
 
+        logger.info("[retrieval] serpapi scholar start query=%r limit=%s year=%s~%s", q[:80], k, year_start, year_end)
         params: Dict[str, Any] = {
             "engine": "google_scholar",
             "q": q,
@@ -220,25 +225,31 @@ class SerpAPISearcher:
                 )
             if self._cache:
                 self._cache.set(cache_key, results)
+            logger.info("[retrieval] serpapi scholar done query=%r hits=%d", q[:80], len(results))
             return results
         except asyncio.TimeoutError:
-            logger.warning("SerpAPI scholar search timeout")
+            logger.warning("[retrieval] serpapi scholar timeout query=%r", q[:80])
             return []
         except Exception as e:
-            logger.error("SerpAPI scholar search failed: %s", e)
+            logger.error("[retrieval] serpapi scholar failed query=%r error=%s", q[:80], e)
             return []
 
     async def search_google(self, query: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         q = (query or "").strip()
-        if not q or not self.enabled:
+        if not q:
+            return []
+        if not self.enabled:
+            logger.info("[retrieval] serpapi google skip enabled=False")
             return []
         k = int(limit or self._config.get("max_results", 10))
         cache_key = _make_key("serpapi_google", q, k)
         if self._cache:
             cached = self._cache.get(cache_key)
             if cached is not None:
+                logger.info("[retrieval] serpapi google cache_hit query=%r hits=%d", q[:80], len(cached))
                 return cached
 
+        logger.info("[retrieval] serpapi google start query=%r limit=%s", q[:80], k)
         params: Dict[str, Any] = {
             "engine": "google",
             "q": q,
@@ -271,12 +282,13 @@ class SerpAPISearcher:
                 )
             if self._cache:
                 self._cache.set(cache_key, results)
+            logger.info("[retrieval] serpapi google done query=%r hits=%d", q[:80], len(results))
             return results
         except asyncio.TimeoutError:
-            logger.warning("SerpAPI google search timeout")
+            logger.warning("[retrieval] serpapi google timeout query=%r", q[:80])
             return []
         except Exception as e:
-            logger.error("SerpAPI google search failed: %s", e)
+            logger.error("[retrieval] serpapi google failed query=%r error=%s", q[:80], e)
             return []
 
     async def close(self) -> None:

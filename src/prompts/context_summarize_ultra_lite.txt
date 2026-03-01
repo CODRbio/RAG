@@ -1,0 +1,6 @@
+Summarize the following text in under {max_chars} characters. Preserve key information and citation markers.
+
+Text:
+{text}
+
+Output only the summary.

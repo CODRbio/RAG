@@ -17,7 +17,7 @@ import {
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { useCanvasStore, useToastStore } from '../../stores';
+import { useCanvasStore, useToastStore, useUIStore } from '../../stores';
 import { useChatStore } from '../../stores';
 import {
   aiEditCanvas,
@@ -75,6 +75,9 @@ export function RefineStage({ canvas }: RefineStageProps) {
   const setShowDeepResearchDialog = useChatStore((s) => s.setShowDeepResearchDialog);
   const setDeepResearchTopic = useChatStore((s) => s.setDeepResearchTopic);
   const setDeepResearchActive = useChatStore((s) => s.setDeepResearchActive);
+  const setSessionId = useChatStore((s) => s.setSessionId);
+  const setCanvasId = useChatStore((s) => s.setCanvasId);
+  const { requestSessionListRefresh } = useUIStore();
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [selection, setSelection] = useState<{
@@ -206,10 +209,13 @@ export function RefineStage({ canvas }: RefineStageProps) {
     setRestarting(true);
     try {
       const resp = await restartDeepResearchPhase(sourceJobId, { phase: 'synthesize' });
+      if (resp.session_id) setSessionId(resp.session_id);
+      if (resp.canvas_id) setCanvasId(resp.canvas_id);
       localStorage.setItem(DEEP_RESEARCH_JOB_KEY, resp.job_id);
       setDeepResearchTopic(canvas.topic || canvas.working_title || 'Deep Research');
       setDeepResearchActive(true);
       setShowDeepResearchDialog(true);
+      requestSessionListRefresh();
       addToast('已提交综合重启', 'success');
     } catch (err) {
       console.error('[RefineStage] restart synthesize failed:', err);

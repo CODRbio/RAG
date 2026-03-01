@@ -9,6 +9,7 @@ from typing import Any, List, Optional
 
 from src.log import get_logger
 from src.utils.prompt_manager import PromptManager
+from src.utils.context_limits import summarize_if_needed, COLLECTION_SCOPE_MAX_CHARS
 
 _pm = PromptManager()
 logger = get_logger(__name__)
@@ -185,17 +186,19 @@ def generate_scope_summary(
 def summarize_new_materials(
     sample_texts: List[str],
     llm_client: Any,
-    max_chars: int = 5000,
+    max_chars: int = COLLECTION_SCOPE_MAX_CHARS,
 ) -> str:
-    """将本次入库的文档片段归纳为 1–2 句「本批材料摘要」，用于与已有 scope 合并。"""
+    """将本次入库的文档片段归纳为 1–2 句「本批材料摘要」，用于与已有 scope 合并。输入总长超 40k 时先总结再送入。"""
     if not sample_texts or not llm_client:
         return ""
     parts = []
     total = 0
+    part_max = 4000
     for t in sample_texts:
         if not isinstance(t, str) or not t.strip():
             continue
-        part = (t.strip()[:1200] + "…" if len(t.strip()) > 1200 else t.strip())
+        raw = t.strip()
+        part = (raw[:part_max] + "…" if len(raw) > part_max else raw)
         parts.append(part)
         total += len(part)
         if total >= max_chars:
@@ -203,6 +206,10 @@ def summarize_new_materials(
     if not parts:
         return ""
     sample_block = "\n---\n".join(parts)
+    if len(sample_block) > max_chars:
+        sample_block = summarize_if_needed(
+            sample_block, max_chars, llm_client=None, purpose="collection_scope_new_materials"
+        )
     prompt = _pm.render("collection_scope_new_materials_summary.txt", sample_block=sample_block)
     try:
         resp = llm_client.chat(

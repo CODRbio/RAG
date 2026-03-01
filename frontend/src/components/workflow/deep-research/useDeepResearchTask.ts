@@ -3,6 +3,7 @@ import { useChatStore, useConfigStore, useToastStore, useCanvasStore, useUIStore
 import {
   clarifyForDeepResearch,
   deepResearchStart,
+  getDeepResearchStartStatus,
   deepResearchSubmit,
   restartDeepResearchPhase,
   restartDeepResearchSection,
@@ -64,11 +65,13 @@ export type UseDeepResearchTaskReturn = {
   phase: Phase;
   setPhase: (p: Phase) => void;
   activeJobId: string | null;
+  planningJobId: string | null;
   stalledJob: StalledJobInfo | null;
   isStopping: boolean;
   isClarifying: boolean;
   progressLogs: string[];
   researchMonitor: ResearchMonitorState;
+  startPhaseProgress: { stage: string; percent: number };
   outlineDraft: string[];
   setOutlineDraft: React.Dispatch<React.SetStateAction<string[]>>;
   briefDraft: BriefDraft | null;
@@ -135,6 +138,11 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
   const [briefDraft, setBriefDraft] = useState<BriefDraft | null>(null);
   const [initialStats, setInitialStats] = useState<InitialStats | null>(null);
   const [optimizationPromptDraft, setOptimizationPromptDraft] = useState('');
+  const [startPhaseProgress, setStartPhaseProgress] = useState<{ stage: string; percent: number }>({
+    stage: '正在启动...',
+    percent: 0,
+  });
+  const [planningJobId, setPlanningJobId] = useState<string | null>(null);
 
   const abortControllerRef = useRef<AbortController | null>(null);
   const lastEventIdRef = useRef(0);
@@ -314,6 +322,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
 
   const finalizeRunningJob = async (jobId: string) => {
     latestJobIdRef.current = jobId;
+    let wasCancelled = false;
     try {
       const job = await getDeepResearchJob(jobId);
       if (job.session_id) setSessionId(job.session_id);
@@ -357,8 +366,16 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
         setShowDeepResearchDialog(false);
         setTimeout(() => setWorkflowStep('idle'), 1000);
       } else if (job.status === 'cancelled') {
-        appendToLastMessage('\n\n[提示] Deep Research 已停止。');
-        addToast('Deep Research 已停止', 'info');
+        // Preserve the stopped task so the user can go to canvas or restart,
+        // rather than resetting to the confirm/clarify phase.
+        wasCancelled = true;
+        addToast('Deep Research 已停止，可进入画布查看或重启', 'info');
+        setStalledJob({
+          jobId,
+          topic: String(job.topic || ''),
+          status: 'cancelled',
+          canvas_id: String(job.canvas_id || ''),
+        });
       } else {
         appendToLastMessage(`\n\n[错误] Deep Research 失败：${job.error_message || job.message || 'unknown error'}`);
         addToast('Deep Research 失败，请重试', 'error');
@@ -374,7 +391,11 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       setIsStopping(false);
       setIsStreaming(false);
       setDeepResearchActive(false);
-      setPhase('confirm');
+      // For cancelled jobs keep the dialog open showing the stopped state (stalledJob banner)
+      // so the user can inspect progress or restart. For done/error, go back to confirm.
+      if (!wasCancelled) {
+        setPhase('confirm');
+      }
     }
   };
 
@@ -450,6 +471,12 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
                   return;
                 }
               }
+            } else if (event === 'error') {
+              console.error('[DeepResearch] Backend emitted error:', data);
+              if (String(data.message).includes('不存在')) {
+                await finalizeRunningJob(jobId);
+                return;
+              }
             } else {
               // Regular DB-backed job event — track event_id for reconnect, then process
               const eid = typeof data._event_id === 'number' ? data._event_id : null;
@@ -466,8 +493,11 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
               ]);
             }
           }
-          // Stream ended normally (server closed after job_status or job not found)
-          break;
+          // If we reach here without returning, the stream was closed by the proxy or network (e.g. proxy timeout).
+          // We must NOT break the outer retry loop! Otherwise it stays stuck forever.
+          if (ac.signal.aborted) break;
+          console.warn('[DeepResearch] SSE stream closed before job completion, reconnecting in 2s...');
+          await new Promise<void>((resolve) => setTimeout(resolve, 2000));
         } catch (err) {
           if (ac.signal.aborted) break;
           console.error('[DeepResearch] SSE stream error, retrying in', retryDelay, 'ms:', err);
@@ -489,7 +519,8 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       try {
         const job = await getDeepResearchJob(savedJobId);
         if (cancelled) return;
-        const isRunnable = job.status === 'pending'
+        const isRunnable = job.status === 'planning'
+          || job.status === 'pending'
           || job.status === 'running'
           || job.status === 'cancelling'
           || job.status === 'waiting_review';
@@ -606,21 +637,31 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
   const runClarify = async (topic: string) => {
     const trimTopic = (topic || '').trim();
     if (!trimTopic) return;
-    const defaults = useConfigStore.getState().deepResearchDefaults;
-    const scopeValue = (defaults.stepModels.scope || '').trim();
-    let resolvedProvider: string | undefined;
-    let resolvedModel: string | undefined;
-    if (scopeValue && scopeValue.includes('::')) {
-      const [provider, model] = scopeValue.split('::', 2);
-      resolvedProvider = provider || undefined;
-      resolvedModel = model || undefined;
-    } else if (scopeValue) {
-      resolvedProvider = selectedProvider || undefined;
-      resolvedModel = scopeValue || undefined;
-    } else {
-      resolvedProvider = selectedProvider || undefined;
-      resolvedModel = selectedModel || undefined;
+    
+    const { deepResearchDefaults } = useConfigStore.getState();
+    const prelimModel = (deepResearchDefaults.preliminaryModel ?? '').trim();
+    const questModel = (deepResearchDefaults.questionModel ?? '').trim();
+    
+    let resolvedProvider: string | undefined = selectedProvider || undefined;
+    let resolvedModel: string | undefined = selectedModel || undefined;
+    if (questModel) {
+      const idx = questModel.indexOf('::');
+      if (idx > 0) {
+        resolvedProvider = questModel.slice(0, idx).trim() || undefined;
+        resolvedModel = questModel.slice(idx + 2).trim() || undefined;
+      }
     }
+    
+    let prelimProvider: string | undefined = undefined;
+    let prelimModelOverride: string | undefined = undefined;
+    if (prelimModel) {
+      const idx = prelimModel.indexOf('::');
+      if (idx > 0) {
+        prelimProvider = prelimModel.slice(0, idx).trim() || undefined;
+        prelimModelOverride = prelimModel.slice(idx + 2).trim() || undefined;
+      }
+    }
+
     setIsClarifying(true);
     try {
       const result = await clarifyForDeepResearch({
@@ -629,8 +670,12 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
         search_mode: 'hybrid',
         llm_provider: resolvedProvider,
         model_override: resolvedModel,
+        prelim_provider: prelimProvider,
+        prelim_model: prelimModelOverride,
       });
       const qs = result.questions || [];
+      if (result.session_id) setSessionId(result.session_id);
+      requestSessionListRefresh();
       setClarificationQuestions(qs);
       const suggestedTopic = (result.suggested_topic || '').trim();
       if (suggestedTopic) {
@@ -714,20 +759,142 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       step_model_strict: stepModelStrict,
     };
     setIsStreaming(true);
+    setStartPhaseProgress({ stage: '正在启动...', percent: 0 });
     try {
-      const startResp = await deepResearchStart(startRequest);
-      if (startResp.session_id) setSessionId(startResp.session_id);
-      if (startResp.canvas_id) setCanvasId(startResp.canvas_id);
-      setOutlineDraft(startResp.outline?.length ? startResp.outline : [topic]);
-      setBriefDraft(startResp.brief || null);
-      setInitialStats(startResp.initial_stats || null);
-      if (startResp.used_fallback) {
-        addToast(`澄清阶段触发回退：${startResp.fallback_reason || 'unknown'}`, 'warning');
+      // 1. Submit the start job – returns immediately with a job_id.
+      //    The backend now creates a DB entry with status='planning' so
+      //    it appears in the sidebar immediately.
+      const jobResp = await deepResearchStart(startRequest);
+      if (jobResp.session_id) setSessionId(jobResp.session_id);
+      const jobId = jobResp.job_id;
+      setPlanningJobId(jobId);
+      requestSessionListRefresh();
+      console.log('[DeepResearch] Start job submitted (planning):', jobId);
+
+      // 2. Poll until scope+plan finishes.
+      //
+      // Bidirectional timeout contract:
+      //   - Backend: heartbeat writes DB updated_at every 15s; hard ceiling ~30min.
+      //   - Frontend: waits 35min (slightly longer than backend) and checks DB
+      //     liveness before declaring failure.  Individual poll errors are tolerated
+      //     as long as the DB job is still alive (updated_at recent).
+      //
+      // The key invariant: we ONLY report failure when the DB job is confirmed
+      // to be in error state, or the backend has been silent for > LIVENESS_GAP.
+      const POLL_INTERVAL_MS = 4000;
+      const MAX_WAIT_MS = 35 * 60 * 1000; // frontend waits 5min longer than backend's 30min ceiling
+      const LIVENESS_GAP_MS = 90_000;      // if DB hasn't been touched for 90s, consider backend dead
+      const deadline = Date.now() + MAX_WAIT_MS;
+      let consecutivePollErrors = 0;
+      let lastProgressLog = '';
+
+      const logProgress = (msg: string) => {
+        if (msg && msg !== lastProgressLog) {
+          lastProgressLog = msg;
+          setProgressLogs((prev) => [...prev, `[planning] ${msg}`].slice(-300));
+        }
+      };
+
+      while (Date.now() < deadline) {
+        await new Promise<void>((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+
+        // ── Primary path: fast poll endpoint ──
+        let status: Awaited<ReturnType<typeof getDeepResearchStartStatus>> | null = null;
+        try {
+          status = await getDeepResearchStartStatus(jobId);
+          consecutivePollErrors = 0;
+        } catch (pollErr) {
+          consecutivePollErrors++;
+          const httpStatus = (pollErr as { response?: { status?: number } })?.response?.status;
+          console.warn(
+            `[DeepResearch] Start poll error #${consecutivePollErrors}`,
+            `(HTTP ${httpStatus ?? 'network'})`,
+          );
+          logProgress(`轮询异常 #${consecutivePollErrors}，正在检查后台状态...`);
+
+          // ── Fallback path: check DB job liveness ──
+          // The backend heartbeat keeps updated_at fresh every 15s.
+          // If updated_at is still recent, the backend is alive — keep waiting.
+          try {
+            const dbJob = await getDeepResearchJob(jobId);
+            const dbStatus = dbJob.status;
+            if (dbStatus === 'error') {
+              throw new Error(dbJob.error_message || dbJob.message || '研究规划生成失败');
+            }
+            if (dbStatus === 'cancelled') {
+              throw new Error('任务已取消');
+            }
+            // Job still alive in DB ('planning' status)
+            const updatedAt = dbJob.updated_at ?? 0;
+            const ageMs = (Date.now() / 1000 - updatedAt) * 1000;
+            if (ageMs < LIVENESS_GAP_MS) {
+              // Backend is alive: show heartbeat info and keep waiting
+              logProgress(dbJob.message || dbJob.current_stage || `后台仍在运行 (${Math.round(ageMs / 1000)}s)`);
+              setStartPhaseProgress({
+                stage: dbJob.message || dbJob.current_stage || '后台运行中...',
+                percent: Math.min(90, Math.max(0, (status?.progress ?? 0))),
+              });
+              continue;
+            }
+            // DB hasn't been updated for too long — backend might have crashed
+            if (consecutivePollErrors < 15) {
+              logProgress(`后台心跳超时 ${Math.round(ageMs / 1000)}s，继续等待...`);
+              continue;
+            }
+            // Too many errors AND stale heartbeat — give up
+            throw new Error(
+              `后台长时间无响应（心跳超时 ${Math.round(ageMs / 1000)}s），` +
+              '请检查后端日志或重试',
+            );
+          } catch (dbErr) {
+            // If the DB check itself also failed, only give up after many retries
+            if ((dbErr as Error).message?.includes('规划生成失败') ||
+                (dbErr as Error).message?.includes('已取消') ||
+                (dbErr as Error).message?.includes('无响应')) {
+              throw dbErr;
+            }
+            if (consecutivePollErrors >= 20) {
+              throw new Error(
+                '前后端连接全部中断，请检查网络和后端状态后重试',
+              );
+            }
+            logProgress(`连接异常 #${consecutivePollErrors}，稍后重试...`);
+            continue;
+          }
+        }
+
+        // ── Normal poll response handling ──
+        if (status.session_id) setSessionId(status.session_id);
+        if (status.status === 'running') {
+          const stageMsg = status.current_stage ?? '正在准备...';
+          setStartPhaseProgress({
+            stage: stageMsg,
+            percent: Math.min(100, Math.max(0, status.progress ?? 0)),
+          });
+          logProgress(stageMsg);
+        }
+
+        if (status.status === 'done') {
+          if (status.canvas_id) setCanvasId(status.canvas_id);
+          setOutlineDraft(status.outline?.length ? status.outline : [topic]);
+          setBriefDraft(status.brief || null);
+          setInitialStats(status.initial_stats || null);
+          setPhase('confirm');
+          return;
+        }
+
+        if (status.status === 'error') {
+          throw new Error(status.error || '研究规划生成失败');
+        }
+        // status === 'running': keep polling
       }
-      setPhase('confirm');
+
+      throw new Error('研究规划生成超时（超过35分钟），请缩短主题或减少检索范围后重试');
     } catch (error) {
       console.error('[DeepResearch] Start error:', error);
-      addToast('研究规划生成失败，请重试', 'error');
+      const msg = (error as Error)?.message || '研究规划生成失败';
+      addToast(msg, 'error');
+      setProgressLogs((prev) => [...prev, `[error] ${msg}`].slice(-300));
     } finally {
       setIsStreaming(false);
     }
@@ -768,6 +935,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
 
     const confirmRequest: DeepResearchConfirmRequest = {
       topic,
+      planning_job_id: planningJobId || undefined,
       session_id: sessionId || undefined,
       canvas_id: canvasId || undefined,
       collection: currentCollection || undefined,
@@ -815,7 +983,8 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       if (keepPreviousJobId && previousActiveJobId && previousActiveJobId !== submitResp.job_id) {
         archiveJobId(previousActiveJobId);
       }
-      requestSessionListRefresh(); // 新建 DR 项目立即进入历史，便于在排队/进行中看到
+      setPlanningJobId(null);
+      requestSessionListRefresh();
       setWorkflowStep('drafting');
       startStreamingJob(submitResp.job_id, true);
       setShowDeepResearchDialog(false);
@@ -990,11 +1159,13 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
     phase,
     setPhase,
     activeJobId,
+    planningJobId,
     stalledJob,
     isStopping,
     isClarifying,
     progressLogs,
     researchMonitor,
+    startPhaseProgress,
     outlineDraft,
     setOutlineDraft,
     briefDraft,

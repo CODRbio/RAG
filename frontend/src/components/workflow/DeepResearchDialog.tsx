@@ -284,6 +284,21 @@ export function DeepResearchDialog() {
 
         {/* Body */}
         <div className="flex-1 overflow-y-auto px-6 py-4 space-y-4">
+          {/* Start-phase heartbeat: progress bar + stage text while generating outline */}
+          {isStreaming && task.phase === 'clarify' && (
+            <div className="rounded-lg border border-indigo-200 bg-indigo-50 px-4 py-3 space-y-2">
+              <div className="w-full bg-gray-200 rounded-full h-1.5 overflow-hidden">
+                <div
+                  className="h-full bg-indigo-600 rounded-full transition-all duration-500 ease-out"
+                  style={{ width: `${task.startPhaseProgress?.percent ?? 0}%` }}
+                />
+              </div>
+              <p className="text-sm text-indigo-800">
+                {task.startPhaseProgress?.stage ?? '正在准备...'}
+              </p>
+            </div>
+          )}
+
           {/* Phase indicator + 当前状态 */}
           <div className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 space-y-1">
             <div className="text-xs text-gray-600">
@@ -319,12 +334,20 @@ export function DeepResearchDialog() {
 
           {/* 已中断的调研：提示与操作 */}
           {task.stalledJob && (
-            <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 space-y-2">
-              <p className="text-sm text-amber-800">
-                {t('deepResearch.stalledBanner')}
+            <div className={`rounded-lg border px-4 py-3 space-y-2 ${
+              task.stalledJob.status === 'cancelled'
+                ? 'border-blue-200 bg-blue-50'
+                : 'border-amber-200 bg-amber-50'
+            }`}>
+              <p className={`text-sm ${task.stalledJob.status === 'cancelled' ? 'text-blue-800' : 'text-amber-800'}`}>
+                {task.stalledJob.status === 'cancelled'
+                  ? t('deepResearch.cancelledBanner', '任务已停止，可进入画布查看现有研究成果，或重启继续研究。')
+                  : t('deepResearch.stalledBanner')}
               </p>
               {task.stalledJob.topic && (
-                <p className="text-xs text-amber-700 truncate">{t('deepResearch.stalledTopic', { topic: task.stalledJob.topic })}</p>
+                <p className={`text-xs truncate ${task.stalledJob.status === 'cancelled' ? 'text-blue-700' : 'text-amber-700'}`}>
+                  {t('deepResearch.stalledTopic', { topic: task.stalledJob.topic })}
+                </p>
               )}
             </div>
           )}
@@ -499,7 +522,7 @@ export function DeepResearchDialog() {
             {task.phase === 'running' && !task.stalledJob ? t('deepResearch.exit') : t('deepResearch.cancel')}
           </button>
           <div className="flex items-center gap-2">
-            {/* 已中断的调研：进入画布 | 放弃并重新开始 | 退出（取消在上面） */}
+            {/* 已停止/已中断：进入画布 | 放弃并重新开始 */}
             {task.stalledJob && (
               <>
                 <button
@@ -510,9 +533,15 @@ export function DeepResearchDialog() {
                 </button>
                 <button
                   onClick={() => { task.clearStalledJob(); task.setPhase('clarify'); }}
-                  className="px-4 py-2 text-sm text-amber-700 hover:bg-amber-100 rounded-lg transition-colors"
+                  className={`px-4 py-2 text-sm rounded-lg transition-colors ${
+                    task.stalledJob.status === 'cancelled'
+                      ? 'text-gray-600 hover:bg-gray-100'
+                      : 'text-amber-700 hover:bg-amber-100'
+                  }`}
                 >
-                  {t('deepResearch.discardAndRestart')}
+                  {task.stalledJob.status === 'cancelled'
+                    ? t('deepResearch.discardStopped', '放弃并重新开始')
+                    : t('deepResearch.discardAndRestart')}
                 </button>
               </>
             )}
@@ -557,7 +586,7 @@ export function DeepResearchDialog() {
             {!task.stalledJob && task.phase === 'running' && (
               <div className="flex items-center gap-2">
                 <button
-                  onClick={() => task.openCanvasForCurrentJob()}
+                  onClick={async () => { await task.openCanvasForCurrentJob(); handleClose(); }}
                   className="px-4 py-2 text-sm text-indigo-600 hover:bg-indigo-50 rounded-lg transition-colors"
                 >
                   {t('deepResearch.goToCanvas')}

@@ -41,8 +41,13 @@ def get_worker_instance_id() -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def cleanup_stale_jobs() -> None:
-    """Reset running/cancelling jobs to error — they were interrupted by a process restart."""
+    """Reset running/cancelling jobs to error — they were interrupted by a process restart.
+
+    Also releases the corresponding Redis active-slot entries so that restarted jobs
+    for the same session are not blocked by stale rag:active_tasks / rag:active_sessions.
+    """
     now = time.time()
+    stale_dr_slots: list[tuple[str, str]] = []  # (job_id, session_id)
     try:
         with Session(get_engine()) as session:
             dr_rows = session.exec(
@@ -52,6 +57,13 @@ def cleanup_stale_jobs() -> None:
             ).all()
             count_dr = len(dr_rows)
             for row in dr_rows:
+                # Collect (job_id, session_id) before mutating so we can release Redis slots
+                try:
+                    req = json.loads(row.request_json or "{}")
+                    sid = str(req.get("session_id") or "")
+                except Exception:
+                    sid = ""
+                stale_dr_slots.append((row.job_id, sid))
                 row.status = "error"
                 row.error_message = "服务重启，任务中断"
                 row.message = "服务重启，任务中断"
@@ -90,6 +102,21 @@ def cleanup_stale_jobs() -> None:
 
     except Exception as e:
         logger.warning("[task_runner] cleanup_stale_jobs failed: %s", e)
+
+    # Release Redis active-slot entries for stale DR jobs so that a new job for the
+    # same session is not blocked by rag:active_tasks / rag:active_sessions leftovers.
+    if stale_dr_slots:
+        try:
+            from src.tasks import get_task_queue
+            tq = get_task_queue()
+            for job_id, session_id in stale_dr_slots:
+                tq.release_slot(job_id, session_id)
+            logger.info(
+                "[task_runner] released %d stale Redis slot(s) on startup",
+                len(stale_dr_slots),
+            )
+        except Exception as e:
+            logger.warning("[task_runner] cleanup_stale_jobs: Redis slot release failed: %s", e)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -285,6 +312,68 @@ def _dr_slots_available() -> int:
         return 0
 
 
+def _reconcile_redis_active_slots(live_dr_tasks: dict) -> None:
+    """Remove stale entries from rag:active_tasks / rag:active_sessions.
+
+    A task_id in Redis SET_ACTIVE is "zombie" when:
+      - it is NOT currently tracked in *live_dr_tasks* (i.e. no running asyncio Task), AND
+      - its DB row is no longer in status running/cancelling.
+
+    This prevents a cancel→restart race from permanently blocking a session.
+    Runs ~every 60 s from the poll loop so any leftover slot is cleaned up quickly.
+    """
+    try:
+        from src.tasks import get_task_queue
+        from src.tasks.redis_queue import SET_ACTIVE, KEY_ACTIVE_SESSIONS
+        tq = get_task_queue()
+        redis_client = tq._client  # type: ignore[attr-defined]
+        if redis_client is None:
+            return
+        active_task_ids: list[str] = [
+            t.decode() if isinstance(t, bytes) else str(t)
+            for t in (redis_client.smembers(SET_ACTIVE) or [])
+        ]
+        if not active_task_ids:
+            return
+        # Check which of these are neither live asyncio tasks nor "running"/"cancelling" in DB
+        zombie_ids = [jid for jid in active_task_ids if jid not in live_dr_tasks]
+        if not zombie_ids:
+            return
+        with Session(get_engine()) as session:
+            rows = session.exec(
+                select(DeepResearchJob).where(
+                    DeepResearchJob.job_id.in_(zombie_ids),
+                    DeepResearchJob.status.in_(["running", "cancelling"]),
+                )
+            ).all()
+            still_running = {row.job_id for row in rows}
+        to_release = [jid for jid in zombie_ids if jid not in still_running]
+        if not to_release:
+            return
+        for jid in to_release:
+            try:
+                with Session(get_engine()) as s2:
+                    row = s2.get(DeepResearchJob, jid)
+                sid = ""
+                if row:
+                    try:
+                        req = json.loads(row.request_json or "{}")
+                        sid = str(req.get("session_id") or row.session_id or "")
+                    except Exception:
+                        sid = str(row.session_id or "")
+                redis_client.srem(SET_ACTIVE, jid)
+                if sid:
+                    redis_client.srem(KEY_ACTIVE_SESSIONS, sid)
+            except Exception as e:
+                logger.debug("[task_runner] reconcile: failed to release %s: %s", jid, e)
+        logger.info(
+            "[task_runner] reconcile: released %d zombie Redis slot(s): %s",
+            len(to_release), to_release,
+        )
+    except Exception as e:
+        logger.debug("[task_runner] _reconcile_redis_active_slots error: %s", e)
+
+
 async def run_background_worker() -> None:
     """Poll rag.db and Redis for pending tasks; Chat + DR share global slots."""
     logger.info(
@@ -296,6 +385,7 @@ async def run_background_worker() -> None:
 
     dr_tasks: dict[str, asyncio.Task] = {}
     ingest_tasks: dict[str, asyncio.Task] = {}
+    _reconcile_counter = 11  # start at 11 so reconciliation runs on the first poll cycle
 
     while True:
         try:
@@ -314,6 +404,17 @@ async def run_background_worker() -> None:
                 dr_tasks.pop(jid, None)
             for jid in [k for k, t in ingest_tasks.items() if t.done()]:
                 ingest_tasks.pop(jid, None)
+
+            # ── Reconcile Redis active-task set against DB (every ~60 s) ──
+            # Removes zombie entries where the DB job is no longer running/cancelling
+            # but the task_id / session_id is still in Redis (e.g. after a crash or
+            # a cancel→restart race that was not caught by _dr_release_slot_eager).
+            _reconcile_counter += 1
+            if _reconcile_counter % 12 == 0:  # every 12 * 5 s = 60 s; also runs on first cycle
+                try:
+                    _reconcile_redis_active_slots(dr_tasks)
+                except Exception as _re:
+                    logger.debug("[task_runner] reconcile slots failed: %s", _re)
 
             # ── Unified Chat: drain Redis queue into global slots ──
             try:

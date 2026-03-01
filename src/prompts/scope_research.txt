@@ -4,6 +4,9 @@ Topic: {topic}
 User clarifications:
 {clarification_block}
 
+Preliminary knowledge about the topic (from web search, use to inform scope and key questions):
+{preliminary_knowledge_block}
+
 Return strict JSON:
 {{
   "scope": "One-sentence scope",

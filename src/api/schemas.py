@@ -65,7 +65,11 @@ class ChatRequest(BaseModel):
     )
     step_top_k: Optional[int] = Field(
         None,
-        description="每步检索保留文档数（local + web 合并重排后），None 表示使用配置默认值",
+        description="每轮检索保留上限（单次检索 local+web 合并后全局重排）。Chat 仅一轮；DR 每轮 research 均适用。None 继承 local_top_k。",
+    )
+    write_top_k: Optional[int] = Field(
+        None,
+        description="单个产出单元进 LLM 的证据上限：Chat 一次问答 = 一单元；DR 一大纲章节 = 一单元。None 时等于 step_top_k。",
     )
     llm_provider: Optional[str] = Field(
         None,
@@ -86,6 +90,10 @@ class ChatRequest(BaseModel):
     use_agent: Optional[bool] = Field(
         None,
         description="[兼容旧字段] 是否启用 Agent 模式，推荐使用 agent_mode 替代",
+    )
+    max_iterations: Optional[int] = Field(
+        2,
+        description="Agent ReAct 最大迭代轮数（仅 assist/autonomous 时生效）。默认 2，可在前端高级设置修改。",
     )
     agent_mode: Optional[str] = Field(
         None,
@@ -124,6 +132,10 @@ class ChatRequest(BaseModel):
             "no_local = 本会话暂不使用本地库；use = 仍使用当前库。"
         ),
     )
+    agent_debug_mode: Optional[bool] = Field(
+        False,
+        description="前端调试面板开启时传 true，本请求期间后端临时提升相关 logger 为 DEBUG 便于追踪。",
+    )
 
 
 class EvidenceSummary(BaseModel):
@@ -144,8 +156,10 @@ class EvidenceSummary(BaseModel):
         None,
         description="双层来源统计: chunk_level（每个信息块计一次）+ citation_level（同网站/文档只计一次）",
     )
-    # 证据充分性
-    evidence_scarce: bool = Field(False, description="True when pre-retrieval evidence is insufficient (chunks<3 or distinct_docs<2)")
+    # 证据充分性（LLM 判断为主，失败时用数量兜底）
+    evidence_scarce: bool = Field(False, description="True when evidence is insufficient to support a substantive answer (LLM-evaluated or fallback: chunks<3 or distinct_docs<2)")
+    coverage_score: Optional[float] = Field(None, description="0-1, from LLM sufficiency eval when run")
+    sufficiency_reason: Optional[str] = Field(None, description="Short reason from LLM when evidence_scarce")
     # 检索诊断信息
     diagnostics: Optional[Dict[str, Any]] = Field(None, description="检索诊断: stages/web_providers/content_fetcher")
 
@@ -332,6 +346,7 @@ class CanvasAIEditRequest(BaseModel):
     action: str = Field(..., description="操作: rewrite | expand | condense | add_citations | targeted_refine")
     context: str = Field("", description="可选：周围上下文")
     search_mode: str = Field("local", description="是否检索补充资料: local | web | hybrid | none")
+    step_top_k: Optional[int] = Field(None, description="检索保留条数；未传时默认 15，且不超过 20")
     directive: str = Field("", description="可选：定向精炼指令（targeted_refine 推荐）")
     preserve_citations: bool = Field(True, description="是否启用引用保护（默认开启）")
 
@@ -524,9 +539,11 @@ class ClarifyRequest(BaseModel):
     message: str = Field(..., min_length=1, description="用户的主题描述")
     session_id: Optional[str] = Field(None, description="会话 ID（用于获取 chat 历史上下文）")
     search_mode: str = Field("hybrid", description="检索模式，用于预检索领域资料辅助生成问题")
-    llm_provider: Optional[str] = Field(None, description="LLM 提供商")
+    llm_provider: Optional[str] = Field(None, description="LLM 提供商（提问模型）")
     ultra_lite_provider: Optional[str] = Field(None, description="超轻量级 LLM 提供商（长文本压缩等）")
-    model_override: Optional[str] = Field(None, description="覆盖 provider 默认模型")
+    model_override: Optional[str] = Field(None, description="覆盖 provider 默认模型（提问模型）")
+    prelim_provider: Optional[str] = Field(None, description="初步认知专用的 LLM provider（通常为 perplexity/sonar）")
+    prelim_model: Optional[str] = Field(None, description="初步认知专用的 model")
 
 
 class ClarifyQuestion(BaseModel):
@@ -543,9 +560,11 @@ class ClarifyResponse(BaseModel):
     """Deep Research 澄清问题响应"""
 
     questions: List[ClarifyQuestion] = Field(default_factory=list, description="澄清问题列表（1-6个）")
+    session_id: str = Field("", description="会话 ID（新建或原有）")
     suggested_topic: str = Field("", description="系统建议的综述主题")
     suggested_outline: List[str] = Field(default_factory=list, description="初步建议的大纲章节")
     research_brief: Optional[Dict[str, Any]] = Field(None, description="结构化研究简报（Scoping Agent 输出）")
+    preliminary_knowledge: str = Field("", description="Perplexity preliminary knowledge about the topic")
     used_fallback: bool = Field(False, description="是否触发了澄清问题降级回退")
     fallback_reason: str = Field("", description="回退原因（若有）")
     llm_provider_used: str = Field("", description="本次实际使用的 provider")
@@ -575,8 +594,14 @@ class DeepResearchRequest(BaseModel):
     local_threshold: Optional[float] = Field(None, description="本地检索阈值")
     year_start: Optional[int] = Field(None, ge=1900, le=2100, description="年份窗口起始（硬过滤）")
     year_end: Optional[int] = Field(None, ge=1900, le=2100, description="年份窗口结束（硬过滤）")
-    step_top_k: Optional[int] = Field(None, description="每步检索保留文档数（合并重排后）")
-    write_top_k: Optional[int] = Field(None, description="Deep Research 写作阶段保留文档数")
+    step_top_k: Optional[int] = Field(
+        None,
+        description="每轮检索保留上限（local+web 合并后全局重排）。None 继承 local_top_k。",
+    )
+    write_top_k: Optional[int] = Field(
+        None,
+        description="每个大纲章节写作时从 section pool 选出的证据上限。None 时由 preset 从 step_top_k 推导。",
+    )
     llm_provider: Optional[str] = Field(None, description="LLM 提供商")
     ultra_lite_provider: Optional[str] = Field(None, description="超轻量级 LLM 提供商（长文本压缩等）")
     model_override: Optional[str] = Field(None, description="覆盖 provider 默认模型")
@@ -619,8 +644,14 @@ class DeepResearchStartRequest(BaseModel):
     local_threshold: Optional[float] = Field(None, description="本地检索阈值")
     year_start: Optional[int] = Field(None, ge=1900, le=2100, description="年份窗口起始（硬过滤）")
     year_end: Optional[int] = Field(None, ge=1900, le=2100, description="年份窗口结束（硬过滤）")
-    step_top_k: Optional[int] = Field(None, description="每步检索保留文档数")
-    write_top_k: Optional[int] = Field(None, description="Deep Research 写作阶段保留文档数")
+    step_top_k: Optional[int] = Field(
+        None,
+        description="每轮检索保留上限（local+web 合并后全局重排）。None 继承 local_top_k。",
+    )
+    write_top_k: Optional[int] = Field(
+        None,
+        description="每个大纲章节写作时从 section pool 选出的证据上限。None 时由 preset 从 step_top_k 推导。",
+    )
     llm_provider: Optional[str] = Field(None, description="LLM 提供商")
     ultra_lite_provider: Optional[str] = Field(None, description="超轻量级 LLM 提供商（长文本压缩等）")
     model_override: Optional[str] = Field(None, description="覆盖 provider 默认模型")
@@ -637,7 +668,7 @@ class DeepResearchStartRequest(BaseModel):
 
 
 class DeepResearchStartResponse(BaseModel):
-    """Deep Research 第一阶段响应"""
+    """Deep Research 第一阶段响应（保留，内部用）"""
 
     session_id: str = Field("", description="会话 ID")
     canvas_id: str = Field("", description="画布 ID")
@@ -646,10 +677,36 @@ class DeepResearchStartResponse(BaseModel):
     initial_stats: Dict[str, Any] = Field(default_factory=dict, description="初始检索统计")
 
 
+class DeepResearchStartAsyncResponse(BaseModel):
+    """Returned immediately from POST /deep-research/start; poll /start/{job_id}/status for result."""
+
+    job_id: str = Field(..., description="Start-phase job ID to poll")
+    session_id: str = Field("", description="会话 ID")
+
+
+class DeepResearchStartStatusResponse(BaseModel):
+    """Polling response for the start-phase background job."""
+
+    job_id: str = Field(..., description="Start-phase job ID")
+    status: str = Field("running", description="running | done | error")
+    session_id: str = Field("", description="会话 ID")
+    error: Optional[str] = Field(None, description="Error message when status==error")
+    canvas_id: str = Field("", description="画布 ID")
+    brief: Dict[str, Any] = Field(default_factory=dict, description="研究简报")
+    outline: List[str] = Field(default_factory=list, description="建议大纲")
+    initial_stats: Dict[str, Any] = Field(default_factory=dict, description="初始检索统计")
+    current_stage: str = Field("", description="当前阶段描述（心跳）")
+    progress: int = Field(0, description="进度 0–100")
+
+
 class DeepResearchConfirmRequest(BaseModel):
     """Deep Research 第二阶段请求：确认后执行研究"""
 
     topic: str = Field(..., min_length=1, description="综述主题")
+    planning_job_id: Optional[str] = Field(
+        None,
+        description="规划阶段的任务 ID（如果提供，将复用该任务而非创建新任务）",
+    )
     session_id: Optional[str] = Field(None, description="会话 ID")
     canvas_id: Optional[str] = Field(None, description="画布 ID")
     user_id: Optional[str] = Field(None, description="用户 ID")
@@ -681,8 +738,14 @@ class DeepResearchConfirmRequest(BaseModel):
     local_threshold: Optional[float] = Field(None, description="本地检索阈值")
     year_start: Optional[int] = Field(None, ge=1900, le=2100, description="年份窗口起始（硬过滤）")
     year_end: Optional[int] = Field(None, ge=1900, le=2100, description="年份窗口结束（硬过滤）")
-    step_top_k: Optional[int] = Field(None, description="每步检索保留文档数")
-    write_top_k: Optional[int] = Field(None, description="Deep Research 写作阶段保留文档数")
+    step_top_k: Optional[int] = Field(
+        None,
+        description="每轮检索保留上限（local+web 合并后全局重排）。None 继承 local_top_k。",
+    )
+    write_top_k: Optional[int] = Field(
+        None,
+        description="每个大纲章节写作时从 section pool 选出的证据上限。None 时由 preset 从 step_top_k 推导。",
+    )
     llm_provider: Optional[str] = Field(None, description="LLM 提供商")
     ultra_lite_provider: Optional[str] = Field(None, description="超轻量级 LLM 提供商（长文本压缩等）")
     model_override: Optional[str] = Field(None, description="覆盖 provider 默认模型")
@@ -749,6 +812,20 @@ class DeepResearchRestartSectionRequest(BaseModel):
     action: str = Field("research", description="重启动作: research | write")
 
 
+class DeepResearchRestartIncompleteSectionsRequest(BaseModel):
+    """Restart all incomplete (no draft) sections in one job."""
+
+    section_titles: List[str] = Field(..., min_length=1, description="需要重启的章节标题列表（未完成的章节）")
+    action: str = Field("research", description="重启动作: research | write")
+
+
+class DeepResearchRestartWithOutlineRequest(BaseModel):
+    """Restart with a new outline: keep existing drafts for matching sections, research+write new/changed ones."""
+
+    new_outline: List[str] = Field(..., min_length=1, description="新大纲章节标题列表")
+    action: str = Field("research", description="重启动作: research | write")
+
+
 class DeepResearchJobInfo(BaseModel):
     """Deep Research 后台任务状态"""
 
@@ -766,6 +843,7 @@ class DeepResearchJobInfo(BaseModel):
     total_time_ms: float = 0.0
     created_at: float
     updated_at: float
+    started_at: Optional[float] = None
     finished_at: Optional[float] = None
 
 

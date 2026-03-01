@@ -121,6 +121,10 @@ class SearchSettings:
     use_colbert_reranker: bool = os.getenv("USE_COLBERT_RERANKER", "true").lower() == "true"
     colbert_model: str = os.getenv("COLBERT_MODEL", "colbert-ir/colbertv2.0")
     colbert_top_k: int = int(os.getenv("COLBERT_TOP_K", "30"))  # cascade 时 BGE 粗排输出条数，再送 ColBERT 精排
+    chat_gap_ratio: float = float(os.getenv("CHAT_GAP_RATIO", "0.2"))
+    research_gap_ratio: float = float(os.getenv("RESEARCH_GAP_RATIO", "0.25"))
+    chat_rank_pool_multiplier: float = float(os.getenv("CHAT_RANK_POOL_MULTIPLIER", "3.0"))
+    research_rank_pool_multiplier: float = float(os.getenv("RESEARCH_RANK_POOL_MULTIPLIER", "3.0"))
 
 
 @dataclass
@@ -195,6 +199,10 @@ class ContentFetcherConfig:
     brightdata_zone: str = ""
     cache_enabled: bool = True
     cache_ttl_seconds: int = 3600
+    disk_cache_enabled: bool = True
+    disk_cache_ttl_seconds: int = 2592000  # 30 days; promoted entries become permanent
+    disk_cache_promote_threshold: int = 3  # hits within TTL before entry is promoted to permanent
+    disk_cache_dir: str = "data/cache"
     max_concurrent: int = 5
     compress_long_fulltext: bool = True
     compress_word_threshold: int = 300
@@ -473,8 +481,11 @@ def _tasks_from_config() -> Dict[str, Any]:
 
 @dataclass
 class RetrievalPerfSettings:
-    """检索层：超时、缓存、并行"""
+    """检索层：超时、缓存、并行。hybrid 时 local 用 timeout_seconds 硬超时，web 用 web_soft_wait_seconds 软等待。"""
     timeout_seconds: int = 60
+    """Local 分支硬超时（秒），避免向量/图 DB 卡死拖住整次请求。"""
+    web_soft_wait_seconds: int = 500
+    """Hybrid 时对 web 分支（provider 搜索 + content_fetcher 拉正文）的最大等待秒数，默认 500s。"""
     cache_enabled: bool = False
     cache_ttl_seconds: int = 3600
     parallel_dense_sparse: bool = True
@@ -592,6 +603,10 @@ class Settings:
             use_colbert_reranker=s.get("use_colbert_reranker", os.getenv("USE_COLBERT_RERANKER", "false").lower() == "true"),
             colbert_model=s.get("colbert_model", os.getenv("COLBERT_MODEL", "colbert-ir/colbertv2.0")),
             colbert_top_k=s.get("colbert_top_k", int(os.getenv("COLBERT_TOP_K", "30"))),
+            chat_gap_ratio=s.get("chat_gap_ratio", float(os.getenv("CHAT_GAP_RATIO", "0.2"))),
+            research_gap_ratio=s.get("research_gap_ratio", float(os.getenv("RESEARCH_GAP_RATIO", "0.25"))),
+            chat_rank_pool_multiplier=s.get("chat_rank_pool_multiplier", float(os.getenv("CHAT_RANK_POOL_MULTIPLIER", "3.0"))),
+            research_rank_pool_multiplier=s.get("research_rank_pool_multiplier", float(os.getenv("RESEARCH_RANK_POOL_MULTIPLIER", "3.0"))),
         )
         w = _web_search_from_config()
         include = w.get("include_domains") or []
@@ -660,6 +675,10 @@ class Settings:
             brightdata_zone=(cf.get("brightdata_zone") or "").strip(),
             cache_enabled=bool(cf.get("cache_enabled", True)),
             cache_ttl_seconds=int(cf.get("cache_ttl_seconds", 3600)),
+            disk_cache_enabled=bool(cf.get("disk_cache_enabled", True)),
+            disk_cache_ttl_seconds=int(cf.get("disk_cache_ttl_seconds", 2592000)),
+            disk_cache_promote_threshold=int(cf.get("disk_cache_promote_threshold", 3)),
+            disk_cache_dir=str(cf.get("disk_cache_dir", "data/cache")),
             max_concurrent=int(cf.get("max_concurrent", 5)),
             compress_long_fulltext=bool(cf.get("compress_long_fulltext", True)),
             compress_word_threshold=int(cf.get("compress_word_threshold", 300)),
@@ -687,6 +706,7 @@ class Settings:
         gp = pf.get("google_search") or {}
         self.perf_retrieval = RetrievalPerfSettings(
             timeout_seconds=int(rp.get("timeout_seconds", 60)),
+            web_soft_wait_seconds=int(rp.get("web_soft_wait_seconds", 500)),
             cache_enabled=bool(rp.get("cache_enabled", False)),
             cache_ttl_seconds=int(rp.get("cache_ttl_seconds", 3600)),
             parallel_dense_sparse=bool(rp.get("parallel_dense_sparse", True)),

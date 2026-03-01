@@ -306,9 +306,11 @@ export function ChatWindow() {
     if (!backgroundJob || stoppingJobId === backgroundJob.job_id) return;
     const ok = window.confirm(t('chat.confirmForceStop'));
     if (!ok) return;
+    // Always use force=true so a stuck "cancelling" job is terminated immediately
+    const isStuck = backgroundJob.status === 'cancelling';
     try {
       setStoppingJobId(backgroundJob.job_id);
-      await cancelDeepResearchJob(backgroundJob.job_id);
+      await cancelDeepResearchJob(backgroundJob.job_id, isStuck);
       addToast(t('chat.stopRequested'), 'info');
     } catch {
       addToast(t('chat.stopFailed'), 'error');
@@ -426,7 +428,7 @@ export function ChatWindow() {
           </button>
           <button
             onClick={handleForceStopBackgroundJob}
-            disabled={!backgroundJob || backgroundJob.status === 'cancelling' || stoppingJobId === backgroundJob?.job_id}
+            disabled={!backgroundJob || stoppingJobId === backgroundJob?.job_id}
             className="px-2 py-1 rounded-md bg-red-900/40 border border-red-500/30 text-red-400 hover:bg-red-900/60 disabled:opacity-50 transition-colors"
           >
             {t('chat.forceStop')}

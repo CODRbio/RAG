@@ -29,7 +29,7 @@
 | 脚本 | 用途 |
 |---|---|
 | `start.sh` | 一键启动后端 + 前端（`--backend-only` / `--frontend-only`） |
-| `08_run_api.py` | 只启动 FastAPI（支持 `--host --port --reload`） |
+| `08_run_api.py` | 只启动 FastAPI（支持 `--host --port --workers`） |
 
 ## 四、检索与功能测试脚本
 
