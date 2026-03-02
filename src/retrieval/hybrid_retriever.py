@@ -139,13 +139,14 @@ def _rerank_candidates(
     top_k: int,
     reranker_mode: Optional[str] = None,
     cascade_bge_k: Optional[int] = None,
+    trace_ctx: Optional[Dict[str, Any]] = None,
 ) -> List[Dict]:
     """Cross-encoder reranking with an embedding funnel for large input sets.
 
-    The funnel threshold is derived dynamically from the caller's *top_k* and
-    ``settings.search.rerank_input_k`` (config / UI controllable).  When the
-    candidate count exceeds that threshold the bi-encoder pre-filter narrows
-    the set so the cross-encoder runs on a bounded number of documents.
+    The funnel threshold is derived from the caller's *top_k*, cascade stage
+    target (when enabled), and a configurable minimum floor
+    ``settings.search.rerank_funnel_floor_k``.  This keeps the funnel tied to
+    runtime policy rather than a fixed global constant.
 
     Supports bge_only | colbert_only | cascade.
     Priority: reranker_mode param > settings.search.reranker_mode.
@@ -159,11 +160,20 @@ def _rerank_candidates(
         logger.debug("_rerank_candidates: empty candidates, skipping")
         return []
 
+    trace_ctx = trace_ctx or {}
+    _trace_parts = []
+    if trace_ctx.get("job_id"):
+        _trace_parts.append(f"job={str(trace_ctx.get('job_id'))[:12]}")
+    if trace_ctx.get("phase"):
+        _trace_parts.append(f"phase={trace_ctx.get('phase')}")
+    if trace_ctx.get("section"):
+        _trace_parts.append(f"section={trace_ctx.get('section')}")
+    trace_suffix = f" [{' '.join(_trace_parts)}]" if _trace_parts else ""
+
     t_total = time.perf_counter()
-    cfg_input_k = getattr(settings.search, "rerank_input_k", 100)
-    # Keep funnel budget close to the requested rerank output size; stage-level
-    # budgets already bound candidate volume upstream.
-    funnel_k = max(cfg_input_k, top_k)
+    funnel_floor_k = int(getattr(settings.search, "rerank_funnel_floor_k", 20) or 20)
+    if funnel_floor_k <= 0:
+        funnel_floor_k = 1
     use_colbert = getattr(settings.search, "use_colbert_reranker", False)
     # Per-request mode overrides global settings; ColBERT modes are only effective
     # when use_colbert_reranker is enabled or the request explicitly asks for colbert.
@@ -175,18 +185,26 @@ def _rerank_candidates(
             mode = reranker_mode
     else:
         mode = getattr(settings.search, "reranker_mode", "bge_only") if use_colbert else "bge_only"
-    # Cascade BGE stage sizing: 1.5× rule
+    # Cascade BGE stage sizing: configurable multiplier (default 1.5×)
     # top_k = final output (UI step_top_k takes priority over config rerank_output_k).
-    # BGE intermediate = ceil(top_k * 1.5) so ColBERT has headroom.
+    # BGE intermediate = ceil(top_k * cascade_bge_multiplier) so ColBERT has headroom.
     # cascade_bge_k = explicit manual override from colbert_top_k filter only.
+    cascade_mul = float(getattr(settings.search, "cascade_bge_multiplier", 1.5) or 1.5)
+    if cascade_mul < 1.0:
+        cascade_mul = 1.0
     if cascade_bge_k is not None:
-        colbert_top_k = cascade_bge_k
+        colbert_top_k = max(1, int(cascade_bge_k))
     else:
-        colbert_top_k = math.ceil(top_k * 1.5)
+        colbert_top_k = max(1, math.ceil(top_k * cascade_mul))
+    stage_target_k = colbert_top_k if mode == "cascade" else top_k
+    # Funnel follows policy-derived target_k with a small protective floor.
+    funnel_k = max(stage_target_k, funnel_floor_k)
 
     logger.info(
-        "rerank_start: candidates=%d top_k=%d mode=%s (requested=%s) funnel_k=%d",
-        len(candidates), top_k, mode, reranker_mode or "default", funnel_k,
+        "rerank_start: candidates=%d top_k=%d mode=%s (requested=%s) "
+        "funnel_k=%d cascade_mul=%.3f bge_target_k=%d%s",
+        len(candidates), top_k, mode, reranker_mode or "default",
+        funnel_k, cascade_mul, colbert_top_k, trace_suffix,
     )
 
     # ── Funnel: shrink large sets before cross-encoder ──
@@ -194,20 +212,23 @@ def _rerank_candidates(
     if len(candidates) > funnel_k:
         candidates = _embedding_pre_filter(query, candidates, funnel_k)
         logger.info(
-            "rerank_funnel: %d → %d (funnel_k=%d, top_k=%d)",
-            n_before_funnel, len(candidates), funnel_k, top_k,
+            "rerank_funnel: %d → %d (funnel_k=%d, top_k=%d)%s",
+            n_before_funnel, len(candidates), funnel_k, top_k, trace_suffix,
         )
 
     docs = [c.get("content") or "" for c in candidates]
 
     # ── colbert_only ──
     if mode == "colbert_only" and colbert_reranker is not None and colbert_reranker.available:
-        logger.info("rerank_colbert_only: %d docs → top_k=%d", len(docs), top_k)
+        logger.info("rerank_colbert_only: %d docs → top_k=%d%s", len(docs), top_k, trace_suffix)
         t = time.perf_counter()
         reranked = colbert_reranker.rerank(query, docs, top_k=min(top_k * 2, len(docs)))
         if reranked:
             result = [{**candidates[r.index], "score": r.score} for r in reranked][:top_k]
-            logger.info("rerank_colbert_only: done in %.0f ms, returned %d", (time.perf_counter() - t) * 1000, len(result))
+            logger.info(
+                "rerank_colbert_only: done in %.0f ms, returned %d%s",
+                (time.perf_counter() - t) * 1000, len(result), trace_suffix,
+            )
             return result
         logger.warning("rerank_colbert_only: empty result (%.0f ms) — falling back to BGE",
                        (time.perf_counter() - t) * 1000)
@@ -216,8 +237,8 @@ def _rerank_candidates(
     if mode == "cascade" and colbert_reranker is not None and colbert_reranker.available:
         bge_k = min(colbert_top_k, len(docs))
         logger.info(
-            "rerank_cascade: BGE %d docs → top %d, then ColBERT → final top_k=%d",
-            len(docs), bge_k, top_k,
+            "rerank_cascade: BGE %d docs → top %d, then ColBERT → final top_k=%d%s",
+            len(docs), bge_k, top_k, trace_suffix,
         )
         t_bge = time.perf_counter()
         try:
@@ -227,8 +248,10 @@ def _rerank_candidates(
                          (time.perf_counter() - t_bge) * 1000, e, exc_info=True)
             # fall through to bge_only below
         else:
-            logger.info("rerank_cascade BGE done in %.0f ms, got %d results",
-                        (time.perf_counter() - t_bge) * 1000, len(bge_out))
+            logger.info(
+                "rerank_cascade BGE done in %.0f ms, got %d results%s",
+                (time.perf_counter() - t_bge) * 1000, len(bge_out), trace_suffix,
+            )
             bge_candidates = [candidates[r.index] for r in bge_out]
             bge_docs = [c.get("content") or "" for c in bge_candidates]
             t_col = time.perf_counter()
@@ -247,7 +270,7 @@ def _rerank_candidates(
                 (time.perf_counter() - t_col) * 1000,
             )
             result = [{**candidates[r.index], "score": r.score} for r in bge_out][:top_k]
-            logger.info("rerank_cascade fallback: returning %d BGE results", len(result))
+            logger.info("rerank_cascade fallback: returning %d BGE results%s", len(result), trace_suffix)
             return result
 
     # ── bge_only (default / fallback) ──
@@ -256,7 +279,7 @@ def _rerank_candidates(
     logger.info(
         "rerank_bge_only: %d docs → top_k=%d%s",
         len(docs), top_k,
-        " (all available, none trimmed)" if len(docs) < top_k else "",
+        (" (all available, none trimmed)" if len(docs) < top_k else "") + trace_suffix,
     )
     t_bge = time.perf_counter()
     try:
@@ -286,6 +309,8 @@ class RetrievalConfig:
     reranker_mode: Optional[str] = None  # 覆盖全局 reranker_mode：bge_only | colbert_only | cascade
     colbert_top_k: Optional[int] = None  # cascade 时 BGE 阶段输出数，由 UI step_top_k 穿透时使用
     step_top_k: Optional[int] = None  # 每步检索最终保留数；未设时继承 settings.rerank_output_k
+    rank_pool_multiplier: Optional[float] = None  # Stage-2 RRF 候选池放大倍率
+    trace_ctx: Optional[Dict[str, Any]] = None  # 观测上下文：job/phase/section
 
 
 class HybridRetriever:
@@ -372,6 +397,8 @@ class HybridRetriever:
         reranker_mode: Optional[str] = None,
         cascade_bge_k: Optional[int] = None,
         step_top_k: Optional[int] = None,
+        rank_pool_multiplier: Optional[float] = None,
+        trace_ctx: Optional[Dict[str, Any]] = None,
     ) -> List[Dict]:
         """
         纯向量检索（Dense + Sparse + Weighted RRF + Rerank）
@@ -382,9 +409,58 @@ class HybridRetriever:
         Args:
             diagnostics: 可选字典，传入时填充各阶段 count + time_ms
         """
-        dense_recall_k = getattr(settings.search, "dense_recall_k", 80)
-        sparse_recall_k = getattr(settings.search, "sparse_recall_k", 80)
-        rerank_input_k = getattr(settings.search, "rerank_input_k", 100)
+        dense_recall_k = int(getattr(settings.search, "dense_recall_k", 80) or 80)
+        sparse_recall_k = int(getattr(settings.search, "sparse_recall_k", 80) or 80)
+        if dense_recall_k <= 0:
+            dense_recall_k = 1
+        if sparse_recall_k <= 0:
+            sparse_recall_k = 1
+        rerank_floor_k = int(getattr(settings.search, "rerank_funnel_floor_k", 20) or 20)
+        if rerank_floor_k <= 0:
+            rerank_floor_k = 1
+        requested_top_k = step_top_k if step_top_k is not None else top_k
+        try:
+            requested_top_k = int(requested_top_k)
+        except (TypeError, ValueError):
+            requested_top_k = int(getattr(settings.search, "rerank_output_k", 20) or 20)
+        requested_top_k = max(1, requested_top_k)
+        pool_mul = rank_pool_multiplier
+        if pool_mul is None:
+            pool_mul = getattr(settings.search, "research_rank_pool_multiplier", 3.0)
+        try:
+            pool_mul = float(pool_mul)
+            if pool_mul <= 0:
+                raise ValueError("rank_pool_multiplier must be positive")
+        except Exception:
+            pool_mul = 3.0
+        use_colbert = getattr(settings.search, "use_colbert_reranker", False)
+        if reranker_mode:
+            if reranker_mode in ("colbert_only", "cascade") and not use_colbert:
+                mode = "bge_only"
+            else:
+                mode = reranker_mode
+        else:
+            mode = getattr(settings.search, "reranker_mode", "bge_only") if use_colbert else "bge_only"
+        cascade_mul = float(getattr(settings.search, "cascade_bge_multiplier", 1.5) or 1.5)
+        if cascade_mul < 1.0:
+            cascade_mul = 1.0
+        if mode == "cascade":
+            if cascade_bge_k is not None:
+                stage_target_k = max(1, int(cascade_bge_k))
+            else:
+                stage_target_k = max(1, int(math.ceil(requested_top_k * cascade_mul)))
+        else:
+            stage_target_k = requested_top_k
+        rrf_pool_target_k = max(
+            stage_target_k,
+            int(math.ceil(stage_target_k * pool_mul)),
+            rerank_floor_k,
+        )
+        # Stage-1 per-branch recall should scale with Stage-2 target pool;
+        # otherwise high top_k requests can be starved before rerank.
+        per_branch_target_k = max(1, int(math.ceil(rrf_pool_target_k / 2.0)))
+        dense_recall_limit = max(dense_recall_k, per_branch_target_k)
+        sparse_recall_limit = max(sparse_recall_k, per_branch_target_k)
         # 请求未传 step_top_k 时继承此默认（与 UI stepTopK 同义）
         rerank_output_k = getattr(settings.search, "rerank_output_k", 20)
         w_dense = getattr(settings.search, "rrf_dense_weight", 0.6)
@@ -392,11 +468,27 @@ class HybridRetriever:
         per_doc_cap = getattr(settings.search, "per_doc_cap", 3)
 
         self.logger.info(
-            "[retrieval] local_vector start query_len=%d collection=%s dense_k=%d sparse_k=%d rerank_input_k=%d step_top_k=%s",
-            len(query), collection, dense_recall_k, sparse_recall_k, rerank_input_k, step_top_k,
+            "[retrieval] local_vector start query_len=%d collection=%s dense_k=%d→%d sparse_k=%d→%d "
+            "step_top_k=%s mode=%s pool_mul=%.2f stage_target_k=%d rrf_pool_target_k=%d",
+            len(query), collection,
+            dense_recall_k, dense_recall_limit,
+            sparse_recall_k, sparse_recall_limit,
+            step_top_k, mode, pool_mul, stage_target_k, rrf_pool_target_k,
         )
 
-        cache_key = _make_key("retrieval_vector", query, collection, top_k, rerank, year_start, year_end, step_top_k)
+        cache_key = _make_key(
+            "retrieval_vector",
+            query,
+            collection,
+            top_k,
+            rerank,
+            year_start,
+            year_end,
+            step_top_k,
+            reranker_mode,
+            cascade_bge_k,
+            round(pool_mul, 4),
+        )
         if self._vector_cache:
             cached = self._vector_cache.get(cache_key)
             if cached is not None:
@@ -424,14 +516,14 @@ class HybridRetriever:
             data=[dense_vec.tolist()],
             anns_field="dense_vector",
             param={"metric_type": "COSINE", "params": {"nprobe": 16}},
-            limit=dense_recall_k,
+            limit=dense_recall_limit,
             expr=year_expr,
         )
         sparse_req = AnnSearchRequest(
             data=[sparse_dict],
             anns_field="sparse_vector",
             param={"metric_type": "IP"},
-            limit=sparse_recall_k,
+            limit=sparse_recall_limit,
             expr=year_expr,
         )
         timeout_s = getattr(settings, "perf_retrieval", None)
@@ -444,7 +536,7 @@ class HybridRetriever:
                 collection=collection,
                 reqs=[dense_req],
                 ranker=RRFRanker(k=settings.search.rrf_k),
-                limit=dense_recall_k,
+                limit=dense_recall_limit,
                 output_fields=output_fields,
             )
 
@@ -453,7 +545,7 @@ class HybridRetriever:
                 collection=collection,
                 reqs=[sparse_req],
                 ranker=RRFRanker(k=settings.search.rrf_k),
-                limit=sparse_recall_k,
+                limit=sparse_recall_limit,
                 output_fields=output_fields,
             )
 
@@ -510,14 +602,15 @@ class HybridRetriever:
         )
         cid_to_doc = {d["chunk_id"]: d for d in dense_hits + sparse_hits}
         candidates = []
-        for cid, _ in fused[:rerank_input_k]:
+        rrf_pool_k = min(len(fused), rrf_pool_target_k)
+        for cid, _ in fused[:rrf_pool_k]:
             if cid in cid_to_doc:
                 candidates.append(cid_to_doc[cid])
         fusion_ms = (time.perf_counter() - t_fusion) * 1000
 
         self.logger.info(
-            "[retrieval] local_vector fusion_done candidates=%d fusion_ms=%.0f",
-            len(candidates), fusion_ms,
+            "[retrieval] local_vector fusion_done fused=%d pool_k=%d candidates=%d fusion_ms=%.0f",
+            len(fused), rrf_pool_k, len(candidates), fusion_ms,
         )
 
         # Stage 3: Rerank（bge_only | colbert_only | cascade）
@@ -530,7 +623,7 @@ class HybridRetriever:
             if docs:
                 hits = _rerank_candidates(
                     query, candidates, top_k=min(rerank_output_limit, len(candidates)),
-                    reranker_mode=reranker_mode, cascade_bge_k=cascade_bge_k,
+                    reranker_mode=reranker_mode, cascade_bge_k=cascade_bge_k, trace_ctx=trace_ctx,
                 )
                 hits = dedup_and_diversify(hits, per_doc_cap=per_doc_cap)
                 out = hits[:step_top_k] if step_top_k is not None else hits[:top_k]
@@ -602,6 +695,8 @@ class HybridRetriever:
         reranker_mode: Optional[str] = None,
         cascade_bge_k: Optional[int] = None,
         step_top_k: Optional[int] = None,
+        rank_pool_multiplier: Optional[float] = None,
+        trace_ctx: Optional[Dict[str, Any]] = None,
     ) -> List[Dict]:
         """
         混合检索（向量 + 图融合）
@@ -622,6 +717,8 @@ class HybridRetriever:
             diagnostics=diagnostics,
             cascade_bge_k=cascade_bge_k,
             step_top_k=step_top_k,
+            rank_pool_multiplier=rank_pool_multiplier,
+            trace_ctx=trace_ctx,
         )
         self.logger.info("[retrieval] local_hybrid vector_done hits=%d", len(vector_hits))
 
@@ -648,7 +745,7 @@ class HybridRetriever:
                 rerank_limit = step_top_k if step_top_k is not None else default_output_k
                 fused_hits = _rerank_candidates(
                     query, hits_with_content, top_k=min(rerank_limit, len(hits_with_content)),
-                    reranker_mode=reranker_mode, cascade_bge_k=cascade_bge_k,
+                    reranker_mode=reranker_mode, cascade_bge_k=cascade_bge_k, trace_ctx=trace_ctx,
                 )
                 per_doc_cap = getattr(settings.search, "per_doc_cap", 3)
                 fused_hits = dedup_and_diversify(fused_hits, per_doc_cap=per_doc_cap)
@@ -695,6 +792,8 @@ class HybridRetriever:
                 reranker_mode=config.reranker_mode,
                 cascade_bge_k=config.colbert_top_k,
                 step_top_k=config.step_top_k,
+                rank_pool_multiplier=config.rank_pool_multiplier,
+                trace_ctx=config.trace_ctx,
             )
         elif config.mode == "graph":
             return self.retrieve_graph(query, config.top_k)
@@ -711,6 +810,8 @@ class HybridRetriever:
                 reranker_mode=config.reranker_mode,
                 cascade_bge_k=config.colbert_top_k,
                 step_top_k=config.step_top_k,
+                rank_pool_multiplier=config.rank_pool_multiplier,
+                trace_ctx=config.trace_ctx,
             )
 
 

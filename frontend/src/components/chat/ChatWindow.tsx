@@ -24,6 +24,7 @@ const PROVIDER_META: Record<string, { label: string; color: string; icon: 'db' |
   scholar:  { label: 'Google Scholar',    color: '#34d399', icon: 'globe' },
   semantic: { label: 'Semantic Scholar',  color: '#facc15', icon: 'globe' },
   ncbi:     { label: 'NCBI PubMed',       color: '#f472b6', icon: 'globe' },
+  sonar:    { label: 'Sonar',             color: '#06b6d4', icon: 'globe' },
   web:      { label: 'Web',              color: '#94a3b8', icon: 'globe' },
 };
 

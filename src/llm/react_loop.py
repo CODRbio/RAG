@@ -81,7 +81,7 @@ def react_loop(
         messages: 初始消息列表（含 system + user）
         tools: 可用工具列表
         llm_client: BaseChatClient 实例
-        max_iterations: 最大迭代次数（防止无限循环）
+        max_iterations: 最大轮数；最后一轮（iteration == max_iterations - 1）固定为「仅总结」轮，不传 tools，以保证返回非空回答。
         model: 可选模型覆盖
         session_id: 会话 ID（用于 debug 日志追溯）
         **llm_kwargs: 传递给 llm_client.chat() 的额外参数
@@ -110,16 +110,21 @@ def react_loop(
         else:
             working_messages.insert(0, {"role": "system", "content": prompt_desc})
 
+    last_non_empty_final_text = ""
+    resp: Optional[Dict[str, Any]] = None
     for iteration in range(max_iterations):
         result.iterations = iteration + 1
 
         # ── LLM 调用（计时）──
+        # 最后一轮不传 tools，强制模型只输出总结，避免到上限时 response_len=0
+        is_last_round = iteration == max_iterations - 1
+        tools_for_this_round = None if is_last_round else (tools if supports_fc else None)
         t_llm = time.perf_counter()
         try:
             resp = llm_client.chat(
                 messages=working_messages,
                 model=model,
-                tools=tools if supports_fc else None,
+                tools=tools_for_this_round,
                 **llm_kwargs,
             )
         except Exception as e:
@@ -147,6 +152,9 @@ def react_loop(
 
         raw = resp.get("raw", {})
         result.raw_response = resp
+        _ft = (resp.get("final_text") or "").strip()
+        if _ft:
+            last_non_empty_final_text = _ft
 
         tool_calls = resp.get("tool_calls") or []
         if not tool_calls and supports_fc:
@@ -252,7 +260,10 @@ def react_loop(
                 working_messages.append(tool_result_to_openai_message(tr))
     else:
         logger.warning(f"ReAct loop reached max iterations ({max_iterations})")
-        result.final_text = resp.get("final_text", "") if 'resp' in dir() else ""
+        result.final_text = (resp.get("final_text") or "").strip() if resp else ""
+        if not result.final_text and last_non_empty_final_text:
+            result.final_text = last_non_empty_final_text
+            logger.info("ReAct: using last non-empty final_text from earlier iteration (len=%d)", len(result.final_text))
 
     result.total_time_ms = (time.perf_counter() - t0) * 1000
     result.agent_stats = _build_agent_stats(result)

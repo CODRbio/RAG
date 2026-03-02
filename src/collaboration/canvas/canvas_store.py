@@ -95,6 +95,7 @@ class CanvasStore:
             topic=row.topic or "",
             working_title=row.working_title or "",
             abstract=row.abstract or "",
+            preliminary_knowledge=row.preliminary_knowledge or "",
             keywords=row.get_keywords(),
             stage=row.stage or "explore",
             refined_markdown=row.refined_markdown or "",
@@ -142,7 +143,7 @@ class CanvasStore:
 
     def update(self, canvas_id: str, **fields: Any) -> bool:
         allowed = {
-            "session_id", "topic", "working_title", "abstract", "keywords",
+            "session_id", "topic", "working_title", "abstract", "preliminary_knowledge", "keywords",
             "stage", "identified_gaps", "user_directives", "research_brief",
             "research_insights", "refined_markdown", "skip_draft_review",
             "skip_refine_review", "version",

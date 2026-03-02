@@ -3,6 +3,7 @@
 """
 
 import contextlib
+import concurrent.futures
 import json
 import math
 import logging
@@ -86,6 +87,7 @@ from src.collaboration.citation.manager import (
 )
 from src.collaboration.canvas.models import Citation
 from dataclasses import asdict
+from src.retrieval.sonar_citations import parse_sonar_citations
 from src.retrieval.service import (
     fuse_pools_with_gap_protection,
     get_retrieval_service,
@@ -199,6 +201,26 @@ def _dr_set_resume_idle(job_id: str) -> None:
 from src.log import get_logger as _get_chat_logger
 
 _chat_logger = _get_chat_logger(__name__)
+
+
+def _ensure_research_session_title(store: Any, session_id: str, topic: str) -> None:
+    """Ensure a research session has a non-empty, readable title."""
+    topic_text = (topic or "").strip()
+    if not session_id or not topic_text:
+        return
+    try:
+        meta = store.get_session_meta(session_id) or {}
+        current_title = str(meta.get("title") or "").strip() if isinstance(meta, dict) else ""
+        current_type = str(meta.get("session_type") or "").strip() if isinstance(meta, dict) else ""
+        updates: Dict[str, Any] = {}
+        if not current_title:
+            updates["title"] = topic_text[:80]
+        if current_type != "research":
+            updates["session_type"] = "research"
+        if updates:
+            store.update_session_meta(session_id, updates)
+    except Exception as exc:
+        _chat_logger.debug("[deep-research] ensure session title failed sid=%s: %s", session_id[:12], exc)
 
 # ── Start-phase job store ─────────────────────────────────────────────────────
 # Scope+plan can take 10+ minutes; we run it in a background thread and return
@@ -512,10 +534,6 @@ def _build_filters(body: ChatRequest) -> dict:
         filters["serpapi_ratio"] = body.serpapi_ratio
     if body.use_query_expansion is not None:
         filters["use_query_expansion"] = body.use_query_expansion
-    if body.use_query_optimizer is not None:
-        filters["use_query_optimizer"] = body.use_query_optimizer
-    if body.query_optimizer_max_queries is not None:
-        filters["query_optimizer_max_queries"] = body.query_optimizer_max_queries
     if body.local_threshold is not None:
         filters["local_threshold"] = body.local_threshold
     if body.year_start is not None:
@@ -538,7 +556,33 @@ def _build_filters(body: ChatRequest) -> dict:
         filters["use_content_fetcher"] = body.use_content_fetcher
     if body.collection:
         filters["collection"] = body.collection
+    # Main fusion rank-pool policy for chat requests (global local+web rerank).
+    filters["rank_pool_multiplier"] = float(
+        getattr(settings.search, "chat_rank_pool_multiplier", 3.0)
+    )
     return filters
+
+
+def _generate_chat_structured_queries(
+    query: str,
+    evidence_context: str,
+    llm_client: Any,
+    model_override: Optional[str] = None,
+) -> Optional[Dict[str, str]]:
+    """Generate 1+1+1 for Chat Round 2. Delegates to shared structured_queries module."""
+    from src.retrieval.structured_queries import generate_structured_queries_1plus1plus1
+    return generate_structured_queries_1plus1plus1(
+        query, evidence_context, llm_client, model_override=model_override
+    )
+
+
+def _chat_web_queries_from_1plus1plus1(
+    structured: Dict[str, str],
+    web_providers: Optional[List[str]] = None,
+) -> Dict[str, List[str]]:
+    """Build web_queries_per_provider from 1+1+1. Delegates to shared structured_queries module."""
+    from src.retrieval.structured_queries import web_queries_per_provider_from_1plus1plus1
+    return web_queries_per_provider_from_1plus1plus1(structured, web_providers)
 
 
 # ── Chat 证据充分性评估（LLM 判断，借鉴 Deep Research evaluate_sufficiency）──
@@ -702,8 +746,6 @@ def _build_deep_research_filters(body: Any) -> dict:
         "web_providers",
         "web_source_configs",
         "serpapi_ratio",
-        "use_query_optimizer",
-        "query_optimizer_max_queries",
         "local_top_k",
         "local_threshold",
         "year_start",
@@ -721,6 +763,9 @@ def _build_deep_research_filters(body: Any) -> dict:
         val = getattr(body, key, None)
         if val is not None and val != "":
             filters[key] = val
+    filters["rank_pool_multiplier"] = float(
+        getattr(settings.search, "research_rank_pool_multiplier", 3.0)
+    )
     return filters
 
 
@@ -880,7 +925,7 @@ def _run_chat_impl(
         "[chat] ▶ 新请求 | session=%s | msg=%r | provider=%s | model=%s | search_mode=%s"
         " | collection=%s | agent_mode=%s"
         " | local_top_k=%s | step_top_k=%s | reranker_mode=%s | web_providers=%s | serpapi_ratio=%s"
-        " | year=%s~%s | optimizer=%s",
+        " | year=%s~%s",
         session_id[:12], message[:60],
         body.llm_provider or "default", body.model_override or "default",
         search_mode, (body.collection or settings.collection.global_), agent_mode,
@@ -889,7 +934,6 @@ def _run_chat_impl(
         ",".join(body.web_providers) if body.web_providers else "none",
         body.serpapi_ratio,
         body.year_start, body.year_end,
-        body.use_query_optimizer,
     )
 
     # ── 2. 意图 + 上下文分析（单次 ultra-lite LLM 调用）──
@@ -1143,20 +1187,128 @@ def _run_chat_impl(
                 mismatch_msg,
             )
 
+    # ── 4.9 Sonar 前置知识（可选）：sonar_strength 不为 off 时调用 Perplexity Sonar，注入 system prompt 并纳入引文池 ──
+    preliminary_knowledge_block = ""
+    sonar_chunks: list = []
+    sonar_gap_hits: List[Dict[str, Any]] = []
+    _sonar_strength = (getattr(body, "sonar_strength", None) or "").strip().lower() or None
+    _use_sonar = _sonar_strength and _sonar_strength != "off"
+    if not _use_sonar and getattr(body, "use_sonar_prelim", False):
+        _use_sonar = True
+        _sonar_strength = (getattr(body, "sonar_model", None) or "").strip() or "sonar-reasoning-pro"
+    elif _use_sonar and not _sonar_strength:
+        _sonar_strength = "sonar-reasoning-pro"
+    if do_retrieval and _use_sonar:
+        _prelim_provider = None
+        if manager.is_available("sonar"):
+            _prelim_provider = "sonar"
+        elif manager.is_available("perplexity"):
+            _prelim_provider = "perplexity"
+        if _prelim_provider:
+            _prelim_model = _sonar_strength or "sonar-reasoning-pro"
+            try:
+                _ppl_client = manager.get_client(_prelim_provider)
+                # Perplexity 支持长 query，直接用用户原始提问，不做预先改写
+                _prelim_prompt = (
+                    "Provide a brief, high-level overview answering the following question. "
+                    "Outline key points and main sources. Keep it under 350 words. Respond in the same language as the question.\n\n"
+                ) + (message or "").strip()
+                _prelim_resp = _ppl_client.chat(
+                    [{"role": "user", "content": _prelim_prompt}],
+                    model=_prelim_model,
+                    timeout_seconds=45,
+                )
+                _prelim_text = (_prelim_resp.get("final_text") or "").strip()
+                if _prelim_text:
+                    # Sonar reasoning-pro may wrap answer in thinking tags; strip for prelim block
+                    _close = "</think>"
+                    if _close in _prelim_text:
+                        _idx = _prelim_text.find(_close)
+                        _prelim_text = _prelim_text[_idx + len(_close) :].lstrip()
+                    preliminary_knowledge_block = "Preliminary knowledge (Sonar):\n" + _prelim_text
+                _raw = _prelim_resp.get("raw") or {}
+                _citations = _raw.get("citations") or _prelim_resp.get("citations")
+                _search_results = _raw.get("search_results") or _prelim_resp.get("search_results")
+                sonar_chunks = parse_sonar_citations(
+                    citations=_citations,
+                    search_results=_search_results,
+                    response_text=_prelim_text,
+                    query=message or "",
+                )
+                sonar_gap_hits = [_chunk_to_hit(c) for c in sonar_chunks]
+                _chat_logger.info(
+                    "[chat] ④.9 Sonar 前置知识 | provider=%s model=%s prelim_len=%d sonar_chunks=%d",
+                    _prelim_provider, _prelim_model, len(preliminary_knowledge_block), len(sonar_chunks),
+                )
+            except Exception as _e:
+                _chat_logger.debug("[chat] ④.9 Sonar 前置知识失败（静默降级）: %s", _e)
+
+    # Round 1 fallback: no Perplexity or sonar_strength=off → local LLM cognition (no search) for hybrid/web
+    if (
+        do_retrieval
+        and effective_search_mode in ("hybrid", "web")
+        and not preliminary_knowledge_block.strip()
+    ):
+        try:
+            _cog_prompt = _pm.render("chat_local_cognition.txt", query=(message or "").strip())
+            _cog_resp = lite_client.chat(
+                [{"role": "user", "content": _cog_prompt}],
+                model=body.model_override or None,
+            )
+            _cog_text = (_cog_resp.get("final_text") or "").strip()
+            if _cog_text:
+                preliminary_knowledge_block = "Preliminary knowledge (local):\n" + _cog_text
+                _chat_logger.info(
+                    "[chat] ④.9 本地认知(无搜索) | prelim_len=%d",
+                    len(preliminary_knowledge_block),
+                )
+        except Exception as _e:
+            _chat_logger.debug("[chat] ④.9 本地认知失败: %s", _e)
+
     # ── 5. 检索执行 ──
     if do_retrieval:
         t_retrieval = _time.perf_counter()
         retrieval = get_retrieval_service(collection=target_collection)
         filters = _build_filters(body)
+        filters["trace_phase"] = "chat_main"
+        filters["trace_section"] = "chat"
         # 强制 Chat 使用 bge_only reranker（速度优先）。UI 传入的 cascade/colbert
         # 在 hybrid 模式下仅用于写作阶段（Deep Research）。
         filters["reranker_mode"] = "bge_only"
+        # Round 2: 1+1+1 结构化查询（仅 hybrid/web）
+        search_query = query or message
+        if effective_search_mode in ("hybrid", "web"):
+            structured = _generate_chat_structured_queries(
+                message or "",
+                preliminary_knowledge_block,
+                lite_client,
+                model_override=body.model_override or None,
+            )
+            if structured:
+                qpp = _chat_web_queries_from_1plus1plus1(structured, body.web_providers)
+                if qpp:
+                    filters["web_queries_per_provider"] = qpp
+                    search_query = structured.get("recall") or search_query
+                    _chat_logger.info(
+                        "[chat] ⑤ Round2 1+1+1 | recall=%r | providers=%s",
+                        (search_query or "")[:60],
+                        list(qpp.keys()),
+                    )
+            else:
+                _chat_logger.warning("[chat] ⑤ Round2 1+1+1 解析失败，使用单 query 检索")
+        _gap_hits = sonar_gap_hits if (effective_search_mode == "hybrid" and sonar_gap_hits) else None
         pack = retrieval.search(
-            query=query or message,
+            query=search_query,
             mode=effective_search_mode,
             filters=filters or None,
             top_k=body.local_top_k,
+            gap_candidates_hits=_gap_hits,
         )
+        # When sonar prelim was used but mode was local/web, append sonar chunks so they enter citation pool
+        if sonar_chunks and effective_search_mode != "hybrid":
+            pack.chunks.extend(sonar_chunks)
+            if "sonar" not in pack.sources_used:
+                pack.sources_used.append("sonar")
         # write_top_k = per-output-unit evidence cap (Chat one Q&A = one unit). Fallback to step_top_k then all.
         write_k = getattr(body, "write_top_k", None) or body.step_top_k or len(pack.chunks)
         max_chunks_for_context = min(write_k, len(pack.chunks))
@@ -1325,19 +1477,33 @@ def _run_chat_impl(
             main_candidates = [_chunk_to_hit(c) for c in pack.chunks]
             gap_candidates: List[Dict[str, Any]] = []
             _supp_total = 0
-            for gq in gap_queries:
-                try:
-                    supp_pack = retrieval.search(
-                        query=gq,
-                        mode=effective_search_mode,
-                        filters=filters or None,
-                        top_k=supp_k,
-                    )
-                    for c in supp_pack.chunks:
-                        gap_candidates.append(_chunk_to_hit(c))
-                    _supp_total += len(supp_pack.chunks)
-                except Exception as e:
-                    _chat_logger.warning("[chat] gap supplement search failed for %r: %s", gq[:50], e)
+
+            def _search_one_gap(gq: str) -> "EvidencePack":
+                supp_filters = dict(filters or {})
+                supp_filters["trace_phase"] = "chat_gap_supplement"
+                return retrieval.search(
+                    query=gq,
+                    mode=effective_search_mode,
+                    filters=supp_filters or None,
+                    top_k=supp_k,
+                )
+
+            _chat_logger.info(
+                "[chat] ⑤¾ gap 补搜开始（并行） | gap_queries=%d | queries=%s",
+                len(gap_queries), [q[:60] for q in gap_queries],
+            )
+            _gap_parallel = max(1, int(getattr(settings.search, "chat_gap_parallel", 2)))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(_gap_parallel, len(gap_queries))) as gap_ex:
+                future_to_gq = {gap_ex.submit(_search_one_gap, gq): gq for gq in gap_queries}
+                for fut in concurrent.futures.as_completed(future_to_gq):
+                    gq = future_to_gq[fut]
+                    try:
+                        supp_pack = fut.result()
+                        for c in supp_pack.chunks:
+                            gap_candidates.append(_chunk_to_hit(c))
+                        _supp_total += len(supp_pack.chunks)
+                    except Exception as e:
+                        _chat_logger.warning("[chat] gap supplement search failed for %r: %s", gq[:50], e)
             if gap_candidates:
                 fusion_diag: Dict[str, Any] = {}
                 fused = fuse_pools_with_gap_protection(
@@ -1348,6 +1514,7 @@ def _run_chat_impl(
                     gap_min_keep=math.ceil(step_k * float(getattr(settings.search, "chat_gap_ratio", 0.2))),
                     gap_ratio=float(getattr(settings.search, "chat_gap_ratio", 0.2)),
                     rank_pool_multiplier=float(getattr(settings.search, "chat_rank_pool_multiplier", 3.0)),
+                    trace_ctx={"phase": "chat_gap_fusion", "section": "chat"},
                     reranker_mode=(filters or {}).get("reranker_mode") or "bge_only",
                     diag=fusion_diag,
                 )
@@ -1422,6 +1589,9 @@ def _run_chat_impl(
     else:
         system_content = _build_system_with_context(context_str)
         prompt_mode = "rag_basic"
+
+    if preliminary_knowledge_block:
+        system_content = system_content.rstrip() + "\n\n" + preliminary_knowledge_block + "\n"
 
     if canvas_id:
         wm = get_or_generate_working_memory(canvas_id, _CONFIG_PATH)
@@ -1607,7 +1777,7 @@ def _run_chat_impl(
     cited_from_agent_count = 0
     non_retrieval_tools_ok = 0
     if use_agent and react_result and react_result.tool_trace:
-        _non_retrieval = {"run_code", "explore_graph", "canvas", "get_citations", "compare_papers"}
+        _non_retrieval = {"run_code", "explore_graph", "canvas", "get_citations", "compare_papers", "summarize_quantitative"}
         for entry in react_result.tool_trace:
             if entry["tool"] in _non_retrieval and not entry.get("is_error"):
                 non_retrieval_tools_ok += 1
@@ -2344,6 +2514,7 @@ def _run_deep_research_job_safe(
     t0 = _time.perf_counter()
     store = get_session_store()
     session_id = body.session_id or store.create_session(canvas_id=body.canvas_id or "")
+    _ensure_research_session_title(store, session_id, body.topic)
     manager = get_manager(str(_CONFIG_PATH))
     client = manager.get_client(body.llm_provider or None)
     user_id = optional_user_id or body.user_id or ""
@@ -2605,6 +2776,16 @@ def _run_deep_research_job_safe(
                             sec.evidence_scarce = False
                         else:
                             sec.status = "researching"
+                    # Non-matched sections must be forced to "done" so that
+                    # get_next_section() never picks them up, regardless of
+                    # whatever stale status they carry from the checkpoint
+                    # (e.g. "researching" from a previous crashed run).
+                    _existing_completed: set = set(reconstructed.get("sections_completed") or [])
+                    for sec in reconstructed["dashboard"].sections:
+                        if sec.title not in matched_titles:
+                            sec.status = "done"
+                            _existing_completed.add(sec.title)
+                    reconstructed["sections_completed"] = list(_existing_completed)
                     # Start from the first matched section (in outline order)
                     all_titles = [s.title for s in reconstructed["dashboard"].sections]
                     first_target = next(
@@ -2912,6 +3093,7 @@ def submit_deep_research_endpoint(
 
     store = get_session_store()
     session_id = body.session_id or store.create_session(canvas_id=body.canvas_id or "")
+    _ensure_research_session_title(store, session_id, body.topic)
     payload = body.model_dump()
     payload["session_id"] = session_id
     payload["_worker_user_id"] = optional_user_id
@@ -2966,6 +3148,7 @@ def confirm_deep_research_endpoint(
 
     session_id = body.session_id or get_session_store().create_session(canvas_id=body.canvas_id or "")
     store = get_session_store()
+    _ensure_research_session_title(store, session_id, body.topic)
     manager = get_manager(str(_CONFIG_PATH))
     client = manager.get_client(body.llm_provider or None)
     user_id = optional_user_id or body.user_id or ""

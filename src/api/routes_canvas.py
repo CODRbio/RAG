@@ -105,6 +105,7 @@ def _canvas_to_response(c) -> CanvasResponse:
         topic=c.topic,
         working_title=c.working_title,
         abstract=c.abstract,
+        preliminary_knowledge=getattr(c, "preliminary_knowledge", "") or "",
         keywords=c.keywords,
         stage=c.stage,
         refined_markdown=getattr(c, "refined_markdown", "") or "",

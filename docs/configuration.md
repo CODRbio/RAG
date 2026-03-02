@@ -73,8 +73,10 @@ PDF 解析相关配置。
 - `top_k`：召回数量
 - `rerank_top_k`：重排后保留数量
 - Dense/Sparse 召回参数
+- `rerank_funnel_floor_k`：重排 funnel 的最小地板（默认 20）
 - `reranker_mode`：重排模式（bge / colbert / cascade）
 - ColBERT 开关与模型配置
+  - `cascade_bge_multiplier`：cascade 中 BGE 中间层倍率（默认 1.5）
 - Gap 融合配置（Chat / Research 可独立）
   - `chat_gap_ratio`：Chat gap 最低配额比例（默认 `0.2`）
   - `research_gap_ratio`：Research gap 最低配额比例（默认 `0.25`）

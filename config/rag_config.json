@@ -99,12 +99,15 @@
     "rrf_dense_weight": 0.6,
     "rrf_sparse_weight": 0.4,
     "rerank_input_k": 100,
+    "rerank_funnel_floor_k": 20,
     "rerank_output_k": 20,
     "per_doc_cap": 5,
     "reranker_mode": "cascade",
     "use_colbert_reranker": true,
     "colbert_model": "jinaai/jina-colbert-v2",
     "colbert_top_k": 30,
+    "cascade_bge_multiplier": 1.5,
+    "chat_gap_parallel": 2,
     "chat_gap_ratio": 0.2,
     "research_gap_ratio": 0.25,
     "chat_rank_pool_multiplier": 3.0,
@@ -119,17 +122,9 @@
     "include_answer": true,
     "include_domains": [],
     "exclude_domains": [],
-    "enable_query_optimizer": true,
     "enable_query_expansion": false,
     "query_expansion_llm": "deepseek",
-    "max_queries": 4,
-    "smart_optimizer": {
-      "enabled": true,
-      "llm_provider": "deepseek",
-      "max_queries_per_provider": 3,
-      "enable_bilingual": true,
-      "fallback_to_simple": true
-    }
+    "max_queries": 4
   },
   "google_search": {
     "enabled": true,

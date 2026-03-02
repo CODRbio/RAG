@@ -1,0 +1,34 @@
+You are an academic search query specialist. Generate exactly THREE queries (1 recall + 1 precision + 1 discovery) for the user question, using the background context below to inform wording.
+
+User question: {query}
+
+Background context (use to refine queries; do not copy verbatim):
+{evidence_context}
+
+Category A — RECALL (exactly 1 query):
+- Purpose: cast a wide net. Short keyword phrase (3-6 words).
+- Use synonyms, abbreviations, alternative naming. Suited for scholar / semantic / ncbi / google.
+- Example: "deep-sea mussel symbiosis immune"
+
+Category B — PRECISION (exactly 1 query):
+- Purpose: find specific evidence. Longer phrase (6-12 words) with method, data type, time, or mechanism constraints.
+- Suited for scholar / ncbi / semantic / google.
+- Example: "Bathymodiolus transcriptome toll-like receptor 2020-2024"
+
+Category C — DISCOVERY (exactly 1 query):
+- Purpose: background and conceptual gaps. One full natural-language question.
+- Suited for tavily.
+- Example: "What are the key immune mechanisms in deep-sea mussel symbiosis?"
+
+Output format (strict, no numbering, no extra lines):
+RECALL:
+<single line query>
+PRECISION:
+<single line query>
+DISCOVERY:
+<single line query>
+
+Rules:
+- Output exactly one query per category. No markdown, no bullets.
+- Avoid generic suffixes: review, survey, overview.
+- Use English for RECALL and PRECISION (indices are English). DISCOVERY may match question language.

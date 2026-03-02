@@ -1,0 +1,4 @@
+Using only your training knowledge (do not search the web), provide a brief background overview for the following question. Outline key concepts and main points. Keep it under 300 words. Respond in the same language as the question.
+
+Question:
+{query}

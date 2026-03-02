@@ -14,3 +14,12 @@ export async function toggleDebug(enabled: boolean): Promise<{ ok: boolean; debu
   const res = await client.post<{ ok: boolean; debug: boolean }>('/debug/toggle', { enabled });
   return res.data;
 }
+
+export async function logFrontendDebugEvent(event: Record<string, unknown>): Promise<void> {
+  await client.post('/debug/frontend-log', event);
+}
+
+export async function logFrontendDebugEvents(events: Array<Record<string, unknown>>): Promise<void> {
+  if (!events.length) return;
+  await client.post('/debug/frontend-log/batch', { events });
+}

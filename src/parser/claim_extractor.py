@@ -41,6 +41,7 @@ class _ClaimItem(BaseModel):
     confidence: str = "medium"
     limitations: str = ""
     source_section: str = ""
+    quantitative_results: str = ""
 
 
 class _ClaimListResponse(BaseModel):
@@ -70,6 +71,7 @@ class Claim:
     limitations: str  # 局限性
     source_section: str  # 来源章节
     source_block_ids: List[str] = field(default_factory=list)  # 关联的 block_id
+    quantitative_results: str = ""  # 关键数值结果原文
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -81,6 +83,7 @@ class Claim:
             "limitations": self.limitations,
             "source_section": self.source_section,
             "source_block_ids": self.source_block_ids,
+            "quantitative_results": self.quantitative_results,
         }
 
     @classmethod
@@ -94,6 +97,7 @@ class Claim:
             limitations=d.get("limitations", ""),
             source_section=d.get("source_section", ""),
             source_block_ids=d.get("source_block_ids", []),
+            quantitative_results=d.get("quantitative_results", ""),
         )
 
 
@@ -187,6 +191,7 @@ class ClaimExtractor:
                 limitations=raw.get("limitations", ""),
                 source_section=section,
                 source_block_ids=block_ids_map.get(section, []),
+                quantitative_results=raw.get("quantitative_results", ""),
             )
             if claim.text.strip():
                 claims.append(claim)

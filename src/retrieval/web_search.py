@@ -145,8 +145,11 @@ class TavilySearcher:
     def enabled(self) -> bool:
         return bool(self._config.get("enabled") and (self._config.get("api_key") or "").strip())
 
-    def _generate_queries_sync(self, user_query: str, llm_provider: Optional[str] = None) -> List[str]:
-        """同步：使用 LLM 生成多查询（可选）。优先使用传入的 llm_provider（UI），无则用 config。"""
+    def _generate_queries_sync(
+        self, user_query: str, llm_provider: Optional[str] = None
+    ) -> List[str]:
+        """DEPRECATED: Tavily LLM query expansion no longer used; expand is always False.
+        同步：使用 LLM 生成多查询（可选）。优先使用传入的 llm_provider（UI），无则用 config。"""
         if not self._config.get("enable_query_expansion"):
             return [user_query]
         try:
@@ -181,7 +184,7 @@ class TavilySearcher:
         return [user_query]
 
     async def _generate_queries_async(self, user_query: str, llm_provider: Optional[str] = None) -> List[str]:
-        """异步：LLM 生成多查询（在 executor 中跑同步）。优先使用传入的 llm_provider（UI），无则用 config。"""
+        """DEPRECATED: Tavily LLM expansion no longer used. 异步：LLM 生成多查询（在 executor 中跑同步）。"""
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
             None,
@@ -264,13 +267,14 @@ class TavilySearcher:
         if not self.enabled:
             logger.warning("Tavily search skipped: disabled or api_key not set.")
             return []
-        expand = use_query_expansion if use_query_expansion is not None else self._config.get("enable_query_expansion", False)
+        # DEPRECATED: expand always False; Tavily LLM expansion no longer used.
+        expand = False
         cache_key = _make_key("tavily", query, expand, max_results)
         if self._cache:
             cached = self._cache.get(cache_key)
             if cached is not None:
                 return cached
-        queries = self._generate_queries_sync(query, llm_provider) if expand else [query]
+        queries = [query]
         if not queries:
             logger.warning("Tavily search skipped: no queries (query expansion may have failed).")
             return []
@@ -298,13 +302,14 @@ class TavilySearcher:
         """异步搜索。查询扩展时优先使用 llm_provider（UI），无则用 config。"""
         if not self.enabled:
             return []
-        expand = use_query_expansion if use_query_expansion is not None else self._config.get("enable_query_expansion", False)
+        # DEPRECATED: expand always False; Tavily LLM expansion no longer used.
+        expand = False
         cache_key = _make_key("tavily", query, expand, max_results)
         if self._cache:
             cached = self._cache.get(cache_key)
             if cached is not None:
                 return cached
-        queries = await self._generate_queries_async(query, llm_provider) if expand else [query]
+        queries = [query]
         timeout_s = getattr(getattr(settings, "perf_web_search", None), "timeout_seconds", 30) or 30
         loop = asyncio.get_event_loop()
         try:

@@ -208,8 +208,7 @@ export function ChatInput() {
     }
 
     const mode = modeOverride || 'chat';
-    const queryOptimizerEnabled = Boolean(webSearchConfig.queryOptimizer ?? true);
-    const maxQueries = Math.min(5, Math.max(1, Number(webSearchConfig.maxQueriesPerProvider ?? 3)));
+    const sonarStrength = ragConfig.sonarStrength ?? 'sonar-reasoning-pro';
 
     const request: ChatRequest = {
       session_id: sessionId || undefined,
@@ -224,8 +223,6 @@ export function ChatInput() {
       web_providers: (searchMode !== 'none' && webEnabled) ? enabledProviders : undefined,
       web_source_configs: (searchMode !== 'none' && webEnabled && Object.keys(webSourceConfigs).length > 0) ? webSourceConfigs : undefined,
       serpapi_ratio: (searchMode !== 'none' && webEnabled && hasAnySerpapi) ? (webSearchConfig.serpapiRatio ?? 50) / 100 : undefined,
-      use_query_optimizer: (searchMode !== 'none' && webEnabled) ? queryOptimizerEnabled : undefined,
-      query_optimizer_max_queries: (searchMode !== 'none' && webEnabled) ? maxQueries : undefined,
       local_top_k: (searchMode !== 'none' && localEnabled) ? ragConfig.localTopK : undefined,
       local_threshold: (searchMode !== 'none' && localEnabled) ? (ragConfig.localThreshold ?? undefined) : undefined,
       year_start: ragConfig.yearStart ?? undefined,
@@ -234,6 +231,9 @@ export function ChatInput() {
       write_top_k: (searchMode !== 'none') ? (ragConfig.writeTopK ?? 15) : undefined,
       use_content_fetcher: (searchMode !== 'none' && webEnabled) ? webSearchConfig.contentFetcherMode : undefined,
       agent_mode: ragConfig.agentMode ?? 'standard',
+      sonar_strength: sonarStrength,
+      use_sonar_prelim: sonarStrength !== 'off',
+      sonar_model: sonarStrength !== 'off' ? sonarStrength : undefined,
       max_iterations: ragConfig.maxIterations ?? 2,
       reranker_mode: searchMode !== 'none'
         ? (ragConfig.enableReranker
@@ -244,6 +244,11 @@ export function ChatInput() {
     };
 
     if (import.meta.env.DEV) {
+      console.info('[ChatInput] request.web_source_configs', {
+        search_mode: request.search_mode,
+        web_source_configs: request.web_source_configs,
+        semantic: request.web_source_configs?.semantic,
+      });
       const base = import.meta.env.VITE_API_BASE_URL || '/api';
       console.log('[ChatInput] POST', `${base}/chat/submit`, JSON.stringify(request, null, 2));
     }

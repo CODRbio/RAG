@@ -26,6 +26,7 @@ export async function updateCanvas(
     topic: string;
     working_title: string;
     abstract: string;
+    preliminary_knowledge: string;
     keywords: string[];
     stage: string;
     refined_markdown: string;

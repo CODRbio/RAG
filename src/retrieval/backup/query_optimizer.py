@@ -1,4 +1,8 @@
 """
+DEPRECATED: Moved to backup as of Chat/Research 1+1+1 unification.
+The codebase no longer uses SmartQueryOptimizer or this module.
+Use structured 1+1+1 query generation (e.g. chat_generate_queries / generate_queries) instead.
+
 Provider-specific query optimizer for web search.
 """
 

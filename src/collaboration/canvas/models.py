@@ -101,6 +101,7 @@ class SurveyCanvas:
     topic: str = ""
     working_title: str = ""
     abstract: str = ""
+    preliminary_knowledge: str = ""
     keywords: List[str] = field(default_factory=list)
     stage: Literal["explore", "outline", "drafting", "refine"] = "explore"
     refined_markdown: str = ""  # 全文精炼稿（Refine 阶段可反复迭代）

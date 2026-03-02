@@ -338,6 +338,14 @@ _SEARCH_WEB_SCHEMA = {
     "required": ["query"],
 }
 
+_SEARCH_SONAR_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "query": {"type": "string", "description": "需要深度联网推理的查询问题"},
+    },
+    "required": ["query"],
+}
+
 _SEARCH_SCHOLAR_SCHEMA = {
     "type": "object",
     "properties": {
@@ -441,6 +449,50 @@ def _handle_search_web(query: str, top_k: int = 10, **_) -> str:
     pack = svc.search(query=query, mode="web", top_k=top_k, filters={"reranker_mode": "bge_only"})
     _collect_chunks(pack.chunks[:min(top_k, 15)])
     return pack.to_context_string(max_chunks=min(top_k, 15))
+
+
+def _handle_search_sonar(query: str, **_) -> str:
+    """使用 Perplexity Sonar Reasoning Pro 联网深度搜索，返回带引用的回答；引用纳入引文池。"""
+    try:
+        from src.llm.llm_manager import get_manager
+        from src.retrieval.sonar_citations import parse_sonar_citations
+
+        manager = get_manager()
+        provider = "sonar" if manager.is_available("sonar") else ("perplexity" if manager.is_available("perplexity") else None)
+        if not provider:
+            return "Sonar/Perplexity 未配置或不可用，请在 config/rag_config.local.json 的 llm.platforms.perplexity 中设置 api_key（如 pplx-xxx）后重试。"
+        client = manager.get_client(provider)
+        prompt = (
+            "Answer the following question concisely with key points and sources. "
+            "Use the same language as the question. Keep under 400 words.\n\n"
+        ) + (query or "").strip()
+        resp = client.chat(
+            [{"role": "user", "content": prompt}],
+            model="sonar-reasoning-pro",
+            timeout_seconds=50,
+        )
+        raw = resp.get("raw") or {}
+        citations = raw.get("citations")
+        search_results = raw.get("search_results")
+        if not citations and resp.get("citations") is not None:
+            citations = resp.get("citations")
+        if not search_results and resp.get("search_results") is not None:
+            search_results = resp.get("search_results")
+        text = (resp.get("final_text") or "").strip()
+        if "</think>" in text:
+            idx = text.find("</think>")
+            text = text[idx + 7 :].lstrip()
+        chunks = parse_sonar_citations(
+            citations=citations,
+            search_results=search_results,
+            response_text=text,
+            query=query or "",
+        )
+        _collect_chunks(chunks)
+        return text if text else "Sonar 未返回有效内容。"
+    except Exception as e:
+        logger.debug("search_sonar failed: %s", e)
+        return f"Sonar 搜索失败: {e}"
 
 
 def _handle_search_scholar(query: str, year_from: Optional[int] = None, limit: int = 5, **_) -> str:
@@ -614,6 +666,116 @@ def _handle_search_ncbi(query: str, limit: int = 5, **_) -> str:
         return f"NCBI 搜索失败: {e}"
 
 
+# ── summarize_quantitative handler ──
+
+_SUMMARIZE_QUANT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "evidence_text": {
+            "type": "string",
+            "description": (
+                "包含定量数据的证据文本（直接复制 context 中标记了 [Q] 的证据段落，"
+                "保留 [ref:xxxx] 标记以便引用溯源）"
+            ),
+        },
+        "variable": {
+            "type": "string",
+            "description": (
+                "待比较的变量名称（如 'pH', 'sample size', 'Shannon diversity', "
+                "'concentration', 'species richness' 等）"
+            ),
+        },
+    },
+    "required": ["evidence_text", "variable"],
+}
+
+
+def _handle_summarize_quantitative(evidence_text: str, variable: str, **_) -> str:
+    """Parse numeric values from evidence text for the given variable, compute statistics."""
+    import statistics as _stat
+
+    # Find ref tags so we can attribute values
+    ref_pattern = re.compile(r"\[ref:[a-f0-9]{6,12}\]")
+    # Generic number extraction: integers, decimals, ranges with ± or -
+    num_pattern = re.compile(
+        r"(?P<val>\d+\.?\d*)"
+        r"(?:\s*[±\+\-/]\s*(?P<err>\d+\.?\d*))?"
+    )
+
+    text = evidence_text or ""
+    variable_lower = variable.strip().lower()
+    if not text or not variable_lower:
+        return "Error: evidence_text and variable are required."
+
+    # Split into per-ref segments by looking for [ref:...] boundaries
+    segments: list[tuple[str, str]] = []  # (ref_tag, text_after)
+    parts = ref_pattern.split(text)
+    refs_found = ref_pattern.findall(text)
+    if refs_found:
+        for i, ref in enumerate(refs_found):
+            segment_text = parts[i + 1] if i + 1 < len(parts) else ""
+            segments.append((ref, segment_text))
+    else:
+        segments.append(("", text))
+
+    # For each segment, look for lines mentioning the variable, extract numbers
+    data_points: list[dict] = []
+    for ref_tag, seg_text in segments:
+        seg_lower = seg_text.lower()
+        if variable_lower not in seg_lower:
+            continue
+        # Find sentences containing the variable
+        sentences = re.split(r"[.。;；\n]", seg_text)
+        for sent in sentences:
+            if variable_lower not in sent.lower():
+                continue
+            for m in num_pattern.finditer(sent):
+                try:
+                    val = float(m.group("val"))
+                    err = float(m.group("err")) if m.group("err") else None
+                    context_snip = sent.strip()[:120]
+                    data_points.append({
+                        "ref": ref_tag,
+                        "value": val,
+                        "error": err,
+                        "snippet": context_snip,
+                    })
+                except (ValueError, TypeError):
+                    continue
+
+    if not data_points:
+        return f"No numeric values found for variable '{variable}' in the provided evidence."
+
+    values = [dp["value"] for dp in data_points]
+    n = len(values)
+    v_min = min(values)
+    v_max = max(values)
+    v_mean = _stat.mean(values)
+    v_median = _stat.median(values)
+    v_stdev = _stat.stdev(values) if n >= 2 else 0.0
+
+    lines = [
+        f"=== Cross-Study Summary: {variable} ===",
+        f"Data points: {n}",
+        f"Range: {v_min} – {v_max}",
+        f"Mean: {v_mean:.4g}",
+        f"Median: {v_median:.4g}",
+    ]
+    if n >= 2:
+        lines.append(f"Std Dev: {v_stdev:.4g}")
+    lines.append("")
+    lines.append("Per-source breakdown:")
+
+    for dp in data_points:
+        val_str = f"{dp['value']}"
+        if dp["error"] is not None:
+            val_str += f" ± {dp['error']}"
+        ref_str = f" {dp['ref']}" if dp["ref"] else ""
+        lines.append(f"  - {val_str}{ref_str}  |  \"{dp['snippet']}\"")
+
+    return "\n".join(lines)
+
+
 def _handle_run_code(code: str, **_) -> str:
     """以子进程方式执行 Python 代码。"""
     # TODO(Security): 生产环境强烈建议将 subprocess 替换为安全的隔离沙盒 API (如 E2B)。
@@ -701,6 +863,15 @@ CORE_TOOLS: List[ToolDef] = [
         handler=_handle_run_code,
     ),
     ToolDef(
+        name="summarize_quantitative",
+        description=(
+            "从证据文本中提取指定变量的定量数据，自动计算跨研究范围、均值、中位数、标准差，"
+            "并输出结构化的跨研究对比表。适用于需要汇总多篇论文中同一指标数值的场景。"
+        ),
+        parameters=_SUMMARIZE_QUANT_SCHEMA,
+        handler=_handle_summarize_quantitative,
+    ),
+    ToolDef(
         name="search_ncbi",
         description=(
             "搜索 NCBI PubMed 生物医学文献库，专攻生物学、医学、基因组学、海洋生态等领域。"
@@ -708,6 +879,15 @@ CORE_TOOLS: List[ToolDef] = [
         ),
         parameters=_SEARCH_NCBI_SCHEMA,
         handler=_handle_search_ncbi,
+    ),
+    ToolDef(
+        name="search_sonar",
+        description=(
+            "使用 Perplexity Sonar Reasoning Pro 进行联网深度搜索和推理分析，"
+            "适用于需要最新信息、跨领域知识或深度推理的问题。返回带引用的结构化回答，引用会纳入引文池。"
+        ),
+        parameters=_SEARCH_SONAR_SCHEMA,
+        handler=_handle_search_sonar,
     ),
 ]
 
@@ -720,7 +900,8 @@ _TOOL_REGISTRY: Dict[str, ToolDef] = {t.name: t for t in CORE_TOOLS}
 
 _GROUP_SEARCH_LOCAL = frozenset({"search_local"})
 _GROUP_WEB = frozenset({"search_web", "search_scholar", "search_ncbi"})
-_GROUP_ANALYSIS = frozenset({"compare_papers", "run_code"})
+_GROUP_SONAR = frozenset({"search_sonar"})
+_GROUP_ANALYSIS = frozenset({"compare_papers", "run_code", "summarize_quantitative"})
 _GROUP_GRAPH = frozenset({"explore_graph"})
 _GROUP_COLLAB = frozenset({"canvas", "get_citations"})
 
@@ -734,8 +915,8 @@ _WEB_PROVIDER_TO_TOOL: Dict[str, str] = {
 }
 
 _RE_ANALYSIS = re.compile(
-    r"对比|比较|差异|统计|计算|代码|数据分析|分析数据"
-    r"|compare|contrast|diff|statistic|calculat|code|data\s*analy",
+    r"对比|比较|差异|统计|计算|代码|数据分析|分析数据|定量|数值|浓度|样本量"
+    r"|compare|contrast|diff|statistic|calculat|code|data\s*analy|quantitat|numeric|sample.size|concentration",
     re.IGNORECASE,
 )
 _RE_GRAPH = re.compile(
@@ -799,6 +980,8 @@ def get_routed_skills(
                     selected.add(tool_name)
         else:
             selected |= _GROUP_WEB
+        # Sonar 工具：web/hybrid 时可用，Agent 可按需调用
+        selected |= _GROUP_SONAR
 
     # 3. Analysis group — keyword activated
     if _RE_ANALYSIS.search(message):

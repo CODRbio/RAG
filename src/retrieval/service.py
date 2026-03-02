@@ -320,6 +320,7 @@ def fuse_pools_with_gap_protection(
     gap_min_keep: Optional[int] = None,
     gap_ratio: Optional[float] = None,
     rank_pool_multiplier: Optional[float] = None,
+    trace_ctx: Optional[Dict[str, Any]] = None,
     reranker_mode: Optional[str] = None,
     skip_rerank: bool = False,
     diag: Optional[Dict[str, Any]] = None,
@@ -358,6 +359,16 @@ def fuse_pools_with_gap_protection(
         Internal keys (_pool_tag) are stripped; _source_type is preserved for
         callers that need it (e.g. service.py hybrid flow).
     """
+    trace_ctx = trace_ctx or {}
+    _trace_parts: List[str] = []
+    if trace_ctx.get("job_id"):
+        _trace_parts.append(f"job={str(trace_ctx.get('job_id'))[:12]}")
+    if trace_ctx.get("phase"):
+        _trace_parts.append(f"phase={trace_ctx.get('phase')}")
+    if trace_ctx.get("section"):
+        _trace_parts.append(f"section={trace_ctx.get('section')}")
+    trace_suffix = f" [{' '.join(_trace_parts)}]" if _trace_parts else ""
+
     n_main = len(main_candidates)
     n_gap = len(gap_candidates)
     if n_main == 0 and n_gap == 0:
@@ -374,8 +385,9 @@ def fuse_pools_with_gap_protection(
     )
     logger.info(
         "[retrieval] fuse_pools entry main=%d gap=%d top_k=%d total=%d rerank_k=%d "
-        "ratio=%s multiplier=%.2f skip_rerank=%s",
+        "ratio=%s multiplier=%.2f skip_rerank=%s%s",
         n_main, n_gap, target_top_k, n_total, rerank_k, gap_ratio, pool_multiplier, skip_rerank,
+        trace_suffix,
     )
 
     # Tag all candidates with pool membership (copies dicts to avoid mutation)
@@ -392,7 +404,7 @@ def fuse_pools_with_gap_protection(
             reranked = _embedding_rerank(query, all_cands, top_k=rerank_k)
         else:
             reranked = _rerank_candidates(
-                query, all_cands, top_k=rerank_k, reranker_mode=reranker_mode,
+                query, all_cands, top_k=rerank_k, reranker_mode=reranker_mode, trace_ctx=trace_ctx,
             )
     except Exception as e:
         logger.warning("fuse_pools global rerank failed (%s); falling back to score sort", e)
@@ -474,8 +486,9 @@ def fuse_pools_with_gap_protection(
     if effective_min_keep > 0 and gap_in_output < effective_min_keep:
         logger.warning(
             "[fuse_pools] gap quota not met after backfill:"
-            " wanted=%d in_output=%d (n_gap=%d top_k=%d)",
+            " wanted=%d in_output=%d (n_gap=%d top_k=%d)%s",
             effective_min_keep, gap_in_output, n_gap, target_top_k,
+            trace_suffix,
         )
 
     # Strip _pool_tag (keep _source_type and other internal keys for callers)
@@ -523,6 +536,7 @@ class RetrievalService:
         mode: str = "local",
         filters: Optional[Dict[str, Any]] = None,
         top_k: Optional[int] = None,
+        gap_candidates_hits: Optional[List[Dict[str, Any]]] = None,
     ) -> EvidencePack:
         """
         统一检索入口。
@@ -532,6 +546,7 @@ class RetrievalService:
             mode: "local" 仅本地向量/图, "web" 仅网络搜索, "hybrid" 本地+网络合并
             filters: 预留过滤条件
             top_k: 返回条数，默认使用实例 top_k
+            gap_candidates_hits: 可选，预计算的 gap 候选（如 Sonar 前置知识引用），仅 hybrid 时参与 fuse_pools_with_gap_protection
 
         Returns:
             EvidencePack
@@ -539,17 +554,30 @@ class RetrievalService:
         k = top_k if top_k is not None else self.top_k
         step_top_k = (filters or {}).get("step_top_k")
         ui_reranker_mode = (filters or {}).get("reranker_mode") or None
+        rank_pool_multiplier = (filters or {}).get("rank_pool_multiplier")
+        try:
+            rank_pool_multiplier = float(rank_pool_multiplier)
+            if rank_pool_multiplier <= 0:
+                raise ValueError("rank_pool_multiplier must be positive")
+        except Exception:
+            rank_pool_multiplier = _DEFAULT_RANK_POOL_MULTIPLIER
+        trace_ctx = {
+            "job_id": (filters or {}).get("trace_job_id"),
+            "phase": (filters or {}).get("trace_phase"),
+            "section": (filters or {}).get("trace_section"),
+        }
+        trace_ctx = {k_: v for k_, v in trace_ctx.items() if v}
         result_limit = step_top_k if step_top_k is not None else k
         _cascade_bge_k = (filters or {}).get("colbert_top_k") or None  # only explicit override
         logger.debug(
             "[service.search] query=%r mode=%s top_k=%s → k=%d | step_top_k=%s → result_limit=%d"
-            " | reranker_mode=%s | web_providers=%s | year=%s~%s | optimizer=%s | serpapi_ratio=%s",
+            " | reranker_mode=%s | rank_pool_multiplier=%.2f | web_providers=%s"
+            " | year=%s~%s | serpapi_ratio=%s",
             query[:60], mode, top_k, k,
             step_top_k, result_limit,
-            ui_reranker_mode,
+            ui_reranker_mode, rank_pool_multiplier,
             ",".join((filters or {}).get("web_providers") or []) or "none",
             (filters or {}).get("year_start"), (filters or {}).get("year_end"),
-            (filters or {}).get("use_query_optimizer"),
             (filters or {}).get("serpapi_ratio"),
         )
 
@@ -575,6 +603,20 @@ class RetrievalService:
         if year_start is not None or year_end is not None:
             diag["year_window"] = {"year_start": year_start, "year_end": year_end}
 
+        def _summarize_web_source_configs(raw_cfg: Any) -> Dict[str, Any]:
+            if not isinstance(raw_cfg, dict):
+                return {}
+            summary: Dict[str, Any] = {}
+            for provider, cfg in raw_cfg.items():
+                if isinstance(cfg, dict):
+                    summary[provider] = {
+                        "topK": cfg.get("topK"),
+                        "top_k": cfg.get("top_k"),
+                    }
+                else:
+                    summary[provider] = None
+            return summary
+
         def _do_local() -> List[Dict[str, Any]]:
             config = RetrievalConfig(
                 mode="hybrid",
@@ -584,6 +626,8 @@ class RetrievalService:
                 year_end=year_end,
                 reranker_mode=ui_reranker_mode,
                 step_top_k=(filters or {}).get("step_top_k"),
+                rank_pool_multiplier=rank_pool_multiplier,
+                trace_ctx=trace_ctx,
             )
             return self.retriever.retrieve(query, self.collection, config, diagnostics=diag)
 
@@ -598,14 +642,12 @@ class RetrievalService:
             # Chat 时前端传 web_source_configs：每个 provider 在各组查询下使用该 provider 的 topK
             web_source_configs = (filters or {}).get("web_source_configs") or {}
             use_query_expansion = (filters or {}).get("use_query_expansion")
-            use_query_optimizer = (filters or {}).get("use_query_optimizer")
-            query_optimizer_max_queries = (filters or {}).get("query_optimizer_max_queries")
             _llm_provider = (filters or {}).get("llm_provider")
             _model_override = (filters or {}).get("model_override")
             # 无 web_source_configs 时用 step_top_k 推导统一上限；有则各 provider 用自身 topK
             _final = (filters or {}).get("step_top_k") or k
             _n_providers = max(len(web_providers or []), 1)
-            _n_queries = query_optimizer_max_queries or 3
+            _n_queries = 3  # default query count when using queries_per_provider
             _auto_per_provider = max(5, math.ceil(_final * 3.5 / (_n_providers * _n_queries)))
             logger.info(
                 "web search params: providers=%s auto_per_provider=%s step_top_k=%s llm=%s/%s",
@@ -614,6 +656,11 @@ class RetrievalService:
                 _final,
                 _llm_provider,
                 _model_override,
+            )
+            logger.info(
+                "[retrieval] request web_source_configs summary=%s semantic=%s",
+                _summarize_web_source_configs(web_source_configs),
+                web_source_configs.get("semantic") if isinstance(web_source_configs, dict) else None,
             )
             use_content_fetcher = (filters or {}).get("use_content_fetcher")
             _queries_per_provider = (filters or {}).get("web_queries_per_provider")
@@ -645,8 +692,6 @@ class RetrievalService:
                 source_configs=web_source_configs,
                 max_results_per_provider=_auto_per_provider,
                 use_query_expansion=use_query_expansion,
-                use_query_optimizer=use_query_optimizer,
-                query_optimizer_max_queries=query_optimizer_max_queries,
                 llm_provider=_llm_provider,
                 model_override=_model_override,
                 use_content_fetcher="off",   # skip fetcher here; done in Phase 2 below
@@ -725,27 +770,26 @@ class RetrievalService:
             local_hits: List[Dict[str, Any]] = []
             web_hits: List[Dict[str, Any]] = []
 
-            # Return more local candidates so the global cross-source rerank has
-            # a rich pool to work with; final truncation to result_limit is done
-            # by fuse_pools_with_gap_protection after merging with web results.
-            local_recall_k = min(actual_recall, max(result_limit * 2, 20))
-            # cascade BGE stage: only explicit colbert_top_k filter is a manual override.
-            # step_top_k flows as top_k into _rerank_candidates which auto-applies ceil(top_k*1.5).
+            # In hybrid mode, local branch uses UI target exactly (no amplification).
+            # Final truncation to result_limit is done by fuse_pools_with_gap_protection
+            # after merging local + web.
             cascade_bge_k = (filters or {}).get("colbert_top_k") or None
             local_config = RetrievalConfig(
                 mode="hybrid",
-                top_k=actual_recall,
+                top_k=result_limit,
                 rerank=not skip_rerank,
                 year_start=year_start,
                 year_end=year_end,
                 reranker_mode=ui_reranker_mode,
                 colbert_top_k=cascade_bge_k,
-                step_top_k=local_recall_k,
+                step_top_k=result_limit,
+                rank_pool_multiplier=1.0,
+                trace_ctx=trace_ctx,
             )
 
             logger.info(
-                "[retrieval] hybrid start result_limit=%s local_recall_k=%s timeout_s=%s skip_rerank=%s",
-                result_limit, local_recall_k, timeout_s, skip_rerank,
+                "[retrieval] hybrid start result_limit=%s (local=result_limit, no amp) timeout_s=%s skip_rerank=%s",
+                result_limit, timeout_s, skip_rerank,
             )
 
             # ── Timeout logic: we do not "require" local; we run local + web in parallel.
@@ -876,19 +920,40 @@ class RetrievalService:
                     "[retrieval] fuse_pre main=%d web=%d total=%d result_limit=%d",
                     len(local_main), len(web_main), main_total, result_limit,
                 )
+            req_mode = ui_reranker_mode or getattr(settings.search, "reranker_mode", "bge_only")
+            cascade_mul = (
+                float(getattr(settings.search, "cascade_bge_multiplier", 1.5) or 1.5)
+                if req_mode == "cascade"
+                else 1.0
+            )
+            first_stage_mul = rank_pool_multiplier * cascade_mul
+            logger.info(
+                "[retrieval] main_fusion_policy mode=%s first_stage_mul=%.2f second_stage_mul=%.2f "
+                "(first≈cascade*rank_pool, second≈rank_pool)",
+                req_mode, first_stage_mul, rank_pool_multiplier,
+            )
+            diag["main_fusion_policy"] = {
+                "mode": req_mode,
+                "cascade_multiplier": round(cascade_mul, 3),
+                "rank_pool_multiplier": round(rank_pool_multiplier, 3),
+                "first_stage_multiplier": round(first_stage_mul, 3),
+                "second_stage_multiplier": round(rank_pool_multiplier, 3),
+            }
 
             # ── Global fusion: single ranked pool → top result_limit ──
             # Local + web are merged and globally reranked in one pass so
             # cross-source ordering reflects a unified relevance scale.
-            # For the chat path there is no dedicated gap pool; gap protection
-            # is applied per-section in Deep Research via _rerank_section_pool_chunks.
+            # Optional gap_candidates_hits (e.g. Sonar prelim citations) participate in fusion.
+            gap_candidates = gap_candidates_hits if gap_candidates_hits else []
             fused_hits = fuse_pools_with_gap_protection(
                 query=query,
                 main_candidates=local_main + web_main,
-                gap_candidates=[],
+                gap_candidates=gap_candidates,
                 top_k=result_limit,
+                rank_pool_multiplier=rank_pool_multiplier,
                 reranker_mode=ui_reranker_mode,
                 skip_rerank=skip_rerank,
+                trace_ctx=trace_ctx,
                 diag=diag,
             )
 
@@ -907,6 +972,8 @@ class RetrievalService:
                     year_end=year_end,
                     reranker_mode=ui_reranker_mode,
                     step_top_k=(filters or {}).get("step_top_k"),
+                    rank_pool_multiplier=rank_pool_multiplier,
+                    trace_ctx=trace_ctx,
                 )
                 hits = self.retriever.retrieve(query, self.collection, config, diagnostics=diag)
                 total_candidates += len(hits) * 2
@@ -930,18 +997,21 @@ class RetrievalService:
                     # 各 provider 使用 web_source_configs 中该 provider 的 topK
                     web_source_configs = (filters or {}).get("web_source_configs") or {}
                     use_query_expansion = (filters or {}).get("use_query_expansion")
-                    use_query_optimizer = (filters or {}).get("use_query_optimizer")
-                    query_optimizer_max_queries = (filters or {}).get("query_optimizer_max_queries")
                     _llm_provider = (filters or {}).get("llm_provider")
                     _model_override = (filters or {}).get("model_override")
                     # 参数级联
                     _final = (filters or {}).get("step_top_k") or k
                     _n_providers = max(len(web_providers or []), 1)
-                    _n_queries = query_optimizer_max_queries or 3
+                    _n_queries = 3
                     _auto_per_provider = max(5, math.ceil(_final * 3.5 / (_n_providers * _n_queries)))
                     _use_content_fetcher = (filters or {}).get("use_content_fetcher")
                     _semantic_query_map = (filters or {}).get("semantic_query_map")
                     _serpapi_ratio = (filters or {}).get("serpapi_ratio")
+                    logger.info(
+                        "[retrieval] request web_source_configs summary=%s semantic=%s",
+                        _summarize_web_source_configs(web_source_configs),
+                        web_source_configs.get("semantic") if isinstance(web_source_configs, dict) else None,
+                    )
 
                     # 为 Lazy Fetching 预判构建 LLM 客户端（仅智能模式 _use_content_fetcher=None 或 'auto'，使用 lite 降级）
                     _llm_client = None
@@ -958,8 +1028,6 @@ class RetrievalService:
                         source_configs=web_source_configs,
                         max_results_per_provider=_auto_per_provider,
                         use_query_expansion=use_query_expansion,
-                        use_query_optimizer=use_query_optimizer,
-                        query_optimizer_max_queries=query_optimizer_max_queries,
                         llm_provider=_llm_provider,
                         model_override=_model_override,
                         use_content_fetcher=_use_content_fetcher,
@@ -983,7 +1051,7 @@ class RetrievalService:
                         else:
                             try:
                                 web_hits = _rerank_candidates(
-                                    query, web_hits, top_k=_web_top_k, reranker_mode=ui_reranker_mode,
+                                    query, web_hits, top_k=_web_top_k, reranker_mode=ui_reranker_mode, trace_ctx=trace_ctx,
                                 )
                             except Exception as e:
                                 logger.warning("web cross-encoder rerank failed, falling back to embedding: %s", e)

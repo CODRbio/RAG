@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Target, FlaskConical, HelpCircle, Ban, BookOpen, Rocket, Clock, Edit3, RotateCcw } from 'lucide-react';
+import { Target, FlaskConical, HelpCircle, Ban, BookOpen, Rocket, Clock, Edit3, RotateCcw, ChevronDown, ChevronUp } from 'lucide-react';
 import type { Canvas } from '../../types';
 import { restartDeepResearchPhase } from '../../api/chat';
 import { useChatStore, useToastStore, useUIStore } from '../../stores';
@@ -23,7 +23,9 @@ export function ExploreStage({ canvas }: ExploreStageProps) {
   const { setDeepResearchTopic, setShowDeepResearchDialog, setDeepResearchActive, setSessionId, setCanvasId } = useChatStore();
   const { requestSessionListRefresh } = useUIStore();
   const [restarting, setRestarting] = useState(false);
+  const [showPreliminaryKnowledge, setShowPreliminaryKnowledge] = useState(false);
   const brief = canvas.research_brief;
+  const preliminaryKnowledge = (canvas.preliminary_knowledge || '').trim();
 
   const resolveSourceJobId = (): string | null => {
     const active = localStorage.getItem(DEEP_RESEARCH_JOB_KEY);
@@ -243,6 +245,35 @@ export function ExploreStage({ canvas }: ExploreStageProps) {
           {canvas.working_title || canvas.topic || '未命名研究'}
         </h3>
       </div>
+
+      {/* Preliminary knowledge (Sonar pre-research) */}
+      {preliminaryKnowledge && (
+        <div className="bg-[var(--bg-surface)] rounded-lg p-4 border border-[var(--border-subtle)]">
+          <button
+            onClick={() => setShowPreliminaryKnowledge((prev) => !prev)}
+            className="w-full flex items-center justify-between text-left"
+          >
+            <div className="flex items-center gap-2">
+              <BookOpen size={14} className="text-[var(--primary)]" />
+              <span className="text-xs font-medium text-[var(--text-tertiary)] uppercase tracking-wider">
+                Preliminary Research (Sonar)
+              </span>
+            </div>
+            {showPreliminaryKnowledge ? (
+              <ChevronUp size={14} className="text-[var(--text-tertiary)]" />
+            ) : (
+              <ChevronDown size={14} className="text-[var(--text-tertiary)]" />
+            )}
+          </button>
+          {showPreliminaryKnowledge && (
+            <div className="mt-3 max-h-72 overflow-y-auto rounded border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-3">
+              <p className="text-sm text-[var(--text-secondary)] whitespace-pre-wrap leading-relaxed">
+                {preliminaryKnowledge}
+              </p>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* 6-Card Grid */}
       <div className="grid grid-cols-1 gap-3">

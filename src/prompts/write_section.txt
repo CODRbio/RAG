@@ -6,6 +6,7 @@ Requirements:
 - Length: around 400-600 words
 - Keep consistency with other sections
 - Cross-check key data points against the verification evidence block before finalizing claims
+- Output only the section body; do not include the section heading or title
 {language_instruction}
 {user_context_block}
 {triangulation_block}

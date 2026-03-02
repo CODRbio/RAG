@@ -137,6 +137,7 @@ def export_canvas(canvas_id: str) -> Dict[str, Any]:
         "topic": c.topic,
         "working_title": c.working_title,
         "abstract": c.abstract,
+        "preliminary_knowledge": c.preliminary_knowledge or "",
         "keywords": c.keywords,
         "stage": c.stage,
         "refined_markdown": c.refined_markdown,

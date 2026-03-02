@@ -188,12 +188,16 @@ export async function deepResearchSubmit(data: DeepResearchConfirmRequest): Prom
 }
 
 export async function getDeepResearchJob(jobId: string): Promise<DeepResearchJobInfo> {
-  const res = await client.get<DeepResearchJobInfo>(`/deep-research/jobs/${encodeURIComponent(jobId)}`);
+  const res = await getWithRetry<DeepResearchJobInfo>(
+    `/deep-research/jobs/${encodeURIComponent(jobId)}`,
+  );
   return res.data;
 }
 
 /**
- * 列出 Deep Research 后台任务（用于恢复视图）
+ * 列出 Deep Research 后台任务（用于恢复视图）。
+ * 使用 getWithRetry：后端 worker 意外退出时（socket hang up）会自动重试，
+ * 避免 Sidebar/CanvasPanel 的轮询请求直接变成用户可见错误。
  */
 export async function listDeepResearchJobs(
   limit: number = 20,
@@ -201,7 +205,7 @@ export async function listDeepResearchJobs(
 ): Promise<DeepResearchJobInfo[]> {
   const params: Record<string, string | number> = { limit };
   if (status) params.status = status;
-  const res = await client.get<DeepResearchJobInfo[]>('/deep-research/jobs', { params });
+  const res = await getWithRetry<DeepResearchJobInfo[]>('/deep-research/jobs', { params });
   return res.data || [];
 }
 
@@ -210,7 +214,7 @@ export async function listDeepResearchJobEvents(
   afterId: number,
   limit: number = 200,
 ): Promise<DeepResearchJobEvent[]> {
-  const res = await client.get<{ job_id: string; events: DeepResearchJobEvent[] }>(
+  const res = await getWithRetry<{ job_id: string; events: DeepResearchJobEvent[] }>(
     `/deep-research/jobs/${encodeURIComponent(jobId)}/events`,
     { params: { after_id: afterId, limit } },
   );

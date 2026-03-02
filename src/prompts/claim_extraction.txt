@@ -9,9 +9,10 @@ For each claim, provide:
 - **confidence**: "high" (directly supported by data), "medium" (inferred), or "low" (speculative)
 - **limitations**: Any caveats or limitations mentioned
 - **source_section**: Which section this claim comes from (abstract/results/conclusion/discussion)
+- **quantitative_results**: Key numerical findings verbatim (e.g. "n=240, pH 7.3 +/- 0.4, p<0.001 vs control"). For comparisons, include both sides. Write "N/A" if no quantitative data.
 
 Return ONLY a JSON object:
-{{"claims": [{{"text": "...", "evidence": "...", "methodology": "...", "confidence": "high|medium|low", "limitations": "...", "source_section": "..."}}]}}
+{{"claims": [{{"text": "...", "evidence": "...", "methodology": "...", "confidence": "high|medium|low", "limitations": "...", "source_section": "...", "quantitative_results": "..."}}]}}
 
 Paper text:
 {text}

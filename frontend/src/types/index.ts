@@ -96,6 +96,9 @@ export interface EvidenceSummary {
   diagnostics?: RetrievalDiagnostics;
 }
 
+/** Pre-Research (Sonar) strength: off | sonar | sonar-pro | sonar-reasoning-pro */
+export type SonarStrength = 'off' | 'sonar' | 'sonar-pro' | 'sonar-reasoning-pro';
+
 export interface ChatRequest {
   session_id?: string;
   user_id?: string;
@@ -106,8 +109,6 @@ export interface ChatRequest {
   web_providers?: string[];
   web_source_configs?: Record<string, { topK: number; threshold: number; useSerpapi?: boolean }>;
   serpapi_ratio?: number;  // SerpAPI 轮询比例 0-1（仅当 google/scholar 启用 useSerpapi 时生效）
-  use_query_optimizer?: boolean;  // 是否启用查询优化器
-  query_optimizer_max_queries?: number; // 每个搜索引擎最多生成的查询数
   use_query_expansion?: boolean;  // 兼容字段（已弃用）
   local_top_k?: number;  // 本地检索返回的最大文档数
   local_threshold?: number;  // 本地检索的相似度阈值 (0-1)
@@ -121,6 +122,12 @@ export interface ChatRequest {
   use_content_fetcher?: 'auto' | 'force' | 'off';  // 是否对网络搜索结果做全文抓取（None 用后端默认）
   use_agent?: boolean;  // [兼容旧字段] 是否启用 Agent，推荐使用 agent_mode
   agent_mode?: 'standard' | 'assist' | 'autonomous';  // Agent 执行模式
+  /** Pre-Research 强度：off | sonar | sonar-pro | sonar-reasoning-pro */
+  sonar_strength?: SonarStrength;
+  /** @deprecated 使用 sonar_strength，后端兼容 */
+  use_sonar_prelim?: boolean;
+  /** @deprecated 使用 sonar_strength，后端兼容 */
+  sonar_model?: string;
   max_iterations?: number;  // Agent ReAct 最大迭代轮数，默认 2，仅 assist/autonomous 时生效
   clarification_answers?: Record<string, string>;
   output_language?: 'auto' | 'en' | 'zh';
@@ -552,6 +559,7 @@ export interface Canvas {
   topic: string;
   working_title: string;
   abstract: string;
+  preliminary_knowledge?: string;
   keywords: string[];
   stage: CanvasStage;
   refined_markdown: string;
@@ -651,6 +659,8 @@ export interface RagConfig {
   enableHippoRAG: boolean;
   enableReranker: boolean;
   agentMode: 'standard' | 'assist' | 'autonomous';  // Agent 执行模式
+  /** Pre-Research 强度：off | sonar | sonar-pro | sonar-reasoning-pro，默认 sonar-reasoning-pro */
+  sonarStrength: SonarStrength;
   maxIterations: number;  // Agent ReAct 最大迭代轮数，默认 2
   agentDebugMode: boolean;  // 是否显示 Agent 详细调试面板
 }
@@ -658,8 +668,6 @@ export interface RagConfig {
 export interface WebSearchConfig {
   enabled: boolean;
   sources: WebSource[];
-  queryOptimizer: boolean;   // 查询优化器（针对不同搜索引擎优化查询格式）
-  maxQueriesPerProvider: number; // 每个搜索引擎每种语言的查询数
   contentFetcherMode: 'auto' | 'force' | 'off';  // 全文抓取模式
   serpapiRatio: number; // SerpAPI 轮询比例 0-100（仅当 google/scholar 开启 useSerpapi 时生效）
 }

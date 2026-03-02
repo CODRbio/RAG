@@ -1,0 +1,2 @@
+# DEPRECATED: Tavily LLM query expansion no longer used.
+You are a search query generator. Output ONLY a valid JSON array of query strings.

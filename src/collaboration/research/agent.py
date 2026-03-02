@@ -117,6 +117,55 @@ _BILINGUAL_HINT_ACADEMIC = _pm.load("bilingual_hint_academic.txt").strip()
 _BILINGUAL_HINT_DISCOVERY = _pm.load("bilingual_hint_discovery.txt").strip()
 _BILINGUAL_HINT_GAP = _pm.load("bilingual_hint_gap_queries.txt").strip()
 
+
+def _make_trace_ctx(
+    state: "DeepResearchState",
+    *,
+    phase: str,
+    section: str = "",
+) -> Dict[str, str]:
+    """Build retrieval/rerank trace context for multi-worker log disambiguation."""
+    ctx: Dict[str, str] = {"phase": phase}
+    jid = str(state.get("job_id") or "").strip()
+    sec = str(section or state.get("current_section") or "").strip()
+    if jid:
+        ctx["job_id"] = jid
+    if sec:
+        ctx["section"] = sec
+    return ctx
+
+
+def _inject_trace_filters(
+    filters: Dict[str, Any],
+    state: "DeepResearchState",
+    *,
+    phase: str,
+    section: str = "",
+) -> Dict[str, Any]:
+    """Attach trace context into retrieval filters (non-functional metadata)."""
+    trace = _make_trace_ctx(state, phase=phase, section=section)
+    if trace.get("job_id"):
+        filters["trace_job_id"] = trace["job_id"]
+    filters["trace_phase"] = trace.get("phase", phase)
+    if trace.get("section"):
+        filters["trace_section"] = trace["section"]
+    return filters
+
+
+def _ensure_research_rank_pool_multiplier(filters: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Normalize research rank-pool multiplier in filters for main fusion."""
+    normalized: Dict[str, Any] = dict(filters or {})
+    fallback = float(getattr(settings.search, "research_rank_pool_multiplier", 3.0))
+    raw = normalized.get("rank_pool_multiplier")
+    try:
+        value = float(raw)
+        if value <= 0:
+            raise ValueError("rank_pool_multiplier must be positive")
+    except Exception:
+        value = fallback
+    normalized["rank_pool_multiplier"] = value
+    return normalized
+
 # ── Engine-specific gap query routing ─────────────────────────────────────────
 # Maps LLM JSON keys → category tags used by _execute_tiered_search routing.
 _GAP_ENGINE_TAG_MAP = {
@@ -832,7 +881,7 @@ def reconstruct_state_from_checkpoint(
         "session_id": str(state_data.get("session_id") or ""),
         "user_id": str(state_data.get("user_id") or ""),
         "search_mode": str(state_data.get("search_mode") or "hybrid"),
-        "filters": dict(state_data.get("filters") or {}),
+        "filters": _ensure_research_rank_pool_multiplier(state_data.get("filters") or {}),
         "write_top_k": state_data.get("write_top_k"),
         "current_section": str(state_data.get("current_section") or ""),
         "sections_completed": list(state_data.get("sections_completed") or []),
@@ -1220,16 +1269,13 @@ def _build_user_context_block(state: DeepResearchState, max_chars: int = DR_USER
 
 
 def _compute_effective_write_k(preset: Dict[str, Any], filters: Optional[Dict[str, Any]]) -> int:
-    """Compute per-section write evidence window with a safety cap.
+    """Compute per-section write evidence window.
 
     write_top_k = per-output-unit evidence cap (one DR section = one unit).
-    If explicitly provided, use it (capped). Otherwise derive from step_top_k * 1.5 or preset.
+    If explicitly provided, use it directly (no backend cap). Otherwise derive
+    from step_top_k * 1.5 or preset.
     """
     preset_write_k = int(preset.get("search_top_k_write", 12))
-    write_k_cap = int(preset.get("search_top_k_write_max", 60))
-    if write_k_cap <= 0:
-        write_k_cap = 60
-    write_k_cap = max(write_k_cap, preset_write_k)
 
     ui_write_k = 0
     try:
@@ -1238,7 +1284,7 @@ def _compute_effective_write_k(preset: Dict[str, Any], filters: Optional[Dict[st
         ui_write_k = 0
 
     if ui_write_k > 0:
-        return min(max(preset_write_k, ui_write_k), write_k_cap)
+        return max(preset_write_k, ui_write_k)
 
     ui_step_k = 0
     try:
@@ -1246,8 +1292,7 @@ def _compute_effective_write_k(preset: Dict[str, Any], filters: Optional[Dict[st
     except (TypeError, ValueError):
         ui_step_k = 0
 
-    effective_write_k = max(preset_write_k, int(ui_step_k * 1.5)) if ui_step_k > 0 else preset_write_k
-    return min(effective_write_k, write_k_cap)
+    return max(preset_write_k, int(ui_step_k * 1.5)) if ui_step_k > 0 else preset_write_k
 
 
 def _tokenize_for_overlap(text: str) -> List[str]:
@@ -1373,6 +1418,7 @@ def _rerank_section_pool_chunks(
     top_k: int,
     *,
     reranker_mode: Optional[str] = None,
+    trace_ctx: Optional[Dict[str, Any]] = None,
 ) -> List[Any]:
     """Rerank section pool chunks with gap-pool protection.
 
@@ -1472,6 +1518,7 @@ def _rerank_section_pool_chunks(
                 top_k=min(max(top_k, 1), len(all_candidates)),
                 gap_ratio=float(getattr(settings.search, "research_gap_ratio", 0.25)),
                 rank_pool_multiplier=float(getattr(settings.search, "research_rank_pool_multiplier", 3.0)),
+                trace_ctx=trace_ctx,
                 reranker_mode=reranker_mode,
             )
         except Exception as e:
@@ -1488,6 +1535,7 @@ def _rerank_section_pool_chunks(
                     candidates=all_candidates,
                     top_k=min(max(top_k, 1), len(all_candidates)),
                     reranker_mode=reranker_mode,
+                    trace_ctx=trace_ctx,
                 )
             except Exception:
                 fused = sorted(
@@ -1688,8 +1736,8 @@ def _generate_refined_queries(
     try:
         svc = _get_retrieval_svc(state)
         ref_filters = dict(state.get("filters") or {})
-        ref_filters["use_query_optimizer"] = False
         ref_filters["reranker_mode"] = "bge_only"
+        _inject_trace_filters(ref_filters, state, phase="refine_query", section=section.title)
         pack = svc.search(
             query=f"{topic} {section.title}",
             mode=state.get("search_mode", "hybrid"),
@@ -2321,19 +2369,44 @@ def plan_node(state: DeepResearchState) -> DeepResearchState:
     trajectory = state["trajectory"]
     max_sections = _normalize_max_sections(state.get("max_sections"), default=4)
 
-    # Initial retrieval for background context
-    # SmartQueryOptimizer is enabled here: it internally detects Chinese input and
-    # generates bilingual (zh+en) queries with engine-aware styles when needed.
-    # English input is unchanged (optimizer generates English-only queries).
+    # Initial retrieval for background context: 1+1+1 structured queries (topic + preliminary_knowledge)
     svc = _get_retrieval_svc(state)
     dr_filters = dict(state.get("filters") or {})
-    dr_filters["use_query_optimizer"] = True
     # Research phase: force bge_only for speed; write nodes use the UI's reranker_mode.
     dr_filters["reranker_mode"] = "bge_only"
-    # Use same step_top_k / local_top_k as rest of pipeline (no hidden override).
+    _inject_trace_filters(dr_filters, state, phase="plan_background", section="")
     step_top_k = dr_filters.get("step_top_k")
     local_top_k = dr_filters.get("local_top_k")
     plan_top_k = int(step_top_k or local_top_k or 15)
+    topic = dashboard.brief.topic or ""
+    prelim = (state.get("preliminary_knowledge") or "").strip()
+
+    from src.retrieval.structured_queries import (
+        generate_structured_queries_1plus1plus1,
+        web_queries_per_provider_from_1plus1plus1,
+    )
+    structured = generate_structured_queries_1plus1plus1(
+        topic,
+        prelim,
+        client,
+        model_override=model_override,
+    )
+    search_query = topic
+    if structured:
+        qpp = web_queries_per_provider_from_1plus1plus1(structured, dr_filters.get("web_providers"))
+        if qpp:
+            dr_filters["web_queries_per_provider"] = qpp
+            search_query = structured.get("recall") or topic
+            logger.info(
+                "[plan_node] background 1+1+1 | recall=%r | providers=%s",
+                (search_query or "")[:60],
+                list(qpp.keys()),
+            )
+        else:
+            logger.info("[plan_node] background 1+1+1: no web_providers, using topic as single query")
+    else:
+        logger.warning("[plan_node] background 1+1+1 parse failed, using topic as single query")
+
     logger.info(
         "[plan_node] background retrieval: mode=%s top_k=%d (step_top_k=%s local_top_k=%s) max_sections=%d providers=%s",
         state.get("search_mode", "hybrid"),
@@ -2345,7 +2418,7 @@ def plan_node(state: DeepResearchState) -> DeepResearchState:
     )
     t_retrieval_start = time.perf_counter()
     pack = svc.search(
-        query=dashboard.brief.topic,
+        query=search_query,
         mode=state.get("search_mode", "hybrid"),
         top_k=plan_top_k,
         filters=dr_filters,
@@ -2497,6 +2570,7 @@ def plan_node(state: DeepResearchState) -> DeepResearchState:
             stage="outline",
             skip_draft_review=bool(state.get("skip_draft_review", False)),
             skip_refine_review=bool(state.get("skip_refine_review", False)),
+            preliminary_knowledge=str(state.get("preliminary_knowledge") or ""),
             # 将 brief 结构化保存，便于 Explore 阶段展示
             research_brief={
                 "scope": dashboard.brief.scope,
@@ -2515,7 +2589,7 @@ def plan_node(state: DeepResearchState) -> DeepResearchState:
     from src.collaboration.citation.manager import sync_evidence_to_canvas
     sync_evidence_to_canvas(state["canvas_id"], pack)
 
-    state["markdown_parts"] = [f"# {dashboard.brief.topic}\n"]
+    state["markdown_parts"] = [f"# **{dashboard.brief.topic}**\n"]
     state["sections_completed"] = []
     _emit_progress(
         state,
@@ -2599,8 +2673,8 @@ def _quick_coverage_check(
     try:
         svc = _get_retrieval_svc(state)
         qcc_filters = dict(state.get("filters") or {})
-        qcc_filters["use_query_optimizer"] = False
         qcc_filters["reranker_mode"] = "bge_only"
+        _inject_trace_filters(qcc_filters, state, phase="quick_coverage_check", section=section.title)
         pack = svc.search(
             query=f"{dashboard.brief.topic} {section.title}",
             mode=state.get("search_mode", "hybrid"),
@@ -2740,6 +2814,7 @@ def _execute_tiered_search(
         # Research phase always uses BGE-only reranker for speed;
         # ColBERT (cascade) is reserved for the write stage.
         f["reranker_mode"] = "bge_only"
+        _inject_trace_filters(f, state, phase=tier_label, section=section.title)
         f["web_providers"] = providers
         if semantic_query_map and "semantic" in providers:
             f["semantic_query_map"] = dict(semantic_query_map)
@@ -2929,7 +3004,6 @@ def research_node(state: DeepResearchState) -> DeepResearchState:
     preset = state.get("depth_preset") or get_depth_preset(state.get("depth", DEFAULT_DEPTH))
     svc = _get_retrieval_svc(state)
     base_dr_filters = dict(state.get("filters") or {})
-    base_dr_filters["use_query_optimizer"] = False
 
     # ── Normal / Gap-fill round ──
     section.status = "researching"
@@ -3060,8 +3134,8 @@ def evaluate_node(state: DeepResearchState) -> DeepResearchState:
     findings = ""
     query_text = f"{dashboard.brief.topic} {section.title}"
     eval_filters = dict(state.get("filters") or {})
-    eval_filters["use_query_optimizer"] = False
     eval_filters["reranker_mode"] = "bge_only"  # 评估证据阶段固定 bge_only
+    _inject_trace_filters(eval_filters, state, phase="evaluate", section=section.title)
     pool_chunks = list((state.get("section_evidence_pool") or {}).get(section.title) or [])
     if pool_chunks:
         reranked_pool = _rerank_section_pool_chunks(
@@ -3069,6 +3143,7 @@ def evaluate_node(state: DeepResearchState) -> DeepResearchState:
             pool_chunks=pool_chunks,
             top_k=eval_top_k,
             reranker_mode=eval_filters.get("reranker_mode"),
+            trace_ctx=_make_trace_ctx(state, phase="evaluate_pool_rerank", section=section.title),
         )
         pool_pack = _build_pack_from_chunks(query_text, reranked_pool)
         findings = cap_and_log(
@@ -3150,6 +3225,7 @@ def evaluate_node(state: DeepResearchState) -> DeepResearchState:
             svc = _get_retrieval_svc(state)
             supplement_filters = dict(eval_filters)
             supplement_filters["reranker_mode"] = "bge_only"
+            _inject_trace_filters(supplement_filters, state, phase="evaluate_supplement", section=section.title)
             supplement_top_k = max(5, int(eval_top_k * 0.2))
             for gap in (section.gaps or [])[:3]:
                 gap_q = f"{dashboard.brief.topic} {section.title} {str(gap).strip()}"
@@ -3247,11 +3323,12 @@ def generate_claims_node(state: DeepResearchState) -> DeepResearchState:
             pool_chunks=pool_chunks,
             top_k=write_top_k,
             reranker_mode=dr_filters.get("reranker_mode"),
+            trace_ctx=_make_trace_ctx(state, phase="generate_claims_pool_rerank", section=section.title),
         )
         pack = _build_pack_from_chunks(query_text, selected_chunks)
     else:
         svc = _get_retrieval_svc(state)
-        dr_filters["use_query_optimizer"] = False
+        _inject_trace_filters(dr_filters, state, phase="generate_claims_search", section=section.title)
         dr_filters["web_queries_per_provider"] = _build_write_queries(
             dashboard.brief.topic, section.title,
         )
@@ -3331,35 +3408,44 @@ def write_node(state: DeepResearchState) -> DeepResearchState:
             pool_chunks=pool_chunks,
             top_k=write_top_k,
             reranker_mode=dr_filters.get("reranker_mode"),
+            trace_ctx=_make_trace_ctx(state, phase="write_pool_rerank", section=section.title),
         )
         verify_chunks = _rerank_section_pool_chunks(
             query=verify_query,
             pool_chunks=pool_chunks,
             top_k=verification_k,
             reranker_mode=dr_filters.get("reranker_mode"),
+            trace_ctx=_make_trace_ctx(state, phase="write_verify_pool_rerank", section=section.title),
         )
         pack = _build_pack_from_chunks(base_query, write_chunks)
         verify_pack = _build_pack_from_chunks(verify_query, verify_chunks)
     else:
         svc = _get_retrieval_svc(state)
-        dr_filters["use_query_optimizer"] = False
+        write_filters = dict(dr_filters)
+        _inject_trace_filters(write_filters, state, phase="write_search", section=section.title)
         write_qpp = _build_write_queries(dashboard.brief.topic, section.title)
-        dr_filters["web_queries_per_provider"] = write_qpp
+        write_filters["web_queries_per_provider"] = write_qpp
+        # Write-stage fallback still uses retrieval.search, but budget semantics
+        # must follow write_top_k instead of inherited step_top_k.
+        write_filters.pop("step_top_k", None)
         pack = svc.search(
             query=base_query,
             mode=state.get("search_mode", "hybrid"),
             top_k=write_top_k,
-            filters=dr_filters,
+            filters=write_filters,
         )
         verify_qpp = _build_write_queries(
             dashboard.brief.topic, section.title, extra_kw_suffix="evidence data",
         )
-        dr_filters["web_queries_per_provider"] = verify_qpp
+        verify_filters = dict(dr_filters)
+        _inject_trace_filters(verify_filters, state, phase="write_verify_search", section=section.title)
+        verify_filters["web_queries_per_provider"] = verify_qpp
+        verify_filters.pop("step_top_k", None)
         verify_pack = svc.search(
             query=verify_query,
             mode=state.get("search_mode", "hybrid"),
             top_k=verification_k,
-            filters=dr_filters,
+            filters=verify_filters,
         )
     evidence_str = pack.to_context_string(max_chunks=write_top_k)
     verification_evidence_str = verify_pack.to_context_string(max_chunks=verification_k)
@@ -3436,8 +3522,12 @@ def write_node(state: DeepResearchState) -> DeepResearchState:
                 "\nQuantitative strictness (MANDATORY):\n"
                 "- Structured numeric evidence (e.g., computed_stats/table-like values) is present.\n"
                 "- When any numeric comparison/difference is needed, you MUST call the `run_code` tool to run real Python/Pandas calculation.\n"
-                "- Do not estimate, round by intuition, or fabricate any number; only report values that come from tool execution.\n"
-                "- If calculation is not possible from available data, explicitly state the data limitation instead of guessing.\n"
+                "- Do not estimate, round by intuition, or fabricate any number.\n"
+                "- If calculation is not possible from available data, explicitly state the data limitation.\n"
+                "- EXTRACT and REPORT all key quantitative findings from the evidence verbatim "
+                "(sample sizes, effect sizes, p-values, means/SD, concentration ranges, etc.).\n"
+                "- When the same variable is reported across multiple studies, present a structured "
+                "cross-study comparison (tabular or side-by-side format).\n"
             )
         claims_block = ""
         if state.get("verified_claims"):
@@ -3501,7 +3591,7 @@ def write_node(state: DeepResearchState) -> DeepResearchState:
 
                 react_result = react_loop(
                     messages=messages,
-                    tools=get_tools_by_names(["run_code"]),
+                    tools=get_tools_by_names(["run_code", "summarize_quantitative"]),
                     llm_client=client,
                     max_iterations=4,
                     model=model_override,
@@ -3522,23 +3612,18 @@ def write_node(state: DeepResearchState) -> DeepResearchState:
         except Exception as e:
             section_text = f"(Section '{section.title}' generation failed: {e})"
 
-    # 对章节文本做 hash->cite_key 后处理，并在 state 内保持引用键稳定
+    # 若 LLM 输出了章节标题，去掉以免与下面追加的 ## title 重复
+    if section_text and not section_text.startswith("(Section '"):
+        section_text = _strip_redundant_heading(section_text, [section.title])
+
+    # 仅累积 evidence chunks；[ref:xxxx] 占位符在 synthesize_node 合并时统一解析为 cite_key
     section_chunks = list(pack.chunks) + list(verify_pack.chunks)
     _accumulate_section_pool(state, section.title, section_chunks, pool_source="write_stage")
     _accumulate_evidence_chunks(state, section_chunks)
-    if section_text and section_chunks:
-        section_text, section_citations = _resolve_text_citations(
-            state,
-            section_text,
-            section_chunks,
-            include_unreferenced_documents=False,
-        )
-        if section_citations:
-            state["citations"] = section_citations
 
-    # 添加到 markdown
+    # 添加到 markdown（保留 [ref:xxxx]，合并时再做文献管理）
     level = "##"
-    state.setdefault("markdown_parts", []).append(f"\n{level} {section.title}\n\n{section_text}\n")
+    state.setdefault("markdown_parts", []).append(f"\n{level} **{section.title}**\n\n{section_text}\n")
 
     # 实时写回 Canvas Draft（让前端 Drafting 面板在任务进行中可见）
     if state.get("canvas_id"):
@@ -3928,6 +4013,30 @@ def _split_into_sections(body_md: str) -> List[Tuple[str, str]]:
     return sections
 
 
+def _strip_redundant_heading(section_text: str, title_candidates: List[str]) -> str:
+    """
+    If the first line of section_text is a markdown heading matching one of
+    title_candidates, remove it. Used to avoid duplicate section titles when
+    the LLM outputs a heading in addition to the one we prepend.
+    """
+    text = (section_text or "").strip()
+    if not text:
+        return ""
+    lines = text.splitlines()
+    if not lines:
+        return text
+    first_raw = lines[0].strip()
+    first = first_raw.lstrip("#").strip().lower()
+    candidate_keys = [c.strip().lower() for c in title_candidates if str(c or "").strip()]
+    if first in candidate_keys:
+        lines = lines[1:]
+    elif any(k and k in first for k in candidate_keys):
+        lines = lines[1:]
+    while lines and not lines[0].strip():
+        lines = lines[1:]
+    return "\n".join(lines).strip()
+
+
 def _extract_first_sentence(text: str, max_chars: int = 120) -> str:
     """Return the first sentence of *text*, truncated to *max_chars*."""
     t = (text or "").strip()
@@ -4012,7 +4121,7 @@ def synthesize_node(state: DeepResearchState) -> DeepResearchState:
         """Split body and references, keeping references untouched for coherence pass."""
         if not markdown_text.strip():
             return "", ""
-        ref_titles = ["## 参考文献", "## References"]
+        ref_titles = ["## 参考文献", "## References", "## **参考文献**", "## **References**"]
         for title in ref_titles:
             idx = markdown_text.rfind(f"\n{title}")
             if idx < 0 and markdown_text.startswith(title):
@@ -4080,24 +4189,6 @@ def synthesize_node(state: DeepResearchState) -> DeepResearchState:
                 "reason": "all_evidence_limited_tags_removed",
             }
         return True, {"before": before_n, "after": after_n, "missing": len(missing)}
-
-    def _strip_redundant_heading(section_text: str, title_candidates: List[str]) -> str:
-        text = (section_text or "").strip()
-        if not text:
-            return ""
-        lines = text.splitlines()
-        if not lines:
-            return text
-        first_raw = lines[0].strip()
-        first = first_raw.lstrip("#").strip().lower()
-        candidate_keys = [c.strip().lower() for c in title_candidates if str(c or "").strip()]
-        if first in candidate_keys:
-            lines = lines[1:]
-        elif any(k and k in first for k in candidate_keys):
-            lines = lines[1:]
-        while lines and not lines[0].strip():
-            lines = lines[1:]
-        return "\n".join(lines).strip()
 
     def _script_profile(text: str) -> Tuple[int, int]:
         cjk_n = len(re.findall(r"[\u4e00-\u9fff]", text or ""))
@@ -4312,29 +4403,17 @@ def synthesize_node(state: DeepResearchState) -> DeepResearchState:
         # 在标题后插入摘要
         if len(parts) > 0:
             abstract_title = "摘要" if is_zh else "Abstract"
-            parts.insert(1, f"\n## {abstract_title}\n\n{abstract}\n")
+            parts.insert(1, f"\n## **{abstract_title}**\n\n{abstract}\n")
 
     # 添加不足与展望
     if limitations_section:
         lim_title = "不足与未来方向" if is_zh else "Limitations and Future Directions"
-        parts.append(f"\n## {lim_title}\n\n{limitations_section}\n")
+        parts.append(f"\n## **{lim_title}**\n\n{limitations_section}\n")
     if open_gap_agenda:
         gap_title = "开放问题与未来研究议程" if is_zh else "Open Gaps and Future Research Agenda"
-        parts.append(f"\n## {gap_title}\n\n{open_gap_agenda}\n")
+        parts.append(f"\n## **{gap_title}**\n\n{open_gap_agenda}\n")
 
-    # 添加参考文献
-    if state.get("canvas_id"):
-        try:
-            from src.collaboration.citation.formatter import format_reference_list
-            from src.collaboration.canvas.canvas_manager import get_canvas_citations
-            citations = get_canvas_citations(state["canvas_id"])
-            if citations:
-                ref_text = format_reference_list(citations)
-                ref_title = "参考文献" if is_zh else "References"
-                parts.append(f"\n## {ref_title}\n\n{ref_text}\n")
-                state["citations"] = citations
-        except Exception:
-            pass
+    # 参考文献在最终 citation 解析后由 resolved_citations 统一生成，此处不插入 canvas 引用池
 
     # ── Global coherence refinement pass (whole-document editorial integration) ──
     assembled = "\n".join(parts)
@@ -4642,7 +4721,7 @@ def synthesize_node(state: DeepResearchState) -> DeepResearchState:
             ref_title = "参考文献" if is_zh else "References"
             ref_text = format_reference_list(resolved_citations).strip()
             if ref_text:
-                final_markdown = body_md.rstrip() + f"\n\n## {ref_title}\n\n{ref_text}\n"
+                final_markdown = body_md.rstrip() + f"\n\n## **{ref_title}**\n\n{ref_text}\n"
 
     state["markdown_parts"] = [final_markdown]
 
@@ -4914,6 +4993,7 @@ def _build_initial_state(
     resolved_depth = depth if depth in DEPTH_PRESETS else DEFAULT_DEPTH
     preset = get_depth_preset(resolved_depth)
     resolved_max_sections = _normalize_max_sections(max_sections, default=4)
+    normalized_filters = _ensure_research_rank_pool_multiplier(filters)
     # max_iterations is set as a placeholder here; the real value is computed
     # dynamically in execute_deep_research() after num_sections is known:
     #   max_iterations = (max_section_research_rounds + max_verify_rewrite_cycles) × num_sections
@@ -4925,8 +5005,8 @@ def _build_initial_state(
         "session_id": session_id,
         "user_id": user_id,
         "search_mode": search_mode,
-        "filters": filters or {},
-        "write_top_k": (filters or {}).get("write_top_k"),
+        "filters": normalized_filters,
+        "write_top_k": normalized_filters.get("write_top_k"),
         "current_section": "",
         "sections_completed": [],
         "markdown_parts": [],
@@ -5006,13 +5086,12 @@ def start_deep_research(
     logger.info(
         "[DR start] ▶ topic=%r | session=%s | search_mode=%s | model=%s"
         " | local_top_k=%s | step_top_k=%s | reranker_mode=%s | web_providers=%s | serpapi_ratio=%s"
-        " | year=%s~%s | optimizer=%s | depth=n/a(start phase)",
+        " | year=%s~%s | depth=n/a(start phase)",
         topic[:80], session_id[:12], search_mode, model_override or "default",
         _f.get("local_top_k"), _f.get("step_top_k"), _f.get("reranker_mode"),
         ",".join(_f["web_providers"]) if _f.get("web_providers") else "none",
         _f.get("serpapi_ratio"),
         _f.get("year_start"), _f.get("year_end"),
-        _f.get("use_query_optimizer"),
     )
     state = _build_initial_state(
         topic=topic,
@@ -5256,7 +5335,7 @@ def prepare_deep_research_runtime(
         depth, num_sections, scaled_max_iter, max_research_rounds, max_rewrite_cycles, num_sections,
     )
     if not initial_state_override:
-        initial_state["markdown_parts"] = [f"# {dashboard.brief.topic}\n"]
+        initial_state["markdown_parts"] = [f"# **{dashboard.brief.topic}**\n"]
 
     if initial_state.get("canvas_id") and not initial_state_override:
         try:
@@ -5341,13 +5420,12 @@ def execute_deep_research(
     logger.info(
         "[DR execute] ▶ topic=%r | session=%s | job=%s | depth=%s | search_mode=%s | model=%s"
         " | local_top_k=%s | step_top_k=%s | reranker_mode=%s | web_providers=%s | serpapi_ratio=%s"
-        " | year=%s~%s | optimizer=%s | sections=%d",
+        " | year=%s~%s | sections=%d",
         topic[:80], session_id[:12], job_id[:16] if job_id else "", depth, search_mode, model_override or "default",
         _f.get("local_top_k"), _f.get("step_top_k"), _f.get("reranker_mode"),
         ",".join(_f["web_providers"]) if _f.get("web_providers") else "none",
         _f.get("serpapi_ratio"),
         _f.get("year_start"), _f.get("year_end"),
-        _f.get("use_query_optimizer"),
         len(confirmed_outline) if confirmed_outline else 0,
     )
     runtime = prepare_deep_research_runtime(
@@ -5580,8 +5658,9 @@ def optimize_section_evidence(
 
     preset = state.get("depth_preset") or get_depth_preset(state.get("depth", DEFAULT_DEPTH))
     svc = _get_retrieval_svc(state)
-    effective_filters = dict(filters or state.get("filters") or {})
-    effective_filters["use_query_optimizer"] = False
+    effective_filters = _ensure_research_rank_pool_multiplier(
+        filters or state.get("filters") or {}
+    )
 
     ui_providers = effective_filters.get("web_providers")
     ui_allowed = set(ui_providers) if ui_providers else None

@@ -106,8 +106,6 @@ export function Sidebar({ onStartResize }: SidebarProps) {
     setWebSearchEnabled,
     toggleWebSource,
     updateWebSourceParam,
-    setQueryOptimizer,
-    setMaxQueriesPerProvider,
     toggleSourceSerpapi,
     setSerpapiRatio,
     setAgentMode,
@@ -136,7 +134,6 @@ export function Sidebar({ onStartResize }: SidebarProps) {
   } = useChatStore();
   const { setCanvas, setCanvasContent, clearCanvas, setIsLoading: setCanvasLoading, setActiveStage } = useCanvasStore();
 
-  const [showQuerySettings, setShowQuerySettings] = useState(false);
   const [chatHistory, setChatHistory] = useState<SessionListItem[]>([]);
   const [backgroundJobs, setBackgroundJobs] = useState<DeepResearchJobInfo[]>([]);
   const [stoppingJobId, setStoppingJobId] = useState<string | null>(null);
@@ -999,80 +996,6 @@ export function Sidebar({ onStartResize }: SidebarProps) {
                 </div>
               )}
 
-              {/* 查询增强选项 */}
-              {webSearchConfig.enabled && (
-                <div className="bg-slate-900/30 border border-slate-700/50 rounded-xl p-3 animate-in slide-in-from-top-2 duration-200 space-y-3">
-                  <div className="text-[10px] font-bold text-slate-500 uppercase">
-                    {t('sidebar.queryEnhancement')}
-                  </div>
-                  
-                  {/* 查询优化器 */}
-                  <div className="flex items-center justify-between">
-                    <div>
-                      <div className="flex items-center gap-1.5">
-                        <span className="text-sm font-medium text-slate-300">{t('sidebar.queryOptimizer')}</span>
-                        <HelpTooltip content={t('sidebar.queryOptimizerHelp')}>
-                          <HelpCircle size={12} />
-                        </HelpTooltip>
-                      </div>
-                      <div className="text-[10px] text-slate-500">
-                        {t('sidebar.queryOptimizerDesc')}
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <button
-                        type="button"
-                        onClick={() => setShowQuerySettings((v) => !v)}
-                        className="text-[10px] text-sky-400 px-2 py-1 border border-slate-700/50 rounded-md hover:bg-slate-800 transition-colors"
-                        title={t('sidebar.settingsQueryTitle')}
-                      >
-                        {t('common.settings')}
-                      </button>
-                      <input
-                        id="query-optimizer"
-                        name="query-optimizer"
-                        type="checkbox"
-                        checked={webSearchConfig.queryOptimizer ?? true}
-                        onChange={(e) => {
-                          setQueryOptimizer(e.target.checked);
-                          addToast(
-                            e.target.checked
-                              ? t('sidebar.queryOptimizerEnabled')
-                              : t('sidebar.queryOptimizerDisabled'),
-                            'info'
-                          );
-                        }}
-                        className="accent-sky-500 w-4 h-4 cursor-pointer"
-                      />
-                    </div>
-                  </div>
-
-                  {showQuerySettings && (
-                    <div className="pt-2 border-t border-slate-700/50">
-                      <label className="flex items-center justify-between">
-                        <span className="text-xs text-slate-400">{t('sidebar.queriesPerProvider')}</span>
-                        <select
-                          id="max-queries-per-provider"
-                          name="max-queries-per-provider"
-                          value={webSearchConfig.maxQueriesPerProvider ?? 3}
-                          onChange={(e) => {
-                            setMaxQueriesPerProvider(Number(e.target.value));
-                            addToast(t('sidebar.queryCountSet', { count: Number(e.target.value) }), 'info');
-                          }}
-                          className="text-xs border border-slate-700 rounded-md px-2 py-1 bg-slate-950 text-slate-300 focus:outline-none focus:border-sky-500"
-                        >
-                          {[1, 2, 3, 4, 5].map((n) => (
-                            <option key={n} value={n}>
-                              {n}
-                            </option>
-                          ))}
-                        </select>
-                      </label>
-                    </div>
-                  )}
-                </div>
-              )}
-
               {/* 全文抓取 */}
               {webSearchConfig.enabled && (
                 <div className="bg-slate-900/30 border border-slate-700/50 rounded-xl p-3 animate-in slide-in-from-top-2 duration-200">
@@ -1196,6 +1119,32 @@ export function Sidebar({ onStartResize }: SidebarProps) {
                   />
                 </div>
               )}
+              {/* Pre-Research 强度 (Sonar) */}
+              <div className="flex items-center justify-between border-t border-slate-700/30 pt-2 mt-1">
+                <div>
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-xs text-slate-400">{t('sidebar.sonarStrength', 'Pre-Research 强度')}</span>
+                    <HelpTooltip content={t('sidebar.sonarStrengthHelp', 'Use Perplexity Sonar to fetch preliminary knowledge before retrieval. Off = disabled; Sonar (fast) / Pro (balanced) / Reasoning Pro (deep, default). Set llm.platforms.perplexity.api_key in config/rag_config.local.json.')}>
+                      <HelpCircle size={10} />
+                    </HelpTooltip>
+                  </div>
+                  <div className="text-[10px] text-slate-500">
+                    {t('sidebar.sonarStrengthDesc', 'Off | Sonar | Pro | Reasoning Pro')}
+                  </div>
+                </div>
+                <select
+                  id="sonar-strength"
+                  name="sonar-strength"
+                  value={ragConfig.sonarStrength ?? 'sonar-reasoning-pro'}
+                  onChange={(e) => updateRagConfig({ sonarStrength: e.target.value as import('../../types').SonarStrength })}
+                  className="text-[10px] border border-slate-700 rounded-md px-2 py-1 bg-slate-950 text-slate-300 focus:outline-none focus:border-sky-500"
+                >
+                  <option value="off">{t('sidebar.sonarStrengthOff', 'Off')}</option>
+                  <option value="sonar">{t('sidebar.sonarStrengthSonar', 'Sonar (fast)')}</option>
+                  <option value="sonar-pro">{t('sidebar.sonarStrengthPro', 'Sonar Pro (balanced)')}</option>
+                  <option value="sonar-reasoning-pro">{t('sidebar.sonarStrengthReasoningPro', 'Reasoning Pro (deep)')}</option>
+                </select>
+              </div>
             </div>
           </section>
         )}

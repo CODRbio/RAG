@@ -104,6 +104,7 @@ export function RetrievalDebugPanel({ summary }: Props) {
                       semantic_snippet: 'bg-amber-100 text-amber-700',
                       semantic_bulk: 'bg-yellow-200 text-yellow-800',
                       ncbi: 'bg-pink-100 text-pink-700',
+                      sonar: 'bg-cyan-100 text-cyan-700',
                       web: 'bg-gray-200 text-gray-600',
                     };
                     const LABELS: Record<string, string> = {
@@ -118,6 +119,7 @@ export function RetrievalDebugPanel({ summary }: Props) {
                       semantic_snippet: 'Semantic Snippet',
                       semantic_bulk: 'Semantic Bulk',
                       ncbi: 'PubMed',
+                      sonar: 'Sonar',
                       web: '网络',
                     };
                     return (

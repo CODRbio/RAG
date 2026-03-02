@@ -145,9 +145,25 @@ kill_port() {
 # ── 清理函数 ──
 PIDS=()
 REDIS_STARTED_BY_SCRIPT=0
+
+# watchdog 会把当前 uvicorn PID 写到此文件，cleanup 据此精准杀进程
+BACKEND_PID_FILE="/tmp/rag_backend_${API_PORT:-9999}.pid"
+
 cleanup() {
   echo ""
   echo -e "${YELLOW}[start.sh] 正在关闭服务...${NC}"
+  # 优先通过 PID 文件关闭最新的 uvicorn 进程（含其 worker 子进程）
+  if [ -f "$BACKEND_PID_FILE" ]; then
+    local bpid
+    bpid=$(cat "$BACKEND_PID_FILE" 2>/dev/null || true)
+    if [ -n "$bpid" ]; then
+      local children
+      children=$(pgrep -P "$bpid" 2>/dev/null || true)
+      [ -n "$children" ] && kill $children 2>/dev/null || true
+      kill "$bpid" 2>/dev/null || true
+    fi
+    rm -f "$BACKEND_PID_FILE"
+  fi
   for pid in "${PIDS[@]}"; do
     # 先清理子进程
     local children
@@ -230,11 +246,50 @@ if [ "$RUN_BACKEND" = true ]; then
 
   echo -e "${CYAN}[start.sh] 启动后端 API → http://${BACKEND_HOST}:${BACKEND_PORT}${NC}"
   echo -e "${CYAN}[start.sh] HF endpoint candidates: ${RAG_HF_ENDPOINTS:-${HF_ENDPOINT:-${HF_MIRROR:-https://huggingface.co}}}${NC}"
-  "${PY_CMD[@]}" -m uvicorn src.api.server:app \
-    --host "$BACKEND_HOST" \
-    --port "$BACKEND_PORT" \
-    --workers 2 &
+
+  # ── 后端 watchdog：worker 意外退出时自动重启 ──
+  # BACKEND_MAX_RESTARTS：最大重启次数（默认 3）
+  # BACKEND_RESTART_DELAY：重启前等待秒数（默认 3）
+  # 信号退出（exit ≥ 130，如 SIGINT/SIGTERM）视为主动停止，不触发重启。
+  _backend_watchdog() {
+    local host="$1" port="$2"
+    local max_restarts="${BACKEND_MAX_RESTARTS:-3}"
+    local restart_delay="${BACKEND_RESTART_DELAY:-3}"
+    local restarts=0
+
+    while [ "$restarts" -le "$max_restarts" ]; do
+      "${PY_CMD[@]}" -m uvicorn src.api.server:app \
+        --host "$host" --port "$port" --workers 2 &
+      local bpid=$!
+      echo "$bpid" > "$BACKEND_PID_FILE"
+      if [ "$restarts" -eq 0 ]; then
+        echo -e "${GREEN}[start.sh] 后端启动 PID=${bpid}${NC}"
+      else
+        echo -e "${GREEN}[start.sh] 后端重启成功 PID=${bpid} (第 ${restarts}/${max_restarts} 次)${NC}"
+      fi
+
+      wait "$bpid"
+      local ec=$?
+
+      # 被信号终止（≥130）或正常退出（0）视为主动停止
+      if [ "$ec" -eq 0 ] || [ "$ec" -ge 130 ]; then
+        break
+      fi
+
+      restarts=$((restarts + 1))
+      if [ "$restarts" -gt "$max_restarts" ]; then
+        echo -e "${YELLOW}[start.sh] 后端已重启 ${max_restarts} 次，停止自动重启。请检查日志。${NC}"
+        break
+      fi
+      echo -e "${YELLOW}[start.sh] 后端意外退出(exit=${ec})，${restart_delay}s 后重启 (${restarts}/${max_restarts})...${NC}"
+      sleep "$restart_delay"
+    done
+    rm -f "$BACKEND_PID_FILE"
+  }
+
+  _backend_watchdog "$BACKEND_HOST" "$BACKEND_PORT" &
   PIDS+=($!)
+
   # 等待后端就绪
   echo -e "${CYAN}[start.sh] 等待后端就绪...${NC}"
   for i in $(seq 1 30); do

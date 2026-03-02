@@ -1,4 +1,8 @@
 """
+DEPRECATED: Moved to backup as of Chat/Research 1+1+1 unification.
+The codebase no longer uses SmartQueryOptimizer. Use structured 1+1+1 query generation
+(chat_generate_queries / generate_queries) and web_queries_per_provider instead.
+
 LLM 驱动的智能查询优化器。
 
 针对不同搜索引擎生成合适的搜索词：
@@ -21,7 +25,7 @@ from src.log import get_logger
 from src.utils.prompt_manager import PromptManager
 
 _pm = PromptManager()
-from src.retrieval.query_optimizer import optimize_query
+from src.retrieval.backup.query_optimizer import optimize_query
 
 logger = get_logger(__name__)
 
@@ -268,7 +272,7 @@ class SmartQueryOptimizer:
         # 代价感知路由 (auto_route=True) 当前未使用：统一用 get_routing_plan()；
         # 此处保留分支但复用 optimizer_normal（原 optimizer_auto_route.txt 已移至 prompts/backup）。
         prompt = _pm.render(
-            "optimizer_normal.txt",
+            "backup/optimizer_normal.txt",
             query=query,
             provider_list=provider_list,
             bilingual_instruction=bilingual_instruction,
@@ -278,7 +282,7 @@ class SmartQueryOptimizer:
         try:
             resp = client.chat(
                 messages=[
-                    {"role": "system", "content": _pm.render("optimizer_system.txt")},
+                    {"role": "system", "content": _pm.render("backup/optimizer_system.txt")},
                     {"role": "user", "content": prompt},
                 ],
                 model=model_override or None,
@@ -392,7 +396,7 @@ class SmartQueryOptimizer:
 
         provider_list = ", ".join(candidate_providers)
         prompt = _pm.render(
-            "optimizer_routing_plan.txt",
+            "backup/optimizer_routing_plan.txt",
             query=query,
             provider_list=provider_list,
             max_per=max_per,
@@ -402,7 +406,7 @@ class SmartQueryOptimizer:
         try:
             resp = client.chat(
                 messages=[
-                    {"role": "system", "content": _pm.render("optimizer_routing_plan_system.txt")},
+                    {"role": "system", "content": _pm.render("backup/optimizer_routing_plan_system.txt")},
                     {"role": "user", "content": prompt},
                 ],
                 model=model_override or None,

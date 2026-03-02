@@ -35,14 +35,6 @@ class ChatRequest(BaseModel):
         None,
         description="仅 Tavily：是否启用多查询扩展，None 表示使用配置默认值",
     )
-    use_query_optimizer: Optional[bool] = Field(
-        None,
-        description="是否启用查询优化器（针对不同搜索引擎优化查询格式），None 表示使用配置默认值",
-    )
-    query_optimizer_max_queries: Optional[int] = Field(
-        None,
-        description="查询优化器：每个搜索引擎每种语言查询数（1-5，中文输入时=中文N+英文N），None 表示使用配置默认值",
-    )
     local_top_k: Optional[int] = Field(
         None,
         description="本地检索返回的最大文档数，None 表示使用配置默认值",
@@ -93,7 +85,7 @@ class ChatRequest(BaseModel):
     )
     max_iterations: Optional[int] = Field(
         2,
-        description="Agent ReAct 最大迭代轮数（仅 assist/autonomous 时生效）。默认 2，可在前端高级设置修改。",
+        description="Agent ReAct 最大轮数（仅 assist/autonomous 时生效）。最后一轮固定用于总结，不调用工具。默认 2（1 轮补充 + 1 轮总结）。",
     )
     agent_mode: Optional[str] = Field(
         None,
@@ -104,6 +96,18 @@ class ChatRequest(BaseModel):
             "autonomous（自主：跳过预检索，Agent 全权自主检索和推理）。"
             "优先级高于 use_agent；为 None 时回退到 use_agent 字段推断。"
         ),
+    )
+    sonar_strength: Optional[str] = Field(
+        None,
+        description="Pre-Research 强度: off | sonar | sonar-pro | sonar-reasoning-pro，默认 sonar-reasoning-pro。优先于 use_sonar_prelim/sonar_model。",
+    )
+    use_sonar_prelim: Optional[bool] = Field(
+        None,
+        description="[已弃用] 使用 sonar_strength。是否启用 Sonar 前置知识。",
+    )
+    sonar_model: Optional[str] = Field(
+        None,
+        description="[已弃用] 使用 sonar_strength。Sonar 前置知识使用的模型。",
     )
     clarification_answers: Optional[Dict[str, str]] = Field(
         None,
@@ -281,6 +285,7 @@ class CanvasUpdateRequest(BaseModel):
     topic: Optional[str] = None
     working_title: Optional[str] = None
     abstract: Optional[str] = None
+    preliminary_knowledge: Optional[str] = None
     keywords: Optional[List[str]] = None
     stage: Optional[str] = None
     refined_markdown: Optional[str] = None
@@ -406,6 +411,7 @@ class CanvasResponse(BaseModel):
     topic: str = ""
     working_title: str = ""
     abstract: str = ""
+    preliminary_knowledge: str = ""
     keywords: List[str] = Field(default_factory=list)
     stage: str = "explore"
     refined_markdown: str = ""
@@ -588,8 +594,6 @@ class DeepResearchRequest(BaseModel):
     web_providers: Optional[List[str]] = Field(None, description="Web 搜索来源")
     web_source_configs: Optional[Dict[str, Dict[str, Any]]] = Field(None, description="每个搜索源配置")
     serpapi_ratio: Optional[float] = Field(None, description="SerpAPI 轮询比例 0-1")
-    use_query_optimizer: Optional[bool] = Field(None, description="启用查询优化器")
-    query_optimizer_max_queries: Optional[int] = Field(None, description="每个搜索引擎查询数")
     local_top_k: Optional[int] = Field(None, description="本地检索 top_k")
     local_threshold: Optional[float] = Field(None, description="本地检索阈值")
     year_start: Optional[int] = Field(None, ge=1900, le=2100, description="年份窗口起始（硬过滤）")
@@ -638,8 +642,6 @@ class DeepResearchStartRequest(BaseModel):
     web_providers: Optional[List[str]] = Field(None, description="Web 搜索来源")
     web_source_configs: Optional[Dict[str, Dict[str, Any]]] = Field(None, description="每个搜索源配置")
     serpapi_ratio: Optional[float] = Field(None, description="SerpAPI 轮询比例 0-1")
-    use_query_optimizer: Optional[bool] = Field(None, description="启用查询优化器")
-    query_optimizer_max_queries: Optional[int] = Field(None, description="每个搜索引擎查询数")
     local_top_k: Optional[int] = Field(None, description="本地检索 top_k")
     local_threshold: Optional[float] = Field(None, description="本地检索阈值")
     year_start: Optional[int] = Field(None, ge=1900, le=2100, description="年份窗口起始（硬过滤）")
@@ -732,8 +734,6 @@ class DeepResearchConfirmRequest(BaseModel):
     web_providers: Optional[List[str]] = Field(None, description="Web 搜索来源")
     web_source_configs: Optional[Dict[str, Dict[str, Any]]] = Field(None, description="每个搜索源配置")
     serpapi_ratio: Optional[float] = Field(None, description="SerpAPI 轮询比例 0-1")
-    use_query_optimizer: Optional[bool] = Field(None, description="启用查询优化器")
-    query_optimizer_max_queries: Optional[int] = Field(None, description="每个搜索引擎查询数")
     local_top_k: Optional[int] = Field(None, description="本地检索 top_k")
     local_threshold: Optional[float] = Field(None, description="本地检索阈值")
     year_start: Optional[int] = Field(None, ge=1900, le=2100, description="年份窗口起始（硬过滤）")

@@ -526,7 +526,10 @@ export function DeepResearchDialog() {
             {task.stalledJob && (
               <>
                 <button
-                  onClick={async () => { await task.openCanvasForCurrentJob(); handleClose(); }}
+                  onClick={async () => {
+                    await task.resumeStalledJob();
+                    setShowDeepResearchDialog(false);
+                  }}
                   className="px-4 py-2 text-sm text-indigo-600 hover:bg-indigo-50 rounded-lg transition-colors"
                 >
                   {t('deepResearch.goToCanvas')}

@@ -1,1 +1,0 @@
-You output only valid JSON. No markdown.

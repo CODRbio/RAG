@@ -1,4 +1,4 @@
-
+# DEPRECATED: Tavily LLM query expansion no longer used; expand is always False.
 Act as a search query optimizer for the Tavily API. 
 Generate 3-5 distinct search queries based on the user's input: "{user_query}"
 
@@ -13,4 +13,3 @@ Generate 3-5 distinct search queries based on the user's input: "{user_query}"
 4.  **Format:** Output ONLY a raw JSON array of strings. No Markdown, no code blocks.
 
 Example Output: ["How does X affect Y in {year}?", "X technical architecture overview", "latest developments in X"]
-            

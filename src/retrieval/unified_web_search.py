@@ -38,7 +38,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from config.settings import settings
 from src.log import get_logger
-from src.retrieval.smart_query_optimizer import RoutingPlan, get_smart_query_optimizer
 
 logger = get_logger(__name__)
 
@@ -354,8 +353,6 @@ class UnifiedWebSearcher:
         source_configs: Optional[Dict[str, Dict[str, Any]]] = None,
         max_results_per_provider: int = 5,
         use_query_expansion: Optional[bool] = None,
-        use_query_optimizer: Optional[bool] = None,
-        query_optimizer_max_queries: Optional[int] = None,
         llm_provider: Optional[str] = None,
         model_override: Optional[str] = None,
         use_content_fetcher: Optional[str] = None,
@@ -376,23 +373,14 @@ class UnifiedWebSearcher:
             source_configs: 每个来源的独立配置 {provider_id: {topK: int, threshold: float}}
             max_results_per_provider: 每个来源的最大结果数（当 source_configs 未指定时使用）
             use_query_expansion: 是否使用查询扩展（仅 Tavily 支持）
-            use_query_optimizer: 是否启用智能查询优化器
-            query_optimizer_max_queries: 优化器每个来源生成的最大查询数
             llm_client: LLMManager 客户端，用于 Lazy Fetching 的 LLM 预判
-            queries_per_provider: 调用方预构建的 per-provider 查询，
-                      优先级高于 default_query 但低于 SmartQueryOptimizer。
-                      当 optimizer 关闭时直接使用；optimizer 开启时忽略。
+            queries_per_provider: 调用方预构建的 per-provider 查询（如 1+1+1 结构化查询），
+                      有则使用，无则各引擎使用 query 作为单查询。
         
         Returns:
             合并去重后的结果列表
         """
-        # 检测是否允许智能自动路由（providers=None 或含 "auto"）
-        raw_providers = providers
-        is_auto_route = raw_providers is None or (
-            raw_providers is not None
-            and "auto" in [p.strip().lower() for p in raw_providers if p]
-        )
-        providers = self._resolve_providers(raw_providers)
+        providers = self._resolve_providers(providers)
 
         if not providers:
             return []
@@ -402,108 +390,25 @@ class UnifiedWebSearcher:
             "[retrieval] unified_web_search start query_len=%d providers=%s max_per_provider=%d",
             len(query), providers, max_results_per_provider,
         )
-        logger.info(
-            f"统一搜索: query={query!r}, providers={providers}, auto_route={is_auto_route}"
-        )
 
         source_configs = source_configs or {}
+        resolved_qpp: Dict[str, List[str]] = queries_per_provider if queries_per_provider else {}
+        if resolved_qpp:
+            logger.info("使用调用方预构建查询: %s", list(resolved_qpp.keys()))
 
-        optimizer_enabled = use_query_optimizer
-        if optimizer_enabled is None:
-            optimizer_enabled = bool(
-                getattr(getattr(settings, "web_search", None), "enable_query_optimizer", True)
-            )
-
-        smart_optimizer = get_smart_query_optimizer()
-        use_smart = optimizer_enabled and smart_optimizer.enabled
-
-        all_hits: List[Dict[str, Any]] = []
-
-        # ── 代价感知路由模式（auto） ────────────────────────────────────────────
-        if is_auto_route and use_smart:
-            logger.info("[retrieval] model_call query_optimizer get_routing_plan")
-            plan: RoutingPlan = smart_optimizer.get_routing_plan(
-                query,
-                providers,
-                max_queries_per_provider=query_optimizer_max_queries,
-                llm_provider=llm_provider,
-                model_override=model_override,
-            )
-            logger.info(
-                f"路由计划执行: primary={plan.primary}, fallback={plan.fallback}, "
-                f"is_fresh={plan.is_fresh}"
-            )
-
-            # 执行 primary 引擎
-            primary_hits = await self._run_providers(
-                plan.primary,
-                plan.queries,
-                query,
-                source_configs,
-                max_results_per_provider,
-                year_start=year_start,
-                year_end=year_end,
-                semantic_query_map=semantic_query_map,
-                serpapi_ratio=serpapi_ratio,
-                use_query_expansion=use_query_expansion,
-                llm_provider=llm_provider,
-            )
-            primary_unique_hits = _merge_and_dedup(primary_hits)
-            all_hits.extend(primary_unique_hits)
-
-            # 结果不足时自动启动 fallback 引擎
-            if len(primary_unique_hits) < plan.min_results and plan.fallback:
-                logger.info(
-                    f"Primary 结果不足 ({len(primary_unique_hits)}/{plan.min_results})，"
-                    f"启动 fallback: {plan.fallback}"
-                )
-                fallback_hits = await self._run_providers(
-                    plan.fallback,
-                    plan.queries,
-                    query,
-                    source_configs,
-                    max_results_per_provider,
-                    year_start=year_start,
-                    year_end=year_end,
-                    semantic_query_map=semantic_query_map,
-                    serpapi_ratio=serpapi_ratio,
-                    use_query_expansion=use_query_expansion,
-                    llm_provider=llm_provider,
-                )
-                all_hits.extend(fallback_hits)
-                logger.info(f"Fallback 补充 {len(fallback_hits)} 条，合计 {len(all_hits)} 条")
-
-        # ── 普通模式（前端手动指定引擎）──────────────────────────────────────────
-        else:
-            resolved_qpp: Dict[str, List[str]] = {}
-            if use_smart:
-                logger.info("[retrieval] model_call query_optimizer optimize")
-                resolved_qpp = smart_optimizer.optimize(
-                    query,
-                    providers,
-                    max_queries_per_provider=query_optimizer_max_queries,
-                    llm_provider=llm_provider,
-                    model_override=model_override,
-                    auto_route=False,
-                )
-                logger.info(f"Smart optimizer 生成多组查询: {list(resolved_qpp.keys())}")
-            elif queries_per_provider:
-                resolved_qpp = queries_per_provider
-                logger.info(f"使用调用方预构建查询: {list(resolved_qpp.keys())}")
-
-            all_hits = await self._run_providers(
-                providers,
-                resolved_qpp,
-                query,
-                source_configs,
-                max_results_per_provider,
-                year_start=year_start,
-                year_end=year_end,
-                semantic_query_map=semantic_query_map,
-                serpapi_ratio=serpapi_ratio,
-                use_query_expansion=use_query_expansion,
-                llm_provider=llm_provider,
-            )
+        all_hits = await self._run_providers(
+            providers,
+            resolved_qpp,
+            query,
+            source_configs,
+            max_results_per_provider,
+            year_start=year_start,
+            year_end=year_end,
+            semantic_query_map=semantic_query_map,
+            serpapi_ratio=serpapi_ratio,
+            use_query_expansion=use_query_expansion,
+            llm_provider=llm_provider,
+        )
 
         # 合并去重
         merged = _merge_and_dedup(all_hits)
@@ -798,7 +703,16 @@ class UnifiedWebSearcher:
         def _get_max(p: str) -> int:
             cfg = source_configs.get(p) or {}
             # 兼容前端 topK / 后端 top_k
-            return cfg.get("topK") or cfg.get("top_k") or max_results_per_provider
+            topk = cfg.get("topK") or cfg.get("top_k")
+            if topk is None:
+                if source_configs:
+                    logger.warning(
+                        "web search provider=%s missing topK/top_k in source_configs; fallback to max_results_per_provider=%s",
+                        p,
+                        max_results_per_provider,
+                    )
+                return max_results_per_provider
+            return topk
 
         if source_configs:
             per_provider_k = {p: _get_max(p) for p in providers}
@@ -1089,8 +1003,6 @@ class UnifiedWebSearcher:
         source_configs: Optional[Dict[str, Dict[str, Any]]] = None,
         max_results_per_provider: int = 5,
         use_query_expansion: Optional[bool] = None,
-        use_query_optimizer: Optional[bool] = None,
-        query_optimizer_max_queries: Optional[int] = None,
         llm_provider: Optional[str] = None,
         model_override: Optional[str] = None,
         use_content_fetcher: Optional[str] = None,
@@ -1115,8 +1027,6 @@ class UnifiedWebSearcher:
             source_configs=source_configs,
             max_results_per_provider=max_results_per_provider,
             use_query_expansion=use_query_expansion,
-            use_query_optimizer=use_query_optimizer,
-            query_optimizer_max_queries=query_optimizer_max_queries,
             llm_provider=llm_provider,
             model_override=model_override,
             use_content_fetcher=use_content_fetcher,

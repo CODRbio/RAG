@@ -317,7 +317,8 @@ def _reconcile_redis_active_slots(live_dr_tasks: dict) -> None:
 
     A task_id in Redis SET_ACTIVE is "zombie" when:
       - it is NOT currently tracked in *live_dr_tasks* (i.e. no running asyncio Task), AND
-      - its DB row is no longer in status running/cancelling.
+      - it is not running in Redis task state, AND
+      - its DR DB row is no longer in status running/cancelling.
 
     This prevents a cancel→restart race from permanently blocking a session.
     Runs ~every 60 s from the poll loop so any leftover slot is cleaned up quickly.
@@ -335,10 +336,21 @@ def _reconcile_redis_active_slots(live_dr_tasks: dict) -> None:
         ]
         if not active_task_ids:
             return
-        # Check which of these are neither live asyncio tasks nor "running"/"cancelling" in DB
+        # First pass: not tracked in in-memory DR tasks.
         zombie_ids = [jid for jid in active_task_ids if jid not in live_dr_tasks]
         if not zombie_ids:
             return
+        # Guardrail for chat/unified tasks:
+        # if Redis task state is still "running", do NOT release the active slot.
+        from src.tasks.task_state import TaskStatus
+        running_in_redis: set[str] = set()
+        for jid in zombie_ids:
+            try:
+                st = tq.get_state(jid)
+            except Exception:
+                st = None
+            if st and st.status == TaskStatus.running:
+                running_in_redis.add(jid)
         with Session(get_engine()) as session:
             rows = session.exec(
                 select(DeepResearchJob).where(
@@ -346,16 +358,19 @@ def _reconcile_redis_active_slots(live_dr_tasks: dict) -> None:
                     DeepResearchJob.status.in_(["running", "cancelling"]),
                 )
             ).all()
-            still_running = {row.job_id for row in rows}
+            still_running = {row.job_id for row in rows} | running_in_redis
         to_release = [jid for jid in zombie_ids if jid not in still_running]
         if not to_release:
             return
         for jid in to_release:
             try:
+                state = tq.get_state(jid)
                 with Session(get_engine()) as s2:
                     row = s2.get(DeepResearchJob, jid)
                 sid = ""
-                if row:
+                if state and getattr(state, "session_id", ""):
+                    sid = str(state.session_id or "")
+                elif row:
                     try:
                         req = json.loads(row.request_json or "{}")
                         sid = str(req.get("session_id") or row.session_id or "")

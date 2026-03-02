@@ -410,6 +410,8 @@ def normalize_response(provider_name: str, raw: Dict[str, Any], is_anthropic: bo
         "reasoning_text": None,
         "usage": None,
         "refusal": None,
+        "citations": None,
+        "search_results": None,
     }
 
     try:
@@ -436,10 +438,25 @@ def _normalize_openai_compat(raw: Dict[str, Any]) -> Dict[str, Any]:
         - choices[0].message.reasoning / thoughts
         - content 为 list 时，拼接 type in ("reasoning", "thinking") 的段落
     """
-    result = {"final_text": None, "reasoning_text": None, "usage": None, "refusal": None}
+    result = {
+        "final_text": None,
+        "reasoning_text": None,
+        "usage": None,
+        "refusal": None,
+        "citations": None,
+        "search_results": None,
+    }
 
     # usage
     result["usage"] = raw.get("usage")
+
+    # Perplexity API: top-level citations (URLs) and search_results (title, url, date, snippet)
+    citations = raw.get("citations")
+    if citations is not None and isinstance(citations, list):
+        result["citations"] = [str(u) for u in citations if u]
+    search_results = raw.get("search_results")
+    if search_results is not None and isinstance(search_results, list):
+        result["search_results"] = search_results
 
     choices = raw.get("choices") or []
     if not choices:

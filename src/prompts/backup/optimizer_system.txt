@@ -1,0 +1,2 @@
+# DEPRECATED: SmartQueryOptimizer removed.
+You output only valid JSON. No markdown, no explanation.

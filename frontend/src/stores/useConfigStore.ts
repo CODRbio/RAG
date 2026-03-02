@@ -44,8 +44,6 @@ interface ConfigState {
     field: 'topK' | 'threshold',
     value: number
   ) => void;
-  setQueryOptimizer: (enabled: boolean) => void;
-  setMaxQueriesPerProvider: (value: number) => void;
   setContentFetcherMode: (mode: 'auto' | 'force' | 'off') => void;
   toggleSourceSerpapi: (sourceId: string) => void;
   setSerpapiRatio: (value: number) => void;
@@ -86,6 +84,7 @@ export const useConfigStore = create<ConfigState>()(
         enableHippoRAG: false,
         enableReranker: true,
         agentMode: 'assist' as const,
+        sonarStrength: 'sonar-reasoning-pro' as const,
         maxIterations: 2,
         agentDebugMode: false,
       },
@@ -93,8 +92,6 @@ export const useConfigStore = create<ConfigState>()(
       webSearchConfig: {
         enabled: true,
         sources: defaultWebSources,
-        queryOptimizer: true,   // 默认开启
-        maxQueriesPerProvider: 3,
         contentFetcherMode: 'auto',  // 全文抓取默认智能模式
         serpapiRatio: 50,
       },
@@ -180,19 +177,6 @@ export const useConfigStore = create<ConfigState>()(
           },
         })),
 
-      setQueryOptimizer: (enabled) =>
-        set((state) => ({
-          webSearchConfig: { ...state.webSearchConfig, queryOptimizer: enabled },
-        })),
-
-      setMaxQueriesPerProvider: (value) =>
-        set((state) => ({
-          webSearchConfig: {
-            ...state.webSearchConfig,
-            maxQueriesPerProvider: Math.min(Math.max(1, value), 5),
-          },
-        })),
-
       setContentFetcherMode: (mode) =>
         set((state) => ({
           webSearchConfig: { ...state.webSearchConfig, contentFetcherMode: mode },
@@ -253,14 +237,21 @@ export const useConfigStore = create<ConfigState>()(
             // Migrate old enableAgent boolean to agentMode tri-state
             agentMode: (persisted.ragConfig as any)?.agentMode
               ?? ((persisted.ragConfig as any)?.enableAgent === false ? 'standard' : 'assist'),
+            // Migrate useSonarPrelim + sonarModel -> sonarStrength
+            sonarStrength: ((): import('../types').SonarStrength => {
+              const strength = (persisted.ragConfig as any)?.sonarStrength;
+              if (strength === 'off' || strength === 'sonar' || strength === 'sonar-pro' || strength === 'sonar-reasoning-pro') return strength;
+              const usePrelim = (persisted.ragConfig as any)?.useSonarPrelim ?? false;
+              const model = (persisted.ragConfig as any)?.sonarModel;
+              if (!usePrelim) return 'off';
+              return (model === 'sonar' || model === 'sonar-pro' || model === 'sonar-reasoning-pro' ? model : 'sonar-reasoning-pro') as import('../types').SonarStrength;
+            })(),
             maxIterations: (persisted.ragConfig as any)?.maxIterations ?? 2,
             agentDebugMode: persisted.ragConfig?.agentDebugMode ?? false,
           },
           webSearchConfig: {
             ...currentState.webSearchConfig,
             ...(persisted.webSearchConfig || {}),
-            queryOptimizer: persisted.webSearchConfig?.queryOptimizer ?? true,
-            maxQueriesPerProvider: persisted.webSearchConfig?.maxQueriesPerProvider ?? 3,
             contentFetcherMode: (persisted.webSearchConfig as any)?.contentFetcherMode ?? ((persisted.webSearchConfig as any)?.enableContentFetcher === true ? 'force' : 'auto'),
             serpapiRatio: (persisted.webSearchConfig as any)?.serpapiRatio ?? 50,
             sources: (() => {

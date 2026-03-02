@@ -113,6 +113,8 @@ class SearchSettings:
     rrf_dense_weight: float = float(os.getenv("RRF_DENSE_WEIGHT", "0.6"))
     rrf_sparse_weight: float = float(os.getenv("RRF_SPARSE_WEIGHT", "0.4"))
     rerank_input_k: int = int(os.getenv("RERANK_INPUT_K", "100"))
+    # rerank funnel 最小地板（候选过少时避免过度截断）
+    rerank_funnel_floor_k: int = int(os.getenv("RERANK_FUNNEL_FLOOR_K", "20"))
     # 请求未传 step_top_k 时，rerank 阶段默认保留条数（与前端 stepTopK 同义，仅作服务端默认）
     rerank_output_k: int = int(os.getenv("RERANK_OUTPUT_K", "20"))
     per_doc_cap: int = int(os.getenv("PER_DOC_CAP", "5"))
@@ -121,6 +123,8 @@ class SearchSettings:
     use_colbert_reranker: bool = os.getenv("USE_COLBERT_RERANKER", "true").lower() == "true"
     colbert_model: str = os.getenv("COLBERT_MODEL", "colbert-ir/colbertv2.0")
     colbert_top_k: int = int(os.getenv("COLBERT_TOP_K", "30"))  # cascade 时 BGE 粗排输出条数，再送 ColBERT 精排
+    cascade_bge_multiplier: float = float(os.getenv("CASCADE_BGE_MULTIPLIER", "1.5"))
+    chat_gap_parallel: int = int(os.getenv("CHAT_GAP_PARALLEL", "2"))
     chat_gap_ratio: float = float(os.getenv("CHAT_GAP_RATIO", "0.2"))
     research_gap_ratio: float = float(os.getenv("RESEARCH_GAP_RATIO", "0.25"))
     chat_rank_pool_multiplier: float = float(os.getenv("CHAT_RANK_POOL_MULTIPLIER", "3.0"))
@@ -138,7 +142,6 @@ class WebSearchConfig:
     include_answer: bool = True
     include_domains: List[str] = field(default_factory=list)
     exclude_domains: List[str] = field(default_factory=list)
-    enable_query_optimizer: bool = True
     enable_query_expansion: bool = False
     query_expansion_llm: str = "deepseek"
     max_queries: int = 4
@@ -597,12 +600,15 @@ class Settings:
             rrf_dense_weight=s.get("rrf_dense_weight", 0.6),
             rrf_sparse_weight=s.get("rrf_sparse_weight", 0.4),
             rerank_input_k=s.get("rerank_input_k", 100),
+            rerank_funnel_floor_k=s.get("rerank_funnel_floor_k", int(os.getenv("RERANK_FUNNEL_FLOOR_K", "20"))),
             rerank_output_k=s.get("rerank_output_k", 20),
             per_doc_cap=s.get("per_doc_cap", 5),
             reranker_mode=s.get("reranker_mode", os.getenv("RERANKER_MODE", "bge_only")),
             use_colbert_reranker=s.get("use_colbert_reranker", os.getenv("USE_COLBERT_RERANKER", "false").lower() == "true"),
             colbert_model=s.get("colbert_model", os.getenv("COLBERT_MODEL", "colbert-ir/colbertv2.0")),
             colbert_top_k=s.get("colbert_top_k", int(os.getenv("COLBERT_TOP_K", "30"))),
+            cascade_bge_multiplier=s.get("cascade_bge_multiplier", float(os.getenv("CASCADE_BGE_MULTIPLIER", "1.5"))),
+            chat_gap_parallel=s.get("chat_gap_parallel", int(os.getenv("CHAT_GAP_PARALLEL", "2"))),
             chat_gap_ratio=s.get("chat_gap_ratio", float(os.getenv("CHAT_GAP_RATIO", "0.2"))),
             research_gap_ratio=s.get("research_gap_ratio", float(os.getenv("RESEARCH_GAP_RATIO", "0.25"))),
             chat_rank_pool_multiplier=s.get("chat_rank_pool_multiplier", float(os.getenv("CHAT_RANK_POOL_MULTIPLIER", "3.0"))),
@@ -624,7 +630,6 @@ class Settings:
             include_answer=w.get("include_answer", True),
             include_domains=include,
             exclude_domains=exclude,
-            enable_query_optimizer=bool(w.get("enable_query_optimizer", True)),
             enable_query_expansion=w.get("enable_query_expansion", False),
             query_expansion_llm=(w.get("query_expansion_llm") or "deepseek").strip(),
             max_queries=min(int(w.get("max_queries", 4)), 8),

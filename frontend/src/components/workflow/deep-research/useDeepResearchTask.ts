@@ -12,6 +12,7 @@ import {
   cancelDeepResearchJob,
 } from '../../../api/chat';
 import { exportCanvas, getCanvas } from '../../../api/canvas';
+import { logFrontendDebugEvents } from '../../../api/debug';
 import type {
   DeepResearchConfirmRequest,
   DeepResearchStartRequest,
@@ -93,6 +94,7 @@ export type UseDeepResearchTaskReturn = {
   ) => Promise<void>;
   handleInsertOptimizationPrompt: (text: string, setUserContext: React.Dispatch<React.SetStateAction<string>>) => void;
   clearStalledJob: () => void;
+  resumeStalledJob: () => Promise<boolean>;
   openCanvasForCurrentJob: () => Promise<void>;
 };
 
@@ -184,6 +186,19 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
 
   const appendProgressEvents = (events: DeepResearchJobEvent[]) => {
     if (!events.length) return;
+    if (ragConfig.agentDebugMode) {
+      const frontendEvents = events.map((evt) => ({
+        channel: 'frontend',
+        area: 'deep_research',
+        event: evt.event,
+        data: evt.data || {},
+        created_at: evt.created_at,
+        event_id: evt.event_id,
+        job_id: activeJobId || planningJobId || latestJobIdRef.current || null,
+        session_id: sessionId || null,
+      }));
+      void logFrontendDebugEvents(frontendEvents).catch(() => {});
+    }
     setResearchMonitor((prev) => {
       const next: ResearchMonitorState = {
         ...prev,
@@ -600,8 +615,6 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       searchMode = 'local';
     }
 
-    const queryOptimizerEnabled = Boolean(webSearchConfig.queryOptimizer ?? true);
-    const maxQueries = Math.min(5, Math.max(1, Number(webSearchConfig.maxQueriesPerProvider ?? 3)));
     const deepStepTopK = Math.max(ragConfig.stepTopK ?? 10, 40);
     const deepWriteTopK = Math.max(
       ragConfig.writeTopK ?? 15,
@@ -617,8 +630,6 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       webSourceConfigs,
       webEnabled,
       localEnabled,
-      queryOptimizerEnabled,
-      maxQueries,
       deepStepTopK,
       deepWriteTopK,
       gapQueryIntent,
@@ -719,8 +730,6 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       webSourceConfigs,
       webEnabled,
       localEnabled,
-      queryOptimizerEnabled,
-      maxQueries,
       deepStepTopK,
       deepWriteTopK,
       gapQueryIntent,
@@ -740,8 +749,6 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       web_providers: webEnabled ? enabledProviders : undefined,
       web_source_configs: (webEnabled && Object.keys(webSourceConfigs).length > 0) ? webSourceConfigs : undefined,
       serpapi_ratio: (webEnabled && serpapiRatio !== undefined) ? serpapiRatio : undefined,
-      use_query_optimizer: webEnabled ? queryOptimizerEnabled : undefined,
-      query_optimizer_max_queries: webEnabled ? maxQueries : undefined,
       use_content_fetcher: webEnabled ? webSearchConfig.contentFetcherMode : undefined,
       gap_query_intent: gapQueryIntent,
       local_top_k: localEnabled ? ragConfig.localTopK : undefined,
@@ -761,6 +768,13 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
     setIsStreaming(true);
     setStartPhaseProgress({ stage: '正在启动...', percent: 0 });
     try {
+      if (import.meta.env.DEV) {
+        console.info('[DeepResearch.start] request.web_source_configs', {
+          search_mode: startRequest.search_mode,
+          web_source_configs: startRequest.web_source_configs,
+          semantic: startRequest.web_source_configs?.semantic,
+        });
+      }
       // 1. Submit the start job – returns immediately with a job_id.
       //    The backend now creates a DB entry with status='planning' so
       //    it appears in the sidebar immediately.
@@ -918,8 +932,6 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       webSourceConfigs,
       webEnabled,
       localEnabled,
-      queryOptimizerEnabled,
-      maxQueries,
       deepStepTopK,
       deepWriteTopK,
       gapQueryIntent,
@@ -951,8 +963,6 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       web_providers: webEnabled ? enabledProviders : undefined,
       web_source_configs: (webEnabled && Object.keys(webSourceConfigs).length > 0) ? webSourceConfigs : undefined,
       serpapi_ratio: (webEnabled && serpapiRatio !== undefined) ? serpapiRatio : undefined,
-      use_query_optimizer: webEnabled ? queryOptimizerEnabled : undefined,
-      query_optimizer_max_queries: webEnabled ? maxQueries : undefined,
       use_content_fetcher: webEnabled ? webSearchConfig.contentFetcherMode : undefined,
       gap_query_intent: gapQueryIntent,
       local_top_k: localEnabled ? ragConfig.localTopK : undefined,
@@ -977,6 +987,13 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
     let submitted = false;
     const previousActiveJobId = localStorage.getItem(DEEP_RESEARCH_JOB_KEY);
     try {
+      if (import.meta.env.DEV) {
+        console.info('[DeepResearch.submit] request.web_source_configs', {
+          search_mode: confirmRequest.search_mode,
+          web_source_configs: confirmRequest.web_source_configs,
+          semantic: confirmRequest.web_source_configs?.semantic,
+        });
+      }
       const submitResp = await deepResearchSubmit(confirmRequest);
       if (submitResp.session_id) setSessionId(submitResp.session_id);
       if (submitResp.canvas_id) setCanvasId(submitResp.canvas_id);
@@ -1121,6 +1138,69 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
     setStalledJob(null);
   };
 
+  /**
+   * Resume a stalled/interrupted job: open its canvas for immediate visual
+   * feedback AND restart the backend research from the `research` phase so
+   * that work actually continues.  Returns `true` when a restart was issued.
+   */
+  const resumeStalledJob = async (): Promise<boolean> => {
+    if (!stalledJob) return false;
+
+    const { jobId, status, canvas_id: stalledCanvasId } = stalledJob;
+    const cid = stalledCanvasId || canvasId || '';
+
+    // 1. Open canvas immediately so the user sees current progress
+    if (cid) {
+      setCanvasId(cid);
+      localStorage.setItem(DEEP_RESEARCH_JOB_KEY, jobId);
+      setCanvasLoading(true);
+      try {
+        const [canvasData, exportResp] = await Promise.all([
+          getCanvas(cid).catch(() => null),
+          exportCanvas(cid, 'markdown').catch(() => null),
+        ]);
+        if (canvasData) {
+          setCanvas(canvasData);
+          setActiveStage(canvasData.stage || 'explore');
+        }
+        if (exportResp?.content) setCanvasContent(exportResp.content);
+        setCanvasOpen(true);
+      } catch (err) {
+        console.error('[DeepResearch] canvas load failed during resume:', err);
+      } finally {
+        setCanvasLoading(false);
+      }
+    }
+
+    // 2. For already-completed jobs, viewing the canvas is sufficient
+    if (status === 'done') {
+      setStalledJob(null);
+      return false;
+    }
+
+    // 3. For cancelled / error / other non-done jobs, restart backend work
+    setStalledJob(null);
+    setDeepResearchActive(true);
+    setPhase('running');
+    setIsStreaming(true);
+    try {
+      const resp = await restartDeepResearchPhase(jobId, { phase: 'research' });
+      if (resp.session_id) setSessionId(resp.session_id);
+      if (resp.canvas_id) setCanvasId(resp.canvas_id);
+      startStreamingJob(resp.job_id, true);
+      requestSessionListRefresh();
+      addToast('已恢复调研任务，后台继续执行', 'success');
+      return true;
+    } catch (err) {
+      console.error('[DeepResearch] resume stalled job failed:', err);
+      setIsStreaming(false);
+      setDeepResearchActive(false);
+      setPhase('confirm');
+      addToast('恢复任务失败，请手动重新开始', 'error');
+      return false;
+    }
+  };
+
   const openCanvasForCurrentJob = async () => {
     const cid = canvasId || stalledJob?.canvas_id || '';
     if (!cid.trim()) {
@@ -1180,6 +1260,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
     restartSection,
     handleInsertOptimizationPrompt,
     clearStalledJob,
+    resumeStalledJob,
     openCanvasForCurrentJob,
   };
 }

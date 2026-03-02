@@ -40,6 +40,7 @@ class Canvas(SQLModel, table=True):
     topic: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
     working_title: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
     abstract: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    preliminary_knowledge: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
     keywords: str = Field(default="[]", sa_column=Column(Text, nullable=False, server_default="[]"))
     stage: str = Field(default="explore", sa_column=Column(Text, nullable=False, server_default="explore"))
     refined_markdown: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))

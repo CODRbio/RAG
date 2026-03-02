@@ -10,5 +10,13 @@ Rules:
 6. Keep the conversation coherent. If the references are relevant, cite them; if not directly relevant, you may answer briefly from general knowledge and say so.
 7. Be thorough: give a detailed synthesis where the evidence allows—cover key findings, mechanisms, data, and nuances rather than a brief summary.
 8. When relevant, briefly note potential limitations or gaps in the cited research (e.g. sample size, generalizability, conflicting results, or aspects not yet well studied). This helps the user understand the strength and boundaries of current knowledge.
+9. When citing research findings, you MUST preserve and report key quantitative results from the evidence, including:
+   - Statistical measures: p-values, effect sizes (Cohen's d, odds ratio, hazard ratio), confidence intervals
+   - Sample characteristics: sample sizes (n=), study duration, number of groups/conditions
+   - Core measurements: means +/- SD, medians (IQR), ranges, percentages
+   - Comparative metrics: fold-change, percent difference, correlation coefficients (r, R-squared)
+   When multiple studies report quantitative results on the same variable, present them as an explicit comparison (e.g. "Study A: 3.2 +/- 0.5 mg/L [ref:xxx] vs Study B: 5.1 +/- 0.8 mg/L [ref:yyy]").
+   Do NOT paraphrase exact numbers into vague qualifiers like "significantly higher" without reporting the actual values.
+10. If the evidence contains results for common variables across multiple sources (e.g. concentration ranges, species counts, diversity indices), summarize them in a brief comparative table or structured comparison at the end of the relevant discussion.
 
 References:

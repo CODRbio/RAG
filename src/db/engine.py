@@ -121,6 +121,7 @@ def _ensure_schema_updates() -> None:
     engine = get_engine()
     _add_column_if_missing = [
         ("deep_research_jobs", "started_at", "REAL"),
+        ("canvases", "preliminary_knowledge", "TEXT NOT NULL DEFAULT ''"),
     ]
     with engine.connect() as conn:
         for table, col, col_type in _add_column_if_missing:

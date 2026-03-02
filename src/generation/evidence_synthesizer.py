@@ -95,6 +95,131 @@ _EVIDENCE_STRENGTH_ORDER = {
 # 本地来源类型
 _LOCAL_SOURCES = {"dense", "sparse", "graph"}
 
+# 定量数据正则：p-value, n=, mean±SD, CI, OR/HR/RR, r/R², fold-change, 浓度单位等
+_QUANT_PATTERNS = re.compile(
+    r"(?:"
+    r"p\s*[<>=≤≥]\s*0?\.\d+"  # p-value
+    r"|p\s*=\s*0?\.\d+"
+    r"|(?:n|N)\s*=\s*\d+"  # sample size
+    r"|\d+\.?\d*\s*[±\+\-]\s*\d+\.?\d*"  # mean ± SD
+    r"|\d+%\s*(?:CI|confidence\s*interval)"  # confidence interval
+    r"|(?:OR|HR|RR|AOR)\s*[=:]\s*\d+\.?\d*"  # odds/hazard/risk ratio
+    r"|r\s*=\s*-?0?\.\d+"  # correlation
+    r"|R[²2]\s*=\s*0?\.\d+"  # R-squared
+    r"|fold[- ]?change"
+    r"|\d+\.?\d*\s*(?:mg|μg|µg|ng|mmol|μmol|μmol|mL|μL|µL)\s*/\s*[Ll]"  # concentrations
+    r"|(?:mean|median)\s*[\(\[]?\s*\d+"  # mean/median (value)
+    r"|IQR\s*[\(\[]?\s*\d+"  # IQR
+    r")",
+    re.IGNORECASE,
+)
+
+# Snippet context window (chars before/after match)
+_QUANT_SNIPPET_CONTEXT = 30
+
+
+def _has_quantitative_data(text: str) -> bool:
+    """Return True if text contains common scientific quantitative expressions."""
+    return bool(_QUANT_PATTERNS.search(text or ""))
+
+
+def _extract_quant_snippets(text: str) -> List[str]:
+    """Extract matching quantitative substrings with surrounding context (~30 chars)."""
+    if not text:
+        return []
+    snippets: List[str] = []
+    for m in _QUANT_PATTERNS.finditer(text):
+        start = max(0, m.start() - _QUANT_SNIPPET_CONTEXT)
+        end = min(len(text), m.end() + _QUANT_SNIPPET_CONTEXT)
+        snip = text[start:end].strip()
+        if snip and snip not in snippets:
+            snippets.append(snip)
+    return snippets
+
+
+def _classify_quant_snippet(snippet: str) -> str:
+    """Classify a quantitative snippet into a category for grouping."""
+    lower = snippet.lower()
+    if re.search(r"\b(?:n|N)\s*=\s*\d+", snippet):
+        return "sample_size"
+    if re.search(r"p\s*[<>=≤≥]|p\s*=\s*0?\.\d+", lower):
+        return "p_value"
+    if re.search(r"(?:OR|HR|RR|AOR)\s*[=:]|effect\s*size|cohen", lower):
+        return "effect_size"
+    if re.search(r"\d+\.?\d*\s*(?:mg|μg|µg|ng|mmol|μmol|µmol|mL|μL|µL)\s*/\s*[Ll]", lower):
+        return "concentration"
+    if re.search(r"r\s*=\s*-?0?\.\d+|R[²2]\s*=\s*0?\.\d+|correlation", lower):
+        return "correlation"
+    if re.search(r"\d+%\s*(?:CI|confidence)", lower):
+        return "confidence_interval"
+    if re.search(r"[±\+\-]\s*\d+\.?\d*|mean|median|IQR", lower):
+        return "mean_sd_median"
+    return "other"
+
+
+def _build_quant_summary(
+    sorted_chunks: List[EvidenceChunk],
+    cross_validated_docs: set,
+) -> str:
+    """
+    Build a structured block of key quantitative data points from chunks,
+    grouped by variable type, with ref tags for citation.
+    """
+    # (category -> list of "(year, ref, snippet)")
+    by_category: Dict[str, List[Tuple[Optional[int], str, str]]] = defaultdict(list)
+
+    for chunk in sorted_chunks:
+        text = chunk.text or ""
+        if not _has_quantitative_data(text):
+            continue
+        ref = chunk.ref_hash
+        year = chunk.year
+        for snip in _extract_quant_snippets(text):
+            cat = _classify_quant_snippet(snip)
+            by_category[cat].append((year, ref, snip))
+
+    if not by_category:
+        return ""
+
+    _CAT_LABELS: Dict[str, str] = {
+        "sample_size": "Sample sizes",
+        "p_value": "Statistical significance",
+        "effect_size": "Effect sizes",
+        "concentration": "Concentrations",
+        "correlation": "Correlations",
+        "confidence_interval": "Confidence intervals",
+        "mean_sd_median": "Means / medians",
+        "other": "Other quantitative",
+    }
+    order = [
+        "sample_size",
+        "p_value",
+        "effect_size",
+        "confidence_interval",
+        "mean_sd_median",
+        "concentration",
+        "correlation",
+        "other",
+    ]
+    lines = ["=== Key Quantitative Data Points ==="]
+    for cat in order:
+        items = by_category.get(cat, [])
+        if not items:
+            continue
+        # Dedupe by snippet text, keep first (year, ref)
+        seen: Dict[str, Tuple[Optional[int], str]] = {}
+        for y, r, snip in items:
+            key = snip[:80].strip()
+            if key not in seen:
+                seen[key] = (y, r)
+        parts = []
+        for snip_short, (y, r) in seen.items():
+            year_ref = f"{y}, [{r}]" if y is not None else f"[{r}]"
+            parts.append(f"{snip_short} ({year_ref})")
+        label = _CAT_LABELS.get(cat, cat)
+        lines.append(f"{label}: " + "; ".join(parts[:5]))  # cap 5 per category
+    return "\n".join(lines)
+
 
 def classify_evidence_type(section_title: Optional[str]) -> str:
     """
@@ -131,6 +256,7 @@ class SynthesisMeta:
     evidence_type_breakdown: Dict[str, int] = field(default_factory=dict)
     cross_validated_count: int = 0
     total_documents: int = 0
+    quant_chunk_count: int = 0  # chunks containing quantitative data
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -140,6 +266,7 @@ class SynthesisMeta:
             "evidence_type_breakdown": self.evidence_type_breakdown,
             "cross_validated_count": self.cross_validated_count,
             "total_documents": self.total_documents,
+            "quant_chunk_count": self.quant_chunk_count,
         }
 
 
@@ -235,6 +362,9 @@ class EvidenceSynthesizer:
         # 独立文献数
         doc_keys = {c.doc_group_key for c in chunks}
 
+        # 含定量数据的 chunk 数
+        quant_chunk_count = sum(1 for c in chunks if _has_quantitative_data(c.text or ""))
+
         return SynthesisMeta(
             year_range=year_range,
             source_breakdown=dict(chunk_counts),
@@ -242,6 +372,7 @@ class EvidenceSynthesizer:
             evidence_type_breakdown=dict(type_counts),
             cross_validated_count=0,
             total_documents=len(doc_keys),
+            quant_chunk_count=quant_chunk_count,
         )
 
     def _find_cross_validated(self, chunks: List[EvidenceChunk]) -> set:
@@ -274,6 +405,11 @@ class EvidenceSynthesizer:
 
         # === Header: 综合概览 ===
         parts.append(self._build_header(meta))
+
+        # === Quantitative summary (when present) ===
+        quant_summary = _build_quant_summary(sorted_chunks, cross_validated_docs)
+        if quant_summary:
+            parts.append("\n" + quant_summary)
 
         # === Body: 按时间排序的证据 ===
         parts.append("\n=== 证据（按时间排序）===\n")
@@ -359,6 +495,10 @@ class EvidenceSynthesizer:
             source_label = "local+web ✓"
 
         tags.append(source_label)
+
+        # 定量数据标记
+        if _has_quantitative_data(text):
+            tags.append("Q")
 
         tag_str = " | ".join(tags)
 
