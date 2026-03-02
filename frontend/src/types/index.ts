@@ -96,8 +96,8 @@ export interface EvidenceSummary {
   diagnostics?: RetrievalDiagnostics;
 }
 
-/** Pre-Research (Sonar) strength: off | sonar | sonar-pro | sonar-reasoning-pro */
-export type SonarStrength = 'off' | 'sonar' | 'sonar-pro' | 'sonar-reasoning-pro';
+/** Pre-Research (Sonar) strength: off | model id from Perplexity (e.g. sonar | sonar-pro | sonar-reasoning-pro | sonar-deep-research) */
+export type SonarStrength = 'off' | 'sonar' | 'sonar-pro' | 'sonar-reasoning-pro' | 'sonar-deep-research' | (string & {});
 
 export interface ChatRequest {
   session_id?: string;
@@ -149,6 +149,7 @@ export interface ChatCitation {
   doi?: string | null;
   bbox?: number[];
   page_num?: number | null;
+  provider?: string | null;
 }
 
 export interface ChatResponse {
@@ -197,7 +198,7 @@ export interface SessionInfo {
   canvas_id: string;
   stage: string;
   turn_count: number;
-  turns: { role: string; content: string; sources?: ChatCitation[] }[];
+  turns: { role: string; content: string; sources?: ChatCitation[]; timestamp?: string | number }[];
   research_dashboard?: ResearchDashboardData | null;
 }
 
@@ -657,9 +658,10 @@ export interface RagConfig {
   yearStart?: number | null; // 全局年份过滤起始
   yearEnd?: number | null; // 全局年份过滤结束
   enableHippoRAG: boolean;
+  graphTopK: number;  // 进入候选池的最大图检索结果数（仅 HippoRAG 开启时生效）
   enableReranker: boolean;
   agentMode: 'standard' | 'assist' | 'autonomous';  // Agent 执行模式
-  /** Pre-Research 强度：off | sonar | sonar-pro | sonar-reasoning-pro，默认 sonar-reasoning-pro */
+  /** Pre-Research 强度：off 或 Perplexity/Sonar 模型 id（与 LLM 选择同源），默认 sonar-reasoning-pro */
   sonarStrength: SonarStrength;
   maxIterations: number;  // Agent ReAct 最大迭代轮数，默认 2
   agentDebugMode: boolean;  // 是否显示 Agent 详细调试面板

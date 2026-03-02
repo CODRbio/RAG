@@ -14,7 +14,7 @@ import uuid
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File
 from pydantic import BaseModel, Field
 from fastapi.responses import StreamingResponse
 
@@ -544,6 +544,8 @@ def _build_filters(body: ChatRequest) -> dict:
         filters["step_top_k"] = body.step_top_k
     if getattr(body, "write_top_k", None) is not None:
         filters["write_top_k"] = body.write_top_k
+    if getattr(body, "graph_top_k", None) is not None:
+        filters["graph_top_k"] = body.graph_top_k
     if body.reranker_mode:
         filters["reranker_mode"] = body.reranker_mode
     if getattr(body, "llm_provider", None):
@@ -752,6 +754,7 @@ def _build_deep_research_filters(body: Any) -> dict:
         "year_end",
         "step_top_k",
         "write_top_k",
+        "graph_top_k",
         "reranker_mode",
         "llm_provider",
         "ultra_lite_provider",
@@ -994,6 +997,7 @@ def _run_chat_impl(
 
     # ── Deep Research 分支 ──
     if is_deep_research(parsed):
+        _chat_logger.info("[work=research] 开始")
         _chat_logger.info("[chat] ── 进入 Deep Research 分支 ──")
         topic = (parsed.params.get("args") or message).strip() or "综述"
         meta_now = store.get_session_meta(session_id) or {}
@@ -1049,6 +1053,7 @@ def _run_chat_impl(
         )
         return session_id, response_text, result.citations, evidence_summary, parsed, dashboard_data, None, {}, None, False, None
 
+    _chat_logger.info("[work=chat] 第1轮")
     # ── 2½. 指代澄清短路（LLM 判定无法推断时直接追问用户）──
     if ctx_analysis and ctx_analysis.context_status == "needs_clarification" and ctx_analysis.clarification:
         _chat_logger.info("[chat] ②½ 指代不明 → 返回澄清问题，跳过检索")
@@ -1272,6 +1277,7 @@ def _run_chat_impl(
         filters = _build_filters(body)
         filters["trace_phase"] = "chat_main"
         filters["trace_section"] = "chat"
+        filters["job_id"] = f"chat_{session_id}"
         # 强制 Chat 使用 bge_only reranker（速度优先）。UI 传入的 cascade/colbert
         # 在 hybrid 模式下仅用于写作阶段（Deep Research）。
         filters["reranker_mode"] = "bge_only"
@@ -1309,7 +1315,8 @@ def _run_chat_impl(
             pack.chunks.extend(sonar_chunks)
             if "sonar" not in pack.sources_used:
                 pack.sources_used.append("sonar")
-        # write_top_k = per-output-unit evidence cap (Chat one Q&A = one unit). Fallback to step_top_k then all.
+        # write_top_k = 混合检索后的最终保留数（送入 LLM 的 evidence 上限）。UI 传 ragConfig.writeTopK，此处生效。
+        # Chat 单轮 Q&A = 一个产出单元；无 write_top_k 时回退 step_top_k 再回退全量。
         write_k = getattr(body, "write_top_k", None) or body.step_top_k or len(pack.chunks)
         max_chunks_for_context = min(write_k, len(pack.chunks))
         synthesizer = EvidenceSynthesizer(max_chunks=max_chunks_for_context)
@@ -1473,7 +1480,7 @@ def _run_chat_impl(
         gap_queries = [q for q in (gap_queries or []) if (q or "").strip()][:3]
         if gap_queries:
             step_k = body.step_top_k or body.local_top_k or 20
-            supp_k = max(5, step_k // 2)
+            supp_k = max(10, step_k)
             main_candidates = [_chunk_to_hit(c) for c in pack.chunks]
             gap_candidates: List[Dict[str, Any]] = []
             _supp_total = 0
@@ -1481,6 +1488,7 @@ def _run_chat_impl(
             def _search_one_gap(gq: str) -> "EvidencePack":
                 supp_filters = dict(filters or {})
                 supp_filters["trace_phase"] = "chat_gap_supplement"
+                supp_filters["pool_only"] = True
                 return retrieval.search(
                     query=gq,
                     mode=effective_search_mode,
@@ -1506,12 +1514,13 @@ def _run_chat_impl(
                         _chat_logger.warning("[chat] gap supplement search failed for %r: %s", gq[:50], e)
             if gap_candidates:
                 fusion_diag: Dict[str, Any] = {}
+                _gap_fusion_k = write_k or step_k  # final output uses write_top_k; intermediate steps use step_top_k
                 fused = fuse_pools_with_gap_protection(
                     query=query or message,
                     main_candidates=main_candidates,
                     gap_candidates=gap_candidates,
-                    top_k=step_k,
-                    gap_min_keep=math.ceil(step_k * float(getattr(settings.search, "chat_gap_ratio", 0.2))),
+                    top_k=_gap_fusion_k,
+                    gap_min_keep=math.ceil(_gap_fusion_k * float(getattr(settings.search, "chat_gap_ratio", 0.2))),
                     gap_ratio=float(getattr(settings.search, "chat_gap_ratio", 0.2)),
                     rank_pool_multiplier=float(getattr(settings.search, "chat_rank_pool_multiplier", 3.0)),
                     trace_ctx={"phase": "chat_gap_fusion", "section": "chat"},
@@ -1536,8 +1545,7 @@ def _run_chat_impl(
                         "chat_gap_supplement_chunks": len(gap_candidates),
                     },
                 )
-                write_k = getattr(body, "write_top_k", None) or body.step_top_k or len(pack.chunks)
-                max_chunks_for_context = min(write_k, len(pack.chunks))
+                max_chunks_for_context = min(write_k or len(pack.chunks), len(pack.chunks))
                 synthesizer = EvidenceSynthesizer(max_chunks=max_chunks_for_context)
                 context_str, synthesis_meta = synthesizer.synthesize(pack)
                 synth_dict = synthesis_meta.to_dict()
@@ -1766,6 +1774,9 @@ def _run_chat_impl(
         }
         # source_breakdown 使用来源级（unique 文献/网页）统计
         evidence_summary.source_breakdown = cite_counts
+        # sources_used 更新为具体 provider 列表（取代粗粒度的 dense/web）
+        if cite_counts:
+            evidence_summary.sources_used = list(cite_counts.keys())
 
         _chat_logger.info(
             "[chat] ⑨ 引文后处理 | cited_docs=%d | ref_map_size=%d | chunk_stats=%s | cite_stats=%s",
@@ -1921,16 +1932,27 @@ def chat_submit(
     return ChatSubmitResponse(task_id=task_id)
 
 
-def _task_event_stream(task_id: str, q):
+_SSE_HEARTBEAT_INTERVAL = 25  # 秒：每隔此时间发一次 SSE 注释保活，防止 proxy/浏览器因空闲超时断连
+
+
+def _task_event_stream(task_id: str, q, after_id: str = "-"):
     """SSE 事件流生成器。
 
     关键顺序：先读取所有待推送事件，再检查是否终态。
     这样即使任务瞬间完成（如 mismatch 路径无 LLM 调用），
     meta/local_db_choice/delta/done 事件也能全部送达前端，
     不会被「已终态→直接 return」的提前退出所跳过。
+
+    after_id: 断点续传起点（Redis stream ID）。前端重连时通过 Last-Event-ID
+    header 传入，避免重放已收到的 delta 导致消息内容重复。
+
+    心跳：任务运行期间每隔 _SSE_HEARTBEAT_INTERVAL 秒发一条 SSE 注释行
+    (": heartbeat")，防止 Vite proxy / nginx 等因 idle timeout 断开连接。
+    浏览器会忽略注释行，不触发任何事件。
     """
     import time
-    last_id = "-"
+    last_id = after_id
+    last_sent_at = time.monotonic()
     if _obs_metrics:
         _obs_metrics.active_connections.inc()
     try:
@@ -1941,7 +1963,9 @@ def _task_event_stream(task_id: str, q):
                 last_id = ev.get("id", last_id)
                 typ = ev.get("type", "message")
                 data = ev.get("data", {})
-                yield f"event: {typ}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+                # id: 字段让前端 EventSource / fetch 能追踪断点位置，用于重连续传
+                yield f"id: {last_id}\nevent: {typ}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+                last_sent_at = time.monotonic()
                 if typ in ("done", "error", "cancelled", "timeout"):
                     return
 
@@ -1954,12 +1978,18 @@ def _task_event_stream(task_id: str, q):
                     last_id = ev.get("id", last_id)
                     typ = ev.get("type", "message")
                     data = ev.get("data", {})
-                    yield f"event: {typ}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+                    yield f"id: {last_id}\nevent: {typ}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+                    last_sent_at = time.monotonic()
                     if typ in ("done", "error", "cancelled", "timeout"):
                         return
                 # 所有事件已发送完毕，补发终态通知
                 yield f"event: {state.status.value}\ndata: {json.dumps({'status': state.status.value}, ensure_ascii=False)}\n\n"
                 return
+
+            # ③ 任务仍在运行：若已超过心跳间隔则发注释保活，防止 proxy idle timeout
+            if time.monotonic() - last_sent_at >= _SSE_HEARTBEAT_INTERVAL:
+                yield ": heartbeat\n\n"
+                last_sent_at = time.monotonic()
 
             time.sleep(0.3)
     finally:
@@ -1968,13 +1998,22 @@ def _task_event_stream(task_id: str, q):
 
 
 @router.get("/chat/stream/{task_id}")
-def chat_stream_by_task_id(task_id: str):
-    """SSE 订阅任务流式输出；事件由调度器在执行时推送。"""
+def chat_stream_by_task_id(task_id: str, request: Request):
+    """SSE 订阅任务流式输出；事件由调度器在执行时推送。
+
+    支持断点续传：前端重连时携带 Last-Event-ID header（标准 SSE 规范）或
+    ?after_id= 查询参数，后端将只推送该 ID 之后的事件，避免 delta 重复叠加。
+    """
     try:
         q = get_task_queue()
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Queue unavailable: {e}")
-    return StreamingResponse(_task_event_stream(task_id, q), media_type="text/event-stream")
+    after_id = (
+        request.headers.get("Last-Event-ID")
+        or request.query_params.get("after_id")
+        or "-"
+    )
+    return StreamingResponse(_task_event_stream(task_id, q, after_id), media_type="text/event-stream")
 
 
 @router.post("/chat/stream")
@@ -3986,10 +4025,18 @@ def get_session(session_id: str) -> SessionInfo:
                 doi=c.get("doi"),
                 bbox=c.get("bbox"),
                 page_num=c.get("page_num"),
+                provider=c.get("provider"),
             )
             for c in (t.citations or [])
         ]
-        turn_items.append(TurnItem(role=t.role, content=t.content, sources=sources))
+        try:
+            ts_iso = t.timestamp.isoformat() if getattr(t, "timestamp", None) else None
+        except (AttributeError, TypeError):
+            ts_iso = None
+        if not ts_iso:
+            import datetime as _dt
+            ts_iso = _dt.datetime.now().isoformat()
+        turn_items.append(TurnItem(role=t.role, content=t.content, sources=sources, timestamp=ts_iso))
 
     # 恢复最近一次 Deep Research dashboard（刷新页面后仍可看到章节列表）
     latest_dashboard = None

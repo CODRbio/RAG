@@ -26,7 +26,8 @@
   },
   "content_fetcher": {
     "brightdata_api_key": "",
-    "brightdata_zone": ""
+    "brightdata_zone": "",
+    "two_captcha_api_key": ""
   },
   "auth": {
     "secret_key": "<set-a-strong-random-value-for-jwt-signing>"

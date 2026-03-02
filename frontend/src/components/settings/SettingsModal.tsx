@@ -272,6 +272,24 @@ export function SettingsModal() {
                   color="bg-purple-500"
                 />
               </div>
+              {ragConfig.enableHippoRAG && (
+                <div className="mt-3 flex items-center justify-between gap-2">
+                  <div>
+                    <span className="text-sm text-slate-200">{t('settings.graphTopK')}</span>
+                    <p className="text-[10px] text-slate-400 mt-0.5">{t('settings.graphTopKDesc')}</p>
+                  </div>
+                  <input
+                    type="number"
+                    min={1}
+                    max={200}
+                    value={ragConfig.graphTopK}
+                    onChange={(e) =>
+                      updateRagConfig({ graphTopK: Math.max(1, Math.min(200, Number(e.target.value) || 1)) })
+                    }
+                    className="w-16 text-[10px] bg-slate-950 border border-slate-700 text-slate-300 rounded px-2 py-1 focus:border-purple-500 focus:outline-none"
+                  />
+                </div>
+              )}
             </div>
           )}
         </div>

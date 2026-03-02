@@ -310,6 +310,7 @@ class RetrievalConfig:
     colbert_top_k: Optional[int] = None  # cascade 时 BGE 阶段输出数，由 UI step_top_k 穿透时使用
     step_top_k: Optional[int] = None  # 每步检索最终保留数；未设时继承 settings.rerank_output_k
     rank_pool_multiplier: Optional[float] = None  # Stage-2 RRF 候选池放大倍率
+    graph_top_k: Optional[int] = None  # HippoRAG 图检索进入候选池的最大结果数；None 用默认 20
     trace_ctx: Optional[Dict[str, Any]] = None  # 观测上下文：job/phase/section
 
 
@@ -631,7 +632,8 @@ class HybridRetriever:
         rerank_ms = (time.perf_counter() - t_rerank) * 1000
 
         if not reranked:
-            out = candidates[:step_top_k] if step_top_k is not None else candidates[:top_k]
+            # 供上层 fuse_pools 做全局 rerank：返回完整 RRF 池子，不截断
+            out = candidates
 
         # 填充诊断信息
         if diagnostics is not None:
@@ -687,20 +689,19 @@ class HybridRetriever:
         query: str,
         collection: str,
         top_k: int = 10,
-        rerank: bool = True,
         graph_weight: float = 0.3,
         year_start: Optional[int] = None,
         year_end: Optional[int] = None,
         diagnostics: Optional[Dict] = None,
-        reranker_mode: Optional[str] = None,
-        cascade_bge_k: Optional[int] = None,
         step_top_k: Optional[int] = None,
         rank_pool_multiplier: Optional[float] = None,
+        graph_top_k: Optional[int] = None,
         trace_ctx: Optional[Dict[str, Any]] = None,
     ) -> List[Dict]:
         """
         混合检索（向量 + 图融合）
         条件触发 HippoRAG：多实体 + 关系类关键词时合并图检索结果
+        始终返回完整候选池，不做 rerank/截断；由上层 fuse_pools 统一 rerank。
         """
         self.logger.info(
             "[retrieval] local_hybrid start query_len=%d collection=%s top_k=%s step_top_k=%s",
@@ -710,12 +711,11 @@ class HybridRetriever:
         vector_hits = self.retrieve_vector(
             query,
             collection,
-            top_k=top_k * 2,
+            top_k=top_k,
             rerank=False,
             year_start=year_start,
             year_end=year_end,
             diagnostics=diagnostics,
-            cascade_bge_k=cascade_bge_k,
             step_top_k=step_top_k,
             rank_pool_multiplier=rank_pool_multiplier,
             trace_ctx=trace_ctx,
@@ -728,31 +728,19 @@ class HybridRetriever:
         if should_use_hipporag(query) and not year_window_enabled:
             self._ensure_graph()
             if self.hippo is not None:
+                _graph_top_k = graph_top_k if graph_top_k is not None else int(
+                    getattr(settings.search, "graph_top_k", 20) or 20
+                )
                 fused_hits = self.hippo.retrieve_with_graph(
                     query,
                     vector_hits,
-                    top_k=top_k * 2,
-                    graph_weight=graph_weight
+                    graph_top_k=_graph_top_k,
+                    graph_weight=graph_weight,
                 )
-                self.logger.info("[retrieval] local_hybrid graph_done fused=%d", len(fused_hits))
+                self.logger.info("[retrieval] local_hybrid graph_done fused=%d (graph_top_k=%d)", len(fused_hits), _graph_top_k)
 
-        # 3. Rerank（bge_only | colbert_only | cascade）
-        if rerank and fused_hits:
-            hits_with_content = [h for h in fused_hits if h.get("content")]
-            if hits_with_content:
-                # 请求未传 step_top_k 时继承 config rerank_output_k
-                default_output_k = getattr(settings.search, "rerank_output_k", 20)
-                rerank_limit = step_top_k if step_top_k is not None else default_output_k
-                fused_hits = _rerank_candidates(
-                    query, hits_with_content, top_k=min(rerank_limit, len(hits_with_content)),
-                    reranker_mode=reranker_mode, cascade_bge_k=cascade_bge_k, trace_ctx=trace_ctx,
-                )
-                per_doc_cap = getattr(settings.search, "per_doc_cap", 3)
-                fused_hits = dedup_and_diversify(fused_hits, per_doc_cap=per_doc_cap)
-
-        out = fused_hits[:step_top_k] if step_top_k is not None else fused_hits[:top_k]
-        self.logger.info("[retrieval] local_hybrid done out=%d", len(out))
-        return out
+        self.logger.info("[retrieval] local_hybrid done pool=%d", len(fused_hits))
+        return fused_hits
 
     def retrieve(
         self,
@@ -802,15 +790,13 @@ class HybridRetriever:
                 query,
                 collection,
                 config.top_k,
-                config.rerank,
                 config.graph_weight,
                 config.year_start,
                 config.year_end,
                 diagnostics=diagnostics,
-                reranker_mode=config.reranker_mode,
-                cascade_bge_k=config.colbert_top_k,
                 step_top_k=config.step_top_k,
                 rank_pool_multiplier=config.rank_pool_multiplier,
+                graph_top_k=config.graph_top_k,
                 trace_ctx=config.trace_ctx,
             )
 

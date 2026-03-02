@@ -175,7 +175,11 @@ class SessionStore:
                     citations = json.loads(r.citations_json)
                 except Exception:
                     pass
-            ts = datetime.fromisoformat(r.timestamp) if r.timestamp else datetime.now()
+            raw_ts = getattr(r, "timestamp", None)
+            try:
+                ts = datetime.fromisoformat(raw_ts) if raw_ts else datetime.now()
+            except (TypeError, ValueError):
+                ts = datetime.now()
             turns.append(
                 ConversationTurn(
                     role=r.role,

@@ -186,26 +186,26 @@ class HippoRAG:
         self,
         query: str,
         vector_hits: List[Dict],
-        top_k: int = 10,
+        graph_top_k: int = 20,
         graph_weight: float = 0.3,
     ) -> List[Dict]:
         """
-        融合向量检索和图检索结果
+        融合向量检索和图检索结果，返回完整候选池（不排序不截断），由上层 fuse_pools 统一 rerank。
 
         Args:
             query: 查询文本
             vector_hits: 向量检索结果（需包含 chunk_id）
-            top_k: 返回数量
+            graph_top_k: PPR 取出的最大图节点数，用于构建 graph_scores
             graph_weight: 图检索权重（0-1）
 
         Returns:
-            融合后的检索结果
+            融合后的候选池（vector+graph 加权分 + graph_only 节点），不截断
         """
         seed_entities = self.get_seed_entities(query)
 
         graph_scores: Dict[str, float] = {}
         if seed_entities:
-            ppr_results = self.personalized_pagerank(seed_entities, top_k=top_k * 2)
+            ppr_results = self.personalized_pagerank(seed_entities, top_k=graph_top_k)
             max_score = ppr_results[0][1] if ppr_results else 1.0
             for chunk_id, score in ppr_results:
                 graph_scores[chunk_id] = score / max_score
@@ -236,8 +236,7 @@ class HippoRAG:
                     "source": "graph_only",
                 })
 
-        fused_results.sort(key=lambda x: x["score"], reverse=True)
-        return fused_results[:top_k]
+        return fused_results
 
     # ========== 持久化 ==========
 

@@ -82,6 +82,7 @@ export const useConfigStore = create<ConfigState>()(
         yearStart: null,
         yearEnd: null,
         enableHippoRAG: false,
+        graphTopK: 20,
         enableReranker: true,
         agentMode: 'assist' as const,
         sonarStrength: 'sonar-reasoning-pro' as const,
@@ -234,17 +235,20 @@ export const useConfigStore = create<ConfigState>()(
               ?? Math.ceil((persisted.ragConfig?.stepTopK ?? (persisted.ragConfig as any)?.finalTopK ?? 10) * 1.5),
             yearStart: normalizeOptionalYear(persisted.ragConfig?.yearStart),
             yearEnd: normalizeOptionalYear(persisted.ragConfig?.yearEnd),
+            enableHippoRAG: persisted.ragConfig?.enableHippoRAG ?? false,
+            graphTopK: persisted.ragConfig?.graphTopK ?? 20,
             // Migrate old enableAgent boolean to agentMode tri-state
             agentMode: (persisted.ragConfig as any)?.agentMode
               ?? ((persisted.ragConfig as any)?.enableAgent === false ? 'standard' : 'assist'),
-            // Migrate useSonarPrelim + sonarModel -> sonarStrength
+            // Migrate useSonarPrelim + sonarModel -> sonarStrength（与 LLM 选择同源，支持 sonar-deep-research 等 Perplexity 模型 id）
             sonarStrength: ((): import('../types').SonarStrength => {
               const strength = (persisted.ragConfig as any)?.sonarStrength;
-              if (strength === 'off' || strength === 'sonar' || strength === 'sonar-pro' || strength === 'sonar-reasoning-pro') return strength;
+              if (strength === 'off') return 'off';
+              if (typeof strength === 'string' && strength.trim()) return strength as import('../types').SonarStrength;
               const usePrelim = (persisted.ragConfig as any)?.useSonarPrelim ?? false;
               const model = (persisted.ragConfig as any)?.sonarModel;
               if (!usePrelim) return 'off';
-              return (model === 'sonar' || model === 'sonar-pro' || model === 'sonar-reasoning-pro' ? model : 'sonar-reasoning-pro') as import('../types').SonarStrength;
+              return (typeof model === 'string' && model.trim() ? model : 'sonar-reasoning-pro') as import('../types').SonarStrength;
             })(),
             maxIterations: (persisted.ragConfig as any)?.maxIterations ?? 2,
             agentDebugMode: persisted.ragConfig?.agentDebugMode ?? false,

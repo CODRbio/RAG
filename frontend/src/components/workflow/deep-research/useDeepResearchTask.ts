@@ -110,6 +110,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
     updateLastMessage,
     appendToLastMessage,
     setLastMessageSources,
+    stampLastMessageTimestamp,
     setSessionId,
     setCanvasId,
     setWorkflowStep,
@@ -375,6 +376,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
           .finally(() => setCanvasLoading(false));
       }
       if (job.status === 'done') {
+        stampLastMessageTimestamp();
         setActiveStage('refine');
         setWorkflowStep('refine');
         addToast('Deep Research 完成', 'success');
@@ -392,6 +394,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
           canvas_id: String(job.canvas_id || ''),
         });
       } else {
+        stampLastMessageTimestamp();
         appendToLastMessage(`\n\n[错误] Deep Research 失败：${job.error_message || job.message || 'unknown error'}`);
         addToast('Deep Research 失败，请重试', 'error');
       }
@@ -757,6 +760,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       year_end: ragConfig.yearEnd ?? undefined,
       step_top_k: deepStepTopK,
       write_top_k: deepWriteTopK,
+      graph_top_k: ragConfig.enableHippoRAG ? ragConfig.graphTopK : undefined,
       reranker_mode: ragConfig.enableReranker
         ? ((localStorage.getItem('adv_reranker_mode') || 'cascade') as 'bge_only' | 'colbert_only' | 'cascade')
         : 'bge_only',
@@ -971,6 +975,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       year_end: ragConfig.yearEnd ?? undefined,
       step_top_k: deepStepTopK,
       write_top_k: deepWriteTopK,
+      graph_top_k: ragConfig.enableHippoRAG ? ragConfig.graphTopK : undefined,
       reranker_mode: ragConfig.enableReranker
         ? ((localStorage.getItem('adv_reranker_mode') || 'cascade') as 'bge_only' | 'colbert_only' | 'cascade')
         : 'bge_only',
@@ -1010,6 +1015,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
     } catch (error) {
       console.error('[DeepResearch] Error:', error);
       addToast('Deep Research 失败，请重试', 'error');
+      stampLastMessageTimestamp();
       appendToLastMessage('\n\n[错误] Deep Research 请求失败。');
       stopStreaming();
       const failedJobId = localStorage.getItem(DEEP_RESEARCH_JOB_KEY);

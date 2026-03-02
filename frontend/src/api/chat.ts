@@ -69,74 +69,116 @@ export async function submitChat(data: ChatRequest): Promise<ChatSubmitResponse>
   return res.data;
 }
 
-/** SSE 订阅任务流（GET /chat/stream/{taskId}） */
+/** SSE 订阅任务流（GET /chat/stream/{taskId}）
+ *
+ * 支持断点续传：连接意外断开时（未收到 done/error/cancelled/timeout）自动重连，
+ * 最多 MAX_RETRIES 次，指数退避（1s / 2s / 4s）。重连时将最后收到的 SSE id
+ * 通过 Last-Event-ID header 传给后端，后端只推送该 id 之后的事件，避免 delta
+ * 重复叠加造成消息内容翻倍。
+ */
 export async function* streamChatByTaskId(
   taskId: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
 ): AsyncGenerator<{ event: string; data: unknown }> {
-  const token = localStorage.getItem('token');
-  const url = `${BASE_URL}/chat/stream/${encodeURIComponent(taskId)}`;
-  const response = await fetch(url, {
-    method: 'GET',
-    headers: {
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-    },
-    signal,
-  });
-  if (!response.ok) {
-    const errBody = await response.text().catch(() => '');
-    throw new Error(`HTTP ${response.status}: ${response.statusText} - ${errBody}`);
-  }
-  const reader = response.body?.getReader();
-  if (!reader) throw new Error('No response body');
-  const decoder = new TextDecoder();
-  let buffer = '';
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    // SSE 事件以双换行分隔，按 \n\n 切分再解析，避免 data 被截断导致 JSON 解析失败
-    const blocks = buffer.split(/\n\n/);
-    buffer = blocks.pop() || '';
-    for (const block of blocks) {
-      let eventType = 'message';
-      const dataLines: string[] = [];
-      for (const line of block.split('\n')) {
-        if (line.startsWith('event: ')) {
-          eventType = line.slice(7).trim();
-        } else if (line.startsWith('data: ')) {
-          dataLines.push(line.slice(6));
+  const MAX_RETRIES = 3;
+  let lastEventId = '';
+  let attempt = 0;
+  let receivedTerminal = false;
+
+  while (!receivedTerminal) {
+    try {
+      const token = localStorage.getItem('token');
+      const url = `${BASE_URL}/chat/stream/${encodeURIComponent(taskId)}`;
+      const headers: Record<string, string> = {
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(lastEventId ? { 'Last-Event-ID': lastEventId } : {}),
+      };
+
+      if (attempt > 0) {
+        console.log(`[streamChatByTaskId] reconnect attempt=${attempt} after_id=${lastEventId || '(start)'}`);
+      }
+
+      const response = await fetch(url, { method: 'GET', headers, signal });
+      if (!response.ok) {
+        const errBody = await response.text().catch(() => '');
+        throw new Error(`HTTP ${response.status}: ${response.statusText} - ${errBody}`);
+      }
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error('No response body');
+
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let gotAnyData = false;
+
+      const parseBlock = (block: string): { event: string; id: string; data: unknown } | null => {
+        let eventType = 'message';
+        let eventId = '';
+        const dataLines: string[] = [];
+        for (const line of block.split('\n')) {
+          if (line.startsWith('event: ')) eventType = line.slice(7).trim();
+          else if (line.startsWith('id: ')) eventId = line.slice(4).trim();
+          else if (line.startsWith('data: ')) dataLines.push(line.slice(6));
+        }
+        const dataStr = dataLines.join('\n');
+        if (!eventType && !dataStr) return null;
+        let data: unknown = {};
+        if (dataStr) {
+          try { data = JSON.parse(dataStr); } catch { data = { raw: dataStr }; }
+        }
+        return { event: eventType, id: eventId, data };
+      };
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        gotAnyData = true;
+        buffer += decoder.decode(value, { stream: true });
+        // SSE 事件以双换行分隔，按 \n\n 切分再解析，避免 data 被截断导致 JSON 解析失败
+        const blocks = buffer.split(/\n\n/);
+        buffer = blocks.pop() || '';
+        for (const block of blocks) {
+          const parsed = parseBlock(block);
+          if (!parsed) continue;
+          if (parsed.id) lastEventId = parsed.id;
+          yield { event: parsed.event, data: parsed.data };
+          if (['done', 'error', 'cancelled', 'timeout'].includes(parsed.event)) {
+            receivedTerminal = true;
+            return;
+          }
         }
       }
-      const dataStr = dataLines.join('\n');
-      if (dataStr === '') {
-        yield { event: eventType, data: {} };
+      // 剩余 buffer 若含完整事件也解析一次
+      if (buffer.trim()) {
+        const parsed = parseBlock(buffer);
+        if (parsed) {
+          if (parsed.id) lastEventId = parsed.id;
+          yield { event: parsed.event, data: parsed.data };
+          if (['done', 'error', 'cancelled', 'timeout'].includes(parsed.event)) {
+            receivedTerminal = true;
+            return;
+          }
+        }
+      }
+
+      // 流正常结束但未收到 terminal 事件（连接被中间层断开）
+      if (!receivedTerminal) {
+        attempt++;
+        if (attempt > MAX_RETRIES) {
+          // 超过重试次数，向调用方抛出，让 catch 展示错误
+          throw new Error(`SSE connection closed unexpectedly after ${MAX_RETRIES} retries`);
+        }
+        // 如果一条数据都没收到（ERR_EMPTY_RESPONSE），等更短的时间
+        const delay = gotAnyData ? Math.min(1000 * attempt, 4000) : 500;
+        await new Promise((r) => setTimeout(r, delay));
         continue;
       }
-      try {
-        const data = JSON.parse(dataStr) as unknown;
-        yield { event: eventType, data };
-      } catch {
-        yield { event: eventType, data: { raw: dataStr } };
-      }
-    }
-  }
-  // 剩余 buffer 若含完整 event+data 也解析一次
-  if (buffer.trim()) {
-    let eventType = 'message';
-    const dataLines: string[] = [];
-    for (const line of buffer.split('\n')) {
-      if (line.startsWith('event: ')) eventType = line.slice(7).trim();
-      else if (line.startsWith('data: ')) dataLines.push(line.slice(6));
-    }
-    const dataStr = dataLines.join('\n');
-    if (dataStr) {
-      try {
-        const data = JSON.parse(dataStr) as unknown;
-        yield { event: eventType, data };
-      } catch {
-        yield { event: eventType, data: { raw: dataStr } };
-      }
+    } catch (err) {
+      if (signal?.aborted) throw err;
+      attempt++;
+      if (attempt > MAX_RETRIES || receivedTerminal) throw err;
+      const delay = Math.min(1000 * attempt, 4000);
+      console.warn(`[streamChatByTaskId] connection error (attempt=${attempt}), retrying in ${delay}ms:`, err);
+      await new Promise((r) => setTimeout(r, delay));
     }
   }
 }

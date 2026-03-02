@@ -200,6 +200,7 @@ class ContentFetcherConfig:
     timeout_seconds: int = 15
     brightdata_api_key: str = ""
     brightdata_zone: str = ""
+    two_captcha_api_key: str = ""  # 与 BrightData 同时配置时，单页抓取上限 2 分钟
     cache_enabled: bool = True
     cache_ttl_seconds: int = 3600
     disk_cache_enabled: bool = True
@@ -524,12 +525,13 @@ class UnifiedWebSearchPerfSettings:
 
 @dataclass
 class GoogleSearchPerfSettings:
-    """Google/Scholar：浏览器复用、缓存"""
+    """Google/Scholar：浏览器复用、缓存、CDP 回退"""
     browser_reuse: bool = True
     max_idle_seconds: int = 300
     max_pages_per_browser: int = 10
     cache_enabled: bool = False
     cache_ttl_seconds: int = 1800
+    cdp_port: Optional[int] = None  # launch 失败且 SingletonLock 存活时尝试 connect_over_cdp
 
 
 @dataclass
@@ -678,6 +680,7 @@ class Settings:
             timeout_seconds=int(cf.get("timeout_seconds", 15)),
             brightdata_api_key=(cf.get("brightdata_api_key") or "").strip(),
             brightdata_zone=(cf.get("brightdata_zone") or "").strip(),
+            two_captcha_api_key=(cf.get("two_captcha_api_key") or "").strip(),
             cache_enabled=bool(cf.get("cache_enabled", True)),
             cache_ttl_seconds=int(cf.get("cache_ttl_seconds", 3600)),
             disk_cache_enabled=bool(cf.get("disk_cache_enabled", True)),
@@ -742,6 +745,7 @@ class Settings:
             max_pages_per_browser=int(gp.get("max_pages_per_browser", 10)),
             cache_enabled=bool(gp.get("cache_enabled", False)),
             cache_ttl_seconds=int(gp.get("cache_ttl_seconds", 1800)),
+            cdp_port=int(gp["cdp_port"]) if gp.get("cdp_port") is not None else None,
         )
         st = _storage_from_config()
         self.storage = StorageSettings(

@@ -14,19 +14,36 @@ import { AgentDebugPanel } from './AgentDebugPanel';
 import { ResearchProgressPanel } from '../research/ResearchProgressPanel';
 import { PdfViewerModal } from '../ui/PdfViewerModal';
 
+/** 格式化消息时间，便于查找：同天只显示时分，否则显示日期+时分 */
+function formatMessageTime(iso?: string | null): string {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  const now = new Date();
+  const sameDay = d.getDate() === now.getDate() && d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear();
+  const sameYear = d.getFullYear() === now.getFullYear();
+  const pad = (n: number) => String(n).padStart(2, '0');
+  if (sameDay) {
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+  if (sameYear) {
+    return `${d.getMonth() + 1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
 const PROVIDER_META: Record<string, { label: string; color: string; icon: 'db' | 'globe' }> = {
-  local:    { label: 'Local RAG',         color: '#38bdf8', icon: 'db' },
-  tavily:   { label: 'Tavily',            color: '#a78bfa', icon: 'globe' },
-  serpapi:  { label: 'SerpAPI',           color: '#22c55e', icon: 'globe' },
-  serpapi_scholar: { label: 'SerpAPI Scholar', color: '#22c55e', icon: 'globe' },
-  serpapi_google:  { label: 'SerpAPI Google',  color: '#16a34a', icon: 'globe' },
-  google:   { label: 'Google',            color: '#f97316', icon: 'globe' },
-  scholar:  { label: 'Google Scholar',    color: '#34d399', icon: 'globe' },
-  semantic: { label: 'Semantic Scholar',  color: '#facc15', icon: 'globe' },
-  ncbi:     { label: 'NCBI PubMed',       color: '#f472b6', icon: 'globe' },
-  sonar:    { label: 'Sonar',             color: '#06b6d4', icon: 'globe' },
-  web:      { label: 'Web',              color: '#94a3b8', icon: 'globe' },
+  local:    { label: 'Local RAG',        color: '#38bdf8', icon: 'db' },
+  tavily:   { label: 'Tavily',           color: '#a78bfa', icon: 'globe' },
+  google:   { label: 'Google',           color: '#f97316', icon: 'globe' },
+  scholar:  { label: 'Google Scholar',   color: '#34d399', icon: 'globe' },
+  semantic: { label: 'Semantic Scholar', color: '#facc15', icon: 'globe' },
+  ncbi:     { label: 'NCBI PubMed',      color: '#f472b6', icon: 'globe' },
+  sonar:    { label: 'Sonar',            color: '#06b6d4', icon: 'globe' },
+  web:      { label: 'Google Fetched',   color: '#94a3b8', icon: 'globe' },
 };
+
+const UNKNOWN_PROVIDER_LABEL = 'Unknown';
 
 function MiniPieChart({ data, size = 48 }: { data: { label: string; value: number; color: string }[]; size?: number }) {
   const total = data.reduce((s, d) => s + d.value, 0);
@@ -70,7 +87,7 @@ function ProviderRow({ label, counts, pieSize = 40 }: { label: string; counts: R
   const total = entries.reduce((s, [, c]) => s + c, 0);
   if (total === 0) return null;
   const pieData = entries.map(([prov, count]) => ({
-    label: PROVIDER_META[prov]?.label || prov,
+    label: PROVIDER_META[prov]?.label || UNKNOWN_PROVIDER_LABEL,
     value: count,
     color: PROVIDER_META[prov]?.color || '#64748b',
   }));
@@ -82,7 +99,7 @@ function ProviderRow({ label, counts, pieSize = 40 }: { label: string; counts: R
         <div className="text-[9px] font-semibold text-slate-500 uppercase tracking-wider mb-1">{label}</div>
         <div className="flex flex-wrap gap-x-3 gap-y-0.5">
           {entries.map(([prov, count]) => {
-            const meta = PROVIDER_META[prov] || { label: prov, color: '#64748b', icon: 'globe' as const };
+            const meta = PROVIDER_META[prov] || { label: UNKNOWN_PROVIDER_LABEL, color: '#64748b', icon: 'globe' as const };
             const pct = Math.round((count / total) * 100);
             return (
               <span key={prov} className="flex items-center gap-1 text-[10px] text-slate-400 whitespace-nowrap">
@@ -541,6 +558,17 @@ export function ChatWindow() {
                 : 'bg-[var(--bg-bubble-ai)] text-slate-200 border border-slate-700/50 shadow-black/20'
             }`}
           >
+            {/* 每条消息的提问/回复时间 */}
+            {msg.timestamp && (
+              <div
+                className={`text-[11px] mb-2 flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'} ${
+                  msg.role === 'user' ? 'text-white/70' : 'text-slate-500'
+                }`}
+                title={msg.timestamp}
+              >
+                {formatMessageTime(msg.timestamp)}
+              </div>
+            )}
             {/* 消息内容 - 使用 Markdown 渲染 */}
             {msg.role === 'assistant' ? (
               <div className="prose prose-invert prose-sm max-w-none 
@@ -609,7 +637,7 @@ export function ChatWindow() {
                           </span>
                           {(() => {
                             const prov = src.provider || (src.url ? 'web' : 'local');
-                            const meta = PROVIDER_META[prov] || { label: prov, color: '#64748b' };
+                            const meta = PROVIDER_META[prov] || { label: UNKNOWN_PROVIDER_LABEL, color: '#64748b' };
                             return (
                               <span
                                 className="text-[9px] font-medium px-1.5 py-0.5 rounded-full border"

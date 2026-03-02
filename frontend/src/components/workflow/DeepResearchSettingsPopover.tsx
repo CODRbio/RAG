@@ -180,24 +180,7 @@ export function DeepResearchSettingsPopover({ open, onClose }: Props) {
           </div>
         </div>
 
-        {/* Output Language */}
-        <div>
-          <label className="flex items-center gap-1 text-[11px] font-medium text-gray-600 mb-1">
-            Output Language
-            <Tip content="Auto: follow the topic's language. You can also force English or Chinese output regardless of the input language.">
-              <HelpCircle size={11} />
-            </Tip>
-          </label>
-          <select
-            value={deepResearchDefaults.outputLanguage}
-            onChange={(e) => updateDeepResearchDefaults({ outputLanguage: e.target.value as 'auto' | 'en' | 'zh' })}
-            className="w-full border border-gray-200 rounded-lg px-2.5 py-1.5 text-[11px] bg-white text-gray-900 focus:ring-2 focus:ring-indigo-500 outline-none"
-          >
-            <option value="auto">Auto (follow topic language)</option>
-            <option value="en">English</option>
-            <option value="zh">中文</option>
-          </select>
-        </div>
+        {/* Output Language 已移至输入栏旁，此处不再重复 */}
 
         {/* Gap Query Intent */}
         <div>

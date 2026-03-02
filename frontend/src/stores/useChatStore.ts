@@ -45,9 +45,11 @@ interface ChatState {
   appendToMessageById: (id: string, delta: string) => void;
   setMessageSourcesById: (id: string, sources: Message['sources'], providerStats?: Message['providerStats']) => void;
   setMessageAgentDebugById: (id: string, debug: AgentDebugData) => void;
+  updateMessageTimestampById: (id: string, timestamp?: string) => void;
   updateLastMessage: (content: string) => void;
   appendToLastMessage: (delta: string) => void;
   setLastMessageSources: (sources: Message['sources'], providerStats?: Message['providerStats']) => void;
+  stampLastMessageTimestamp: () => void;
   clearMessages: () => void;
   setWorkflowStep: (step: WorkflowStep) => void;
   setIsStreaming: (streaming: boolean) => void;
@@ -115,7 +117,11 @@ export const useChatStore = create<ChatState>((set) => ({
 
   addMessage: (msg) =>
     set((state) => ({
-      messages: [...state.messages, { ...msg, timestamp: new Date().toISOString() }],
+      messages: [...state.messages, {
+        ...msg,
+        // 用户消息立即打时间戳；助手占位消息先不打，等输出完成再写入
+        timestamp: msg.timestamp || (msg.role === 'user' ? new Date().toISOString() : undefined),
+      }],
     })),
   updateMessageById: (id, content) =>
     set((state) => ({
@@ -134,6 +140,12 @@ export const useChatStore = create<ChatState>((set) => ({
   setMessageAgentDebugById: (id, debug) =>
     set((state) => ({
       messages: state.messages.map((m) => (m.id === id ? { ...m, agentDebug: debug } : m)),
+    })),
+  updateMessageTimestampById: (id, timestamp) =>
+    set((state) => ({
+      messages: state.messages.map((m) =>
+        m.id === id ? { ...m, timestamp: timestamp || new Date().toISOString() } : m
+      ),
     })),
 
   updateLastMessage: (content) =>
@@ -168,6 +180,18 @@ export const useChatStore = create<ChatState>((set) => ({
           ...messages[messages.length - 1],
           sources,
           ...(providerStats ? { providerStats } : {}),
+        };
+      }
+      return { messages };
+    }),
+
+  stampLastMessageTimestamp: () =>
+    set((state) => {
+      const messages = [...state.messages];
+      if (messages.length > 0 && !messages[messages.length - 1].timestamp) {
+        messages[messages.length - 1] = {
+          ...messages[messages.length - 1],
+          timestamp: new Date().toISOString(),
         };
       }
       return { messages };
@@ -252,12 +276,21 @@ export const useChatStore = create<ChatState>((set) => ({
           bbox: s.bbox,
           page_num: s.page_num,
           type: s.url ? 'web' : 'local',
+          provider: s.provider || (s.url ? 'web' : 'local'),
         }));
+        // 兼容后端返回的 timestamp：字符串(ISO) 或数字(unix ms)，刷新后加载会话时必须有时间便于查找
+        let timestamp: string | undefined;
+        if (typeof turn.timestamp === 'string' && turn.timestamp) {
+          timestamp = turn.timestamp;
+        } else if (typeof turn.timestamp === 'number' && Number.isFinite(turn.timestamp)) {
+          const ms = turn.timestamp > 1e12 ? turn.timestamp : turn.timestamp * 1000;
+          timestamp = new Date(ms).toISOString();
+        }
         return {
           id: `${sessionId}-${index}`,
           role: (turn.role === 'assistant' ? 'assistant' : 'user') as 'user' | 'assistant',
           content: typeof turn.content === 'string' ? turn.content : '',
-          timestamp: new Date().toISOString(),
+          timestamp,
           sources,
         };
       });

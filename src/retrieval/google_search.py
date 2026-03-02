@@ -58,8 +58,16 @@ logger = get_logger(__name__)
 _shared_browser_manager: Optional["_BrowserManager"] = None
 _shared_browser_last_used: float = 0.0
 _shared_browser_lock = asyncio.Lock()
+# 引用计数：有活跃使用者时不关闭
+_browser_ref_count: int = 0
+_browser_active_jobs: set = set()  # job_id / chat session 标识
+_delayed_cleanup_task: Optional[asyncio.Task] = None
 # Cross-job guard for Chromium profile operations.
 _browser_profile_lock = threading.Lock()
+# Scholar Playwright operations share one Chromium instance (page navigation, keyboard
+# focus, pagination all conflict).  Serialize them completely so only one runs at a time.
+# Waiters block here without consuming the operation's own timeout budget.
+_playwright_scholar_lock = asyncio.Lock()
 
 
 class _ProfileLockGuard:
@@ -99,6 +107,40 @@ def _cleanup_stale_singleton_lock(user_data_dir: str) -> None:
         logger.info("Removed stale Chromium SingletonLock: %s", lock_path)
     except OSError:
         pass
+
+
+def _singleton_lock_held_by_live_process(user_data_dir: str) -> bool:
+    """True if SingletonLock exists and the owning process is still alive."""
+    lock_path = os.path.join(user_data_dir, "SingletonLock")
+    if not os.path.lexists(lock_path):
+        return False
+    try:
+        target = os.readlink(lock_path)
+        parts = target.rsplit("-", 1)
+        if len(parts) == 2:
+            pid = int(parts[1])
+            os.kill(pid, 0)  # raises OSError if process is dead
+            return True  # process alive
+    except (OSError, ValueError, IndexError):
+        pass
+    return False
+
+
+async def _do_close_shared_browser() -> None:
+    """Actually close the shared browser and reset global state. Caller must hold _shared_browser_lock."""
+    global _shared_browser_manager, _shared_browser_last_used, _browser_ref_count, _browser_active_jobs
+    if _shared_browser_manager is None:
+        return
+    try:
+        await _shared_browser_manager.close()
+        logger.info("共享浏览器实例已关闭")
+    except Exception as e:
+        logger.warning("关闭共享浏览器时出错: %s", e)
+    finally:
+        _shared_browser_manager = None
+        _shared_browser_last_used = 0
+        _browser_ref_count = 0
+        _browser_active_jobs = set()
 
 
 async def _close_shared_browser_if_exists() -> None:
@@ -159,6 +201,135 @@ async def _get_or_create_shared_browser_manager(
             _shared_browser_manager = manager
             _shared_browser_last_used = time.monotonic()
             return manager, context
+
+
+async def acquire_shared_browser(
+    job_id: str = "",
+    timeout: int = 120000,
+    user_data_dir: str = "",
+    headless: Optional[bool] = None,
+    proxy: Optional[str] = None,
+    extension_path: Optional[str] = None,
+) -> Tuple["_BrowserManager", Any, bool]:
+    """
+    获取共享浏览器，引用计数 +1（仅当 is_shared=True 时）。
+    - browser_reuse 且已有共享实例：复用，ref_count++，返回 (manager, context, True)。
+    - browser_reuse 且无共享实例：创建并设为共享，ref_count=1，返回 (manager, context, True)。
+    - 非 browser_reuse：创建独立实例，返回 (manager, context, False)，调用方在 finally 中关闭 manager。
+    """
+    perf = getattr(settings, "perf_google_search", None)
+    reuse = bool(perf and getattr(perf, "browser_reuse", True))
+    jid = (job_id or "").strip() or f"_anon_{id(object())}"
+
+    if not reuse:
+        manager = _BrowserManager(timeout=timeout)
+        async with _profile_lock_guard:
+            context = await manager.launch_persistent_browser(
+                user_data_dir=user_data_dir,
+                headless=headless,
+                proxy=proxy,
+                stealth_mode=True,
+                extension_path=extension_path,
+            )
+        return manager, context, False
+
+    async with _profile_lock_guard:
+        async with _shared_browser_lock:
+            global _shared_browser_manager, _shared_browser_last_used
+            global _browser_ref_count, _browser_active_jobs, _delayed_cleanup_task
+            now = time.monotonic()
+            if _shared_browser_manager is not None and _shared_browser_manager.browsers:
+                _browser_ref_count += 1
+                _browser_active_jobs.add(jid)
+                _shared_browser_last_used = now
+                if _delayed_cleanup_task and not _delayed_cleanup_task.done():
+                    _delayed_cleanup_task.cancel()
+                    _delayed_cleanup_task = None
+                return _shared_browser_manager, _shared_browser_manager.browsers[0], True
+            manager = _BrowserManager(timeout=timeout)
+            try:
+                context = await manager.launch_persistent_browser(
+                    user_data_dir=user_data_dir,
+                    headless=headless,
+                    proxy=proxy,
+                    stealth_mode=True,
+                    extension_path=extension_path,
+                )
+            except Exception as launch_err:
+                cdp_port = getattr(perf, "cdp_port", None) if perf else None
+                if (
+                    cdp_port
+                    and _singleton_lock_held_by_live_process(user_data_dir)
+                ):
+                    try:
+                        from playwright.async_api import async_playwright
+                        playwright = await async_playwright().start()
+                        browser = await playwright.chromium.connect_over_cdp(
+                            f"http://127.0.0.1:{cdp_port}"
+                        )
+                        ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
+                        manager.playwright = playwright
+                        manager.attach_cdp_browser(browser, ctx)
+                        context = ctx
+                        logger.info("launch 失败，已通过 CDP 连接已有浏览器 (port=%s)", cdp_port)
+                    except Exception as cdp_err:
+                        logger.warning("CDP 回退失败: %s", cdp_err)
+                        raise launch_err from cdp_err
+                else:
+                    raise
+            _shared_browser_manager = manager
+            _shared_browser_last_used = now
+            _browser_ref_count = 1
+            _browser_active_jobs = {jid}
+            if _delayed_cleanup_task and not _delayed_cleanup_task.done():
+                _delayed_cleanup_task.cancel()
+                _delayed_cleanup_task = None
+            return manager, context, True
+
+
+async def release_shared_browser(
+    job_id: str = "",
+    is_shared: bool = True,
+    manager: Optional["_BrowserManager"] = None,
+) -> None:
+    """
+    释放浏览器引用。is_shared=False 且 manager 非空时直接关闭 manager；
+    否则 ref_count--，若归零则调度延迟关闭（max_idle_seconds 后再真正关闭）。
+    """
+    if not is_shared and manager is not None:
+        try:
+            async with _profile_lock_guard:
+                await manager.close()
+        except Exception as e:
+            logger.warning("关闭独立浏览器时出错: %s", e)
+        return
+
+    jid = (job_id or "").strip()
+    perf = getattr(settings, "perf_google_search", None)
+    max_idle = (getattr(perf, "max_idle_seconds", None) or 300) if perf else 300
+
+    async with _profile_lock_guard:
+        async with _shared_browser_lock:
+            global _browser_ref_count, _browser_active_jobs, _shared_browser_last_used
+            global _delayed_cleanup_task
+            _browser_ref_count = max(0, _browser_ref_count - 1)
+            if jid:
+                _browser_active_jobs.discard(jid)
+            _shared_browser_last_used = time.monotonic()
+
+            if _browser_ref_count <= 0:
+
+                async def _delayed_close() -> None:
+                    await asyncio.sleep(max_idle)
+                    async with _profile_lock_guard:
+                        async with _shared_browser_lock:
+                            global _shared_browser_manager, _delayed_cleanup_task
+                            if _browser_ref_count <= 0 and _shared_browser_manager is not None:
+                                await _do_close_shared_browser()
+                            _delayed_cleanup_task = None
+
+                _delayed_cleanup_task = asyncio.create_task(_delayed_close())
+                logger.debug("已调度共享浏览器延迟关闭 (idle %ds)", max_idle)
 
 
 # ============================================================
@@ -394,19 +565,42 @@ async def _simulate_human_scroll_to_bottom(page):
 # 浏览器管理器
 # ============================================================
 class _BrowserManager:
-    """浏览器管理器，负责创建和管理浏览器实例"""
+    """浏览器管理器，负责创建和管理浏览器实例（含 CDP 连接）"""
     
     def __init__(self, timeout: int = 120000):
         self.playwright = None
         self.browsers = []
         self.browser_pids = []  # 记录 chromium 进程 PID
+        self._cdp_browser = None  # 通过 connect_over_cdp 连接时持有，close 时仅断开不杀进程
         self.timeout = timeout
         self._playwright_lock = asyncio.Lock()
+
+    def attach_cdp_browser(self, browser: Any, context: Any) -> None:
+        """附加通过 connect_over_cdp 得到的 browser 与默认 context。"""
+        self._cdp_browser = browser
+        self.browsers = [context]
     
     async def close(self):
-        """关闭所有浏览器实例：先关所有页面，再关 context，最后 stop playwright"""
+        """关闭所有浏览器实例：先关所有页面，再关 context，最后 stop playwright（CDP 时仅断开连接）"""
         import signal
         
+        # CDP 连接：只断开，不杀进程
+        if self._cdp_browser is not None:
+            try:
+                await asyncio.wait_for(self._cdp_browser.close(), timeout=10.0)
+                logger.debug("CDP 浏览器连接已断开")
+            except Exception as e:
+                logger.warning("断开 CDP 浏览器时出错: %s", e)
+            self._cdp_browser = None
+            self.browsers = []
+            if self.playwright:
+                try:
+                    await asyncio.wait_for(self.playwright.stop(), timeout=10.0)
+                except Exception:
+                    pass
+                self.playwright = None
+            return
+
         # 保存 PID 列表副本（关闭时使用）
         pids_to_check = list(self.browser_pids)
         
@@ -878,16 +1072,18 @@ class GoogleSearcher:
         limit: Optional[int] = None,
         year_start: Optional[int] = None,
         year_end: Optional[int] = None,
+        job_id: str = "",
     ) -> List[Dict[str, Any]]:
         """
         搜索 Google Scholar
-        
+
         Args:
             query: 搜索查询
             limit: 最大结果数
             year_start: 开始年份
             year_end: 结束年份
-        
+            job_id: 调用方 job/session 标识，用于浏览器引用计数
+
         Returns:
             RAG 格式的结果列表
         """
@@ -901,144 +1097,136 @@ class GoogleSearcher:
             cached = self._cache.get(cache_key)
             if cached is not None:
                 return cached
-        
+
         timeout = self._config.get("timeout", 60000)
         headless = self._config.get("headless")
         proxy = self._config.get("proxy")
         user_data_dir = self._get_user_data_dir()
-        
+
         results = []
         browser_manager = None
         context = None
         page = None
-        reuse_browser = getattr(getattr(settings, "perf_google_search", None), "browser_reuse", True)
+        is_shared = True
 
-        try:
-            shared_mgr, shared_ctx = await _get_or_create_shared_browser_manager(
-                timeout=timeout,
-                user_data_dir=user_data_dir,
-                headless=headless,
-                proxy=proxy,
-                extension_path=self._get_extension_path(),
-            )
-            if shared_mgr is not None and shared_ctx is not None:
-                browser_manager = shared_mgr
-                context = shared_ctx
-            else:
-                browser_manager = _BrowserManager(timeout=timeout)
-                async with _profile_lock_guard:
-                    context = await browser_manager.launch_persistent_browser(
-                        user_data_dir=self._get_user_data_dir(),
-                        headless=headless,
-                        proxy=proxy,
-                        stealth_mode=True,
-                        extension_path=self._get_extension_path()
-                    )
+        # 等待全局串行锁——等待期间不占用 Playwright 操作的 timeout 预算
+        logger.debug(f"[scholar-lock] waiting  query={query!r}")
+        async with _playwright_scholar_lock:
+            logger.debug(f"[scholar-lock] acquired query={query!r}")
+            try:
+                browser_manager, context, is_shared = await acquire_shared_browser(
+                    job_id=job_id,
+                    timeout=timeout,
+                    user_data_dir=user_data_dir,
+                    headless=headless,
+                    proxy=proxy,
+                    extension_path=self._get_extension_path(),
+                )
 
-            page = await context.new_page()
-            page.set_default_timeout(timeout)
-            await browser_manager._apply_stealth_mode(page)
+                page = await context.new_page()
+                page.set_default_timeout(timeout)
+                await browser_manager._apply_stealth_mode(page)
 
-            # 通过搜索框输入方式搜索（避免 URL 携带搜索词触发封控）
-            await self._navigate_scholar_via_searchbox(
-                page, query, year_start, year_end, timeout
-            )
-            
-            # 检查验证码
-            if await self._check_captcha(page):
-                logger.warning("检测到验证码")
-                display_mode = _get_display_mode()
-                is_headed = display_mode in ("real", "virtual") or headless == False
-                
-                if is_headed:
-                    logger.info("有头模式，等待验证码解决...")
-                    await self._inject_capsolver_attributes(page)
-                    
-                    for i in range(90):
-                        await asyncio.sleep(1)
-                        if not await self._check_captcha(page):
-                            logger.info("验证码已解决")
-                            try:
-                                await page.wait_for_load_state("domcontentloaded", timeout=15000)
-                                await page.wait_for_selector('.gs_r', timeout=10000)
-                            except Exception:
-                                pass
-                            break
-                        if i > 0 and i % 15 == 0:
-                            await self._inject_capsolver_attributes(page)
-                    
-                    if not await self._check_results(page, '.gs_r'):
-                        logger.error("验证码处理后仍无结果")
+                # 通过搜索框输入方式搜索（避免 URL 携带搜索词触发封控）
+                await self._navigate_scholar_via_searchbox(
+                    page, query, year_start, year_end, timeout
+                )
+
+                # 检查验证码
+                if await self._check_captcha(page):
+                    logger.warning("检测到验证码")
+                    display_mode = _get_display_mode()
+                    is_headed = display_mode in ("real", "virtual") or headless == False
+
+                    if is_headed:
+                        logger.info("有头模式，等待验证码解决...")
+                        await self._inject_capsolver_attributes(page)
+
+                        for i in range(90):
+                            await asyncio.sleep(1)
+                            if not await self._check_captcha(page):
+                                logger.info("验证码已解决")
+                                try:
+                                    await page.wait_for_load_state("domcontentloaded", timeout=15000)
+                                    await page.wait_for_selector('.gs_r', timeout=10000)
+                                except Exception:
+                                    pass
+                                break
+                            if i > 0 and i % 15 == 0:
+                                await self._inject_capsolver_attributes(page)
+
+                        if not await self._check_results(page, '.gs_r'):
+                            logger.error("验证码处理后仍无结果")
+                            return results
+                    else:
+                        logger.error("无头模式下无法处理验证码")
                         return results
-                else:
-                    logger.error("无头模式下无法处理验证码")
-                    return results
-            
-            # 获取总结果数
-            html_content = await page.content()
-            total = _ScholarParser.extract_total_results(html_content)
-            if total:
-                logger.info(f"总共约 {total} 条结果")
-            
-            # 多页抓取
-            current_page = 1
-            needed_pages = (limit + 9) // 10
-            
-            while current_page <= needed_pages and len(results) < limit:
-                logger.info(f"处理第 {current_page} 页 (已收集 {len(results)}/{limit})")
-                
-                try:
-                    await page.wait_for_selector('div.gs_r.gs_or.gs_scl', timeout=timeout/4)
-                except Exception:
-                    pass
-                
-                html = await page.content()
-                page_results = _ScholarParser.extract_results(html)
-                
-                if not page_results:
-                    logger.warning(f"第 {current_page} 页无结果")
-                    break
-                
-                for r in page_results[:limit - len(results)]:
-                    rag_item = self._to_scholar_rag_format(r, query)
-                    results.append(rag_item)
-                
-                logger.info(f"第 {current_page} 页提取 {len(page_results)} 条")
-                
-                if len(results) >= limit or current_page >= needed_pages:
-                    break
-                
-                # 翻页
-                await self._random_delay(1.0, 3.0)
-                await _simulate_human_scroll_to_bottom(page)
-                
-                if not await self._click_next_page(page, timeout):
-                    break
-                
-                current_page += 1
-                await self._random_delay()
-                await _simulate_human_behavior(page)
-            
-            logger.info(f"Scholar 搜索完成，共 {len(results)} 条结果")
-            if self._cache:
-                self._cache.set(cache_key, results)
-            return results
 
-        except Exception as e:
-            logger.error(f"Scholar 搜索出错: {e}")
-            return results
-        finally:
-            if page:
-                try:
-                    await page.close()
-                except Exception:
-                    pass
-            if browser_manager and not reuse_browser:
-                async with _profile_lock_guard:
-                    await browser_manager.close()
-            elif browser_manager and reuse_browser:
-                global _shared_browser_last_used
-                _shared_browser_last_used = time.monotonic()
+                # 获取总结果数
+                html_content = await page.content()
+                total = _ScholarParser.extract_total_results(html_content)
+                if total:
+                    logger.info(f"总共约 {total} 条结果")
+
+                # 多页抓取
+                current_page = 1
+                needed_pages = (limit + 9) // 10
+
+                while current_page <= needed_pages and len(results) < limit:
+                    logger.info(f"处理第 {current_page} 页 (已收集 {len(results)}/{limit})")
+
+                    try:
+                        await page.wait_for_selector('div.gs_r.gs_or.gs_scl', timeout=timeout/4)
+                    except Exception:
+                        pass
+
+                    html = await page.content()
+                    page_results = _ScholarParser.extract_results(html)
+
+                    if not page_results:
+                        logger.warning(f"第 {current_page} 页无结果")
+                        break
+
+                    for r in page_results[:limit - len(results)]:
+                        rag_item = self._to_scholar_rag_format(r, query)
+                        results.append(rag_item)
+
+                    logger.info(f"第 {current_page} 页提取 {len(page_results)} 条")
+
+                    if len(results) >= limit or current_page >= needed_pages:
+                        break
+
+                    # 翻页
+                    await self._random_delay(1.0, 3.0)
+                    await _simulate_human_scroll_to_bottom(page)
+
+                    if not await self._click_next_page(page, timeout):
+                        break
+
+                    current_page += 1
+                    await self._random_delay()
+                    await _simulate_human_behavior(page)
+
+                logger.info(f"Scholar 搜索完成，共 {len(results)} 条结果")
+                if self._cache:
+                    self._cache.set(cache_key, results)
+                return results
+
+            except Exception as e:
+                logger.error(f"Scholar 搜索出错: {e}")
+                return results
+            finally:
+                if page:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+                if browser_manager is not None:
+                    await release_shared_browser(
+                        job_id=job_id,
+                        is_shared=is_shared,
+                        manager=None if is_shared else browser_manager,
+                    )
 
     async def search_scholar_batch(
         self,
@@ -1046,29 +1234,31 @@ class GoogleSearcher:
         limit_per_query: int = 5,
         year_start: Optional[int] = None,
         year_end: Optional[int] = None,
+        job_id: str = "",
     ) -> List[Dict[str, Any]]:
         """
         批量搜索 Google Scholar（串行执行）
-        
+
         在同一个浏览器实例中依次执行多个查询，每个查询返回 limit_per_query 条结果。
-        搜索完成后关闭浏览器。
-        
+        搜索完成后通过 release_shared_browser 释放引用。
+
         Args:
             queries: 查询列表
             limit_per_query: 每个查询的最大结果数
             year_start: 开始年份
             year_end: 结束年份
-        
+            job_id: 调用方 job/session 标识，用于浏览器引用计数
+
         Returns:
             合并后的 RAG 格式结果列表（len = queries数 × limit_per_query）
         """
         if not self.enabled or not self.scholar_enabled:
             logger.warning("Google Scholar batch search skipped: disabled in config")
             return []
-        
+
         if not queries:
             return []
-        
+
         # 检查缓存：如果所有查询都有缓存，直接返回
         all_results = []
         queries_to_search = []
@@ -1080,180 +1270,167 @@ class GoogleSearcher:
                     all_results.extend(cached)
                     continue
             queries_to_search.append(q)
-        
+
         if not queries_to_search:
             logger.info("[retrieval] playwright scholar_batch skip all_cached queries=%d", len(queries))
             logger.info(f"Scholar 批量搜索：所有 {len(queries)} 个查询都命中缓存")
             return all_results
-        
+
         logger.info("[retrieval] playwright scholar_batch start queries=%d cached=%d", len(queries_to_search), len(queries) - len(queries_to_search))
         logger.info(f"Scholar 批量搜索：{len(queries_to_search)} 个查询待执行，{len(queries) - len(queries_to_search)} 个命中缓存")
-        
+
         timeout = self._config.get("timeout", 60000)
         headless = self._config.get("headless")
         proxy = self._config.get("proxy")
         user_data_dir = self._get_user_data_dir()
-        
+
         browser_manager = None
         context = None
         page = None
-        reuse_browser = getattr(getattr(settings, "perf_google_search", None), "browser_reuse", True)
-        using_shared_browser = False
-        
-        try:
-            shared_mgr, shared_ctx = await _get_or_create_shared_browser_manager(
-                timeout=timeout,
-                user_data_dir=user_data_dir,
-                headless=headless,
-                proxy=proxy,
-                extension_path=self._get_extension_path(),
-            )
-            if shared_mgr is not None and shared_ctx is not None:
-                browser_manager = shared_mgr
-                context = shared_ctx
-                using_shared_browser = True
-            else:
-                browser_manager = _BrowserManager(timeout=timeout)
-                async with _profile_lock_guard:
-                    context = await browser_manager.launch_persistent_browser(
-                        user_data_dir=user_data_dir,
-                        headless=headless,
-                        proxy=proxy,
-                        stealth_mode=True,
-                        extension_path=self._get_extension_path()
-                    )
-            
-            page = await context.new_page()
-            page.set_default_timeout(timeout)
-            await browser_manager._apply_stealth_mode(page)
-            
-            # 串行执行每个查询
-            for idx, query in enumerate(queries_to_search):
-                logger.info(f"Scholar 批量搜索 [{idx+1}/{len(queries_to_search)}]: {query!r}")
-                
-                query_results = []
-                try:
-                    # 通过搜索框输入方式搜索（避免 URL 携带搜索词触发封控）
-                    await self._navigate_scholar_via_searchbox(
-                        page, query, year_start, year_end, timeout
-                    )
-                    
-                    # 检查验证码
-                    if await self._check_captcha(page):
-                        logger.warning(f"检测到验证码 (query={query!r})")
-                        display_mode = _get_display_mode()
-                        is_headed = display_mode in ("real", "virtual") or headless == False
-                        
-                        if is_headed:
-                            await self._inject_capsolver_attributes(page)
-                            for i in range(90):
-                                await asyncio.sleep(1)
-                                if not await self._check_captcha(page):
-                                    logger.info("验证码已解决")
-                                    try:
-                                        await page.wait_for_load_state("domcontentloaded", timeout=15000)
-                                        await page.wait_for_selector('.gs_r', timeout=10000)
-                                    except Exception:
-                                        pass
-                                    break
-                                if i > 0 and i % 15 == 0:
-                                    await self._inject_capsolver_attributes(page)
-                            
-                            if not await self._check_results(page, '.gs_r'):
-                                logger.error(f"验证码处理后仍无结果 (query={query!r})")
+        is_shared = True
+
+        # 等待全局串行锁——等待期间不占用 Playwright 操作的 timeout 预算
+        logger.debug(f"[scholar-lock] waiting  batch queries={len(queries_to_search)}")
+        async with _playwright_scholar_lock:
+            logger.debug(f"[scholar-lock] acquired batch queries={len(queries_to_search)}")
+            try:
+                browser_manager, context, is_shared = await acquire_shared_browser(
+                    job_id=job_id,
+                    timeout=timeout,
+                    user_data_dir=user_data_dir,
+                    headless=headless,
+                    proxy=proxy,
+                    extension_path=self._get_extension_path(),
+                )
+
+                page = await context.new_page()
+                page.set_default_timeout(timeout)
+                await browser_manager._apply_stealth_mode(page)
+
+                # 串行执行每个查询
+                for idx, query in enumerate(queries_to_search):
+                    logger.info(f"Scholar 批量搜索 [{idx+1}/{len(queries_to_search)}]: {query!r}")
+
+                    query_results = []
+                    try:
+                        # 通过搜索框输入方式搜索（避免 URL 携带搜索词触发封控）
+                        await self._navigate_scholar_via_searchbox(
+                            page, query, year_start, year_end, timeout
+                        )
+
+                        # 检查验证码
+                        if await self._check_captcha(page):
+                            logger.warning(f"检测到验证码 (query={query!r})")
+                            display_mode = _get_display_mode()
+                            is_headed = display_mode in ("real", "virtual") or headless == False
+
+                            if is_headed:
+                                await self._inject_capsolver_attributes(page)
+                                for i in range(90):
+                                    await asyncio.sleep(1)
+                                    if not await self._check_captcha(page):
+                                        logger.info("验证码已解决")
+                                        try:
+                                            await page.wait_for_load_state("domcontentloaded", timeout=15000)
+                                            await page.wait_for_selector('.gs_r', timeout=10000)
+                                        except Exception:
+                                            pass
+                                        break
+                                    if i > 0 and i % 15 == 0:
+                                        await self._inject_capsolver_attributes(page)
+
+                                if not await self._check_results(page, '.gs_r'):
+                                    logger.error(f"验证码处理后仍无结果 (query={query!r})")
+                                    continue
+                            else:
+                                logger.error(f"无头模式下无法处理验证码 (query={query!r})")
                                 continue
-                        else:
-                            logger.error(f"无头模式下无法处理验证码 (query={query!r})")
-                            continue
-                    
-                    # 提取结果（支持多页抓取，每页 10 条）
-                    needed_pages = max(1, (limit_per_query + 9) // 10)
-                    current_page = 1
 
-                    while current_page <= needed_pages and len(query_results) < limit_per_query:
-                        try:
-                            await page.wait_for_selector('div.gs_r.gs_or.gs_scl', timeout=timeout/4)
-                        except Exception:
-                            pass
+                        # 提取结果（支持多页抓取，每页 10 条）
+                        needed_pages = max(1, (limit_per_query + 9) // 10)
+                        current_page = 1
 
-                        html = await page.content()
-                        page_results = _ScholarParser.extract_results(html)
+                        while current_page <= needed_pages and len(query_results) < limit_per_query:
+                            try:
+                                await page.wait_for_selector('div.gs_r.gs_or.gs_scl', timeout=timeout/4)
+                            except Exception:
+                                pass
 
-                        if not page_results:
-                            logger.warning(f"  Scholar batch: 第 {current_page} 页无结果 (query={query!r})")
-                            break
+                            html = await page.content()
+                            page_results = _ScholarParser.extract_results(html)
 
-                        for r in page_results[:limit_per_query - len(query_results)]:
-                            rag_item = self._to_scholar_rag_format(r, query)
-                            query_results.append(rag_item)
+                            if not page_results:
+                                logger.warning(f"  Scholar batch: 第 {current_page} 页无结果 (query={query!r})")
+                                break
 
-                        logger.info(f"  Scholar batch: 第 {current_page} 页提取 {len(page_results)} 条 (累计 {len(query_results)}/{limit_per_query})")
+                            for r in page_results[:limit_per_query - len(query_results)]:
+                                rag_item = self._to_scholar_rag_format(r, query)
+                                query_results.append(rag_item)
 
-                        if len(query_results) >= limit_per_query or current_page >= needed_pages:
-                            break
+                            logger.info(f"  Scholar batch: 第 {current_page} 页提取 {len(page_results)} 条 (累计 {len(query_results)}/{limit_per_query})")
 
-                        # 翻页
-                        await self._random_delay(1.0, 3.0)
-                        await _simulate_human_scroll_to_bottom(page)
-                        if not await self._click_next_page(page, timeout):
-                            break
-                        current_page += 1
-                        await self._random_delay()
+                            if len(query_results) >= limit_per_query or current_page >= needed_pages:
+                                break
 
-                    logger.info(f"  -> 获取 {len(query_results)} 条结果 (query={query!r})")
+                            # 翻页
+                            await self._random_delay(1.0, 3.0)
+                            await _simulate_human_scroll_to_bottom(page)
+                            if not await self._click_next_page(page, timeout):
+                                break
+                            current_page += 1
+                            await self._random_delay()
 
-                    # 缓存单个查询的结果
-                    if self._cache and query_results:
-                        cache_key = _make_key("google_scholar", query, limit_per_query, year_start, year_end)
-                        self._cache.set(cache_key, query_results)
+                        logger.info(f"  -> 获取 {len(query_results)} 条结果 (query={query!r})")
 
-                    all_results.extend(query_results)
-                    
-                    # 查询间延迟（避免被封）
-                    if idx < len(queries_to_search) - 1:
-                        await self._random_delay(2.0, 4.0)
-                
-                except Exception as e:
-                    logger.error(f"Scholar 批量搜索单个查询出错 (query={query!r}): {e}")
-                    continue
-            
-            logger.info("[retrieval] playwright scholar_batch done total_hits=%d", len(all_results))
-            logger.info(f"Scholar 批量搜索完成，共 {len(all_results)} 条结果")
-            return all_results
-        
-        except Exception as e:
-            logger.error(f"Scholar 批量搜索出错: {e}")
-            return all_results
-        finally:
-            # 关闭页面
-            if page:
-                try:
-                    await page.close()
-                except Exception:
-                    pass
-            if browser_manager and (not reuse_browser or not using_shared_browser):
-                try:
-                    async with _profile_lock_guard:
-                        await browser_manager.close()
-                    logger.info("Scholar 批量搜索：浏览器已关闭")
-                except Exception as e:
-                    logger.warning(f"关闭浏览器时出错: {e}")
-            elif browser_manager and reuse_browser and using_shared_browser:
-                global _shared_browser_last_used
-                _shared_browser_last_used = time.monotonic()
+                        # 缓存单个查询的结果
+                        if self._cache and query_results:
+                            cache_key = _make_key("google_scholar", query, limit_per_query, year_start, year_end)
+                            self._cache.set(cache_key, query_results)
+
+                        all_results.extend(query_results)
+
+                        # 查询间延迟（避免被封）
+                        if idx < len(queries_to_search) - 1:
+                            await self._random_delay(2.0, 4.0)
+
+                    except Exception as e:
+                        logger.error(f"Scholar 批量搜索单个查询出错 (query={query!r}): {e}")
+                        continue
+
+                logger.info("[retrieval] playwright scholar_batch done total_hits=%d", len(all_results))
+                logger.info(f"Scholar 批量搜索完成，共 {len(all_results)} 条结果")
+                return all_results
+
+            except Exception as e:
+                logger.error(f"Scholar 批量搜索出错: {e}")
+                return all_results
+            finally:
+                if page:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+                if browser_manager is not None:
+                    await release_shared_browser(
+                        job_id=job_id,
+                        is_shared=is_shared,
+                        manager=None if is_shared else browser_manager,
+                    )
 
     async def search_google(
         self,
         query: str,
         limit: Optional[int] = None,
+        job_id: str = "",
     ) -> List[Dict[str, Any]]:
         """
         搜索 Google
-        
+
         Args:
             query: 搜索查询
             limit: 最大结果数
-        
+            job_id: 调用方 job/session 标识，用于浏览器引用计数
+
         Returns:
             RAG 格式的结果列表
         """
@@ -1267,7 +1444,7 @@ class GoogleSearcher:
             cached = self._cache.get(cache_key)
             if cached is not None:
                 return cached
-        
+
         timeout = self._config.get("timeout", 60000)
         headless = self._config.get("headless")
         proxy = self._config.get("proxy")
@@ -1277,29 +1454,17 @@ class GoogleSearcher:
         browser_manager = None
         context = None
         page = None
-        reuse_browser = getattr(getattr(settings, "perf_google_search", None), "browser_reuse", True)
+        is_shared = True
 
         try:
-            shared_mgr, shared_ctx = await _get_or_create_shared_browser_manager(
+            browser_manager, context, is_shared = await acquire_shared_browser(
+                job_id=job_id,
                 timeout=timeout,
                 user_data_dir=user_data_dir,
                 headless=headless,
                 proxy=proxy,
                 extension_path=self._get_extension_path(),
             )
-            if shared_mgr is not None and shared_ctx is not None:
-                browser_manager = shared_mgr
-                context = shared_ctx
-            else:
-                browser_manager = _BrowserManager(timeout=timeout)
-                async with _profile_lock_guard:
-                    context = await browser_manager.launch_persistent_browser(
-                        user_data_dir=self._get_user_data_dir(),
-                        headless=headless,
-                        proxy=proxy,
-                        stealth_mode=True,
-                        extension_path=self._get_extension_path()
-                    )
 
             page = await context.new_page()
             page.set_default_timeout(timeout)
@@ -1362,38 +1527,40 @@ class GoogleSearcher:
                     await page.close()
                 except Exception:
                     pass
-            if browser_manager and not reuse_browser:
-                async with _profile_lock_guard:
-                    await browser_manager.close()
-            elif browser_manager and reuse_browser:
-                global _shared_browser_last_used
-                _shared_browser_last_used = time.monotonic()
+            if browser_manager is not None:
+                await release_shared_browser(
+                    job_id=job_id,
+                    is_shared=is_shared,
+                    manager=None if is_shared else browser_manager,
+                )
 
     async def search_google_batch(
         self,
         queries: List[str],
         limit_per_query: int = 5,
+        job_id: str = "",
     ) -> List[Dict[str, Any]]:
         """
         批量搜索 Google（串行执行）
-        
+
         在同一个浏览器实例中依次执行多个查询，每个查询返回 limit_per_query 条结果。
-        搜索完成后关闭浏览器。
-        
+        搜索完成后通过 release_shared_browser 释放引用。
+
         Args:
             queries: 查询列表
             limit_per_query: 每个查询的最大结果数
-        
+            job_id: 调用方 job/session 标识，用于浏览器引用计数
+
         Returns:
             合并后的 RAG 格式结果列表（len = queries数 × limit_per_query）
         """
         if not self.enabled or not self.google_enabled:
             logger.warning("Google batch search skipped: disabled in config")
             return []
-        
+
         if not queries:
             return []
-        
+
         # 检查缓存
         all_results = []
         queries_to_search = []
@@ -1405,53 +1572,39 @@ class GoogleSearcher:
                     all_results.extend(cached)
                     continue
             queries_to_search.append(q)
-        
+
         if not queries_to_search:
             logger.info("[retrieval] playwright google_batch skip all_cached queries=%d", len(queries))
             logger.info(f"Google 批量搜索：所有 {len(queries)} 个查询都命中缓存")
             return all_results
-        
+
         logger.info("[retrieval] playwright google_batch start queries=%d cached=%d", len(queries_to_search), len(queries) - len(queries_to_search))
         logger.info(f"Google 批量搜索：{len(queries_to_search)} 个查询待执行，{len(queries) - len(queries_to_search)} 个命中缓存")
-        
+
         timeout = self._config.get("timeout", 60000)
         headless = self._config.get("headless")
         proxy = self._config.get("proxy")
         user_data_dir = self._get_user_data_dir()
-        
+
         browser_manager = None
         context = None
         page = None
-        reuse_browser = getattr(getattr(settings, "perf_google_search", None), "browser_reuse", True)
-        using_shared_browser = False
-        
+        is_shared = True
+
         try:
-            shared_mgr, shared_ctx = await _get_or_create_shared_browser_manager(
+            browser_manager, context, is_shared = await acquire_shared_browser(
+                job_id=job_id,
                 timeout=timeout,
                 user_data_dir=user_data_dir,
                 headless=headless,
                 proxy=proxy,
                 extension_path=self._get_extension_path(),
             )
-            if shared_mgr is not None and shared_ctx is not None:
-                browser_manager = shared_mgr
-                context = shared_ctx
-                using_shared_browser = True
-            else:
-                browser_manager = _BrowserManager(timeout=timeout)
-                async with _profile_lock_guard:
-                    context = await browser_manager.launch_persistent_browser(
-                        user_data_dir=user_data_dir,
-                        headless=headless,
-                        proxy=proxy,
-                        stealth_mode=True,
-                        extension_path=self._get_extension_path()
-                    )
-            
+
             page = await context.new_page()
             page.set_default_timeout(timeout)
             await browser_manager._apply_stealth_mode(page)
-            
+
             # 串行执行每个查询
             for idx, query in enumerate(queries_to_search):
                 logger.info(f"Google 批量搜索 [{idx+1}/{len(queries_to_search)}]: {query!r}")
@@ -1524,22 +1677,17 @@ class GoogleSearcher:
             logger.error(f"Google 批量搜索出错: {e}")
             return all_results
         finally:
-            # 关闭页面
             if page:
                 try:
                     await page.close()
                 except Exception:
                     pass
-            if browser_manager and (not reuse_browser or not using_shared_browser):
-                try:
-                    async with _profile_lock_guard:
-                        await browser_manager.close()
-                    logger.info("Google 批量搜索：浏览器已关闭")
-                except Exception as e:
-                    logger.warning(f"关闭浏览器时出错: {e}")
-            elif browser_manager and reuse_browser and using_shared_browser:
-                global _shared_browser_last_used
-                _shared_browser_last_used = time.monotonic()
+            if browser_manager is not None:
+                await release_shared_browser(
+                    job_id=job_id,
+                    is_shared=is_shared,
+                    manager=None if is_shared else browser_manager,
+                )
 
     def _build_scholar_url(
         self, 
@@ -1584,6 +1732,9 @@ class GoogleSearcher:
         
         流程: 加载首页(或复用已有结果页) → 搜索框输入 → 提交 → (可选)年份过滤
         若搜索框不可用（如验证码页面），自动回退到 URL 方式。
+
+        调用方（search_scholar / search_scholar_batch）已持有 _playwright_scholar_lock，
+        此处无需额外加锁，直接顺序执行即可。
         """
         current_url = page.url or ""
         on_scholar = "scholar.google.com" in current_url
@@ -1678,6 +1829,7 @@ class GoogleSearcher:
         
         metadata = {
             "source": "scholar",
+            "provider": "scholar",
             "doc_id": result.get('title', ''),
             "title": result.get('title', ''),
             "url": url,
@@ -1716,6 +1868,7 @@ class GoogleSearcher:
             "score": self.GOOGLE_DEFAULT_SCORE,
             "metadata": {
                 "source": "google",
+                "provider": "google",
                 "doc_id": result.get('title', ''),
                 "title": result.get('title', ''),
                 "url": url,
@@ -1801,19 +1954,33 @@ class GoogleSearcher:
 
 
 async def cleanup_shared_browser():
-    """清理全局共享的浏览器实例。在程序退出或测试完成后调用。"""
-    global _shared_browser_manager, _shared_browser_last_used
+    """清理全局共享的浏览器实例。在程序退出或测试完成后调用。ref_count > 0 时不强关。"""
+    global _shared_browser_manager, _shared_browser_last_used, _browser_ref_count, _browser_active_jobs
     async with _profile_lock_guard:
         async with _shared_browser_lock:
+            if _browser_ref_count > 0:
+                logger.warning(
+                    "Skip cleanup_shared_browser: ref_count=%d active_jobs=%s",
+                    _browser_ref_count,
+                    _browser_active_jobs,
+                )
+                return
             if _shared_browser_manager is not None:
-                try:
-                    await _shared_browser_manager.close()
-                    logger.info("共享浏览器实例已关闭")
-                except Exception as e:
-                    logger.warning(f"关闭共享浏览器时出错: {e}")
-                finally:
-                    _shared_browser_manager = None
-                    _shared_browser_last_used = 0
+                await _do_close_shared_browser()
+
+
+def release_shared_browser_sync(job_id: str = "") -> None:
+    """同步释放本 job 对共享浏览器的引用（供 DR 结束等同步上下文调用）。"""
+    from src.retrieval.unified_web_search import _get_bg_loop
+    try:
+        bg = _get_bg_loop()
+        fut = asyncio.run_coroutine_threadsafe(
+            release_shared_browser(job_id=job_id, is_shared=True, manager=None),
+            bg,
+        )
+        fut.result(timeout=10)
+    except Exception:
+        pass
 
 
 def cleanup_shared_browser_sync():

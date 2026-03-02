@@ -188,7 +188,7 @@ class SerpAPISearcher:
 
                 metadata: Dict[str, Any] = {
                     "source": "serpapi_scholar",
-                    "provider": "serpapi",
+                    "provider": "serpapi_scholar",
                     "doc_id": title or url or f"serpapi_scholar_{idx}",
                     "title": title,
                     "url": url,
@@ -266,7 +266,7 @@ class SerpAPISearcher:
                 snippet = (item.get("snippet") or "").strip()
                 metadata: Dict[str, Any] = {
                     "source": "serpapi_google",
-                    "provider": "serpapi",
+                    "provider": "serpapi_google",
                     "doc_id": title or url or f"serpapi_google_{idx}",
                     "title": title,
                     "url": url,

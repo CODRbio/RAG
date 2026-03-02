@@ -22,6 +22,51 @@ from src.retrieval.unified_web_search import unified_web_searcher
 
 logger = logging.getLogger(__name__)
 
+# ── Provider normalization ────────────────────────────────────────────────────
+# Map raw provider strings (from search-engine metadata) to canonical names.
+# Semantic: any provider containing "semantic" (regex) → "semantic".
+# Other mappings by exact key.
+_PROVIDER_CANONICAL: Dict[str, str] = {
+    # Scholar: SerpAPI + Playwright → "scholar"
+    "serpapi_scholar":  "scholar",
+    # Google: SerpAPI + Playwright → "google"
+    "serpapi_google":   "google",
+    "serpapi":          "google",   # base SerpAPI (no qualifier) treated as Google
+    # Sonar / Perplexity variants → "sonar"
+    "sonar-pro":                  "sonar",
+    "sonar_pro":                  "sonar",
+    "sonar-pro-thinking":         "sonar",
+    "sonar_pro_thinking":         "sonar",
+    "sonar-reasoning-pro":        "sonar",
+    "sonar_reasoning_pro":        "sonar",
+    "sonar-reasoning":            "sonar",
+    "sonar_reasoning":            "sonar",
+    "perplexity":                 "sonar",
+    "perplexity-sonar":           "sonar",
+    "perplexity_sonar":           "sonar",
+}
+
+# Any provider name containing "semantic" (case-insensitive) → "semantic"
+_PROVIDER_SEMANTIC_RE = re.compile(r"semantic", re.IGNORECASE)
+
+
+def _normalize_provider(provider: Optional[str]) -> Optional[str]:
+    """Canonicalize a raw provider name to a stable display name.
+
+    - Contains "semantic" (regex) → "semantic".
+    - Else exact match in _PROVIDER_CANONICAL.
+    - Unknown web providers stay as-is; local stays "local".
+    """
+    if not provider:
+        return provider
+    s = provider.strip()
+    if not s:
+        return provider
+    low = s.lower()
+    if _PROVIDER_SEMANTIC_RE.search(low):
+        return "semantic"
+    return _PROVIDER_CANONICAL.get(low, provider)
+
 
 def _embedding_rerank(
     query: str,
@@ -230,7 +275,15 @@ def _hit_to_chunk(hit: Dict[str, Any], source_type: str, query: str) -> Evidence
 
     provider = meta.get("provider") or meta.get("source")
     if not provider:
-        provider = "local" if source_type in ("dense", "graph") else "web"
+        # 来自网络下载的（含 fetch 与 应 fetch 但走缓存的）统一为 web；仅本地向量/图为 local
+        has_url = bool(meta.get("url") or hit.get("url"))
+        if source_type in ("dense", "graph"):
+            provider = "local"
+        elif source_type == "web" or has_url:
+            provider = "web"
+        else:
+            provider = "web"
+    provider = _normalize_provider(str(provider)) if provider else None
 
     return EvidenceChunk(
         chunk_id=str(chunk_id),
@@ -246,7 +299,7 @@ def _hit_to_chunk(hit: Dict[str, Any], source_type: str, query: str) -> Evidence
         page_num=meta.get("page") if isinstance(meta.get("page"), int) else None,
         section_title=meta.get("section_path"),
         bbox=bbox,
-        provider=str(provider) if provider else None,
+        provider=provider,
     )
 
 
@@ -587,13 +640,10 @@ class RetrievalService:
         t0 = time.perf_counter()
         timeout_s = getattr(getattr(settings, "perf_retrieval", None), "timeout_seconds", 60) or 60
 
-        # Amplify retrieval pool so that the reranker always operates on a
-        # sufficiently large candidate set, regardless of the caller's top_k.
-        #
-        # NOTE: Each stage already has its own top_k budgets (including per-provider
-        # web limits). We keep a modest amplification here to preserve reranker
-        # headroom without inflating cross-encoder cost too aggressively.
-        actual_recall = max(80, result_limit * 2)
+        # No amplification here: the caller's result_limit is respected as-is.
+        # Pool expansion for the reranker happens inside fuse_pools_with_gap_protection
+        # via rank_pool_multiplier — that is the single intentional expansion point.
+        actual_recall = result_limit
         year_start, year_end = _normalize_year_window(filters)
 
         # 诊断信息收集
@@ -621,12 +671,11 @@ class RetrievalService:
             config = RetrievalConfig(
                 mode="hybrid",
                 top_k=actual_recall,
-                rerank=True,
                 year_start=year_start,
                 year_end=year_end,
-                reranker_mode=ui_reranker_mode,
                 step_top_k=(filters or {}).get("step_top_k"),
-                rank_pool_multiplier=rank_pool_multiplier,
+                graph_top_k=(filters or {}).get("graph_top_k"),
+                rank_pool_multiplier=1.0,
                 trace_ctx=trace_ctx,
             )
             return self.retriever.retrieve(query, self.collection, config, diagnostics=diag)
@@ -666,6 +715,7 @@ class RetrievalService:
             _queries_per_provider = (filters or {}).get("web_queries_per_provider")
             _semantic_query_map = (filters or {}).get("semantic_query_map")
             _serpapi_ratio = (filters or {}).get("serpapi_ratio")
+            _job_id = (filters or {}).get("job_id") or ""
 
             # 为 Lazy Fetching 预判构建 LLM 客户端（仅智能模式 use_content_fetcher=None 或 'auto'，使用 lite 降级）
             _llm_client = None
@@ -701,6 +751,7 @@ class RetrievalService:
                 queries_per_provider=_queries_per_provider,
                 semantic_query_map=_semantic_query_map,
                 serpapi_ratio=_serpapi_ratio,
+                job_id=_job_id,
             )
             phase1_ms = (time.perf_counter() - t_web) * 1000
             # Make snippets available to main thread right now
@@ -770,20 +821,21 @@ class RetrievalService:
             local_hits: List[Dict[str, Any]] = []
             web_hits: List[Dict[str, Any]] = []
 
-            # In hybrid mode, local branch uses UI target exactly (no amplification).
-            # Final truncation to result_limit is done by fuse_pools_with_gap_protection
-            # after merging local + web.
+            # In hybrid mode, local branch returns RRF-sorted pool only; rerank is done
+            # once in fuse_pools_with_gap_protection after merging local + web.
             cascade_bge_k = (filters or {}).get("colbert_top_k") or None
+            graph_top_k = (filters or {}).get("graph_top_k")
             local_config = RetrievalConfig(
                 mode="hybrid",
                 top_k=result_limit,
-                rerank=not skip_rerank,
+                rerank=False,
                 year_start=year_start,
                 year_end=year_end,
                 reranker_mode=ui_reranker_mode,
                 colbert_top_k=cascade_bge_k,
                 step_top_k=result_limit,
                 rank_pool_multiplier=1.0,
+                graph_top_k=graph_top_k,
                 trace_ctx=trace_ctx,
             )
 
@@ -940,57 +992,85 @@ class RetrievalService:
                 "second_stage_multiplier": round(rank_pool_multiplier, 3),
             }
 
-            # ── Global fusion: single ranked pool → top result_limit ──
-            # Local + web are merged and globally reranked in one pass so
-            # cross-source ordering reflects a unified relevance scale.
-            # Optional gap_candidates_hits (e.g. Sonar prelim citations) participate in fusion.
-            gap_candidates = gap_candidates_hits if gap_candidates_hits else []
-            fused_hits = fuse_pools_with_gap_protection(
-                query=query,
-                main_candidates=local_main + web_main,
-                gap_candidates=gap_candidates,
-                top_k=result_limit,
-                rank_pool_multiplier=rank_pool_multiplier,
-                reranker_mode=ui_reranker_mode,
-                skip_rerank=skip_rerank,
-                trace_ctx=trace_ctx,
-                diag=diag,
-            )
+            # ── Pool-only mode: caller will do the final fuse_pools (e.g. chat gap) ──
+            pool_only = bool((filters or {}).get("pool_only"))
+            if pool_only:
+                for h in local_main + web_main:
+                    source_type = h.get("_source_type", "dense")
+                    all_chunks.append(_hit_to_chunk(h, source_type, query))
+                logger.info("[retrieval] pool_only mode: returning %d raw hits (no rerank)", len(all_chunks))
+            else:
+                # ── Global fusion: single ranked pool → top result_limit ──
+                gap_candidates = gap_candidates_hits if gap_candidates_hits else []
+                fused_hits = fuse_pools_with_gap_protection(
+                    query=query,
+                    main_candidates=local_main + web_main,
+                    gap_candidates=gap_candidates,
+                    top_k=result_limit,
+                    rank_pool_multiplier=rank_pool_multiplier,
+                    reranker_mode=ui_reranker_mode,
+                    skip_rerank=skip_rerank,
+                    trace_ctx=trace_ctx,
+                    diag=diag,
+                )
 
-            logger.info("[retrieval] fuse_done fused=%d", len(fused_hits))
+                logger.info("[retrieval] fuse_done fused=%d", len(fused_hits))
 
-            for h in fused_hits:
-                source_type = h.get("_source_type", "dense")
-                all_chunks.append(_hit_to_chunk(h, source_type, query))
+                for h in fused_hits:
+                    source_type = h.get("_source_type", "dense")
+                    all_chunks.append(_hit_to_chunk(h, source_type, query))
         else:
             if mode == "local":
                 config = RetrievalConfig(
                     mode="hybrid",
                     top_k=actual_recall,
-                    rerank=not skip_rerank,
+                    rerank=False,
                     year_start=year_start,
                     year_end=year_end,
                     reranker_mode=ui_reranker_mode,
                     step_top_k=(filters or {}).get("step_top_k"),
-                    rank_pool_multiplier=rank_pool_multiplier,
+                    graph_top_k=(filters or {}).get("graph_top_k"),
+                    rank_pool_multiplier=1.0,
                     trace_ctx=trace_ctx,
                 )
                 hits = self.retriever.retrieve(query, self.collection, config, diagnostics=diag)
                 total_candidates += len(hits) * 2
+
+                local_pool: List[Dict[str, Any]] = []
                 for h in hits:
-                    # 应用阈值过滤
                     score = float(h.get("score", 0.0))
                     if local_threshold is not None and score < local_threshold:
                         continue
                     st = h.get("source") or (h.get("metadata") or {}).get("source")
-                    source_type = "graph" if st == "graph" else "dense"
-                    if "dense" not in sources_used and source_type == "dense":
+                    h["_source_type"] = "graph" if st == "graph" else "dense"
+                    if "dense" not in sources_used and h["_source_type"] == "dense":
                         sources_used.append("dense")
-                    if source_type == "graph" and "graph" not in sources_used:
+                    if h["_source_type"] == "graph" and "graph" not in sources_used:
                         sources_used.append("graph")
-                    all_chunks.append(_hit_to_chunk(h, source_type, query))
-                if not sources_used and all_chunks:
+                    local_pool.append(h)
+                if not sources_used and local_pool:
                     sources_used.append("dense")
+
+                pool_only = bool((filters or {}).get("pool_only"))
+                if pool_only:
+                    for h in local_pool:
+                        all_chunks.append(_hit_to_chunk(h, h.get("_source_type", "dense"), query))
+                    logger.info("[retrieval] local pool_only: returning %d raw hits", len(local_pool))
+                else:
+                    fused_hits = fuse_pools_with_gap_protection(
+                        query=query,
+                        main_candidates=local_pool,
+                        gap_candidates=[],
+                        top_k=result_limit,
+                        rank_pool_multiplier=rank_pool_multiplier,
+                        reranker_mode=ui_reranker_mode,
+                        skip_rerank=skip_rerank,
+                        trace_ctx=trace_ctx,
+                        diag=diag,
+                    )
+                    logger.info("[retrieval] local fuse_done fused=%d from pool=%d", len(fused_hits), len(local_pool))
+                    for h in fused_hits:
+                        all_chunks.append(_hit_to_chunk(h, h.get("_source_type", "dense"), query))
             elif mode == "web":
                 try:
                     web_providers = (filters or {}).get("web_providers")
@@ -1036,6 +1116,7 @@ class RetrievalService:
                         year_end=year_end,
                         semantic_query_map=_semantic_query_map,
                         serpapi_ratio=_serpapi_ratio,
+                        job_id=(filters or {}).get("job_id") or "",
                     )
                     total_candidates += len(web_hits)
                     sources_used.append("web")

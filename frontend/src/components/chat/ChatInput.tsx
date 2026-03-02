@@ -46,6 +46,7 @@ export function ChatInput() {
     clearStreamingTask,
     streamingTasks,
     setMessageAgentDebugById,
+    updateMessageTimestampById,
     setPendingLocalDbChoice,
     clearPendingLocalDbChoice,
     setLocalDbChoiceHandler,
@@ -229,12 +230,14 @@ export function ChatInput() {
       year_end: ragConfig.yearEnd ?? undefined,
       step_top_k: (searchMode !== 'none') ? (ragConfig.stepTopK ?? 10) : undefined,
       write_top_k: (searchMode !== 'none') ? (ragConfig.writeTopK ?? 15) : undefined,
+      graph_top_k: (searchMode !== 'none' && ragConfig.enableHippoRAG) ? ragConfig.graphTopK : undefined,
       use_content_fetcher: (searchMode !== 'none' && webEnabled) ? webSearchConfig.contentFetcherMode : undefined,
       agent_mode: ragConfig.agentMode ?? 'standard',
       sonar_strength: sonarStrength,
       use_sonar_prelim: sonarStrength !== 'off',
       sonar_model: sonarStrength !== 'off' ? sonarStrength : undefined,
       max_iterations: ragConfig.maxIterations ?? 2,
+      output_language: deepResearchDefaults.outputLanguage ?? 'auto',
       reranker_mode: searchMode !== 'none'
         ? (ragConfig.enableReranker
           ? ((localStorage.getItem('adv_reranker_mode') || 'cascade') as 'bge_only' | 'colbert_only' | 'cascade')
@@ -339,8 +342,8 @@ export function ChatInput() {
               }
             }
             if (ev === 'delta') appendToMessageById(newAssistantId, (d as { delta: string }).delta);
-            if (ev === 'done') setWorkflowStep('idle');
-            if (ev === 'error' || ev === 'cancelled' || ev === 'timeout') break;
+            if (ev === 'done') { updateMessageTimestampById(newAssistantId); setWorkflowStep('idle'); }
+            if (ev === 'error' || ev === 'cancelled' || ev === 'timeout') { updateMessageTimestampById(newAssistantId); break; }
           }
         } catch (e) {
           console.error('[ChatInput] localDbChoice follow-up error:', e);
@@ -440,9 +443,11 @@ export function ChatInput() {
           }
 
         } else if (event === 'done') {
+          updateMessageTimestampById(assistantMessageId);
           setWorkflowStep('refine');
           setTimeout(() => setWorkflowStep('idle'), 1000);
         } else if (event === 'error' || event === 'cancelled' || event === 'timeout') {
+          updateMessageTimestampById(assistantMessageId);
           if (event === 'error') {
             appendToMessageById(assistantMessageId, '\n\n' + (t('chat.requestError') || 'Error'));
             addToast(t('chat.sendFailed'), 'error');
@@ -462,6 +467,7 @@ export function ChatInput() {
       } else {
         addToast(t('chat.sendFailed'), 'error');
       }
+      updateMessageTimestampById(assistantMessageId);
       appendToMessageById(assistantMessageId, '\n\n' + (t('chat.requestError') || '请求失败'));
     } finally {
       if (taskId) clearStreamingTask(taskId);
@@ -523,6 +529,18 @@ export function ChatInput() {
 
         {/* 输入区域 */}
         <div className="flex items-center gap-2">
+          {/* 输出语言：常用选项，与搜索栏并列 */}
+          <select
+            value={deepResearchDefaults.outputLanguage ?? 'auto'}
+            onChange={(e) => useConfigStore.getState().updateDeepResearchDefaults({ outputLanguage: e.target.value as 'auto' | 'en' | 'zh' })}
+            title={t('sidebar.outputLanguage')}
+            className="flex-shrink-0 h-[42px] px-2.5 rounded-lg border border-slate-700 bg-slate-800/60 text-slate-200 text-sm focus:ring-1 focus:ring-sky-500 focus:border-sky-500 outline-none cursor-pointer"
+          >
+            <option value="auto">{t('chatInput.langAuto', 'Auto')}</option>
+            <option value="en">EN</option>
+            <option value="zh">中文</option>
+          </select>
+
           {/* Deep Research 按钮组：⚙ 设置 + 🔭 启动 */}
           <div className="relative flex items-center">
             <button

@@ -63,6 +63,10 @@ class ChatRequest(BaseModel):
         None,
         description="单个产出单元进 LLM 的证据上限：Chat 一次问答 = 一单元；DR 一大纲章节 = 一单元。None 时等于 step_top_k。",
     )
+    graph_top_k: Optional[int] = Field(
+        None,
+        description="HippoRAG 图检索进入候选池的最大结果数。仅当启用 HippoRAG 时生效；None 表示使用后端默认。",
+    )
     llm_provider: Optional[str] = Field(
         None,
         description="LLM 提供商: deepseek | openai | gemini | claude | kimi 等，None 表示使用配置默认值",
@@ -244,6 +248,7 @@ class TurnItem(BaseModel):
     role: str
     content: str
     sources: List[ChatCitation] = Field(default_factory=list, description="该轮对话的引用来源")
+    timestamp: Optional[str] = Field(None, description="该轮消息时间，ISO8601 字符串，便于前端展示与查找")
 
 
 class SessionInfo(BaseModel):
@@ -606,6 +611,10 @@ class DeepResearchRequest(BaseModel):
         None,
         description="每个大纲章节写作时从 section pool 选出的证据上限。None 时由 preset 从 step_top_k 推导。",
     )
+    graph_top_k: Optional[int] = Field(
+        None,
+        description="HippoRAG 图检索进入候选池的最大结果数。None 表示使用后端默认。",
+    )
     llm_provider: Optional[str] = Field(None, description="LLM 提供商")
     ultra_lite_provider: Optional[str] = Field(None, description="超轻量级 LLM 提供商（长文本压缩等）")
     model_override: Optional[str] = Field(None, description="覆盖 provider 默认模型")
@@ -653,6 +662,10 @@ class DeepResearchStartRequest(BaseModel):
     write_top_k: Optional[int] = Field(
         None,
         description="每个大纲章节写作时从 section pool 选出的证据上限。None 时由 preset 从 step_top_k 推导。",
+    )
+    graph_top_k: Optional[int] = Field(
+        None,
+        description="HippoRAG 图检索进入候选池的最大结果数。None 表示使用后端默认。",
     )
     llm_provider: Optional[str] = Field(None, description="LLM 提供商")
     ultra_lite_provider: Optional[str] = Field(None, description="超轻量级 LLM 提供商（长文本压缩等）")
@@ -745,6 +758,10 @@ class DeepResearchConfirmRequest(BaseModel):
     write_top_k: Optional[int] = Field(
         None,
         description="每个大纲章节写作时从 section pool 选出的证据上限。None 时由 preset 从 step_top_k 推导。",
+    )
+    graph_top_k: Optional[int] = Field(
+        None,
+        description="HippoRAG 图检索进入候选池的最大结果数。None 表示使用后端默认。",
     )
     llm_provider: Optional[str] = Field(None, description="LLM 提供商")
     ultra_lite_provider: Optional[str] = Field(None, description="超轻量级 LLM 提供商（长文本压缩等）")

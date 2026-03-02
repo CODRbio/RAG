@@ -101,6 +101,10 @@ ACADEMIC_DOMAINS = {
     "acm.org", "dl.acm.org",
 }
 
+# 每页抓取总时长上限：默认 1 分钟；启用 BrightData + 2captcha 时为 2 分钟
+PER_PAGE_TIMEOUT_CAP_SECONDS = 60
+PER_PAGE_TIMEOUT_CAP_EXTENDED_SECONDS = 120
+
 # 学术域名子串匹配
 ACADEMIC_DOMAIN_SUBSTRINGS = {
     "scholar", "arxiv", "pubmed", "doi.org", "sciencedirect",
@@ -203,6 +207,7 @@ class WebContentFetcher:
     timeout_seconds: int = 15
     brightdata_api_key: str = ""
     brightdata_zone: str = ""
+    two_captcha_api_key: str = ""  # 与 BrightData 同时启用时，单页抓取上限提高到 2 分钟
     cache_enabled: bool = True
     cache_ttl_seconds: int = 3600
     disk_cache_enabled: bool = True
@@ -232,6 +237,17 @@ class WebContentFetcher:
             )
         self._inflight: Dict[str, asyncio.Future] = {}
 
+    def _per_page_timeout_cap_seconds(self) -> int:
+        """单页抓取总时长上限：启用 BrightData 且配置 2captcha 时为 2 分钟，否则 1 分钟。"""
+        if self.brightdata_api_key and self.two_captcha_api_key:
+            return PER_PAGE_TIMEOUT_CAP_EXTENDED_SECONDS
+        return PER_PAGE_TIMEOUT_CAP_SECONDS
+
+    @property
+    def effective_timeout_seconds(self) -> int:
+        """实际使用的单页超时：不超过配置的 timeout_seconds，且不超过每页总上限。"""
+        return min(self.timeout_seconds, self._per_page_timeout_cap_seconds())
+
     @classmethod
     def from_settings(cls) -> "WebContentFetcher":
         """从 config/settings.py 全局 settings 加载配置"""
@@ -246,6 +262,7 @@ class WebContentFetcher:
                     timeout_seconds=getattr(cfg, "timeout_seconds", 15),
                     brightdata_api_key=getattr(cfg, "brightdata_api_key", ""),
                     brightdata_zone=getattr(cfg, "brightdata_zone", ""),
+                    two_captcha_api_key=getattr(cfg, "two_captcha_api_key", ""),
                     cache_enabled=getattr(cfg, "cache_enabled", True),
                     cache_ttl_seconds=getattr(cfg, "cache_ttl_seconds", 3600),
                     disk_cache_enabled=getattr(cfg, "disk_cache_enabled", True),
@@ -278,7 +295,7 @@ class WebContentFetcher:
                     None,
                     lambda: trafilatura.fetch_url(url),
                 ),
-                timeout=self.timeout_seconds,
+                timeout=self.effective_timeout_seconds,
             )
             if not downloaded:
                 return None
@@ -333,7 +350,7 @@ class WebContentFetcher:
                 async with session.get(
                     url,
                     proxy=proxy_url,
-                    timeout=aiohttp.ClientTimeout(total=self.timeout_seconds),
+                    timeout=aiohttp.ClientTimeout(total=self.effective_timeout_seconds),
                     headers={"User-Agent": "Mozilla/5.0 (compatible; DeepSeaRAG/1.0)"},
                     ssl=False,
                 ) as resp:
@@ -411,7 +428,7 @@ class WebContentFetcher:
                     await page.goto(
                         url,
                         wait_until="domcontentloaded",
-                        timeout=self.timeout_seconds * 1000,
+                        timeout=self.effective_timeout_seconds * 1000,
                     )
 
                     # 等待正文加载
@@ -519,12 +536,27 @@ class WebContentFetcher:
         fut: asyncio.Future[Optional[str]] = loop.create_future()
         self._inflight[url] = fut
 
-        try:
+        async def _fetch_with_cap() -> Optional[str]:
             text = await self._fetch_trafilatura(url)
             if text is None:
                 text = await self._fetch_brightdata(url)
             if text is None:
                 text = await self._fetch_playwright(url)
+            return text
+
+        try:
+            try:
+                text = await asyncio.wait_for(
+                    _fetch_with_cap(),
+                    timeout=float(self.effective_timeout_seconds),
+                )
+            except asyncio.TimeoutError:
+                logger.debug(
+                    "抓取总超时放弃: %s (上限 %ds)",
+                    url,
+                    self.effective_timeout_seconds,
+                )
+                text = None
 
             if text and len(text) > self.max_content_length:
                 text = text[: self.max_content_length]

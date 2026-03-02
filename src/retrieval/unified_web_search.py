@@ -362,6 +362,7 @@ class UnifiedWebSearcher:
         queries_per_provider: Optional[Dict[str, List[str]]] = None,
         semantic_query_map: Optional[Dict[str, str]] = None,
         serpapi_ratio: Optional[float] = None,
+        job_id: str = "",
     ) -> List[Dict[str, Any]]:
         """
         异步搜索多个来源并合并去重
@@ -408,6 +409,7 @@ class UnifiedWebSearcher:
             serpapi_ratio=serpapi_ratio,
             use_query_expansion=use_query_expansion,
             llm_provider=llm_provider,
+            job_id=job_id,
         )
 
         # 合并去重
@@ -559,6 +561,7 @@ class UnifiedWebSearcher:
         limit_per_query: int,
         year_start: Optional[int] = None,
         year_end: Optional[int] = None,
+        job_id: str = "",
     ) -> List[Dict[str, Any]]:
         """Google Scholar 批量搜索（串行执行）"""
         try:
@@ -568,6 +571,7 @@ class UnifiedWebSearcher:
                 limit_per_query=limit_per_query,
                 year_start=year_start,
                 year_end=year_end,
+                job_id=job_id,
             )
         except Exception as e:
             logger.error(f"Google Scholar 批量搜索失败: {e}")
@@ -578,11 +582,14 @@ class UnifiedWebSearcher:
         searcher,
         queries: List[str],
         limit_per_query: int,
+        job_id: str = "",
     ) -> List[Dict[str, Any]]:
         """Google 批量搜索（串行执行）"""
         try:
             logger.info(f"Google 批量搜索：{len(queries)} 个查询，每个最多 {limit_per_query} 条")
-            return await searcher.search_google_batch(queries, limit_per_query=limit_per_query)
+            return await searcher.search_google_batch(
+                queries, limit_per_query=limit_per_query, job_id=job_id
+            )
         except Exception as e:
             logger.error(f"Google 批量搜索失败: {e}")
             return []
@@ -680,6 +687,7 @@ class UnifiedWebSearcher:
         serpapi_ratio: Optional[float] = None,
         use_query_expansion: Optional[bool] = None,
         llm_provider: Optional[str] = None,
+        job_id: str = "",
     ) -> List[Dict[str, Any]]:
         """
         并发执行指定引擎列表，返回所有命中结果（未去重）。
@@ -946,6 +954,7 @@ class UnifiedWebSearcher:
                             scholar_max,
                             year_start=year_start,
                             year_end=year_end,
+                            job_id=job_id,
                         ),
                         True,
                     )
@@ -954,7 +963,12 @@ class UnifiedWebSearcher:
         if google_browser_queries:
             if gsearcher and google_browser_queries:
                 tasks_with_flags.append(
-                    (self._search_google_batch(gsearcher, google_browser_queries, google_max), True)
+                    (
+                        self._search_google_batch(
+                            gsearcher, google_browser_queries, google_max, job_id=job_id
+                        ),
+                        True,
+                    )
                 )
 
         if not tasks_with_flags:
@@ -1012,6 +1026,7 @@ class UnifiedWebSearcher:
         queries_per_provider: Optional[Dict[str, List[str]]] = None,
         semantic_query_map: Optional[Dict[str, str]] = None,
         serpapi_ratio: Optional[float] = None,
+        job_id: str = "",
     ) -> List[Dict[str, Any]]:
         """同步搜索 — 在持久后台事件循环上运行异步版本。
 
@@ -1036,6 +1051,7 @@ class UnifiedWebSearcher:
             queries_per_provider=queries_per_provider,
             semantic_query_map=semantic_query_map,
             serpapi_ratio=serpapi_ratio,
+            job_id=job_id,
         )
         bg = _get_bg_loop()
         future = asyncio.run_coroutine_threadsafe(self.search(**_search_kwargs), bg)

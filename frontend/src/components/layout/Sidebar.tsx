@@ -26,6 +26,7 @@ import {
 import { useAuthStore, useConfigStore, useUIStore, useToastStore, useChatStore, useCanvasStore } from '../../stores';
 import { checkHealth } from '../../api/health';
 import { listSessions, deleteSession, listDeepResearchJobs, cancelDeepResearchJob, deleteDeepResearchJob } from '../../api/chat';
+import { listLLMProviders, listAllLiveModels, type LLMProviderInfo } from '../../api/ingest';
 import { getModelStatus, syncModels } from '../../api/models';
 import { exportCanvas, getCanvas } from '../../api/canvas';
 import { toggleDebug } from '../../api/debug';
@@ -141,6 +142,37 @@ export function Sidebar({ onStartResize }: SidebarProps) {
   const [isLoadingJobs, setIsLoadingJobs] = useState(false);
   const [isSyncingModels, setIsSyncingModels] = useState(false);
   const [modelStatusSummary, setModelStatusSummary] = useState<string | null>(null);
+  // Pre-Research 强度选项：与 LLM 选择同源，从 Perplexity/Sonar 拉取模型列表
+  const [sonarModelOptions, setSonarModelOptions] = useState<{ value: string; label: string }[]>([
+    { value: 'sonar', label: 'Sonar (fast)' },
+    { value: 'sonar-pro', label: 'Sonar Pro (balanced)' },
+    { value: 'sonar-reasoning-pro', label: 'Reasoning Pro (deep)' },
+    { value: 'sonar-deep-research', label: 'Deep Research' },
+  ]);
+
+  // 加载 Pre-Research 可选模型（与 Header LLM 选择同源：perplexity/sonar provider 的 models）
+  useEffect(() => {
+    listLLMProviders()
+      .then((data) => {
+        if (!data.providers?.length) return;
+        const prelim = data.providers.find((p) => p.id === 'perplexity' || p.id === 'sonar');
+        if (!prelim?.models?.length) return;
+        listAllLiveModels().then((live) => {
+          const platform = prelim.platform ?? prelim.id.split('-')[0];
+          const liveModels = live.platforms?.[platform]?.models ?? prelim.models;
+          const labelMap: Record<string, string> = {
+            sonar: t('sidebar.sonarStrengthSonar', 'Sonar (fast)'),
+            'sonar-pro': t('sidebar.sonarStrengthPro', 'Sonar Pro (balanced)'),
+            'sonar-reasoning-pro': t('sidebar.sonarStrengthReasoningPro', 'Reasoning Pro (deep)'),
+            'sonar-deep-research': t('sidebar.sonarStrengthDeepResearch', 'Deep Research'),
+          };
+          setSonarModelOptions(
+            liveModels.map((id) => ({ value: id, label: labelMap[id] ?? id })),
+          );
+        }).catch(() => setSonarModelOptions((prev) => prev));
+      })
+      .catch(() => {});
+  }, [t]);
 
   // 加载后台 Deep Research 任务：所有任务都显示，直到被显式删除
   const loadBackgroundJobs = useCallback(async () => {
@@ -1119,17 +1151,17 @@ export function Sidebar({ onStartResize }: SidebarProps) {
                   />
                 </div>
               )}
-              {/* Pre-Research 强度 (Sonar) */}
+              {/* Pre-Research 强度 (Sonar)：与 LLM 选择同源，从 Perplexity 拉取模型列表 */}
               <div className="flex items-center justify-between border-t border-slate-700/30 pt-2 mt-1">
                 <div>
                   <div className="flex items-center gap-1.5">
                     <span className="text-xs text-slate-400">{t('sidebar.sonarStrength', 'Pre-Research 强度')}</span>
-                    <HelpTooltip content={t('sidebar.sonarStrengthHelp', 'Use Perplexity Sonar to fetch preliminary knowledge before retrieval. Off = disabled; Sonar (fast) / Pro (balanced) / Reasoning Pro (deep, default). Set llm.platforms.perplexity.api_key in config/rag_config.local.json.')}>
+                    <HelpTooltip content={t('sidebar.sonarStrengthHelp', 'Use Perplexity Sonar to fetch preliminary knowledge before retrieval. Off = disabled; options from same Perplexity model list as LLM selector. Set llm.platforms.perplexity.api_key in config/rag_config.local.json.')}>
                       <HelpCircle size={10} />
                     </HelpTooltip>
                   </div>
                   <div className="text-[10px] text-slate-500">
-                    {t('sidebar.sonarStrengthDesc', 'Off | Sonar | Pro | Reasoning Pro')}
+                    {t('sidebar.sonarStrengthDesc', 'Off | Perplexity models (e.g. Sonar … Deep Research)')}
                   </div>
                 </div>
                 <select
@@ -1140,9 +1172,15 @@ export function Sidebar({ onStartResize }: SidebarProps) {
                   className="text-[10px] border border-slate-700 rounded-md px-2 py-1 bg-slate-950 text-slate-300 focus:outline-none focus:border-sky-500"
                 >
                   <option value="off">{t('sidebar.sonarStrengthOff', 'Off')}</option>
-                  <option value="sonar">{t('sidebar.sonarStrengthSonar', 'Sonar (fast)')}</option>
-                  <option value="sonar-pro">{t('sidebar.sonarStrengthPro', 'Sonar Pro (balanced)')}</option>
-                  <option value="sonar-reasoning-pro">{t('sidebar.sonarStrengthReasoningPro', 'Reasoning Pro (deep)')}</option>
+                  {sonarModelOptions.map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </option>
+                  ))}
+                  {/* 若当前值为持久化的模型 id 但不在 API 返回列表中，仍显示可选 */}
+                  {ragConfig.sonarStrength && ragConfig.sonarStrength !== 'off' && !sonarModelOptions.some((o) => o.value === ragConfig.sonarStrength) && (
+                    <option value={ragConfig.sonarStrength}>{ragConfig.sonarStrength}</option>
+                  )}
                 </select>
               </div>
             </div>

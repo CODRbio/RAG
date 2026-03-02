@@ -937,6 +937,25 @@ class HTTPChatClient(BaseChatClient):
         if payload.get("max_completion_tokens") is None:
             payload.pop("max_completion_tokens", None)
 
+        # Provider-specific default max_tokens when missing (per-platform limits).
+        # Prevents truncation or API errors when the caller does not set a value.
+        provider_name = (self.config.name or "").lower()
+        if "max_tokens" not in payload and "max_completion_tokens" not in payload:
+            if "kimi" in provider_name:
+                payload["max_tokens"] = 32_768  # Moonshot cap
+            elif "deepseek" in provider_name:
+                payload["max_tokens"] = 8_192   # deepseek-chat / reasoner cap
+            elif "gemini" in provider_name:
+                payload["max_tokens"] = 65_536 # 64K output
+            elif "openai" in provider_name:
+                payload["max_tokens"] = 128_000 # GPT-5.2 128K
+            elif "qwen" in provider_name:
+                model_lower = (model or "").lower()
+                if "plus" in model_lower or "max" in model_lower:
+                    payload["max_tokens"] = 65_536  # qwen3.5-plus / qwen3-max
+                else:
+                    payload["max_tokens"] = 32_768  # qwen-plus, qwen-flash, etc.
+
         # Reasoning/thinking models: avoid restricting chain-of-thought with a small limit.
         # Covers: OpenAI reasoning_effort, DeepSeek thinking.type, Kimi thinking.type,
         #         Qwen enable_thinking
@@ -950,6 +969,20 @@ class HTTPChatClient(BaseChatClient):
                 val = payload.get(key)
                 if val is not None and val < 8000:
                     payload.pop(key, None)
+
+        # Qwen enable_thinking: inject thinking_budget if not explicitly set.
+        #
+        # Without thinking_budget, the model can spend its ENTIRE token quota on
+        # reasoning_content (chain-of-thought) and output an empty content field,
+        # producing response_len=0.  thinking_budget caps the reasoning phase and
+        # forces the model to start generating the actual answer afterwards.
+        #
+        # Derive from max_tokens minus 8000 so the model always has ≥8K tokens for
+        # the final content. Override via provider params: { "enable_thinking": true, "thinking_budget": N }
+        _MIN_RESPONSE_TOKENS = 8_000
+        if payload.get("enable_thinking") is True and "thinking_budget" not in payload:
+            cap = payload.get("max_tokens") or 65_536
+            payload["thinking_budget"] = max(25_000, cap - _MIN_RESPONSE_TOKENS)
 
         # OpenAI 新 API: 使用 max_completion_tokens
         is_openai = "api.openai.com" in (self.config.base_url or "")
@@ -989,19 +1022,30 @@ class HTTPChatClient(BaseChatClient):
             payload[key] = value
 
         # Anthropic API 必须提供大于 0 的整型 max_tokens。
-        # Sonnet 4.6 / Opus 4.6 支持最高 128K output，给一个宽裕的默认值。
+        # Claude 4.5 / Sonnet 4.5 / Opus 4.5 最大输出 64K；Opus 4.6+ 才到 128K。
         thinking_cfg = payload.get("thinking") or {}
         thinking_type = thinking_cfg.get("type")
         is_thinking = thinking_type in ("enabled", "adaptive")
+        _CLAUDE_45_MAX_OUTPUT = 64_000
+        _MIN_VISIBLE_TOKENS = 8_000
 
         if payload.get("max_tokens") is None:
-            payload["max_tokens"] = 64000 if is_thinking else 16384
+            payload["max_tokens"] = _CLAUDE_45_MAX_OUTPUT if is_thinking else 16384
 
-        # Extended thinking: max_tokens 必须 > budget_tokens，否则 API 报错
+        # Extended thinking: max_tokens 必须 > budget_tokens，否则 API 报错。
+        # Cap budget so that (budget + visible response) stays within max_tokens.
         if is_thinking and thinking_type == "enabled":
             budget = int(thinking_cfg.get("budget_tokens") or 10000)
-            if payload["max_tokens"] <= budget:
-                payload["max_tokens"] = budget + 8000
+            max_out = payload["max_tokens"]
+            if max_out <= budget:
+                payload["max_tokens"] = budget + _MIN_VISIBLE_TOKENS
+            # Ensure we do not exceed platform cap and that budget leaves room for answer
+            payload["max_tokens"] = min(payload["max_tokens"], _CLAUDE_45_MAX_OUTPUT)
+            max_budget = payload["max_tokens"] - _MIN_VISIBLE_TOKENS
+            if budget > max_budget:
+                thinking_cfg = dict(thinking_cfg)
+                thinking_cfg["budget_tokens"] = max_budget
+                payload["thinking"] = thinking_cfg
 
         # ── Function Calling: 注入 tools ──
         if tools:

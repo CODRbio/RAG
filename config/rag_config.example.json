@@ -166,6 +166,7 @@
     "timeout_seconds": 15,
     "brightdata_api_key": "",
     "brightdata_zone": "",
+    "two_captcha_api_key": "",
     "cache_enabled": true,
     "cache_ttl_seconds": 3600,
     "disk_cache_enabled": true,

@@ -830,29 +830,13 @@ def _save_phase_checkpoint(state: DeepResearchState, phase: str, section_title: 
 
 
 def _cleanup_shared_browser_if_no_active_jobs(current_job_id: str = "") -> None:
-    """Close shared web-search browser only when no other DR jobs are active."""
+    """Release this job's reference to the shared browser; close only when ref_count reaches 0 (after idle delay)."""
     try:
-        from sqlmodel import Session, select
-        from src.db.engine import get_engine
-        from src.db.models import DeepResearchJob
+        from src.retrieval.google_search import release_shared_browser_sync
 
-        with Session(get_engine()) as session:
-            stmt = select(DeepResearchJob.job_id).where(
-                DeepResearchJob.status.in_(["running", "cancelling"])
-            )
-            jid = str(current_job_id or "").strip()
-            if jid:
-                stmt = stmt.where(DeepResearchJob.job_id != jid)
-            other_active = session.exec(stmt.limit(1)).first() is not None
-        if other_active:
-            logger.debug("Skip shared browser cleanup: other DR jobs still active")
-            return
-
-        from src.retrieval.google_search import cleanup_shared_browser_sync
-
-        cleanup_shared_browser_sync()
+        release_shared_browser_sync(job_id=current_job_id or "")
     except Exception:
-        logger.debug("Shared browser cleanup skipped due to error", exc_info=True)
+        logger.debug("Shared browser release skipped due to error", exc_info=True)
 
 
 def reconstruct_state_from_checkpoint(
@@ -2269,6 +2253,7 @@ def _record_insight(
 
 def scoping_node(state: DeepResearchState) -> DeepResearchState:
     """Phase 1: 范围界定 — 生成 Research Brief"""
+    logger.info("[work=research] 阶段=scope")
     t_scope_start = time.perf_counter()
     topic = state["topic"]
     logger.info(
@@ -2355,6 +2340,7 @@ def scoping_node(state: DeepResearchState) -> DeepResearchState:
 
 def plan_node(state: DeepResearchState) -> DeepResearchState:
     """Phase 2: 规划 — 生成大纲并初始化 Dashboard"""
+    logger.info("[work=research] 阶段=plan")
     t_plan_start = time.perf_counter()
     logger.info(
         "[plan_node] begin | topic=%r search_mode=%s max_sections=%s",
@@ -3012,6 +2998,10 @@ def research_node(state: DeepResearchState) -> DeepResearchState:
     state["iteration_count"] = state.get("iteration_count", 0) + 1
 
     _emit_progress(state, "section_research_start", {"section": section.title, "round": section.research_rounds})
+    logger.info(
+        "[work=research] 阶段=research 第%d轮 section=%s",
+        section.research_rounds, section.title,
+    )
 
     # Build queries (recall + precision + gap + discovery)
     recall_q = int(preset.get("recall_queries_per_section", 2))
@@ -3118,6 +3108,10 @@ def _finalise_research_round(
 
 def evaluate_node(state: DeepResearchState) -> DeepResearchState:
     """Evaluate information sufficiency and decide if more search is needed."""
+    logger.info(
+        "[work=research] 阶段=evaluate section=%s",
+        state.get("current_section", ""),
+    )
     _ensure_not_cancelled(state)
     _tick_cost_monitor(state, "evaluate")
     dashboard = state["dashboard"]
@@ -3310,6 +3304,7 @@ def generate_claims_node(state: DeepResearchState) -> DeepResearchState:
     section = dashboard.get_section(state.get("current_section", ""))
     if section is None:
         return state
+    logger.info("[work=research] 阶段=generate_claims section=%s", section.title)
 
     # 每个大纲内结合材料写作（claims 所用证据）：使用 UI 穿透的 reranker_mode
     preset = state.get("depth_preset") or get_depth_preset(state.get("depth", DEFAULT_DEPTH))
@@ -3383,6 +3378,7 @@ def write_node(state: DeepResearchState) -> DeepResearchState:
     section = dashboard.get_section(state.get("current_section", ""))
     if section is None:
         return state
+    logger.info("[work=research] 阶段=write section=%s", section.title)
 
     section.status = "writing"
 
@@ -3689,6 +3685,10 @@ def write_node(state: DeepResearchState) -> DeepResearchState:
 
 def verify_node(state: DeepResearchState) -> DeepResearchState:
     """Phase 4b: 验证 — Chain of Verification 验证声明"""
+    logger.info(
+        "[work=research] 阶段=verify section=%s",
+        state.get("current_section", ""),
+    )
     _ensure_not_cancelled(state)
     _tick_cost_monitor(state, "verify")
     dashboard = state["dashboard"]
@@ -3863,6 +3863,7 @@ def verify_node(state: DeepResearchState) -> DeepResearchState:
 
 def review_gate_node(state: DeepResearchState) -> DeepResearchState:
     """最终审核门：所有章节审核通过后，才允许进入 synthesize。"""
+    logger.info("[work=research] 阶段=review_gate")
     _ensure_not_cancelled(state)
     _tick_cost_monitor(state, "review_gate")
     if bool(state.get("force_synthesize", False)):
@@ -4097,6 +4098,7 @@ def _build_document_blueprint(
 
 def synthesize_node(state: DeepResearchState) -> DeepResearchState:
     """Phase 5: 全局综合 — 生成摘要 + 不足与展望 + 参考文献"""
+    logger.info("[work=research] 阶段=synthesize")
     _ensure_not_cancelled(state)
     _tick_cost_monitor(state, "synthesize")
     client, model_override = _resolve_step_client_and_model(state, "synthesize")
@@ -4994,6 +4996,8 @@ def _build_initial_state(
     preset = get_depth_preset(resolved_depth)
     resolved_max_sections = _normalize_max_sections(max_sections, default=4)
     normalized_filters = _ensure_research_rank_pool_multiplier(filters)
+    if job_id:
+        normalized_filters = {**normalized_filters, "job_id": job_id}
     # max_iterations is set as a placeholder here; the real value is computed
     # dynamically in execute_deep_research() after num_sections is known:
     #   max_iterations = (max_section_research_rounds + max_verify_rewrite_cycles) × num_sections
@@ -5083,6 +5087,7 @@ def start_deep_research(
 
     t_start_phase1 = time.perf_counter()
     _f = filters or {}
+    logger.info("[work=research] 阶段=scope+plan（确认前）")
     logger.info(
         "[DR start] ▶ topic=%r | session=%s | search_mode=%s | model=%s"
         " | local_top_k=%s | step_top_k=%s | reranker_mode=%s | web_providers=%s | serpapi_ratio=%s"
@@ -5417,6 +5422,7 @@ def execute_deep_research(
 ) -> Dict[str, Any]:
     """Phase 2: run research loop with confirmed brief/outline."""
     _f = filters or {}
+    logger.info("[work=research] 阶段=execute 开始")
     logger.info(
         "[DR execute] ▶ topic=%r | session=%s | job=%s | depth=%s | search_mode=%s | model=%s"
         " | local_top_k=%s | step_top_k=%s | reranker_mode=%s | web_providers=%s | serpapi_ratio=%s"

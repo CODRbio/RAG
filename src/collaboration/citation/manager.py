@@ -243,7 +243,13 @@ def chunk_to_citation(
 
     provider = getattr(chunk, "provider", None)
     if not provider:
-        provider = "local" if chunk.source_type in ("dense", "graph") else "web"
+        has_url = bool(getattr(chunk, "url", None))
+        if chunk.source_type in ("dense", "graph"):
+            provider = "local"
+        elif chunk.source_type == "web" or has_url:
+            provider = "web"
+        else:
+            provider = "web"
 
     citation = Citation(
         id=chunk.chunk_id[:16] if chunk.chunk_id else "",
@@ -405,7 +411,13 @@ def resolve_response_citations(
         best = _pick_best_metadata(group)
         prov = getattr(best, "provider", None)
         if not prov:
-            prov = "local" if best.source_type in ("dense", "graph") else "web"
+            has_url = bool(getattr(best, "url", None))
+            if best.source_type in ("dense", "graph"):
+                prov = "local"
+            elif best.source_type == "web" or has_url:
+                prov = "web"
+            else:
+                prov = "web"
         citation = Citation(
             id=doc_key[:16],
             title=best.doc_title or "",
