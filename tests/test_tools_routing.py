@@ -65,6 +65,18 @@ def test_routing_web_providers_subset_and_empty_list_semantics():
     )
     assert empty == ["search_local"]
 
+    # Sonar as independent web tool: only when "sonar" in allowed_web_providers
+    with_sonar = _tool_names(
+        get_routed_skills(
+            message="请检索外部信息",
+            current_stage="explore",
+            search_mode="hybrid",
+            allowed_web_providers=["tavily", "sonar"],
+        )
+    )
+    assert "search_sonar" in with_sonar
+    assert "search_web" in with_sonar
+
 
 def test_routing_analysis_and_graph_keywords():
     analysis = _tool_names(

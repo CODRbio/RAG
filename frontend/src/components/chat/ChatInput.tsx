@@ -236,6 +236,9 @@ export function ChatInput() {
       sonar_strength: sonarStrength,
       use_sonar_prelim: sonarStrength !== 'off',
       sonar_model: sonarStrength !== 'off' ? sonarStrength : undefined,
+      agent_sonar_model: (searchMode !== 'none' && webEnabled && enabledProviders.includes('sonar'))
+        ? (ragConfig.agentSonarModel ?? 'sonar-pro')
+        : undefined,
       max_iterations: ragConfig.maxIterations ?? 2,
       output_language: deepResearchDefaults.outputLanguage ?? 'auto',
       reranker_mode: searchMode !== 'none'

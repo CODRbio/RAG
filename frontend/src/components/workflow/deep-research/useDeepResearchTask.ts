@@ -764,6 +764,9 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       reranker_mode: ragConfig.enableReranker
         ? ((localStorage.getItem('adv_reranker_mode') || 'cascade') as 'bge_only' | 'colbert_only' | 'cascade')
         : 'bge_only',
+      agent_sonar_model: (webEnabled && enabledProviders.includes('sonar'))
+        ? (ragConfig.agentSonarModel ?? 'sonar-pro')
+        : undefined,
       clarification_answers: hasNonEmptyAnswers ? answers : undefined,
       output_language: outputLanguage,
       step_models: normalizeStepModels(stepModels),
@@ -979,6 +982,9 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       reranker_mode: ragConfig.enableReranker
         ? ((localStorage.getItem('adv_reranker_mode') || 'cascade') as 'bge_only' | 'colbert_only' | 'cascade')
         : 'bge_only',
+      agent_sonar_model: (webEnabled && enabledProviders.includes('sonar'))
+        ? (ragConfig.agentSonarModel ?? 'sonar-pro')
+        : undefined,
       user_context: userContext.trim() || undefined,
       user_context_mode: userContext.trim() ? userContextMode : undefined,
       user_documents: tempDocuments.length ? tempDocuments : undefined,

@@ -246,14 +246,14 @@ export function ConfirmPhase({
           <input
             type="range"
             min={2}
-            max={6}
+            max={9}
             step={1}
             value={maxSections}
             onChange={(e) => onMaxSectionsChange(parseInt(e.target.value, 10))}
             className="flex-1 accent-indigo-500"
           />
-          <div className="flex gap-1">
-            {[2, 3, 4, 5, 6].map((n) => (
+          <div className="flex gap-1 flex-wrap">
+            {[2, 3, 4, 5, 6, 7, 8, 9].map((n) => (
               <button
                 key={n}
                 onClick={() => onMaxSectionsChange(n)}

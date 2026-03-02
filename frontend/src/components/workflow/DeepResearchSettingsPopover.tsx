@@ -301,7 +301,7 @@ export function DeepResearchSettingsPopover({ open, onClose }: Props) {
         <div>
           <label className="flex items-center gap-1 text-[11px] font-medium text-gray-600 mb-1.5">
             Max Sections (大纲章节数)
-            <Tip content="控制生成大纲的最大章节数量。建议 2-6 节，默认 4 节。较少的章节适合聚焦性研究，较多章节适合全面综述。">
+            <Tip content="控制生成大纲的最大章节数量。可选 2-9 节，默认 4 节。较少的章节适合聚焦性研究，较多章节适合全面综述。">
               <HelpCircle size={11} />
             </Tip>
           </label>
@@ -309,7 +309,7 @@ export function DeepResearchSettingsPopover({ open, onClose }: Props) {
             <input
               type="range"
               min={2}
-              max={6}
+              max={9}
               step={1}
               value={deepResearchDefaults.maxSections}
               onChange={(e) => updateDeepResearchDefaults({ maxSections: parseInt(e.target.value, 10) })}

@@ -56,6 +56,7 @@ const defaultWebSources: WebSource[] = [
   { id: 'scholar', name: 'Google Scholar', enabled: false, topK: 3, threshold: 0.6, useSerpapi: false },
   { id: 'semantic', name: 'Semantic Scholar', enabled: false, topK: 3, threshold: 0.7 },
   { id: 'ncbi', name: 'NCBI PubMed', enabled: false, topK: 5, threshold: 0.6 },
+  { id: 'sonar', name: 'Sonar (检索工具)', enabled: false, topK: 1, threshold: 0.5 },  // 独立于预研究；整体一次调用，无数量限制；模型由 agentSonarModel 指定
 ];
 
 const normalizeOptionalYear = (value: unknown): number | null => {
@@ -86,6 +87,7 @@ export const useConfigStore = create<ConfigState>()(
         enableReranker: true,
         agentMode: 'assist' as const,
         sonarStrength: 'sonar-reasoning-pro' as const,
+        agentSonarModel: 'sonar-pro' as const,  // Sonar 检索工具用模型（仅当 Web 来源勾选 Sonar 时生效），与预研究分离
         maxIterations: 2,
         agentDebugMode: false,
       },

@@ -906,6 +906,36 @@ export function Sidebar({ onStartResize }: SidebarProps) {
                         </div>
                         {source.enabled && (
                           <div className="space-y-2 animate-in slide-in-from-top-1 duration-200">
+                            {/* Sonar：仅显示工具模型选择，无 Top-K（整体一次调用） */}
+                            {source.id === 'sonar' ? (
+                              <div className="space-y-1">
+                                <label className="text-[10px] text-slate-500">{t('sidebar.sonarToolModel')}</label>
+                                <select
+                                  value={ragConfig.agentSonarModel ?? 'sonar-pro'}
+                                  onChange={(e) => updateRagConfig({ agentSonarModel: e.target.value })}
+                                  className="w-full text-[11px] bg-slate-950 border border-slate-700 text-slate-300 rounded px-2 py-1.5 focus:border-sky-500 focus:outline-none"
+                                >
+                                  {(sonarModelOptions.filter((o) => o.value !== 'sonar-deep-research').length > 0
+                                    ? sonarModelOptions.filter((o) => o.value !== 'sonar-deep-research')
+                                    : [
+                                        { value: 'sonar', label: 'sonar' },
+                                        { value: 'sonar-pro', label: 'sonar-pro' },
+                                      ]
+                                  ).map((opt) => (
+                                    <option key={opt.value} value={opt.value}>
+                                      {opt.label}
+                                    </option>
+                                  ))}
+                                </select>
+                                <div className="text-[9px] text-slate-600 mt-1">
+                                  {t('sidebar.sonarToolModelHelp')}
+                                </div>
+                                <div className="text-[9px] text-amber-500/90 mt-1">
+                                  {t('sidebar.sonarToolRequiresAgent')}
+                                </div>
+                              </div>
+                            ) : (
+                              <>
                             {/* Top-K 配置 */}
                             <div className="flex items-center justify-between text-[10px] text-slate-500">
                               <span>Top-K</span>
@@ -952,6 +982,8 @@ export function Sidebar({ onStartResize }: SidebarProps) {
                             <div className="text-[9px] text-slate-600 mt-1">
                               {t('sidebar.webTopKDesc')}
                             </div>
+                              </>
+                            )}
 
                             {/* SerpAPI sub-toggle (google / scholar only) */}
                             {(source.id === 'google' || source.id === 'scholar') && (
@@ -1151,37 +1183,46 @@ export function Sidebar({ onStartResize }: SidebarProps) {
                   />
                 </div>
               )}
-              {/* Pre-Research 强度 (Sonar)：与 LLM 选择同源，从 Perplexity 拉取模型列表 */}
-              <div className="flex items-center justify-between border-t border-slate-700/30 pt-2 mt-1">
-                <div>
-                  <div className="flex items-center gap-1.5">
-                    <span className="text-xs text-slate-400">{t('sidebar.sonarStrength', 'Pre-Research 强度')}</span>
-                    <HelpTooltip content={t('sidebar.sonarStrengthHelp', 'Use Perplexity Sonar to fetch preliminary knowledge before retrieval. Off = disabled; options from same Perplexity model list as LLM selector. Set llm.platforms.perplexity.api_key in config/rag_config.local.json.')}>
-                      <HelpCircle size={10} />
-                    </HelpTooltip>
-                  </div>
-                  <div className="text-[10px] text-slate-500">
-                    {t('sidebar.sonarStrengthDesc', 'Off | Perplexity models (e.g. Sonar … Deep Research)')}
-                  </div>
+              {/* 预研究 (Pre-Research)：检索前一次 Sonar 深度调用，可选深度模型 */}
+              <div className="border-t border-slate-700/30 pt-2 mt-1 space-y-1.5">
+                <div className="text-[10px] font-medium text-slate-500 uppercase tracking-wider">
+                  {t('sidebar.preResearchSection', 'Pre-Research')}
                 </div>
-                <select
-                  id="sonar-strength"
-                  name="sonar-strength"
-                  value={ragConfig.sonarStrength ?? 'sonar-reasoning-pro'}
-                  onChange={(e) => updateRagConfig({ sonarStrength: e.target.value as import('../../types').SonarStrength })}
-                  className="text-[10px] border border-slate-700 rounded-md px-2 py-1 bg-slate-950 text-slate-300 focus:outline-none focus:border-sky-500"
-                >
-                  <option value="off">{t('sidebar.sonarStrengthOff', 'Off')}</option>
-                  {sonarModelOptions.map((opt) => (
-                    <option key={opt.value} value={opt.value}>
-                      {opt.label}
-                    </option>
-                  ))}
-                  {/* 若当前值为持久化的模型 id 但不在 API 返回列表中，仍显示可选 */}
-                  {ragConfig.sonarStrength && ragConfig.sonarStrength !== 'off' && !sonarModelOptions.some((o) => o.value === ragConfig.sonarStrength) && (
-                    <option value={ragConfig.sonarStrength}>{ragConfig.sonarStrength}</option>
-                  )}
-                </select>
+                <div className="flex items-center justify-between">
+                  <div>
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-xs text-slate-400">{t('sidebar.sonarStrength', 'Pre-Research 强度')}</span>
+                      <HelpTooltip content={t('sidebar.sonarStrengthHelp', 'Use Perplexity Sonar to fetch preliminary knowledge before retrieval. Off = disabled; options from same Perplexity model list as LLM selector. Set llm.platforms.perplexity.api_key in config/rag_config.local.json.')}>
+                        <HelpCircle size={10} />
+                      </HelpTooltip>
+                    </div>
+                    <div className="text-[10px] text-slate-500">
+                      {t('sidebar.sonarStrengthDesc', 'Off | Perplexity models (e.g. Sonar … Deep Research)')}
+                    </div>
+                  </div>
+                  <select
+                    id="sonar-strength"
+                    name="sonar-strength"
+                    value={ragConfig.sonarStrength ?? 'sonar-reasoning-pro'}
+                    onChange={(e) => updateRagConfig({ sonarStrength: e.target.value as import('../../types').SonarStrength })}
+                    className="text-[10px] border border-slate-700 rounded-md px-2 py-1 bg-slate-950 text-slate-300 focus:outline-none focus:border-sky-500"
+                  >
+                    <option value="off">{t('sidebar.sonarStrengthOff', 'Off')}</option>
+                    {sonarModelOptions.map((opt) => (
+                      <option key={opt.value} value={opt.value}>
+                        {opt.label}
+                      </option>
+                    ))}
+                    {ragConfig.sonarStrength && ragConfig.sonarStrength !== 'off' && !sonarModelOptions.some((o) => o.value === ragConfig.sonarStrength) && (
+                      <option value={ragConfig.sonarStrength}>{ragConfig.sonarStrength}</option>
+                    )}
+                  </select>
+                </div>
+                {ragConfig.sonarStrength && ragConfig.sonarStrength !== 'off' && (
+                  <div className="text-[10px] text-slate-500">
+                    {t('sidebar.sonarToolNote', '开启后，Agent 将不再调用 Sonar 工具，避免重复。')}
+                  </div>
+                )}
               </div>
             </div>
           </section>

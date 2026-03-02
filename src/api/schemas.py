@@ -21,7 +21,11 @@ class ChatRequest(BaseModel):
     search_mode: str = Field("local", description="检索模式: local | web | hybrid | none")
     web_providers: Optional[List[str]] = Field(
         None,
-        description="Web 搜索来源选择: tavily | scholar | google | semantic，可传一个或多个",
+        description="Web 搜索来源选择: tavily | scholar | google | semantic | sonar，可传一个或多个；sonar 为独立检索工具，模型由 agent_sonar_model 指定",
+    )
+    agent_sonar_model: Optional[str] = Field(
+        None,
+        description="Sonar 检索工具使用的模型（仅当 web_providers 含 sonar 时生效）: sonar | sonar-pro，默认 sonar-pro",
     )
     web_source_configs: Optional[Dict[str, Dict[str, Any]]] = Field(
         None,
@@ -528,7 +532,7 @@ class AutoCompleteRequest(BaseModel):
     session_id: Optional[str] = Field(None, description="会话 ID")
     canvas_id: Optional[str] = Field(None, description="画布 ID")
     search_mode: str = Field("hybrid", description="检索模式: local | web | hybrid")
-    max_sections: int = Field(4, ge=2, le=6, description="最大章节数")
+    max_sections: int = Field(4, ge=2, le=9, description="最大章节数")
 
 
 class AutoCompleteResponse(BaseModel):
@@ -590,7 +594,7 @@ class DeepResearchRequest(BaseModel):
     canvas_id: Optional[str] = Field(None, description="画布 ID")
     user_id: Optional[str] = Field(None, description="用户 ID")
     search_mode: str = Field("hybrid", description="检索模式: local | web | hybrid")
-    max_sections: int = Field(4, ge=2, le=6, description="最大章节数")
+    max_sections: int = Field(4, ge=2, le=9, description="最大章节数")
     clarification_answers: Dict[str, str] = Field(
         default_factory=dict,
         description="澄清问题回答 {question_id: answer_text}",
@@ -634,7 +638,7 @@ class DeepResearchStartRequest(BaseModel):
     canvas_id: Optional[str] = Field(None, description="画布 ID")
     user_id: Optional[str] = Field(None, description="用户 ID")
     search_mode: str = Field("hybrid", description="检索模式: local | web | hybrid")
-    max_sections: int = Field(4, ge=2, le=6, description="最大章节数")
+    max_sections: int = Field(4, ge=2, le=9, description="最大章节数")
     clarification_answers: Optional[Dict[str, str]] = Field(
         None,
         description="澄清问题回答 {question_id: answer_text}",
@@ -679,6 +683,10 @@ class DeepResearchStartRequest(BaseModel):
     reranker_mode: Optional[str] = Field(
         None,
         description="重排序模式: bge_only | colbert_only | cascade；研究过程强制 bge_only，写作阶段使用此值",
+    )
+    agent_sonar_model: Optional[str] = Field(
+        None,
+        description="Sonar 检索工具模型（仅当 web_providers 含 sonar 时生效）: sonar | sonar-pro 等，默认 sonar-pro",
     )
 
 
@@ -776,6 +784,10 @@ class DeepResearchConfirmRequest(BaseModel):
         None,
         description="重排序模式: bge_only | colbert_only | cascade；研究过程强制 bge_only，写作阶段使用此值",
     )
+    agent_sonar_model: Optional[str] = Field(
+        None,
+        description="Sonar 检索工具模型（仅当 web_providers 含 sonar 时生效）: sonar | sonar-pro 等，默认 sonar-pro",
+    )
     user_context: Optional[str] = Field(
         None,
         description="用户补充的观点/约束（仅本次 Deep Research 使用，不写入持久知识库）",
@@ -801,7 +813,7 @@ class DeepResearchConfirmRequest(BaseModel):
         False,
         description="跳过前置论点提炼（Claim Generation）阶段，直接进入写作",
     )
-    max_sections: int = Field(4, ge=2, le=6, description="最大章节数")
+    max_sections: int = Field(4, ge=2, le=9, description="最大章节数")
 
 
 class DeepResearchSubmitResponse(BaseModel):

@@ -77,7 +77,7 @@ from src.collaboration.memory.persistent_store import get_user_profile
 from src.collaboration.workflow import run_workflow
 from src.llm.llm_manager import get_manager
 from src.llm.react_loop import react_loop
-from src.llm.tools import CORE_TOOLS, get_routed_skills, start_agent_chunk_collector, drain_agent_chunks, set_tool_collection
+from src.llm.tools import CORE_TOOLS, get_routed_skills, start_agent_chunk_collector, drain_agent_chunks, set_tool_collection, set_agent_sonar_model
 from src.collaboration.citation.manager import (
     _dedupe_citations,
     chunk_to_citation,
@@ -756,6 +756,7 @@ def _build_deep_research_filters(body: Any) -> dict:
         "write_top_k",
         "graph_top_k",
         "reranker_mode",
+        "agent_sonar_model",
         "llm_provider",
         "ultra_lite_provider",
         "model_override",
@@ -1685,6 +1686,7 @@ def _run_chat_impl(
         if use_agent:
             start_agent_chunk_collector()
             set_tool_collection(target_collection)
+            set_agent_sonar_model(getattr(body, "agent_sonar_model", None) or "sonar-pro")
             routed_tools = get_routed_skills(
                 message=message,
                 current_stage=current_stage or "",

@@ -37,6 +37,16 @@ def set_tool_collection(collection: Optional[str]) -> None:
     _agent_chunks_local.collection = collection or None
 
 
+def set_agent_sonar_model(model: Optional[str]) -> None:
+    """Set the Sonar model for search_sonar in this thread (e.g. sonar | sonar-pro). Used when Sonar is enabled as a web retrieval tool."""
+    _agent_chunks_local.agent_sonar_model = (model or "sonar-pro").strip() or "sonar-pro"
+
+
+def get_agent_sonar_model() -> str:
+    """Return the thread-local Sonar model for search_sonar, default sonar-pro."""
+    return getattr(_agent_chunks_local, "agent_sonar_model", None) or "sonar-pro"
+
+
 def start_agent_chunk_collector() -> None:
     """Activate the per-thread chunk collector (call before react_loop)."""
     _agent_chunks_local.chunks = []
@@ -451,45 +461,59 @@ def _handle_search_web(query: str, top_k: int = 10, **_) -> str:
     return pack.to_context_string(max_chunks=min(top_k, 15))
 
 
-def _handle_search_sonar(query: str, **_) -> str:
-    """使用 Perplexity Sonar Reasoning Pro 联网深度搜索，返回带引用的回答；引用纳入引文池。"""
-    try:
-        from src.llm.llm_manager import get_manager
-        from src.retrieval.sonar_citations import parse_sonar_citations
+def invoke_sonar_search(query: str, model: str = "sonar-pro") -> tuple:
+    """Call Sonar API and return (response_text, parsed_chunks).
 
-        manager = get_manager()
-        provider = "sonar" if manager.is_available("sonar") else ("perplexity" if manager.is_available("perplexity") else None)
-        if not provider:
-            return "Sonar/Perplexity 未配置或不可用，请在 config/rag_config.local.json 的 llm.platforms.perplexity 中设置 api_key（如 pplx-xxx）后重试。"
-        client = manager.get_client(provider)
-        prompt = (
-            "Answer the following question concisely with key points and sources. "
-            "Use the same language as the question. Keep under 400 words.\n\n"
-        ) + (query or "").strip()
-        resp = client.chat(
-            [{"role": "user", "content": prompt}],
-            model="sonar-reasoning-pro",
-            timeout_seconds=50,
+    Reusable by both Agent tool handler and Deep Research pipeline.
+    Returns: (str, list) — text is the model reply; list elements are EvidenceChunk-like dicts/chunks.
+    """
+    from src.llm.llm_manager import get_manager
+    from src.retrieval.sonar_citations import parse_sonar_citations
+
+    manager = get_manager()
+    provider = "sonar" if manager.is_available("sonar") else ("perplexity" if manager.is_available("perplexity") else None)
+    if not provider:
+        return (
+            "Sonar/Perplexity 未配置或不可用，请在 config/rag_config.local.json 的 llm.platforms.perplexity 中设置 api_key（如 pplx-xxx）后重试。",
+            [],
         )
-        raw = resp.get("raw") or {}
-        citations = raw.get("citations")
-        search_results = raw.get("search_results")
-        if not citations and resp.get("citations") is not None:
-            citations = resp.get("citations")
-        if not search_results and resp.get("search_results") is not None:
-            search_results = resp.get("search_results")
-        text = (resp.get("final_text") or "").strip()
-        if "</think>" in text:
-            idx = text.find("</think>")
-            text = text[idx + 7 :].lstrip()
-        chunks = parse_sonar_citations(
-            citations=citations,
-            search_results=search_results,
-            response_text=text,
-            query=query or "",
-        )
+    client = manager.get_client(provider)
+    prompt = (
+        "Answer the following question concisely with key points and sources. "
+        "Use the same language as the question. Keep under 400 words.\n\n"
+    ) + (query or "").strip()
+    resp = client.chat(
+        [{"role": "user", "content": prompt}],
+        model=model,
+        timeout_seconds=50,
+    )
+    raw = resp.get("raw") or {}
+    citations = raw.get("citations")
+    search_results = raw.get("search_results")
+    if not citations and resp.get("citations") is not None:
+        citations = resp.get("citations")
+    if not search_results and resp.get("search_results") is not None:
+        search_results = resp.get("search_results")
+    text = (resp.get("final_text") or "").strip()
+    if "</think>" in text:
+        idx = text.find("</think>")
+        text = text[idx + 7 :].lstrip()
+    chunks = parse_sonar_citations(
+        citations=citations,
+        search_results=search_results,
+        response_text=text,
+        query=query or "",
+    )
+    return (text if text else "Sonar 未返回有效内容。", chunks)
+
+
+def _handle_search_sonar(query: str, **_) -> str:
+    """使用 Perplexity Sonar 联网深度搜索，返回带引用的回答；引用纳入引文池。"""
+    try:
+        model = get_agent_sonar_model()
+        text, chunks = invoke_sonar_search(query, model=model)
         _collect_chunks(chunks)
-        return text if text else "Sonar 未返回有效内容。"
+        return text
     except Exception as e:
         logger.debug("search_sonar failed: %s", e)
         return f"Sonar 搜索失败: {e}"
@@ -912,6 +936,7 @@ _WEB_PROVIDER_TO_TOOL: Dict[str, str] = {
     "semantic": "search_scholar",
     "ncbi": "search_ncbi",
     "pubmed": "search_ncbi",
+    "sonar": "search_sonar",  # 独立检索工具，与预研究分离；模型由 agent_sonar_model 指定
 }
 
 _RE_ANALYSIS = re.compile(
@@ -958,11 +983,13 @@ def get_routed_skills(
     1. search_local: always on when search_mode != "none"
     2. Web group (search_web / search_scholar / search_ncbi):
        active when search_mode allows web; narrowed by allowed_web_providers
-    3. Analysis group (compare_papers / run_code):
+    3. Sonar (search_sonar): when web/hybrid and "sonar" in allowed_web_providers (independent
+       from pre-research; model set via agent_sonar_model).
+    4. Analysis group (compare_papers / run_code):
        keyword-triggered by comparison / statistics / code mentions
-    4. Graph group (explore_graph):
+    5. Graph group (explore_graph):
        keyword-triggered by relationship / graph / network mentions
-    5. Collab group (canvas / get_citations):
+    6. Collab group (canvas / get_citations):
        stage-triggered (drafting / refine) or keyword-triggered
     """
     selected: set[str] = set()
@@ -980,8 +1007,12 @@ def get_routed_skills(
                     selected.add(tool_name)
         else:
             selected |= _GROUP_WEB
-        # Sonar 工具：web/hybrid 时可用，Agent 可按需调用
-        selected |= _GROUP_SONAR
+        # Sonar 作为独立 Web 检索工具：仅当 allowed_web_providers 含 "sonar" 时加入（与预研究分离，模型由 agent_sonar_model 指定）
+        if allowed_web_providers is not None and "sonar" in [p.lower().strip() for p in allowed_web_providers]:
+            selected |= _GROUP_SONAR
+        elif allowed_web_providers is None:
+            # 未传列表时保持原行为：web/hybrid 即提供 Sonar
+            selected |= _GROUP_SONAR
 
     # 3. Analysis group — keyword activated
     if _RE_ANALYSIS.search(message):

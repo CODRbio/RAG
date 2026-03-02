@@ -128,6 +128,8 @@ export interface ChatRequest {
   use_sonar_prelim?: boolean;
   /** @deprecated 使用 sonar_strength，后端兼容 */
   sonar_model?: string;
+  /** Sonar 检索工具模型（仅当 web_providers 含 sonar 时生效）：sonar | sonar-pro */
+  agent_sonar_model?: string;
   max_iterations?: number;  // Agent ReAct 最大迭代轮数，默认 2，仅 assist/autonomous 时生效
   clarification_answers?: Record<string, string>;
   output_language?: 'auto' | 'en' | 'zh';
@@ -344,6 +346,7 @@ export interface DeepResearchStartRequest {
   ultra_lite_provider?: string;
   model_override?: string;
   reranker_mode?: 'bge_only' | 'colbert_only' | 'cascade';
+  agent_sonar_model?: string;
 }
 
 /** Returned immediately from POST /deep-research/start – poll status endpoint for result. */
@@ -407,6 +410,7 @@ export interface DeepResearchConfirmRequest {
   ultra_lite_provider?: string;
   model_override?: string;
   reranker_mode?: 'bge_only' | 'colbert_only' | 'cascade';
+  agent_sonar_model?: string;
   user_context?: string;
   user_context_mode?: 'supporting' | 'direct_injection';
   user_documents?: Array<{ name: string; content: string }>;
@@ -663,6 +667,8 @@ export interface RagConfig {
   agentMode: 'standard' | 'assist' | 'autonomous';  // Agent 执行模式
   /** Pre-Research 强度：off 或 Perplexity/Sonar 模型 id（与 LLM 选择同源），默认 sonar-reasoning-pro */
   sonarStrength: SonarStrength;
+  /** Sonar 检索工具使用的模型（仅当 Web 来源勾选 Sonar 时生效），与预研究分离；选项来自 /llm/models */
+  agentSonarModel?: string;
   maxIterations: number;  // Agent ReAct 最大迭代轮数，默认 2
   agentDebugMode: boolean;  // 是否显示 Agent 详细调试面板
 }
