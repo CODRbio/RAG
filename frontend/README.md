@@ -2,7 +2,7 @@
 
 前端基于 React + TypeScript + Vite + Zustand + Tailwind CSS，负责聊天交互、画布编辑、配置管理、图谱探索、多文档对比和 Deep Research 工作流。
 
-更新时间：2026-02-19
+更新时间：2026-03-02
 
 ## 技术栈
 

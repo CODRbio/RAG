@@ -53,6 +53,11 @@
 | `release_migration_ubuntu.md` | Ubuntu 发布与迁移全流程（systemd + Nginx） |
 | `testing_and_evaluation.md` | pytest 与评测体系 |
 | `dependency_matrix.md` | Python / 前端依赖矩阵与运行时要求 |
+| `prompts_usage.md` | 提示词使用说明与模板约定 |
+| `llm_call_policy.md` | LLM 调用策略与约定 |
+| `rerank-mechanism.md` | 重排序机制说明 |
+| `research-search-audit.md` | Deep Research 检索行为审计与排障 |
+| `multi_call_plan.md` | 多路调用与路由规划 |
 
 ## 维护规范
 
@@ -66,3 +71,5 @@
   - `architecture.md`（架构约束或数据流）
 - 与用户直接相关的变更（启动方式、主要能力）同步更新根目录 `README.md`。
 - 依赖版本变更时更新 `dependency_matrix.md`。
+
+*最后更新：2026-03-02*

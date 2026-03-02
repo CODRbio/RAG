@@ -227,6 +227,10 @@ user_prompt = _pm.render("chat_route_classify.txt", history=history, message=mes
 
 对于包含 JSON 示例的模板，字面量花括号需使用 `{{` / `}}`，以兼容 `str.format`。
 
+---
+
+*最后更新：2026-03-02*
+
 ## License
 
 MIT

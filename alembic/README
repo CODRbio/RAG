@@ -1,1 +1,1 @@
-Generic single-database configuration.
+DeepSea RAG 数据库迁移（Alembic）。默认使用 SQLite `data/rag.db`，可通过 `RAG_DATABASE_URL` 覆盖。详见根目录 `docs/configuration.md` 与 `docs/scripts_guide.md`。

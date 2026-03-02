@@ -2356,6 +2356,7 @@ def plan_node(state: DeepResearchState) -> DeepResearchState:
     max_sections = _normalize_max_sections(state.get("max_sections"), default=4)
 
     # Initial retrieval for background context: 1+1+1 structured queries (topic + preliminary_knowledge)
+    # Plan phase does not use Sonar; strip it so only tavily/scholar/etc. get 1+1+1 queries.
     svc = _get_retrieval_svc(state)
     dr_filters = dict(state.get("filters") or {})
     # Research phase: force bge_only for speed; write nodes use the UI's reranker_mode.
@@ -2378,8 +2379,13 @@ def plan_node(state: DeepResearchState) -> DeepResearchState:
         model_override=model_override,
     )
     search_query = topic
+    plan_web_providers = [
+        p for p in (dr_filters.get("web_providers") or [])
+        if str(p).strip().lower() != "sonar"
+    ]
+    dr_filters["web_providers"] = plan_web_providers
     if structured:
-        qpp = web_queries_per_provider_from_1plus1plus1(structured, dr_filters.get("web_providers"))
+        qpp = web_queries_per_provider_from_1plus1plus1(structured, plan_web_providers)
         if qpp:
             dr_filters["web_queries_per_provider"] = qpp
             search_query = structured.get("recall") or topic
@@ -2611,37 +2617,6 @@ def _filter_by_ui(tier_providers: List[str], ui_allowed: Optional[set]) -> List[
     if ui_allowed is None:
         return tier_providers
     return [p for p in tier_providers if p in ui_allowed]
-
-
-def _supplement_with_sonar(
-    state: DeepResearchState,
-    query: str,
-    section_title: str,
-    pool_source: str = "sonar_supplement",
-) -> List[Any]:
-    """If 'sonar' is in web_providers, call invoke_sonar_search and return chunks; else return []."""
-    filters = state.get("filters") or {}
-    providers = filters.get("web_providers") or []
-    if not providers or "sonar" not in [str(p).lower().strip() for p in providers]:
-        return []
-    model = (filters.get("agent_sonar_model") or "sonar-pro").strip() or "sonar-pro"
-    try:
-        from src.llm.tools import invoke_sonar_search
-        _text, chunks = invoke_sonar_search(query, model=model)
-        if not chunks:
-            return []
-        for ch in chunks:
-            if isinstance(ch, dict):
-                ch["pool_source"] = pool_source
-            else:
-                try:
-                    setattr(ch, "pool_source", pool_source)
-                except Exception:
-                    pass
-        return list(chunks)
-    except Exception as e:
-        logger.debug("_supplement_with_sonar failed: %s", e)
-        return []
 
 
 def _resolve_fetcher(ui_mode: str, tier_providers: List[str]) -> str:
@@ -2934,10 +2909,11 @@ def _execute_tiered_search(
                 })
                 return all_chunks, all_sources
 
-    # ── Tier 2: Semantic Scholar (keyword) + Tavily (discovery) ──
+    # ── Tier 2: Semantic Scholar (keyword) + Tavily (discovery) + Sonar (discovery, same queries as Tavily) ──
     if max_tier >= 2:
         t2_kw = _filter_by_ui(["semantic"], ui_allowed_providers)
         t2_disc = _filter_by_ui(["tavily"], ui_allowed_providers)
+        t2_sonar = _filter_by_ui(["sonar"], ui_allowed_providers)
         if t2_kw:
             kw_queries = [(q, cat) for q, cat in queries if cat in ("gap", "gap_semantic", "recall", "precision")]
             for q, cat in kw_queries:
@@ -2951,6 +2927,10 @@ def _execute_tiered_search(
             disc_queries = [(q, cat) for q, cat in queries if cat in ("discovery", "gap_discovery", "gap_tavily")]
             for q, cat in disc_queries:
                 _run_search(q, t2_disc, "tier2_tavily")
+        if t2_sonar:
+            disc_queries = [(q, cat) for q, cat in queries if cat in ("discovery", "gap_discovery", "gap_tavily")]
+            for q, cat in disc_queries:
+                _run_search(q, t2_sonar, "tier2_sonar")
         if known_gaps and _quick_coverage_check(state, section, all_chunks, known_gaps):
             _emit_progress(state, "tier2_sufficient", {
                 "section": section.title,
@@ -3078,12 +3058,6 @@ def research_node(state: DeepResearchState) -> DeepResearchState:
         ui_content_fetcher=ui_fetcher,
         ui_source_configs=ui_source_configs,
     )
-    # Sonar as supplementary retrieval (not in plan; available in research/evaluate/write)
-    section_query = f"{dashboard.brief.topic} {section.title}"
-    sonar_chunks = _supplement_with_sonar(state, section_query, section.title, pool_source="research_round")
-    if sonar_chunks:
-        all_chunks.extend(sonar_chunks)
-        all_sources.add("sonar")
 
     _finalise_research_round(state, section, all_chunks, all_sources, queries_repr=queries, client=client)
     _save_phase_checkpoint(state, "research", section.title)
@@ -3267,8 +3241,6 @@ def evaluate_node(state: DeepResearchState) -> DeepResearchState:
                     filters=supplement_filters,
                 )
                 supplement_chunks.extend(gap_pack.chunks)
-                sonar_chunks = _supplement_with_sonar(state, gap_q, section.title, pool_source="eval_supplement")
-                supplement_chunks.extend(sonar_chunks)
             if supplement_chunks:
                 _accumulate_section_pool(
                     state,
@@ -3482,9 +3454,6 @@ def write_node(state: DeepResearchState) -> DeepResearchState:
             top_k=verification_k,
             filters=verify_filters,
         )
-        sonar_chunks = _supplement_with_sonar(state, base_query, section.title, pool_source="write_sonar")
-        if sonar_chunks:
-            pack.chunks.extend(sonar_chunks)
     evidence_str = pack.to_context_string(max_chunks=write_top_k)
     verification_evidence_str = verify_pack.to_context_string(max_chunks=verification_k)
     _emit_progress(

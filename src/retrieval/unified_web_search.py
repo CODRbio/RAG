@@ -363,6 +363,7 @@ class UnifiedWebSearcher:
         semantic_query_map: Optional[Dict[str, str]] = None,
         serpapi_ratio: Optional[float] = None,
         job_id: str = "",
+        agent_sonar_model: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         异步搜索多个来源并合并去重
@@ -410,6 +411,7 @@ class UnifiedWebSearcher:
             use_query_expansion=use_query_expansion,
             llm_provider=llm_provider,
             job_id=job_id,
+            agent_sonar_model=agent_sonar_model,
         )
 
         # 合并去重
@@ -674,6 +676,40 @@ class UnifiedWebSearcher:
             logger.error(f"NCBI 搜索失败: {e}")
             return []
 
+    async def _search_sonar(
+        self,
+        query: str,
+        limit: int,
+        model: str = "sonar-pro",
+    ) -> List[Dict[str, Any]]:
+        """Perplexity Sonar 搜索；同步 invoke_sonar_search 用 to_thread 包装。"""
+        try:
+            from src.llm.tools import invoke_sonar_search
+
+            _text, chunks = await asyncio.to_thread(invoke_sonar_search, query, model)
+            hits: List[Dict[str, Any]] = []
+            for c in chunks[:limit]:
+                meta = {
+                    "chunk_id": getattr(c, "chunk_id", None),
+                    "doc_id": getattr(c, "doc_id", None),
+                    "title": getattr(c, "doc_title", None),
+                    "url": getattr(c, "url", None),
+                    "year": getattr(c, "year", None),
+                    "authors": getattr(c, "authors", None),
+                    "doi": getattr(c, "doi", None),
+                    "provider": "sonar",
+                    "source": "sonar",
+                }
+                hits.append({
+                    "content": getattr(c, "text", "") or "",
+                    "score": getattr(c, "score", 0.0),
+                    "metadata": meta,
+                })
+            return hits
+        except Exception as e:
+            logger.error("Sonar 搜索失败: %s", e)
+            return []
+
     async def _run_providers(
         self,
         providers: List[str],
@@ -688,6 +724,7 @@ class UnifiedWebSearcher:
         use_query_expansion: Optional[bool] = None,
         llm_provider: Optional[str] = None,
         job_id: str = "",
+        agent_sonar_model: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         并发执行指定引擎列表，返回所有命中结果（未去重）。
@@ -830,6 +867,12 @@ class UnifiedWebSearcher:
                                 False,
                             )
                         )
+            elif provider == "sonar":
+                sonar_model = (agent_sonar_model or "sonar-pro").strip() or "sonar-pro"
+                for q in qs:
+                    tasks_with_flags.append(
+                        (self._search_sonar(q, pmax, sonar_model), False)
+                    )
 
         def _sanitize_queries(raw_queries: List[str], label: str) -> List[str]:
             sanitized = [_sanitize_scholar_query(q) for q in raw_queries]
@@ -1027,6 +1070,7 @@ class UnifiedWebSearcher:
         semantic_query_map: Optional[Dict[str, str]] = None,
         serpapi_ratio: Optional[float] = None,
         job_id: str = "",
+        agent_sonar_model: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """同步搜索 — 在持久后台事件循环上运行异步版本。
 
@@ -1052,6 +1096,7 @@ class UnifiedWebSearcher:
             semantic_query_map=semantic_query_map,
             serpapi_ratio=serpapi_ratio,
             job_id=job_id,
+            agent_sonar_model=agent_sonar_model,
         )
         bg = _get_bg_loop()
         future = asyncio.run_coroutine_threadsafe(self.search(**_search_kwargs), bg)

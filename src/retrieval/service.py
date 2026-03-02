@@ -716,6 +716,7 @@ class RetrievalService:
             _semantic_query_map = (filters or {}).get("semantic_query_map")
             _serpapi_ratio = (filters or {}).get("serpapi_ratio")
             _job_id = (filters or {}).get("job_id") or ""
+            _agent_sonar_model = (filters or {}).get("agent_sonar_model") or "sonar-pro"
 
             # 为 Lazy Fetching 预判构建 LLM 客户端（仅智能模式 use_content_fetcher=None 或 'auto'，使用 lite 降级）
             _llm_client = None
@@ -752,6 +753,7 @@ class RetrievalService:
                 semantic_query_map=_semantic_query_map,
                 serpapi_ratio=_serpapi_ratio,
                 job_id=_job_id,
+                agent_sonar_model=_agent_sonar_model,
             )
             phase1_ms = (time.perf_counter() - t_web) * 1000
             # Make snippets available to main thread right now
@@ -1087,6 +1089,7 @@ class RetrievalService:
                     _use_content_fetcher = (filters or {}).get("use_content_fetcher")
                     _semantic_query_map = (filters or {}).get("semantic_query_map")
                     _serpapi_ratio = (filters or {}).get("serpapi_ratio")
+                    _agent_sonar_model = (filters or {}).get("agent_sonar_model") or "sonar-pro"
                     logger.info(
                         "[retrieval] request web_source_configs summary=%s semantic=%s",
                         _summarize_web_source_configs(web_source_configs),
@@ -1117,6 +1120,7 @@ class RetrievalService:
                         semantic_query_map=_semantic_query_map,
                         serpapi_ratio=_serpapi_ratio,
                         job_id=(filters or {}).get("job_id") or "",
+                        agent_sonar_model=_agent_sonar_model,
                     )
                     total_candidates += len(web_hits)
                     sources_used.append("web")

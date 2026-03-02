@@ -556,6 +556,8 @@ def _build_filters(body: ChatRequest) -> dict:
         filters["model_override"] = body.model_override
     if body.use_content_fetcher is not None:
         filters["use_content_fetcher"] = body.use_content_fetcher
+    if getattr(body, "agent_sonar_model", None):
+        filters["agent_sonar_model"] = body.agent_sonar_model
     if body.collection:
         filters["collection"] = body.collection
     # Main fusion rank-pool policy for chat requests (global local+web rerank).
@@ -1282,8 +1284,12 @@ def _run_chat_impl(
         # 强制 Chat 使用 bge_only reranker（速度优先）。UI 传入的 cascade/colbert
         # 在 hybrid 模式下仅用于写作阶段（Deep Research）。
         filters["reranker_mode"] = "bge_only"
-        # Round 2: 1+1+1 结构化查询（仅 hybrid/web）
+        # Round 2: 1+1+1 结构化查询（仅 hybrid/web）；Sonar 不参与 1+1+1，仅 gap 补搜时用
         search_query = query or message
+        _no_sonar = [
+            p for p in (filters.get("web_providers") or [])
+            if (p or "").strip().lower() != "sonar"
+        ]
         if effective_search_mode in ("hybrid", "web"):
             structured = _generate_chat_structured_queries(
                 message or "",
@@ -1292,7 +1298,7 @@ def _run_chat_impl(
                 model_override=body.model_override or None,
             )
             if structured:
-                qpp = _chat_web_queries_from_1plus1plus1(structured, body.web_providers)
+                qpp = _chat_web_queries_from_1plus1plus1(structured, _no_sonar)
                 if qpp:
                     filters["web_queries_per_provider"] = qpp
                     search_query = structured.get("recall") or search_query
@@ -1304,10 +1310,12 @@ def _run_chat_impl(
             else:
                 _chat_logger.warning("[chat] ⑤ Round2 1+1+1 解析失败，使用单 query 检索")
         _gap_hits = sonar_gap_hits if (effective_search_mode == "hybrid" and sonar_gap_hits) else None
+        main_filters = dict(filters)
+        main_filters["web_providers"] = _no_sonar
         pack = retrieval.search(
             query=search_query,
             mode=effective_search_mode,
-            filters=filters or None,
+            filters=main_filters or None,
             top_k=body.local_top_k,
             gap_candidates_hits=_gap_hits,
         )
