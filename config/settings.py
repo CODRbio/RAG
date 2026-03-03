@@ -214,6 +214,21 @@ class ContentFetcherConfig:
 
 
 @dataclass
+class ScholarDownloaderSettings:
+    """Scholar PDF downloader: download_dir, Anna's Archive, 2Captcha, auto-ingest."""
+    enabled: bool = True
+    download_dir: str = "data/raw_papers"
+    annas_archive_api_key: str = ""
+    twocaptcha_api_key: str = ""
+    capsolver_extension_path: str = "./Extension-capsolver"
+    proxy: Optional[str] = None
+    max_concurrent_downloads: int = 3
+    show_browser: bool = False
+    persist_browser: bool = True
+    auto_ingest_after_download: bool = True
+
+
+@dataclass
 class ApiSettings:
     """API 服务配置"""
     host: str = os.getenv("API_HOST", "127.0.0.1")
@@ -481,6 +496,10 @@ def _auth_from_config() -> Dict[str, Any]:
 
 def _tasks_from_config() -> Dict[str, Any]:
     return (_RAW_CONFIG.get("tasks") or {})
+
+
+def _scholar_downloader_from_config() -> Dict[str, Any]:
+    return (_RAW_CONFIG.get("scholar_downloader") or {})
 
 
 @dataclass
@@ -784,6 +803,19 @@ class Settings:
             run_timeout_seconds=int(tq.get("run_timeout_seconds", 600)),
             heartbeat_interval_seconds=int(tq.get("heartbeat_interval_seconds", 15)),
             task_state_ttl_seconds=int(tq.get("task_state_ttl_seconds", 86400)),
+        )
+        sd = _scholar_downloader_from_config()
+        self.scholar_downloader = ScholarDownloaderSettings(
+            enabled=bool(sd.get("enabled", True)),
+            download_dir=str(sd.get("download_dir", "data/raw_papers")),
+            annas_archive_api_key=str(sd.get("annas_archive_api_key", "")),
+            twocaptcha_api_key=str(sd.get("twocaptcha_api_key", "")),
+            capsolver_extension_path=str(sd.get("capsolver_extension_path", "./Extension-capsolver")),
+            proxy=sd.get("proxy"),
+            max_concurrent_downloads=int(sd.get("max_concurrent_downloads", 3)),
+            show_browser=bool(sd.get("show_browser", False)),
+            persist_browser=bool(sd.get("persist_browser", True)),
+            auto_ingest_after_download=bool(sd.get("auto_ingest_after_download", True)),
         )
 
     @property

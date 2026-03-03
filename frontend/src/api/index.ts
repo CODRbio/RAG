@@ -9,5 +9,6 @@ export * from './ingest';
 export * from './graph';
 export * from './compare';
 export * from './debug';
+export * from './scholar';
 export { default as client } from './client';
 export { streamChat } from './client';

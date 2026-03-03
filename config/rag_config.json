@@ -177,6 +177,18 @@
     "compress_word_threshold": 300,
     "compress_max_output_words": 400
   },
+  "scholar_downloader": {
+    "enabled": true,
+    "download_dir": "data/raw_papers",
+    "annas_archive_api_key": "",
+    "twocaptcha_api_key": "",
+    "capsolver_extension_path": "./Extension-capsolver",
+    "proxy": null,
+    "max_concurrent_downloads": 3,
+    "show_browser": false,
+    "persist_browser": true,
+    "auto_ingest_after_download": true
+  },
   "api": {
     "host": "127.0.0.1",
     "port": 9999

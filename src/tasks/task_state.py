@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional
 class TaskKind(str, Enum):
     chat = "chat"
     dr = "dr"
+    scholar = "scholar"
 
 
 class TaskStatus(str, Enum):

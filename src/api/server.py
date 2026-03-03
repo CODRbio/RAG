@@ -24,6 +24,7 @@ from src.api.routes_ingest import router as ingest_router
 from src.api.routes_graph import router as graph_router
 from src.api.routes_compare import router as compare_router
 from src.api.routes_debug import router as debug_router
+from src.api.routes_scholar import router as scholar_router
 from src.api.routes_tasks import router as tasks_router
 from src.log import get_logger
 from src.utils.storage_cleaner import run_cleanup, get_storage_stats
@@ -95,12 +96,17 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Shutdown: 取消 Worker
+    # Shutdown: 取消 Worker + 关闭 Scholar 适配器
     worker_task.cancel()
     try:
         await worker_task
     except asyncio.CancelledError:
         pass
+    try:
+        from src.retrieval.downloader.adapter import shutdown_adapter
+        shutdown_adapter()
+    except Exception as e:
+        logger.warning("shutdown_adapter failed: %s", e)
 
 
 app = FastAPI(
@@ -131,6 +137,7 @@ app.include_router(ingest_router)
 app.include_router(graph_router)
 app.include_router(compare_router)
 app.include_router(debug_router)
+app.include_router(scholar_router)
 
 # Observability: 中间件 + /metrics + /health/detailed
 setup_observability(app)

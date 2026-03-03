@@ -307,6 +307,23 @@ def graph_chunk_detail(
 def graph_pdf_stream(paper_id: str):
     """返回原始 PDF 文件流，供前端 PDF 高亮溯源使用。"""
     pdf_path = settings.path.raw_papers / f"{paper_id}.pdf"
+
+    if not pdf_path.exists():
+        from src.indexing.paper_store import get_paper_by_id
+        record = get_paper_by_id(paper_id)
+        if record and record.get("file_path"):
+            candidate = Path(record["file_path"])
+            if candidate.exists():
+                pdf_path = candidate
+
+    if not pdf_path.exists():
+        try:
+            alt = Path(settings.scholar_downloader.download_dir) / f"{paper_id}.pdf"
+            if alt.exists():
+                pdf_path = alt
+        except Exception:
+            pass
+
     if not pdf_path.exists():
         raise HTTPException(status_code=404, detail=f"PDF '{paper_id}.pdf' 未找到")
     return FileResponse(

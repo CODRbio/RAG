@@ -29,6 +29,13 @@
     "brightdata_zone": "",
     "two_captcha_api_key": ""
   },
+  "scholar_downloader": {
+    "enabled": true,
+    "download_dir": "data/raw_papers",
+    "annas_archive_api_key": "",
+    "twocaptcha_api_key": "",
+    "capsolver_extension_path": "./Extension-capsolver"
+  },
   "auth": {
     "secret_key": "<set-a-strong-random-value-for-jwt-signing>"
   }

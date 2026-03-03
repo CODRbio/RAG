@@ -118,6 +118,21 @@ def list_papers(collection: str) -> List[dict]:
     ]
 
 
+def get_paper_by_id(paper_id: str) -> Optional[dict]:
+    """按 paper_id 查找（跨所有 collection），用于 PDF 端点 fallback。"""
+    with Session(get_engine()) as session:
+        stmt = select(Paper).where(Paper.paper_id == paper_id).limit(1)
+        row = session.exec(stmt).first()
+    if not row:
+        return None
+    return {
+        "paper_id": row.paper_id,
+        "file_path": row.file_path or "",
+        "collection": row.collection or "",
+        "filename": row.filename or "",
+    }
+
+
 def get_paper(collection: str, paper_id: str) -> Optional[dict]:
     """获取单个 paper 信息。"""
     with Session(get_engine()) as session:
