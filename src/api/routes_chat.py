@@ -1942,7 +1942,7 @@ def chat_submit(
     return ChatSubmitResponse(task_id=task_id)
 
 
-_SSE_HEARTBEAT_INTERVAL = 25  # 秒：每隔此时间发一次 SSE 注释保活，防止 proxy/浏览器因空闲超时断连
+_SSE_HEARTBEAT_INTERVAL = 15  # 秒：每隔此时间发一次 SSE 注释保活，防止 proxy/浏览器因空闲超时断连
 
 
 def _task_event_stream(task_id: str, q, after_id: str = "-"):
@@ -1959,6 +1959,10 @@ def _task_event_stream(task_id: str, q, after_id: str = "-"):
     心跳：任务运行期间每隔 _SSE_HEARTBEAT_INTERVAL 秒发一条 SSE 注释行
     (": heartbeat")，防止 Vite proxy / nginx 等因 idle timeout 断开连接。
     浏览器会忽略注释行，不触发任何事件。
+
+    关键：在 while 循环开始前立即 yield 一个初始注释，强制 Starlette 立即
+    发出 HTTP 响应头和第一个字节，避免浏览器/代理因等待首字节超时而报
+    ERR_EMPTY_RESPONSE。
     """
     import time
     last_id = after_id
@@ -1966,6 +1970,9 @@ def _task_event_stream(task_id: str, q, after_id: str = "-"):
     if _obs_metrics:
         _obs_metrics.active_connections.inc()
     try:
+        # 立即发送初始注释，让 HTTP 响应头和首字节立刻到达客户端
+        yield ": stream-init\n\n"
+        last_sent_at = time.monotonic()
         while True:
             # ① 先读取所有已推送但未发送的事件
             events = q.read_events(task_id, after_id=last_id)
@@ -2023,7 +2030,15 @@ def chat_stream_by_task_id(task_id: str, request: Request):
         or request.query_params.get("after_id")
         or "-"
     )
-    return StreamingResponse(_task_event_stream(task_id, q, after_id), media_type="text/event-stream")
+    return StreamingResponse(
+        _task_event_stream(task_id, q, after_id),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @router.post("/chat/stream")
@@ -2055,7 +2070,15 @@ def chat_stream(
         raise HTTPException(status_code=503, detail=f"Queue submit failed: {e}")
     if _obs_metrics and hasattr(_obs_metrics, "task_queue_submitted_total"):
         _obs_metrics.task_queue_submitted_total.labels(kind="chat").inc()
-    return StreamingResponse(_task_event_stream(task_id, q), media_type="text/event-stream")
+    return StreamingResponse(
+        _task_event_stream(task_id, q),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @router.post("/intent/detect", response_model=IntentDetectResponse)

@@ -172,6 +172,11 @@ async def scholar_batch_download(req: BatchDownloadRequest, background_tasks: Ba
                     completed += 1
                 else:
                     failed += 1
+                    logger.warning(
+                        "文献下载/入库失败: %s - %s",
+                        paper.title,
+                        result.get("message", "未知错误"),
+                    )
                 state = q.get_state(task_id)
                 if state:
                     state.payload["completed"] = completed

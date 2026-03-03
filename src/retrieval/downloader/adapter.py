@@ -10,9 +10,9 @@ import hashlib
 import os
 import re
 import asyncio
+import random
 import unicodedata
 import threading
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
 from config.settings import settings
@@ -54,7 +54,7 @@ def _normalize_to_paper_id(
 class ScholarDownloaderAdapter:
     """
     RAG ↔ PaperDownloader adapter.
-    Search: RAG modules only. Download: ThreadPoolExecutor → PaperDownloader.
+    Search: RAG modules only. Download: background event loop → shared PaperDownloader.
     """
 
     def __init__(self) -> None:
@@ -68,10 +68,32 @@ class ScholarDownloaderAdapter:
         self.max_concurrent = cfg.max_concurrent_downloads
         os.makedirs(self.download_dir, exist_ok=True)
 
-        self._executor = ThreadPoolExecutor(
-            max_workers=2,
-            thread_name_prefix="scholar_dl",
+        from .paper_downloader_refactored import PaperDownloader
+
+        self._dl = PaperDownloader(
+            download_dir=self.download_dir,
+            show_browser=self.show_browser,
+            persist_browser=True,
+            max_concurrent=self.max_concurrent,
         )
+        self._dl.config.setdefault("api_keys", {})["annas_archive"] = self.annas_api_key
+
+        self._bg_loop = asyncio.new_event_loop()
+        self._bg_thread = threading.Thread(
+            target=self._run_bg_loop,
+            daemon=True,
+            name="scholar_dl_bg",
+        )
+        self._bg_thread.start()
+
+        self._warmup_future = asyncio.run_coroutine_threadsafe(
+            self._dl.initialize(),
+            self._bg_loop,
+        )
+
+    def _run_bg_loop(self) -> None:
+        asyncio.set_event_loop(self._bg_loop)
+        self._bg_loop.run_forever()
 
     async def search_google_scholar(
         self,
@@ -119,58 +141,34 @@ class ScholarDownloaderAdapter:
         query: str,
         limit: int = 10,
     ) -> List[Dict[str, Any]]:
-        """Anna's Archive keyword search; no RAG module, run in executor."""
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            self._executor, self._sync_search_annas, query, limit
+        """Anna's Archive keyword search running on shared downloader loop."""
+        fut = asyncio.run_coroutine_threadsafe(
+            self._impl_search_annas(query=query, limit=limit),
+            self._bg_loop,
         )
-
-    def _sync_search_annas(self, query: str, limit: int) -> List[Dict[str, Any]]:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            return loop.run_until_complete(self._impl_search_annas(query, limit))
-        finally:
-            try:
-                loop.run_until_complete(loop.shutdown_asyncgens())
-            except Exception:
-                pass
-            loop.close()
-            asyncio.set_event_loop(None)
+        return await asyncio.wrap_future(fut)
 
     async def _impl_search_annas(
         self, query: str, limit: int
     ) -> List[Dict[str, Any]]:
-        from .paper_downloader_refactored import PaperDownloader
-
-        dl = PaperDownloader(
-            download_dir=self.download_dir,
-            show_browser=False,
-            persist_browser=False,
-        )
-        try:
-            dl.config.setdefault("api_keys", {})["annas_archive"] = self.annas_api_key
-            await dl.initialize()
-            raw = await dl.annas_keyword_search(query=query, limit=limit)
-            return [
-                {
-                    "content": r.get("snippet", ""),
-                    "score": 0.7,
-                    "metadata": {
-                        "source": "annas_archive",
-                        "title": r.get("title", ""),
-                        "authors": r.get("authors", []),
-                        "year": r.get("year"),
-                        "doi": None,
-                        "annas_md5": r.get("md5"),
-                        "url": r.get("link"),
-                        "downloadable": bool(r.get("md5")),
-                    },
-                }
-                for r in raw
-            ]
-        finally:
-            await dl.cleanup_resources(force_close=True)
+        raw = await self._dl.annas_keyword_search(query=query, limit=limit)
+        return [
+            {
+                "content": r.get("snippet", ""),
+                "score": 0.7,
+                "metadata": {
+                    "source": "annas_archive",
+                    "title": r.get("title", ""),
+                    "authors": r.get("authors", []),
+                    "year": r.get("year"),
+                    "doi": None,
+                    "annas_md5": r.get("md5"),
+                    "url": r.get("link"),
+                    "downloadable": bool(r.get("md5")),
+                },
+            }
+            for r in raw
+        ]
 
     async def download_paper(
         self,
@@ -183,66 +181,11 @@ class ScholarDownloaderAdapter:
         year: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Download one paper PDF to download_dir. Returns success, paper_id, filepath, message."""
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            self._executor,
-            self._sync_download,
-            title,
-            doi,
-            pdf_url,
-            annas_md5,
-            authors,
-            year,
+        fut = asyncio.run_coroutine_threadsafe(
+            self._impl_download_inner(title, doi, pdf_url, annas_md5, authors, year),
+            self._bg_loop,
         )
-
-    def _sync_download(
-        self,
-        title: str,
-        doi: Optional[str],
-        pdf_url: Optional[str],
-        annas_md5: Optional[str],
-        authors: Optional[List[str]],
-        year: Optional[int],
-    ) -> Dict[str, Any]:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            return loop.run_until_complete(
-                self._impl_download(
-                    title, doi, pdf_url, annas_md5, authors, year
-                )
-            )
-        finally:
-            try:
-                loop.run_until_complete(loop.shutdown_asyncgens())
-            except Exception:
-                pass
-            loop.close()
-            asyncio.set_event_loop(None)
-
-    async def _impl_download(
-        self,
-        title: str,
-        doi: Optional[str],
-        pdf_url: Optional[str],
-        annas_md5: Optional[str],
-        authors: Optional[List[str]],
-        year: Optional[int],
-    ) -> Dict[str, Any]:
-        try:
-            return await asyncio.wait_for(
-                self._impl_download_inner(
-                    title, doi, pdf_url, annas_md5, authors, year
-                ),
-                timeout=300,
-            )
-        except asyncio.TimeoutError:
-            return {
-                "success": False,
-                "paper_id": None,
-                "filepath": None,
-                "message": "下载超时（5分钟）",
-            }
+        return await asyncio.wrap_future(fut)
 
     async def _impl_download_inner(
         self,
@@ -253,35 +196,28 @@ class ScholarDownloaderAdapter:
         authors: Optional[List[str]],
         year: Optional[int],
     ) -> Dict[str, Any]:
-        from .paper_downloader_refactored import PaperDownloader
+        async def _do_download() -> Dict[str, Any]:
+            paper_id = _normalize_to_paper_id(title, authors, year)
+            filepath = os.path.join(self.download_dir, f"{paper_id}.pdf")
 
-        paper_id = _normalize_to_paper_id(title, authors, year)
-        filepath = os.path.join(self.download_dir, f"{paper_id}.pdf")
+            if os.path.exists(filepath) and is_valid_pdf(filepath):
+                logger.info("PDF already exists, skip: %s", filepath)
+                return {
+                    "success": True,
+                    "paper_id": paper_id,
+                    "filepath": filepath,
+                    "message": "已存在，跳过下载",
+                }
 
-        if os.path.exists(filepath) and is_valid_pdf(filepath):
-            logger.info("PDF already exists, skip: %s", filepath)
-            return {
-                "success": True,
-                "paper_id": paper_id,
-                "filepath": filepath,
-                "message": "已存在，跳过下载",
-            }
-
-        dl = PaperDownloader(
-            download_dir=self.download_dir,
-            show_browser=self.show_browser,
-            persist_browser=False,
-        )
-        try:
-            dl.config.setdefault("api_keys", {})["annas_archive"] = self.annas_api_key
-            await dl.initialize()
+            # Make sure shared browser context is healthy; no-op when already ready.
+            await self._dl.initialize()
 
             success = False
             message = ""
 
             if annas_md5 and self.annas_api_key:
                 try:
-                    ok, reason, _ = await dl.download_with_annas_archive(
+                    ok, _reason, _ = await self._dl.download_with_annas_archive(
                         annas_md5, filepath, title=title, authors=authors, year=year
                     )
                     if ok:
@@ -292,7 +228,8 @@ class ScholarDownloaderAdapter:
 
             if not success and pdf_url:
                 try:
-                    success = await dl.find_and_download_pdf_with_browser(
+                    await asyncio.sleep(random.uniform(1.0, 3.0))
+                    success = await self._dl.find_and_download_pdf_with_browser(
                         pdf_url, filepath, title=title, authors=authors, year=year
                     )
                     if success:
@@ -302,9 +239,13 @@ class ScholarDownloaderAdapter:
 
             if not success and doi:
                 try:
-                    success = await dl.download_with_sci_hub(
-                        f"https://doi.org/{doi}", filepath,
-                        title=title, authors=authors, year=year,
+                    await asyncio.sleep(random.uniform(1.5, 3.5))
+                    success = await self._dl.download_with_sci_hub(
+                        f"https://doi.org/{doi}",
+                        filepath,
+                        title=title,
+                        authors=authors,
+                        year=year,
                     )
                     if success:
                         message = "Sci-Hub"
@@ -313,9 +254,9 @@ class ScholarDownloaderAdapter:
 
             if not success and doi and self.annas_api_key:
                 try:
-                    md5 = await dl._annas_search_md5(doi)
+                    md5 = await self._dl._annas_search_md5(doi)
                     if md5:
-                        ok, _, _ = await dl.download_with_annas_archive(
+                        ok, _, _ = await self._dl.download_with_annas_archive(
                             md5, filepath, title=title, authors=authors, year=year
                         )
                         if ok:
@@ -359,6 +300,15 @@ class ScholarDownloaderAdapter:
                 "message": message,
             }
 
+        try:
+            return await asyncio.wait_for(_do_download(), timeout=300)
+        except asyncio.TimeoutError:
+            return {
+                "success": False,
+                "paper_id": None,
+                "filepath": None,
+                "message": "下载超时（5分钟）",
+            }
         except Exception as e:
             logger.error("download_paper fatal: %s", e)
             return {
@@ -367,11 +317,6 @@ class ScholarDownloaderAdapter:
                 "filepath": None,
                 "message": f"下载异常: {e}",
             }
-        finally:
-            try:
-                await dl.cleanup_resources(force_close=True)
-            except Exception as e:
-                logger.warning("Browser cleanup error (non-fatal): %s", e)
 
     async def batch_download(
         self,
@@ -404,7 +349,18 @@ class ScholarDownloaderAdapter:
         return results
 
     def shutdown(self) -> None:
-        self._executor.shutdown(wait=True)
+        if self._bg_loop and self._bg_loop.is_running():
+            cleanup_future = asyncio.run_coroutine_threadsafe(
+                self._dl.cleanup_resources(force_close=True),
+                self._bg_loop,
+            )
+            try:
+                cleanup_future.result(timeout=15)
+            except Exception as e:
+                logger.warning("Downloader cleanup during shutdown failed: %s", e)
+            self._bg_loop.call_soon_threadsafe(self._bg_loop.stop)
+        if self._bg_thread and self._bg_thread.is_alive():
+            self._bg_thread.join(timeout=10)
 
 
 _adapter_instance: Optional[ScholarDownloaderAdapter] = None

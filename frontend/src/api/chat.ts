@@ -114,13 +114,16 @@ export async function* streamChatByTaskId(
         let eventType = 'message';
         let eventId = '';
         const dataLines: string[] = [];
+        let hasField = false;
         for (const line of block.split('\n')) {
-          if (line.startsWith('event: ')) eventType = line.slice(7).trim();
-          else if (line.startsWith('id: ')) eventId = line.slice(4).trim();
-          else if (line.startsWith('data: ')) dataLines.push(line.slice(6));
+          if (line.startsWith(':')) continue; // SSE comment — ignore per spec
+          if (line.startsWith('event: ')) { eventType = line.slice(7).trim(); hasField = true; }
+          else if (line.startsWith('id: ')) { eventId = line.slice(4).trim(); hasField = true; }
+          else if (line.startsWith('data: ')) { dataLines.push(line.slice(6)); hasField = true; }
+          else if (line.trim()) hasField = true; // unknown non-empty field
         }
+        if (!hasField) return null; // comment-only block or empty block
         const dataStr = dataLines.join('\n');
-        if (!eventType && !dataStr) return null;
         let data: unknown = {};
         if (dataStr) {
           try { data = JSON.parse(dataStr); } catch { data = { raw: dataStr }; }
