@@ -50,6 +50,7 @@ from bs4 import BeautifulSoup
 
 from config.settings import settings
 from src.log import get_logger
+from src.retrieval.browser_service import SharedBrowserService
 from src.utils.cache import TTLCache, _make_key, get_cache
 
 logger = get_logger(__name__)
@@ -683,6 +684,26 @@ class _BrowserManager:
             logger.info(f"显示模式: {display_mode}, headless={headless}")
         
         os.makedirs(user_data_dir, exist_ok=True)
+
+        # 优先连接共享 CDP 浏览器，避免重复拉起 Chromium 进程
+        cdp_url = SharedBrowserService.get_cdp_url()
+        if cdp_url:
+            logger.info("检测到共享浏览器，使用 CDP 连接: %s", cdp_url)
+            browser = await self.playwright.chromium.connect_over_cdp(cdp_url)
+            context_options = {
+                "accept_downloads": True,
+                "user_agent": _get_random_user_agent(),
+                "viewport": _get_random_viewport(),
+                "locale": "en-US",
+                "timezone_id": "America/New_York",
+            }
+            if proxy:
+                if proxy.startswith("socks5h://"):
+                    proxy = proxy.replace("socks5h://", "socks5://")
+                context_options["proxy"] = {"server": proxy}
+            context = await browser.new_context(**context_options)
+            self.attach_cdp_browser(browser, context)
+            return context
         
         context_options = {
             "headless": headless,

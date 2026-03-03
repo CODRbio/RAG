@@ -30,6 +30,7 @@ from src.log import get_logger
 from src.utils.storage_cleaner import run_cleanup, get_storage_stats
 from src.utils.task_runner import cleanup_stale_jobs, run_background_worker
 from src.observability import setup_observability
+from src.retrieval.browser_service import SharedBrowserService
 
 logger = get_logger(__name__)
 
@@ -91,7 +92,13 @@ async def lifespan(app: FastAPI):
     dl = init_debug_logger(enabled=settings.debug)
     logger.info("[startup] debug mode: %s (log_dir=%s)", "ON" if dl.enabled else "OFF", dl.log_dir)
 
-    # 4. 启动后台任务轮询 Worker
+    # 4. 启动共享浏览器（供 Download / RAG 共用）
+    try:
+        await SharedBrowserService.start()
+    except Exception as e:
+        logger.warning("[startup] shared browser service start failed, fallback to local launch: %s", e)
+
+    # 5. 启动后台任务轮询 Worker
     worker_task = asyncio.create_task(run_background_worker())
 
     yield
@@ -107,6 +114,10 @@ async def lifespan(app: FastAPI):
         shutdown_adapter()
     except Exception as e:
         logger.warning("shutdown_adapter failed: %s", e)
+    try:
+        await SharedBrowserService.stop()
+    except Exception as e:
+        logger.warning("SharedBrowserService.stop failed: %s", e)
 
 
 app = FastAPI(

@@ -42,6 +42,7 @@ from urllib.parse import urlparse
 from pydantic import BaseModel, Field
 
 from src.log import get_logger
+from src.retrieval.browser_service import SharedBrowserService
 from src.utils.cache import DiskCache, TTLCache, _make_key, get_cache, get_disk_cache
 from src.utils.prompt_manager import PromptManager
 
@@ -396,7 +397,7 @@ class WebContentFetcher:
         使用 Playwright headless 浏览器抓取。
 
         支持 JS 渲染页面，含 stealth 反检测。
-        浏览器实例临时创建，不复用 google_search.py 的全局浏览器。
+        优先复用共享 CDP 浏览器；不可用时回退到临时浏览器。
         """
         try:
             from playwright.async_api import async_playwright
@@ -410,7 +411,13 @@ class WebContentFetcher:
                 pass
 
             async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
+                cdp_url = SharedBrowserService.get_cdp_url()
+                own_browser = False
+                if cdp_url:
+                    browser = await p.chromium.connect_over_cdp(cdp_url)
+                else:
+                    browser = await p.chromium.launch(headless=True)
+                    own_browser = True
                 try:
                     context = await browser.new_context(
                         user_agent=(
@@ -437,7 +444,8 @@ class WebContentFetcher:
                     html = await page.content()
                     await context.close()
                 finally:
-                    await browser.close()
+                    if own_browser:
+                        await browser.close()
 
             if not html or len(html) < 200:
                 return None

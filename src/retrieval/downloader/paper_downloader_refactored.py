@@ -3330,6 +3330,13 @@ class PaperDownloader:
 
             except Exception as e:
                 self.logger.error(f"初始下载失败：{e}, 检查是否404错误")
+                # expect_download 超时后，下载可能已在后台落盘；先等待其稳定，避免过早关闭页面导致 Target closed
+                if latest_download.get("obj") is not None:
+                    dl = latest_download["obj"]
+                    try:
+                        await asyncio.wait_for(dl.path(), timeout=30.0)
+                    except Exception:
+                        pass
                 try:
                     analysis = await self.page_analyzer.analyze(page)
                     self.logger.info(f"[观察点-初始下载失败] {self.page_analyzer.format_analysis(analysis)}")
@@ -5008,7 +5015,7 @@ class PaperDownloader:
                             f"已用时 {elapsed:.1f}s, URL: {current_url[:60]}...")
             
             # 防止URL死循环
-            url_key = current_url.split('?')[0]  # 去掉查询参数
+            url_key = current_url.split('#')[0].split('?')[0]  # 去掉锚点和查询参数
             if url_key in visited_urls and iteration > 0:
                 self.logger.debug(f"[智能循环] URL重复访问，尝试不同策略")
             visited_urls.add(url_key)
@@ -6511,7 +6518,12 @@ class PaperDownloader:
                 self.logger.info(f"Cloudflare 验证后触发下载，文件已保存: {cf_downloaded_file}")
                 return True
             elif cf_success:
-                await simulate_human_behavior(page)
+                if not self.headless:
+                    await self.browser_manager.execute_with_ui_lock(
+                        simulate_human_behavior(page)
+                    )
+                else:
+                    await simulate_human_behavior(page)
             else:
                 self.logger.warning("Cloudflare 验证码解决失败，继续尝试其他方法")
             # 检查是否是需要多步操作的站点（使用类配置）
@@ -7142,7 +7154,8 @@ class PaperDownloader:
                             new_page.off("download", new_page_download_handler)
                         except Exception:
                             pass
-                    await new_page.close()
+                    if not new_page.is_closed():
+                        await asyncio.wait_for(new_page.close(), timeout=3.0)
                     self._active_pages.discard(new_page)
                 except Exception as e:
                     self.logger.warning(f"关闭新页面时出错: {str(e)}")

@@ -10,6 +10,7 @@ import tempfile
 
 # 导入显示器管理模块
 from .display_manager import ensure_display, get_display_mode, should_use_headed_mode
+from src.retrieval.browser_service import SharedBrowserService
 
 # 尝试导入 playwright-stealth，如果失败则使用备用方案
 #
@@ -92,6 +93,8 @@ class BrowserManager:
         self.timeout = 120000
         self._temp_files = []  # 用于跟踪需要清理的临时文件
         self._playwright_lock = asyncio.Lock()  # 保护 Playwright 初始化的锁
+        self._ui_action_lock = asyncio.Lock()  # 有头模式下串行化拟人化交互
+        self._cdp_browser_handle = None  # CDP 连接到共享浏览器（不拥有进程）
         
     async def close(self, force_cleanup: bool = False):
         """关闭所有浏览器实例和Playwright
@@ -136,6 +139,7 @@ class BrowserManager:
         self._cleanup_temp_files()
                 
         self.browsers = []
+        self._cdp_browser_handle = None
         
         # 仅在明确需要时才强制清理（默认不调用，避免 pkill 触发崩溃报告）
         if force_cleanup:
@@ -143,6 +147,10 @@ class BrowserManager:
     
     async def force_cleanup(self):
         """强制清理所有残留的 Chromium/Chrome 进程"""
+        if self._cdp_browser_handle is not None:
+            logger.info("检测到共享 CDP 浏览器连接，跳过 force_cleanup")
+            return
+
         import subprocess
         import platform
         
@@ -230,6 +238,11 @@ class BrowserManager:
         async with self._playwright_lock:
             if not self.playwright:
                 self.playwright = await async_playwright().start()
+
+    async def execute_with_ui_lock(self, coro):
+        """在有头模式下串行执行拟人化交互，避免焦点抢占。"""
+        async with self._ui_action_lock:
+            return await coro
             
     async def launch_browser(self, 
                            browser_type: str = "chromium", 
@@ -256,6 +269,14 @@ class BrowserManager:
             Browser: 浏览器实例
         """
         await self._ensure_playwright()
+
+        # 优先复用全局共享浏览器（CDP）
+        cdp_url = SharedBrowserService.get_cdp_url()
+        if cdp_url and browser_type in ("chromium", "chrome"):
+            logger.info(f"连接共享浏览器 CDP: {cdp_url}")
+            browser = await self.playwright.chromium.connect_over_cdp(cdp_url)
+            self._cdp_browser_handle = browser
+            return browser
         
         # 自动检测显示模式
         if headless is None:
@@ -438,6 +459,30 @@ class BrowserManager:
             BrowserContext: 浏览器上下文
         """
         await self._ensure_playwright()
+
+        # 优先复用全局共享浏览器（CDP）
+        cdp_url = SharedBrowserService.get_cdp_url()
+        if cdp_url and browser_type in ("chromium", "chrome"):
+            logger.info(f"通过 CDP 复用共享浏览器: {cdp_url}")
+            if user_data_dir:
+                logger.info("CDP 模式不使用 user_data_dir 持久化配置，改为独立 context 隔离")
+
+            browser = await self.playwright.chromium.connect_over_cdp(cdp_url)
+            self._cdp_browser_handle = browser
+            context = await browser.new_context(
+                accept_downloads=True,
+                user_agent=user_agent or DEFAULT_USER_AGENT,
+                viewport=viewport or DEFAULT_VIEWPORT,
+                locale=DEFAULT_LOCALE,
+                timezone_id=DEFAULT_TIMEZONE,
+                geolocation=DEFAULT_GEOLOCATION,
+                color_scheme="light",
+                reduced_motion="no-preference",
+                has_touch=False,
+            )
+            if downloads_path:
+                os.makedirs(downloads_path, exist_ok=True)
+            return context
         
         # 自动检测显示模式
         if headless is None:
