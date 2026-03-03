@@ -6,6 +6,7 @@ import { IngestPage } from './pages/IngestPage';
 import { AdminPage } from './pages/AdminPage';
 import { GraphExplorer } from './components/graph/GraphExplorer';
 import { CompareView } from './components/compare/CompareView';
+import { ScholarPage } from './pages/ScholarPage';
 import { Sidebar } from './components/layout/Sidebar';
 import { Header } from './components/layout/Header';
 import { CanvasPanel } from './components/canvas/CanvasPanel';
@@ -92,6 +93,8 @@ function App() {
         return <GraphExplorer />;
       case 'compare':
         return <CompareView />;
+      case 'scholar':
+        return <ScholarPage />;
       default:
         return <ChatPage />;
     }

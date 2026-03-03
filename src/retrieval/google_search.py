@@ -51,6 +51,8 @@ from bs4 import BeautifulSoup
 from config.settings import settings
 from src.log import get_logger
 from src.retrieval.browser_service import SharedBrowserService
+from src.retrieval.capsolver_api import CapSolverAPI
+from src.retrieval.two_captcha_api import TwoCaptchaAPI
 from src.utils.cache import TTLCache, _make_key, get_cache
 
 logger = get_logger(__name__)
@@ -580,6 +582,10 @@ class _BrowserManager:
         """附加通过 connect_over_cdp 得到的 browser 与默认 context。"""
         self._cdp_browser = browser
         self.browsers = [context]
+
+    def is_cdp_connected(self) -> bool:
+        """是否通过 CDP 连接共享浏览器（无本地窗口，不应按有头模式等待验证码）。"""
+        return self._cdp_browser is not None
     
     async def close(self):
         """关闭所有浏览器实例：先关所有页面，再关 context，最后 stop playwright（CDP 时仅断开连接）"""
@@ -677,18 +683,28 @@ class _BrowserManager:
 
         _cleanup_stale_singleton_lock(user_data_dir)
 
-        # 自动检测显示模式
+        # 未配置时默认无头；显式 headless=False 时尝试启用有头（Linux 可走 Xvfb）
         if headless is None:
+            headless = True
+            logger.debug("google_search headless 未配置，默认无头")
+        elif headless is False:
             use_headed, display_mode = _ensure_display()
-            headless = not use_headed
-            logger.info(f"显示模式: {display_mode}, headless={headless}")
+            if use_headed:
+                logger.info("显式请求有头模式，显示模式=%s", display_mode)
+                headless = False
+            else:
+                logger.warning("显式请求有头模式但无可用显示器，降级为无头")
+                headless = True
         
         os.makedirs(user_data_dir, exist_ok=True)
 
-        # 优先连接共享 CDP 浏览器，避免重复拉起 Chromium 进程
+        # 优先连接共享 CDP 浏览器——但需要有头而共享浏览器是无头时跳过，自己 launch 有头实例
         cdp_url = SharedBrowserService.get_cdp_url()
-        if cdp_url:
-            logger.info("检测到共享浏览器，使用 CDP 连接: %s", cdp_url)
+        shared_is_headless = getattr(SharedBrowserService, "_headless", True)
+        if cdp_url and (headless or not shared_is_headless):
+            # 共享浏览器可用且模式匹配：直接 CDP 连接
+            logger.info("检测到共享浏览器，使用 CDP 连接: %s (shared_headless=%s, requested_headless=%s)",
+                        cdp_url, shared_is_headless, headless)
             browser = await self.playwright.chromium.connect_over_cdp(cdp_url)
             context_options = {
                 "accept_downloads": True,
@@ -704,7 +720,10 @@ class _BrowserManager:
             context = await browser.new_context(**context_options)
             self.attach_cdp_browser(browser, context)
             return context
-        
+
+        if cdp_url and not headless and shared_is_headless:
+            logger.info("需要有头浏览器但共享浏览器为无头，跳过 CDP 连接，将本地 launch 有头实例")
+
         context_options = {
             "headless": headless,
             "accept_downloads": True,
@@ -1038,6 +1057,8 @@ class GoogleSearcher:
     _config: Dict[str, Any] = field(default_factory=dict)
     _browser_manager: Optional[_BrowserManager] = field(default=None, repr=False)
     _cache: Optional[TTLCache] = field(default=None, repr=False)
+    _capsolver_api: Optional[CapSolverAPI] = field(default=None, repr=False)
+    _two_captcha_api: Optional[TwoCaptchaAPI] = field(default=None, repr=False)
     
     # 默认分数
     SCHOLAR_DEFAULT_SCORE = 0.8
@@ -1046,6 +1067,18 @@ class GoogleSearcher:
     def __post_init__(self):
         if not self._config:
             self._config = _get_google_search_config()
+        cap_cfg = getattr(settings, "capsolver", None)
+        if cap_cfg and getattr(cap_cfg, "enabled", False) and getattr(cap_cfg, "api_key", ""):
+            self._capsolver_api = CapSolverAPI(
+                api_key=getattr(cap_cfg, "api_key", ""),
+                timeout_seconds=getattr(cap_cfg, "timeout_seconds", 120),
+            )
+        two_key = (
+            getattr(getattr(settings, "content_fetcher", None), "two_captcha_api_key", "") or
+            getattr(getattr(settings, "scholar_downloader", None), "twocaptcha_api_key", "")
+        )
+        if two_key:
+            self._two_captcha_api = TwoCaptchaAPI(api_key=two_key, timeout_seconds=120)
         perf = getattr(settings, "perf_google_search", None)
         self._cache = (
             get_cache(
@@ -1129,6 +1162,7 @@ class GoogleSearcher:
         context = None
         page = None
         is_shared = True
+        do_headed_retry = None
 
         # 等待全局串行锁——等待期间不占用 Playwright 操作的 timeout 预算
         logger.debug(f"[scholar-lock] waiting  query={query!r}")
@@ -1153,85 +1187,75 @@ class GoogleSearcher:
                     page, query, year_start, year_end, timeout
                 )
 
-                # 检查验证码
-                if await self._check_captcha(page):
+                # 检查验证码（等待 JS 异步重定向稳定）
+                if await self._wait_and_check_captcha(page):
                     logger.warning("检测到验证码")
-                    display_mode = _get_display_mode()
-                    is_headed = display_mode in ("real", "virtual") or headless == False
-
-                    if is_headed:
-                        logger.info("有头模式，等待验证码解决...")
-                        await self._inject_capsolver_attributes(page)
-
-                        for i in range(90):
-                            await asyncio.sleep(1)
-                            if not await self._check_captcha(page):
-                                logger.info("验证码已解决")
-                                try:
-                                    await page.wait_for_load_state("domcontentloaded", timeout=15000)
-                                    await page.wait_for_selector('.gs_r', timeout=10000)
-                                except Exception:
-                                    pass
-                                break
-                            if i > 0 and i % 15 == 0:
-                                await self._inject_capsolver_attributes(page)
-
-                        if not await self._check_results(page, '.gs_r'):
-                            logger.error("验证码处理后仍无结果")
-                            return results
-                    else:
-                        logger.error("无头模式下无法处理验证码")
+                    captcha_result = await self._handle_captcha_with_tiers(
+                        page=page,
+                        browser_manager=browser_manager,
+                        headless=headless,
+                        result_selector=".gs_r",
+                        scope="scholar",
+                    )
+                    if captcha_result == "needs_headed":
+                        do_headed_retry = ("scholar", query, limit, year_start, year_end, timeout, "scholar")
+                    elif captcha_result == "failed":
                         return results
+                    # else "solved" -> fall through
 
-                # 获取总结果数
-                html_content = await page.content()
-                total = _ScholarParser.extract_total_results(html_content)
-                if total:
-                    logger.info(f"总共约 {total} 条结果")
+                if do_headed_retry is not None:
+                    # Skip extraction; will retry with headed browser after releasing lock
+                    pass
+                else:
+                    # 获取总结果数
+                    html_content = await page.content()
+                    total = _ScholarParser.extract_total_results(html_content)
+                    if total:
+                        logger.info(f"总共约 {total} 条结果")
 
-                # 多页抓取
-                current_page = 1
-                needed_pages = (limit + 9) // 10
+                    # 多页抓取
+                    current_page = 1
+                    needed_pages = (limit + 9) // 10
 
-                while current_page <= needed_pages and len(results) < limit:
-                    logger.info(f"处理第 {current_page} 页 (已收集 {len(results)}/{limit})")
+                    while current_page <= needed_pages and len(results) < limit:
+                        logger.info(f"处理第 {current_page} 页 (已收集 {len(results)}/{limit})")
 
-                    try:
-                        await page.wait_for_selector('div.gs_r.gs_or.gs_scl', timeout=timeout/4)
-                    except Exception:
-                        pass
+                        try:
+                            await page.wait_for_selector('div.gs_r.gs_or.gs_scl', timeout=timeout/4)
+                        except Exception:
+                            pass
 
-                    html = await page.content()
-                    page_results = _ScholarParser.extract_results(html)
+                        html = await page.content()
+                        page_results = _ScholarParser.extract_results(html)
 
-                    if not page_results:
-                        logger.warning(f"第 {current_page} 页无结果")
-                        break
+                        if not page_results:
+                            logger.warning(f"第 {current_page} 页无结果")
+                            break
 
-                    for r in page_results[:limit - len(results)]:
-                        rag_item = self._to_scholar_rag_format(r, query)
-                        results.append(rag_item)
+                        for r in page_results[:limit - len(results)]:
+                            rag_item = self._to_scholar_rag_format(r, query)
+                            results.append(rag_item)
 
-                    logger.info(f"第 {current_page} 页提取 {len(page_results)} 条")
+                        logger.info(f"第 {current_page} 页提取 {len(page_results)} 条")
 
-                    if len(results) >= limit or current_page >= needed_pages:
-                        break
+                        if len(results) >= limit or current_page >= needed_pages:
+                            break
 
-                    # 翻页
-                    await self._random_delay(1.0, 3.0)
-                    await _simulate_human_scroll_to_bottom(page)
+                        # 翻页
+                        await self._random_delay(1.0, 3.0)
+                        await _simulate_human_scroll_to_bottom(page)
 
-                    if not await self._click_next_page(page, timeout):
-                        break
+                        if not await self._click_next_page(page, timeout):
+                            break
 
-                    current_page += 1
-                    await self._random_delay()
-                    await _simulate_human_behavior(page)
+                        current_page += 1
+                        await self._random_delay()
+                        await _simulate_human_behavior(page)
 
-                logger.info(f"Scholar 搜索完成，共 {len(results)} 条结果")
-                if self._cache:
-                    self._cache.set(cache_key, results)
-                return results
+                    logger.info(f"Scholar 搜索完成，共 {len(results)} 条结果")
+                    if self._cache:
+                        self._cache.set(cache_key, results)
+                    return results
 
             except Exception as e:
                 logger.error(f"Scholar 搜索出错: {e}")
@@ -1248,6 +1272,20 @@ class GoogleSearcher:
                         is_shared=is_shared,
                         manager=None if is_shared else browser_manager,
                     )
+
+        if do_headed_retry is not None:
+            _fn, _q, _lim, _ys, _ye, _to, _sc = do_headed_retry
+            return await self._retry_with_headed_browser(
+                search_fn=_fn,
+                query=_q,
+                limit=_lim,
+                year_start=_ys,
+                year_end=_ye,
+                result_selector=".gs_r",
+                timeout=_to,
+                scope=_sc,
+            )
+        return results
 
     async def search_scholar_batch(
         self,
@@ -1309,6 +1347,7 @@ class GoogleSearcher:
         context = None
         page = None
         is_shared = True
+        headed_retries: List[Tuple[str, int, Optional[int], Optional[int], int, str]] = []
 
         # 等待全局串行锁——等待期间不占用 Playwright 操作的 timeout 预算
         logger.debug(f"[scholar-lock] waiting  batch queries={len(queries_to_search)}")
@@ -1339,32 +1378,20 @@ class GoogleSearcher:
                             page, query, year_start, year_end, timeout
                         )
 
-                        # 检查验证码
-                        if await self._check_captcha(page):
+                        # 检查验证码（等待 JS 异步重定向稳定）
+                        if await self._wait_and_check_captcha(page):
                             logger.warning(f"检测到验证码 (query={query!r})")
-                            display_mode = _get_display_mode()
-                            is_headed = display_mode in ("real", "virtual") or headless == False
-
-                            if is_headed:
-                                await self._inject_capsolver_attributes(page)
-                                for i in range(90):
-                                    await asyncio.sleep(1)
-                                    if not await self._check_captcha(page):
-                                        logger.info("验证码已解决")
-                                        try:
-                                            await page.wait_for_load_state("domcontentloaded", timeout=15000)
-                                            await page.wait_for_selector('.gs_r', timeout=10000)
-                                        except Exception:
-                                            pass
-                                        break
-                                    if i > 0 and i % 15 == 0:
-                                        await self._inject_capsolver_attributes(page)
-
-                                if not await self._check_results(page, '.gs_r'):
-                                    logger.error(f"验证码处理后仍无结果 (query={query!r})")
-                                    continue
-                            else:
-                                logger.error(f"无头模式下无法处理验证码 (query={query!r})")
+                            captcha_result = await self._handle_captcha_with_tiers(
+                                page=page,
+                                browser_manager=browser_manager,
+                                headless=headless,
+                                result_selector=".gs_r",
+                                scope=f"scholar_batch:{query}",
+                            )
+                            if captcha_result == "needs_headed":
+                                headed_retries.append((query, limit_per_query, year_start, year_end, timeout, f"scholar_batch:{query}"))
+                                continue
+                            if captcha_result == "failed":
                                 continue
 
                         # 提取结果（支持多页抓取，每页 10 条）
@@ -1420,11 +1447,9 @@ class GoogleSearcher:
 
                 logger.info("[retrieval] playwright scholar_batch done total_hits=%d", len(all_results))
                 logger.info(f"Scholar 批量搜索完成，共 {len(all_results)} 条结果")
-                return all_results
 
             except Exception as e:
                 logger.error(f"Scholar 批量搜索出错: {e}")
-                return all_results
             finally:
                 if page:
                     try:
@@ -1437,6 +1462,25 @@ class GoogleSearcher:
                         is_shared=is_shared,
                         manager=None if is_shared else browser_manager,
                     )
+
+        for _q, _lim, _ys, _ye, _to, _sc in headed_retries:
+            retry_results = await self._retry_with_headed_browser(
+                search_fn="scholar",
+                query=_q,
+                limit=_lim,
+                year_start=_ys,
+                year_end=_ye,
+                result_selector=".gs_r",
+                timeout=_to,
+                scope=_sc,
+            )
+            if retry_results and self._cache:
+                cache_key = _make_key("google_scholar", _q, _lim, _ys, _ye)
+                self._cache.set(cache_key, retry_results)
+            all_results.extend(retry_results)
+
+        logger.info("[retrieval] playwright scholar_batch done total_hits=%d", len(all_results))
+        return all_results
 
     async def search_google(
         self,
@@ -1476,6 +1520,7 @@ class GoogleSearcher:
         context = None
         page = None
         is_shared = True
+        do_headed_retry = False
 
         try:
             browser_manager, context, is_shared = await acquire_shared_browser(
@@ -1506,38 +1551,34 @@ class GoogleSearcher:
                 logger.warning("等待页面加载超时，继续处理...")
             
             # 检查验证码
-            if await self._check_captcha(page):
+            if await self._wait_and_check_captcha(page):
                 logger.warning("检测到验证码")
-                display_mode = _get_display_mode()
-                is_headed = display_mode in ("real", "virtual") or headless == False
-                
-                if is_headed:
-                    logger.info("有头模式，等待验证码解决...")
-                    for i in range(90):
-                        await asyncio.sleep(1)
-                        if not await self._check_captcha(page):
-                            logger.info("验证码已解决")
-                            break
-                    
-                    if not await self._check_results(page, 'div.g'):
-                        logger.error("验证码处理后仍无结果")
-                        return results
-                else:
-                    logger.error("无头模式下无法处理验证码")
+                captcha_result = await self._handle_captcha_with_tiers(
+                    page=page,
+                    browser_manager=browser_manager,
+                    headless=headless,
+                    result_selector="div.g",
+                    scope="google",
+                )
+                if captcha_result == "needs_headed":
+                    do_headed_retry = True
+                elif captcha_result == "failed":
                     return results
+                # else "solved" -> fall through
             
-            # 提取结果
-            html = await page.content()
-            page_results = _GoogleParser.extract_results(html)
-            
-            for r in page_results[:limit]:
-                rag_item = self._to_google_rag_format(r, query)
-                results.append(rag_item)
-            
-            logger.info(f"Google 搜索完成，共 {len(results)} 条结果")
-            if self._cache:
-                self._cache.set(cache_key, results)
-            return results
+            if not do_headed_retry:
+                # 提取结果
+                html = await page.content()
+                page_results = _GoogleParser.extract_results(html)
+                
+                for r in page_results[:limit]:
+                    rag_item = self._to_google_rag_format(r, query)
+                    results.append(rag_item)
+                
+                logger.info(f"Google 搜索完成，共 {len(results)} 条结果")
+                if self._cache:
+                    self._cache.set(cache_key, results)
+                return results
 
         except Exception as e:
             logger.error(f"Google 搜索出错: {e}")
@@ -1554,6 +1595,17 @@ class GoogleSearcher:
                     is_shared=is_shared,
                     manager=None if is_shared else browser_manager,
                 )
+
+        if do_headed_retry:
+            return await self._retry_with_headed_browser(
+                search_fn="google",
+                query=query,
+                limit=limit,
+                result_selector="div.g",
+                timeout=timeout,
+                scope="google",
+            )
+        return results
 
     async def search_google_batch(
         self,
@@ -1611,6 +1663,7 @@ class GoogleSearcher:
         context = None
         page = None
         is_shared = True
+        headed_retries_google: List[Tuple[str, int, int, str]] = []
 
         try:
             browser_manager, context, is_shared = await acquire_shared_browser(
@@ -1646,23 +1699,19 @@ class GoogleSearcher:
                         pass
                     
                     # 检查验证码
-                    if await self._check_captcha(page):
+                    if await self._wait_and_check_captcha(page):
                         logger.warning(f"检测到验证码 (query={query!r})")
-                        display_mode = _get_display_mode()
-                        is_headed = display_mode in ("real", "virtual") or headless == False
-                        
-                        if is_headed:
-                            for i in range(90):
-                                await asyncio.sleep(1)
-                                if not await self._check_captcha(page):
-                                    logger.info("验证码已解决")
-                                    break
-                            
-                            if not await self._check_results(page, 'div.g'):
-                                logger.error(f"验证码处理后仍无结果 (query={query!r})")
-                                continue
-                        else:
-                            logger.error(f"无头模式下无法处理验证码 (query={query!r})")
+                        captcha_result = await self._handle_captcha_with_tiers(
+                            page=page,
+                            browser_manager=browser_manager,
+                            headless=headless,
+                            result_selector="div.g",
+                            scope=f"google_batch:{query}",
+                        )
+                        if captcha_result == "needs_headed":
+                            headed_retries_google.append((query, limit_per_query, timeout, f"google_batch:{query}"))
+                            continue
+                        if captcha_result == "failed":
                             continue
                     
                     # 提取结果
@@ -1692,11 +1741,9 @@ class GoogleSearcher:
             
             logger.info("[retrieval] playwright google_batch done total_hits=%d", len(all_results))
             logger.info(f"Google 批量搜索完成，共 {len(all_results)} 条结果")
-            return all_results
         
         except Exception as e:
             logger.error(f"Google 批量搜索出错: {e}")
-            return all_results
         finally:
             if page:
                 try:
@@ -1709,6 +1756,21 @@ class GoogleSearcher:
                     is_shared=is_shared,
                     manager=None if is_shared else browser_manager,
                 )
+
+        for _q, _lim, _to, _sc in headed_retries_google:
+            retry_results = await self._retry_with_headed_browser(
+                search_fn="google",
+                query=_q,
+                limit=_lim,
+                result_selector="div.g",
+                timeout=_to,
+                scope=_sc,
+            )
+            if retry_results and self._cache:
+                self._cache.set(_make_key("google_web", _q, _lim), retry_results)
+            all_results.extend(retry_results)
+
+        return all_results
 
     def _build_scholar_url(
         self, 
@@ -1816,6 +1878,9 @@ class GoogleSearcher:
             await page.wait_for_load_state("networkidle", timeout=timeout / 2)
         except Exception:
             logger.debug("等待 networkidle 超时，继续处理")
+
+        # sorry 重定向可能在 networkidle 后才完成，多等一下让页面稳定
+        await asyncio.sleep(1.5)
         
         # 年份过滤（在已建立 session 的基础上追加参数，不触发封控）
         if year_start or year_end:
@@ -1899,12 +1964,35 @@ class GoogleSearcher:
         }
     
     async def _check_captcha(self, page) -> bool:
-        """检查是否有验证码"""
+        """检查是否有验证码（DOM 元素 + sorry URL + HTML 文本回退）"""
         try:
-            selector = "form#captcha-form, #gs_captcha_ccl, div.g-recaptcha, #recaptcha"
-            return await page.query_selector(selector) is not None
+            url = (page.url or "").lower()
+            if "/sorry/" in url or "google.com/sorry" in url:
+                return True
+            selector = "form#captcha-form, #gs_captcha_ccl, div.g-recaptcha, #recaptcha, [data-sitekey]"
+            if await page.query_selector(selector) is not None:
+                return True
+            # JS 异步跳转可能还没完成，回退检查 HTML 文本
+            html = await page.content()
+            if "captcha-form" in html or "g-recaptcha" in html or "sorry/image" in html:
+                return True
+            return False
         except Exception:
             return False
+
+    async def _wait_and_check_captcha(self, page, max_wait: float = 5.0) -> bool:
+        """等待页面稳定后检查验证码（处理 JS 异步重定向）"""
+        if await self._check_captcha(page):
+            return True
+        deadline = asyncio.get_event_loop().time() + max_wait
+        while asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(1)
+            if await self._check_captcha(page):
+                return True
+            # 有结果元素出现说明不是验证码页
+            if await page.query_selector(".gs_r, div.g"):
+                return False
+        return False
     
     async def _check_results(self, page, selector: str) -> bool:
         """检查是否有搜索结果"""
@@ -1912,7 +2000,237 @@ class GoogleSearcher:
             return await page.query_selector(selector) is not None
         except Exception:
             return False
-    
+
+    def _get_capsolver_api(self) -> Optional[CapSolverAPI]:
+        api = self._capsolver_api
+        if api and api.enabled:
+            return api
+        return None
+
+    def _get_two_captcha_api(self) -> Optional[TwoCaptchaAPI]:
+        api = self._two_captcha_api
+        if api and api.enabled:
+            return api
+        return None
+
+    async def _handle_captcha_with_tiers(
+        self,
+        page,
+        browser_manager: _BrowserManager,
+        headless: Optional[bool],
+        result_selector: str,
+        scope: str,
+    ) -> str:
+        """
+        Tiered captcha handling:
+        1) CapSolver API (headless friendly)
+        2) 2Captcha API (headless friendly)
+        3) If already in headed non-CDP browser: extension fallback
+        4) Else: return "needs_headed" so caller can retry with headed browser
+
+        Returns:
+            "solved" | "needs_headed" | "failed"
+        """
+        capsolver = self._get_capsolver_api()
+        if capsolver:
+            solved = await capsolver.solve_captcha_on_page(page)
+            if solved:
+                # Give challenge page some time to navigate/refresh after token injection.
+                for _ in range(20):
+                    await asyncio.sleep(1)
+                    if not await self._check_captcha(page):
+                        break
+                if not await self._check_captcha(page):
+                    try:
+                        await page.wait_for_load_state("domcontentloaded", timeout=15000)
+                    except Exception:
+                        pass
+                    try:
+                        await page.wait_for_selector(result_selector, timeout=12000)
+                    except Exception:
+                        pass
+                    if await self._check_results(page, result_selector):
+                        logger.info("captcha solved by CapSolver API (%s)", scope)
+                        return "solved"
+                logger.warning("CapSolver API attempted but captcha/results not cleared (%s)", scope)
+            else:
+                logger.warning("CapSolver API solve failed (%s)", scope)
+
+        two_captcha = self._get_two_captcha_api()
+        if two_captcha:
+            solved = await two_captcha.solve_captcha_on_page(page)
+            if solved:
+                for _ in range(20):
+                    await asyncio.sleep(1)
+                    if not await self._check_captcha(page):
+                        break
+                if not await self._check_captcha(page):
+                    try:
+                        await page.wait_for_load_state("domcontentloaded", timeout=15000)
+                    except Exception:
+                        pass
+                    try:
+                        await page.wait_for_selector(result_selector, timeout=12000)
+                    except Exception:
+                        pass
+                    if await self._check_results(page, result_selector):
+                        logger.info("captcha solved by 2Captcha API (%s)", scope)
+                        return "solved"
+                logger.warning("2Captcha API attempted but captcha/results not cleared (%s)", scope)
+            else:
+                logger.warning("2Captcha API solve failed (%s)", scope)
+
+        # Only do inline headed extension-wait when already in a headed non-CDP browser
+        is_headed = (
+            (headless is False) and not browser_manager.is_cdp_connected()
+        )
+        if is_headed:
+            logger.info("有头模式兜底验证码处理（CapSolver->2Captcha 失败后）(%s)...", scope)
+            await self._inject_capsolver_attributes(page)
+            for i in range(90):
+                await asyncio.sleep(1)
+                if not await self._check_captcha(page):
+                    logger.info("验证码已解决 (%s)", scope)
+                    try:
+                        await page.wait_for_load_state("domcontentloaded", timeout=15000)
+                        await page.wait_for_selector(result_selector, timeout=10000)
+                    except Exception:
+                        pass
+                    break
+                if i > 0 and i % 15 == 0:
+                    await self._inject_capsolver_attributes(page)
+            if await self._check_results(page, result_selector):
+                return "solved"
+            logger.error("验证码处理后仍无结果 (%s)", scope)
+            return "failed"
+
+        logger.info(
+            "无头/CDP 模式下 API 解验证码失败 (%s)，将尝试有头重试",
+            scope,
+        )
+        return "needs_headed"
+
+    async def _retry_with_headed_browser(
+        self,
+        search_fn: str,
+        query: str,
+        limit: int,
+        year_start: Optional[int] = None,
+        year_end: Optional[int] = None,
+        result_selector: str = ".gs_r",
+        timeout: int = 60000,
+        scope: str = "",
+    ) -> List[Dict[str, Any]]:
+        """
+        Retry a single search in a fresh local headed browser (no CDP).
+        Used when CapSolver + 2Captcha fail in headless/CDP mode.
+        """
+        use_headed, display_mode = _ensure_display()
+        if not use_headed:
+            logger.warning("有头重试跳过: 无可用显示器 (display=%s)", display_mode)
+            return []
+
+        user_data_dir = self._get_user_data_dir()
+        proxy = self._config.get("proxy")
+        extension_path = self._get_extension_path()
+        manager = _BrowserManager(timeout=timeout)
+        context = None
+        page = None
+        results: List[Dict[str, Any]] = []
+
+        try:
+            async with _profile_lock_guard:
+                context = await manager.launch_persistent_browser(
+                    user_data_dir=user_data_dir,
+                    headless=False,
+                    proxy=proxy,
+                    stealth_mode=True,
+                    extension_path=extension_path,
+                )
+            page = await context.new_page()
+            page.set_default_timeout(timeout)
+            await manager._apply_stealth_mode(page)
+
+            if search_fn == "scholar":
+                await self._navigate_scholar_via_searchbox(
+                    page, query, year_start, year_end, timeout
+                )
+            else:
+                encoded = quote_plus(query)
+                search_url = f"https://www.google.com/search?q={encoded}&hl=en"
+                await page.goto(search_url, wait_until="domcontentloaded")
+                await self._random_delay()
+                await _simulate_human_behavior(page)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=timeout // 2)
+                except Exception:
+                    pass
+
+            if await self._wait_and_check_captcha(page):
+                logger.info("有头重试: 检测到验证码，等待扩展处理 (%s)", scope)
+                await self._inject_capsolver_attributes(page)
+                for i in range(90):
+                    await asyncio.sleep(1)
+                    if not await self._check_captcha(page):
+                        logger.info("有头重试: 验证码已解决 (%s)", scope)
+                        try:
+                            await page.wait_for_load_state("domcontentloaded", timeout=15000)
+                            await page.wait_for_selector(result_selector, timeout=10000)
+                        except Exception:
+                            pass
+                        break
+                    if i > 0 and i % 15 == 0:
+                        await self._inject_capsolver_attributes(page)
+                if await self._check_captcha(page) or not await self._check_results(page, result_selector):
+                    logger.warning("有头重试: 验证码未解决或无结果 (%s)", scope)
+                    return results
+
+            if search_fn == "scholar":
+                needed_pages = (limit + 9) // 10
+                current_page = 1
+                while current_page <= needed_pages and len(results) < limit:
+                    try:
+                        await page.wait_for_selector("div.gs_r.gs_or.gs_scl", timeout=timeout // 4)
+                    except Exception:
+                        pass
+                    html = await page.content()
+                    page_results = _ScholarParser.extract_results(html)
+                    if not page_results:
+                        break
+                    for r in page_results[: limit - len(results)]:
+                        results.append(self._to_scholar_rag_format(r, query))
+                    if len(results) >= limit or current_page >= needed_pages:
+                        break
+                    await self._random_delay(1.0, 3.0)
+                    await _simulate_human_scroll_to_bottom(page)
+                    if not await self._click_next_page(page, timeout):
+                        break
+                    current_page += 1
+                    await self._random_delay()
+                    await _simulate_human_behavior(page)
+            else:
+                html = await page.content()
+                page_results = _GoogleParser.extract_results(html)
+                for r in page_results[:limit]:
+                    results.append(self._to_google_rag_format(r, query))
+
+            if results:
+                logger.info("有头重试成功 (%s): %d 条结果", scope, len(results))
+        except Exception as e:
+            logger.warning("有头重试异常 (%s): %s", scope, e)
+        finally:
+            if page:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+            await release_shared_browser(
+                job_id="",
+                is_shared=False,
+                manager=manager,
+            )
+        return results
+
     async def _inject_capsolver_attributes(self, page):
         """注入 capsolver 属性"""
         try:

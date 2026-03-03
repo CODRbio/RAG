@@ -171,6 +171,14 @@ class SerpAPIConfig:
 
 
 @dataclass
+class CapSolverConfig:
+    """CapSolver API 配置（无头验证码求解）"""
+    enabled: bool = True
+    api_key: str = ""
+    timeout_seconds: int = 120
+
+
+@dataclass
 class SemanticScholarConfig:
     """Semantic Scholar API 配置（通过 ai4scholar 代理）"""
     enabled: bool = False
@@ -458,6 +466,10 @@ def _serpapi_from_config() -> Dict[str, Any]:
     return (_RAW_CONFIG.get("serpapi") or {})
 
 
+def _capsolver_from_config() -> Dict[str, Any]:
+    return (_RAW_CONFIG.get("capsolver") or {})
+
+
 def _api_from_config() -> Dict[str, Any]:
     return (_RAW_CONFIG.get("api") or {})
 
@@ -673,6 +685,12 @@ class Settings:
             api_key=(sp.get("api_key") or "").strip(),
             max_results=min(int(sp.get("max_results", 10)), 20),
             timeout_seconds=int(sp.get("timeout_seconds", 30)),
+        )
+        cs = _capsolver_from_config()
+        self.capsolver = CapSolverConfig(
+            enabled=bool(cs.get("enabled", True)),
+            api_key=(cs.get("api_key") or "").strip(),
+            timeout_seconds=int(cs.get("timeout_seconds", 120)),
         )
         ss = _semantic_scholar_from_config()
         self.semantic_scholar = SemanticScholarConfig(

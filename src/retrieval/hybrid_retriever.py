@@ -88,21 +88,17 @@ def _embedding_pre_filter(
     candidates: List[Dict],
     keep_k: int,
 ) -> List[Dict]:
-    """Fast bi-encoder pre-filter: encode query + docs with BGE-M3, rank by
-    cosine similarity, return the top *keep_k* candidates.
+    """Bi-encoder pre-filter using pre-fetched dense vectors from Milvus.
 
-    Used as a funnel to shrink large candidate sets (200+) before feeding
-    them to the expensive cross-encoder.  ~3-7 s for 200 docs on MPS.
+    Encodes only the query once; uses doc['dense_vector'] for cosine similarity
+    to avoid O(N) re-encoding. Candidates without dense_vector (e.g. sparse-only
+    hits) receive the minimum scored value so they are not unfairly penalized.
     """
     import numpy as np
 
-    docs = [c.get("content") or "" for c in candidates]
-    valid = [(i, d) for i, d in enumerate(docs) if d.strip()]
-    if not valid or len(valid) <= keep_k:
-        logger.debug("embedding_pre_filter: %d candidates ≤ keep_k=%d, no filter needed", len(candidates), keep_k)
+    if not candidates or len(candidates) <= keep_k:
         return candidates[:keep_k]
 
-    valid_indices, valid_docs = zip(*valid)
     t0 = time.perf_counter()
     try:
         query_dense = embedder.encode([query])["dense"][0]
@@ -110,27 +106,35 @@ def _embedding_pre_filter(
         if q_norm < 1e-10:
             logger.warning("embedding_pre_filter: zero-norm query vector, returning head slice")
             return candidates[:keep_k]
-        query_unit = query_dense / q_norm
-
-        doc_dense = embedder.encode(list(valid_docs))["dense"]
+        query_unit = np.asarray(query_dense) / q_norm
     except Exception as e:
         logger.error("embedding_pre_filter: encode failed (%s), returning head slice", e, exc_info=True)
         return candidates[:keep_k]
 
-    scored: List[Tuple[int, float]] = []
-    for j, orig_idx in enumerate(valid_indices):
-        d_norm = np.linalg.norm(doc_dense[j])
-        sim = float(np.dot(query_unit, doc_dense[j] / d_norm)) if d_norm > 1e-10 else 0.0
-        scored.append((orig_idx, sim))
+    scored: List[Tuple[Dict, Optional[float]]] = []
+    for doc in candidates:
+        doc_vec = doc.get("dense_vector")
+        if doc_vec is not None:
+            doc_arr = np.asarray(doc_vec, dtype=np.float64)
+            d_norm = np.linalg.norm(doc_arr)
+            sim = float(np.dot(query_unit, doc_arr / d_norm)) if d_norm > 1e-10 else 0.0
+            scored.append((doc, sim))
+        else:
+            scored.append((doc, None))
 
-    scored.sort(key=lambda x: x[1], reverse=True)
+    scores_with_values = [s for _, s in scored if s is not None]
+    min_score = min(scores_with_values) if scores_with_values else 0.0
+    scored_normalized: List[Tuple[Dict, float]] = [
+        (doc, s if s is not None else min_score) for doc, s in scored
+    ]
+    scored_normalized.sort(key=lambda x: x[1], reverse=True)
     elapsed_ms = (time.perf_counter() - t0) * 1000
     logger.info(
-        "embedding_pre_filter: %d → %d candidates in %.0f ms (top_sim=%.4f)",
+        "embedding_pre_filter: %d → %d in %.1f ms (top_sim=%.4f)",
         len(candidates), keep_k, elapsed_ms,
-        scored[0][1] if scored else 0.0,
+        scored_normalized[0][1] if scored_normalized else 0.0,
     )
-    return [candidates[idx] for idx, _ in scored[:keep_k]]
+    return [doc for doc, _ in scored_normalized[:keep_k]]
 
 
 def _rerank_candidates(
@@ -506,7 +510,8 @@ class HybridRetriever:
 
         output_fields = [
             "content", "raw_content", "paper_id", "chunk_id",
-            "domain", "content_type", "chunk_type", "section_path", "page"
+            "domain", "content_type", "chunk_type", "section_path", "page",
+            "dense_vector",
         ]
 
         # Stage 1: 分离召回（可选并行 + 超时）
@@ -576,6 +581,7 @@ class HybridRetriever:
                 "chunk_id": cid,
                 "content": e.get("content") if isinstance(e, dict) else getattr(e, "content", None),
                 "raw_content": e.get("raw_content") if isinstance(e, dict) else getattr(e, "raw_content", None),
+                "dense_vector": e.get("dense_vector") if isinstance(e, dict) else getattr(e, "dense_vector", None),
                 "metadata": {
                     "paper_id": e.get("paper_id", "") if isinstance(e, dict) else getattr(e, "paper_id", ""),
                     "chunk_id": cid,

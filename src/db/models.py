@@ -610,3 +610,52 @@ class RevokedToken(SQLModel, table=True):
     # ISO-8601 timestamp copied from the JWT `exp` claim; used for cleanup.
     expires_at: str = Field(sa_column=Column(Text, nullable=False))
     revoked_at: str = Field(default_factory=_now_iso, sa_column=Column(Text, nullable=False))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 10. Scholar sub-libraries  (named candidate lists for download)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class ScholarLibrary(SQLModel, table=True):
+    """Named sub-library for storing search results as download candidates."""
+
+    __tablename__ = "scholar_libraries"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str = Field(sa_column=Column(Text, nullable=False, unique=True))
+    description: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    created_at: str = Field(default_factory=_now_iso, sa_column=Column(Text, nullable=False))
+    updated_at: str = Field(default_factory=_now_iso, sa_column=Column(Text, nullable=False))
+
+    papers: List["ScholarLibraryPaper"] = Relationship(
+        back_populates="library",
+        sa_relationship_kwargs={"cascade": "all, delete-orphan"},
+    )
+
+
+class ScholarLibraryPaper(SQLModel, table=True):
+    """A paper saved in a scholar library (candidate for download)."""
+
+    __tablename__ = "scholar_library_papers"
+    __table_args__ = (Index("idx_scholar_lib_papers_library_id", "library_id"),)
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    library_id: int = Field(foreign_key="scholar_libraries.id")
+    title: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    authors: str = Field(default="[]", sa_column=Column(Text, nullable=False, server_default="[]"))
+    year: Optional[int] = Field(default=None, sa_column=Column(Integer, nullable=True))
+    doi: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    pdf_url: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    url: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    source: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    score: float = Field(default=0.0, sa_column=Column(Float, nullable=False, server_default="0"))
+    annas_md5: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    added_at: str = Field(default_factory=_now_iso, sa_column=Column(Text, nullable=False))
+
+    library: Optional[ScholarLibrary] = Relationship(back_populates="papers")
+
+    def get_authors(self) -> List[str]:
+        try:
+            return json.loads(self.authors or "[]")
+        except Exception:
+            return []

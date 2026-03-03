@@ -15,6 +15,7 @@ class SharedBrowserService:
     _playwright: Optional[Playwright] = None
     _browser: Optional[Browser] = None
     _cdp_url: Optional[str] = None
+    _headless: bool = True
 
     @classmethod
     async def start(cls, port: int = 9222, headless: bool = True) -> None:
@@ -23,13 +24,14 @@ class SharedBrowserService:
             if cls._browser is not None and cls._playwright is not None:
                 return
 
+            cls._headless = headless
             cls._playwright = await async_playwright().start()
             cls._browser = await cls._playwright.chromium.launch(
                 headless=headless,
                 args=[f"--remote-debugging-port={port}"],
             )
             cls._cdp_url = f"http://127.0.0.1:{port}"
-            logger.info("[shared-browser] started at %s", cls._cdp_url)
+            logger.info("[shared-browser] started at %s (headless=%s)", cls._cdp_url, headless)
 
     @classmethod
     def get_cdp_url(cls) -> Optional[str]:

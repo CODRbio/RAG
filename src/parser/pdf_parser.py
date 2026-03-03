@@ -1554,6 +1554,28 @@ _SKIP_HEADING_LABELS = {
 }
 
 
+def extract_native_metadata(pdf_path: Path) -> dict:
+    """
+    Extract title and DOI from the PDF's native Document Information (e.g. /Title).
+    Used as a fallback when block-based heuristics fail (e.g. odd layout, copyright page).
+    """
+    meta: dict = {}
+    try:
+        import fitz
+        with fitz.open(str(pdf_path)) as doc:
+            pdf_meta = doc.metadata
+            raw_title = pdf_meta.get("title", "").strip()
+            if raw_title and len(raw_title) > 10 and raw_title.lower() not in ("untitled",):
+                meta["title"] = raw_title
+            combined = str(pdf_meta)
+            m = _DOI_RE.search(combined)
+            if m:
+                meta["doi"] = m.group(1).rstrip(".:")
+    except Exception as e:
+        logger.debug("extract_native_metadata failed: %s", e)
+    return meta
+
+
 def extract_doc_metadata(blocks: list[ContentBlock], scan_blocks: int = 30) -> dict:
     """
     从 content_flow 前 N 个 block 提取论文级元数据（DOI + 标题）。
@@ -1666,8 +1688,10 @@ class PDFProcessor:
             enricher = LLMEnricher(self.config, self.llm_manager)
             blocks, enrichment_meta = enricher.enrich_all(blocks, str(out), progress_callback=progress_callback)
 
-        # 6. Extract doc-level metadata (DOI, title)
-        doc_meta = extract_doc_metadata(blocks)
+        # 6. Extract doc-level metadata (DOI, title); native PDF metadata fills gaps
+        doc_meta = extract_doc_metadata(blocks) or {}
+        native_meta = extract_native_metadata(pdf_path)
+        doc_meta = {**doc_meta, **{k: v for k, v in native_meta.items() if k not in doc_meta}}
         if doc_meta:
             logger.info("doc_metadata for %s: doi=%s title=%s",
                         doc_id, doc_meta.get("doi", "-"), (doc_meta.get("title") or "-")[:60])

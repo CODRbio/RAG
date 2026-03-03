@@ -119,22 +119,56 @@ class ScholarDownloaderAdapter:
         self,
         query: str,
         limit: int = 10,
+        year_start: Optional[int] = None,
+        year_end: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        """Semantic Scholar via RAG semantic_scholar."""
+        """Semantic Scholar relevance search (/paper/search)."""
         from src.retrieval.semantic_scholar import semantic_scholar_searcher
 
-        return await semantic_scholar_searcher.search(query=query, limit=limit)
+        return await semantic_scholar_searcher.search(
+            query=query, limit=limit, year_start=year_start, year_end=year_end
+        )
+
+    async def search_semantic_scholar_relevance(
+        self,
+        query: str,
+        limit: int = 10,
+        year_start: Optional[int] = None,
+        year_end: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Semantic Scholar relevance search (same as search_semantic_scholar)."""
+        return await self.search_semantic_scholar(
+            query=query, limit=limit, year_start=year_start, year_end=year_end
+        )
+
+    async def search_semantic_scholar_bulk(
+        self,
+        query: str,
+        limit: int = 10,
+        year_start: Optional[int] = None,
+        year_end: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Semantic Scholar bulk/boolean search (/paper/search/bulk)."""
+        from src.retrieval.semantic_scholar import semantic_scholar_searcher
+
+        return await semantic_scholar_searcher.search_bulk(
+            query=query, limit=limit, year_start=year_start, year_end=year_end
+        )
 
     async def search_ncbi(
         self,
         query: str,
         limit: int = 10,
+        year_start: Optional[int] = None,
+        year_end: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """PubMed/NCBI via RAG ncbi_search."""
         from src.retrieval.ncbi_search import get_ncbi_searcher
 
         searcher = get_ncbi_searcher()
-        return await searcher.search(query=query, limit=limit)
+        return await searcher.search(
+            query=query, limit=limit, year_start=year_start, year_end=year_end
+        )
 
     async def search_annas_archive(
         self,

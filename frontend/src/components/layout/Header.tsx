@@ -16,6 +16,7 @@ import {
   Telescope,
   RefreshCw,
   ListOrdered,
+  BookOpen,
 } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -32,7 +33,7 @@ type LlmProviderCachePayload = {
   providers: LLMProviderInfo[];
 };
 
-type HeaderTabId = 'chat' | 'ingest' | 'users' | 'graph' | 'compare';
+type HeaderTabId = 'chat' | 'ingest' | 'users' | 'graph' | 'compare' | 'scholar';
 
 interface HeaderTabConfig {
   id: HeaderTabId;
@@ -431,6 +432,12 @@ export function Header() {
       activeClass: 'border-sky-400 text-sky-400 shadow-[0_4px_12px_-4px_rgba(56,189,248,0.5)]',
     },
     {
+      id: 'scholar',
+      labelKey: 'header.scholar',
+      icon: BookOpen,
+      activeClass: 'border-teal-400 text-teal-400 shadow-[0_4px_12px_-4px_rgba(45,212,191,0.5)]',
+    },
+    {
       id: 'graph',
       labelKey: 'header.graph',
       icon: Network,
@@ -452,15 +459,17 @@ export function Header() {
     });
   }
 
-  const maxVisibleTabs = headerWidth >= 1320
+  const useTwoRowLayout = headerWidth > 0 && headerWidth < 1100;
+  const maxVisibleTabs = useTwoRowLayout
     ? tabConfigs.length
-    : headerWidth >= 1200
-      ? Math.min(tabConfigs.length, 4)
-      : headerWidth >= 1040
-        ? Math.min(tabConfigs.length, 3)
-        : Math.min(tabConfigs.length, 2);
-
-  const tabPriority: HeaderTabId[] = ['chat', 'ingest', 'graph', 'compare', 'users'];
+    : headerWidth >= 1320
+      ? tabConfigs.length
+      : headerWidth >= 1200
+        ? Math.min(tabConfigs.length, 5)
+        : headerWidth >= 1040
+          ? Math.min(tabConfigs.length, 4)
+          : Math.min(tabConfigs.length, 3);
+  const tabPriority: HeaderTabId[] = ['chat', 'ingest', 'scholar', 'graph', 'compare', 'users'];
   const visibleTabIds: HeaderTabId[] = [];
   const addVisible = (id: HeaderTabId) => {
     if (!tabConfigs.some((tab) => tab.id === id)) return;
@@ -499,61 +508,74 @@ export function Header() {
     );
   };
 
+  const showMoreDropdown = !useTwoRowLayout && hiddenTabs.length > 0;
+
   return (
-    <header ref={headerRef} className="glass-header px-4 h-16 flex items-center justify-between gap-3 flex-shrink-0 z-30 transition-colors duration-300 overflow-visible">
-      <div className="flex gap-3 min-w-0 items-center">
+    <header
+      ref={headerRef}
+      className={`glass-header px-4 flex-shrink-0 z-30 transition-colors duration-300 overflow-visible ${
+        useTwoRowLayout ? 'flex flex-col py-2 gap-2 min-h-[4rem]' : 'h-16 flex items-center justify-between gap-3'
+      }`}
+    >
+      <div className={`flex gap-3 min-w-0 items-center ${useTwoRowLayout ? 'flex-wrap' : ''}`}>
         <button
           onClick={toggleSidebar}
-          className="text-slate-400 hover:text-sky-400 p-1 transition-colors"
+          className="text-slate-400 hover:text-sky-400 p-1 transition-colors shrink-0"
           title={currentLang === 'zh' ? '切换侧边栏' : 'Toggle Sidebar'}
         >
           <MoreHorizontal size={20} />
         </button>
-        {!compactHeader && <div className="h-8 w-[1px] bg-slate-700/50"></div>}
+        {!compactHeader && !useTwoRowLayout && <div className="h-8 w-[1px] bg-slate-700/50"></div>}
 
-        {visibleTabs.map(renderTabButton)}
-
-        {hiddenTabs.length > 0 && (
-          <div ref={moreMenuRef} className="relative">
-            <button
-              onClick={() => setShowMoreTabs((prev) => !prev)}
-              className={`h-16 flex items-center gap-1 px-1.5 border-b-2 font-medium text-sm transition-all focus:outline-none whitespace-nowrap ${
-                hiddenTabs.some((tab) => tab.id === activeTab)
-                  ? 'border-sky-400 text-sky-400'
-                  : 'border-transparent text-slate-400 hover:text-slate-200'
-              }`}
-              title={currentLang === 'zh' ? '更多' : 'More'}
-            >
-              <MoreHorizontal size={18} />
-            </button>
-            {showMoreTabs && (
-              <div className="absolute top-[56px] left-0 min-w-[170px] bg-slate-900/95 border border-slate-700 rounded-lg shadow-xl py-1.5 z-[60]">
-                {hiddenTabs.map((tab) => {
-                  const Icon = tab.icon;
-                  const isActive = activeTab === tab.id;
-                  return (
-                    <button
-                      key={`more-${tab.id}`}
-                      onClick={() => handleTabChange(tab.id)}
-                      className={`w-full px-3 py-1.5 text-xs flex items-center gap-2 transition-colors ${
-                        isActive
-                          ? 'text-sky-300 bg-sky-900/40'
-                          : 'text-slate-300 hover:bg-slate-800'
-                      }`}
-                      title={t(tab.labelKey)}
-                    >
-                      <Icon size={14} />
-                      {t(tab.labelKey)}
-                    </button>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-        )}
+        {useTwoRowLayout
+          ? tabConfigs.map(renderTabButton)
+          : (
+            <>
+              {visibleTabs.map(renderTabButton)}
+              {showMoreDropdown && (
+                <div ref={moreMenuRef} className="relative">
+                  <button
+                    onClick={() => setShowMoreTabs((prev) => !prev)}
+                    className={`h-16 flex items-center gap-1 px-1.5 border-b-2 font-medium text-sm transition-all focus:outline-none whitespace-nowrap ${
+                      hiddenTabs.some((tab) => tab.id === activeTab)
+                        ? 'border-sky-400 text-sky-400'
+                        : 'border-transparent text-slate-400 hover:text-slate-200'
+                    }`}
+                    title={currentLang === 'zh' ? '更多' : 'More'}
+                  >
+                    <MoreHorizontal size={18} />
+                  </button>
+                  {showMoreTabs && (
+                    <div className="absolute top-[56px] left-0 min-w-[170px] bg-slate-900/95 border border-slate-700 rounded-lg shadow-xl py-1.5 z-[60]">
+                      {hiddenTabs.map((tab) => {
+                        const Icon = tab.icon;
+                        const isActive = activeTab === tab.id;
+                        return (
+                          <button
+                            key={`more-${tab.id}`}
+                            onClick={() => handleTabChange(tab.id)}
+                            className={`w-full px-3 py-1.5 text-xs flex items-center gap-2 transition-colors ${
+                              isActive
+                                ? 'text-sky-300 bg-sky-900/40'
+                                : 'text-slate-300 hover:bg-slate-800'
+                            }`}
+                            title={t(tab.labelKey)}
+                          >
+                            <Icon size={14} />
+                            {t(tab.labelKey)}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
+            </>
+          )}
       </div>
 
-      {/* Center: Model Selector + Workflow */}
+      {/* Center + Right: Model Selector, Workflow, Status (one row; or second row when two-row layout) */}
+      <div className={`flex items-center justify-between gap-2 shrink-0 ${useTwoRowLayout ? 'w-full' : ''}`}>
       <div className="flex items-center gap-2 shrink-0">
         {/* Two-step: Provider → Model */}
         <div className={`flex items-center gap-1.5 ${compactHeader ? 'px-2 py-1' : 'px-2.5 py-1'} bg-slate-800/60 rounded-lg border border-slate-700/60 backdrop-blur-sm shadow-sm hover:border-sky-500/30 transition-all`}>
@@ -730,6 +752,7 @@ export function Header() {
           )}
           <span>{showCompactRightText || !compactHeader ? canvasLabel : 'CV'}</span>
         </button>
+      </div>
       </div>
     </header>
   );

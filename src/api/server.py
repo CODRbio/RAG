@@ -93,8 +93,11 @@ async def lifespan(app: FastAPI):
     logger.info("[startup] debug mode: %s (log_dir=%s)", "ON" if dl.enabled else "OFF", dl.log_dir)
 
     # 4. 启动共享浏览器（供 Download / RAG 共用）
+    #    当 google_search.headless 显式设为 false 时以有头模式启动，否则默认无头
     try:
-        await SharedBrowserService.start()
+        _gs_headless = getattr(getattr(settings, "google_search", None), "headless", None)
+        _shared_headless = _gs_headless if _gs_headless is not None else True
+        await SharedBrowserService.start(headless=_shared_headless)
     except Exception as e:
         logger.warning("[startup] shared browser service start failed, fallback to local launch: %s", e)
 

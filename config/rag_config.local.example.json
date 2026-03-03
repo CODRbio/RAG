@@ -36,6 +36,10 @@
     "twocaptcha_api_key": "",
     "capsolver_extension_path": "./Extension-capsolver"
   },
+  "capsolver": {
+    "enabled": true,
+    "api_key": ""
+  },
   "auth": {
     "secret_key": "<set-a-strong-random-value-for-jwt-signing>"
   }

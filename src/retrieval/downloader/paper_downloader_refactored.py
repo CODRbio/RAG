@@ -22,7 +22,10 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from .log_utils import setup_logger, cleanup_old_logs
 import logging
 from bs4 import BeautifulSoup
-from twocaptcha import TwoCaptcha
+try:
+    from twocaptcha import TwoCaptcha
+except ImportError:
+    TwoCaptcha = None  # optional: captcha solving disabled when not installed
 
 # playwright-stealth 兼容层：
 # - v2.x：Stealth().apply_stealth_async(page)
@@ -1999,7 +2002,11 @@ class PaperDownloader:
     def solver_captcha(self,apikey, params):  # 使用 2Captcha 服务解决 Turnstile 验证码    
         """
         使用 2Captcha 服务解决 Turnstile 验证码。
+        需要安装: pip install 2captcha-python
         """
+        if TwoCaptcha is None:
+            self.logger.warning("twocaptcha not installed; captcha solving disabled. Install with: pip install 2captcha-python")
+            return None
         solver = TwoCaptcha(apikey)
         try:
             result = solver.turnstile(sitekey=params["sitekey"],

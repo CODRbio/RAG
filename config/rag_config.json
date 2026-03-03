@@ -143,6 +143,11 @@
     "max_results": 10,
     "timeout_seconds": 30
   },
+  "capsolver": {
+    "enabled": true,
+    "api_key": "",
+    "timeout_seconds": 120
+  },
   "semantic_scholar": {
     "enabled": false,
     "api_key": "",

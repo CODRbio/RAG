@@ -52,7 +52,33 @@ export interface ScholarHealth {
   download_dir: string;
 }
 
-export type ScholarSource = 'google_scholar' | 'semantic' | 'ncbi' | 'annas_archive';
+/** Scholar sub-library (named candidate list for download). */
+export interface ScholarLibrary {
+  id: number;
+  name: string;
+  description: string;
+  paper_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/** A paper saved in a scholar library. */
+export interface ScholarLibraryPaper {
+  id: number;
+  library_id: number;
+  title: string;
+  authors: string[];
+  year: number | null;
+  doi: string | null;
+  pdf_url: string | null;
+  url: string | null;
+  source: string;
+  score: number;
+  annas_md5: string | null;
+  added_at: string;
+}
+
+export type ScholarSource = 'google_scholar' | 'google' | 'semantic' | 'semantic_relevance' | 'semantic_bulk' | 'ncbi' | 'annas_archive';
 
 export async function searchScholar(params: {
   query: string;
@@ -60,15 +86,21 @@ export async function searchScholar(params: {
   limit?: number;
   year_start?: number;
   year_end?: number;
+  optimize?: boolean;
+  use_serpapi?: boolean;
+  serpapi_ratio?: number;
 }): Promise<ScholarSearchResult[]> {
   const res = await client.post<{ results: ScholarSearchResult[] }>(
     '/scholar/search',
     {
       query: params.query,
       source: params.source ?? 'google_scholar',
-      limit: params.limit ?? 10,
+      limit: params.limit ?? 30,
       year_start: params.year_start,
       year_end: params.year_end,
+      optimize: params.optimize ?? false,
+      use_serpapi: params.use_serpapi,
+      serpapi_ratio: params.serpapi_ratio,
     },
   );
   return res.data.results;
@@ -121,4 +153,49 @@ export async function getScholarHealth(): Promise<ScholarHealth> {
 export function getPdfViewUrl(paperId: string): string {
   const base = import.meta.env.VITE_API_BASE_URL || '/api';
   return `${base}/graph/pdf/${encodeURIComponent(paperId)}`;
+}
+
+// ─── Scholar sub-libraries ───────────────────────────────────────────────────
+
+export async function listLibraries(): Promise<ScholarLibrary[]> {
+  const res = await client.get<ScholarLibrary[]>('/scholar/libraries');
+  return res.data;
+}
+
+export async function createLibrary(params: {
+  name: string;
+  description?: string;
+}): Promise<ScholarLibrary & { id: number }> {
+  const res = await client.post<ScholarLibrary & { id: number }>('/scholar/libraries', {
+    name: params.name,
+    description: params.description ?? '',
+  });
+  return res.data;
+}
+
+export async function deleteLibrary(libId: number): Promise<void> {
+  await client.delete(`/scholar/libraries/${libId}`);
+}
+
+export async function getLibraryPapers(libId: number): Promise<ScholarLibraryPaper[]> {
+  const res = await client.get<ScholarLibraryPaper[]>(`/scholar/libraries/${libId}/papers`);
+  return res.data;
+}
+
+export async function addPapersToLibrary(
+  libId: number,
+  papers: ScholarSearchResult[],
+): Promise<{ added: number; total_requested: number }> {
+  const res = await client.post<{ added: number; total_requested: number }>(
+    `/scholar/libraries/${libId}/papers`,
+    { papers },
+  );
+  return res.data;
+}
+
+export async function removePaperFromLibrary(
+  libId: number,
+  paperId: number,
+): Promise<void> {
+  await client.delete(`/scholar/libraries/${libId}/papers/${paperId}`);
 }

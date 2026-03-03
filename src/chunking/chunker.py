@@ -72,19 +72,48 @@ def _block_bbox(block: dict | Any) -> Optional[list]:
     return None
 
 
+# Placeholders use \x00 to avoid colliding with normal text when protecting abbreviations.
+_ABBR_PLACEHOLDERS = {
+    "et al.": "et_al\x00DOT\x00",
+    "Fig.": "Fig\x00DOT\x00",
+    "fig.": "fig\x00DOT\x00",
+    "Eq.": "Eq\x00DOT\x00",
+    "eq.": "eq\x00DOT\x00",
+    "i.e.": "i_e\x00DOT\x00",
+    "e.g.": "e_g\x00DOT\x00",
+    "vs.": "vs\x00DOT\x00",
+    "cf.": "cf\x00DOT\x00",
+    "Sec.": "Sec\x00DOT\x00",
+    "sec.": "sec\x00DOT\x00",
+    "No.": "No\x00DOT\x00",
+    "Vol.": "Vol\x00DOT\x00",
+    "vol.": "vol\x00DOT\x00",
+    "approx.": "approx\x00DOT\x00",
+}
+
+
 def _sentence_tokenize(text: str) -> list[str]:
-    """简单句子切分：按 . ! ? 。！？；; 分割"""
+    """Sentence tokenization with academic abbreviation protection.
+
+    Splits on . ! ? 。！？；; but protects abbreviations (e.g. et al., Fig., i.e.)
+    so they are not split, avoiding fragment boundaries at chunk edges.
+    """
     if not text.strip():
         return []
+    processed = text
+    for abbr, placeholder in _ABBR_PLACEHOLDERS.items():
+        processed = processed.replace(abbr, placeholder)
     pattern = r'(?<=[.!?。！？；;])\s+'
-    parts = re.split(pattern, text)
+    parts = re.split(pattern, processed)
     result = []
     for p in parts:
+        for abbr, placeholder in _ABBR_PLACEHOLDERS.items():
+            p = p.replace(placeholder, abbr)
         p = p.strip()
         if p:
             result.append(p)
-    if not result:
-        result = [text.strip()] if text.strip() else []
+    if not result and text.strip():
+        result = [text.strip()]
     return result
 
 

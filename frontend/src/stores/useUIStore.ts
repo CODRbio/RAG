@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 
-type ActiveTab = 'chat' | 'ingest' | 'users' | 'graph' | 'compare';
+type ActiveTab = 'chat' | 'ingest' | 'users' | 'graph' | 'compare' | 'scholar';
 
 interface UIState {
   // 布局尺寸

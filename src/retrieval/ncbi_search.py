@@ -64,25 +64,26 @@ class NCBISearcher:
         year_start: Optional[int] = None,
         year_end: Optional[int] = None,
     ) -> List[str]:
-        """返回相关度排序的 PubMed ID 列表。"""
-        term = query
-        if year_start is not None or year_end is not None:
-            if year_start is not None and year_end is not None:
-                y0, y1 = sorted((int(year_start), int(year_end)))
-                term += f' AND ("{y0}"[Date - Publication] : "{y1}"[Date - Publication])'
-            elif year_start is not None:
-                term += f' AND ("{int(year_start)}"[Date - Publication] : "3000"[Date - Publication])'
-            elif year_end is not None:
-                term += f' AND ("1000"[Date - Publication] : "{int(year_end)}"[Date - Publication])'
+        """返回相关度排序的 PubMed ID 列表。使用 ESearch 的 mindate/maxdate+datetype 做出版日期过滤。"""
         params = self._base_params()
         params.update(
             {
                 "db": "pubmed",
-                "term": term,
+                "term": query,
                 "retmax": str(limit),
                 "sort": "relevance",
             }
         )
+        # PubMed E-Utilities: use mindate/maxdate + datetype=pdat (publication date).
+        # Both must be set together; use full date YYYY/01/01 and YYYY/12/31 for reliability.
+        if year_start is not None or year_end is not None:
+            y_lo = int(year_start) if year_start is not None else 1900
+            y_hi = int(year_end) if year_end is not None else 2030
+            y_lo, y_hi = min(y_lo, y_hi), max(y_lo, y_hi)
+            params["datetype"] = "pdat"
+            params["mindate"] = f"{y_lo}/01/01"
+            params["maxdate"] = f"{y_hi}/12/31"
+            logger.info("NCBI esearch 日期过滤: mindate=%s maxdate=%s", params["mindate"], params["maxdate"])
         async with session.get(ESEARCH_URL, params=params) as resp:
             resp.raise_for_status()
             data = await resp.json(content_type=None)

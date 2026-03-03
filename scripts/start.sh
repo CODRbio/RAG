@@ -4,10 +4,11 @@
 #
 # 用法:
 #   bash scripts/start.sh              # 默认端口（后端 9999，前端 5173）
+#   bash scripts/start.sh --quick     # 快速启动：跳过 DB 迁移、1 个 worker、缩短就绪等待
 #   bash scripts/start.sh --backend-only   # 仅启动后端
 #   bash scripts/start.sh --frontend-only  # 仅启动前端
 #   bash scripts/start.sh --no-redis       # 不自动检查/拉起 Redis（不推荐）
-#   API_PORT=8000 bash scripts/start.sh    # 自定义后端端口
+#   API_PORT=8000 bash scripts/start.sh   # 自定义后端端口
 #
 # 退出: Ctrl+C 会同时关闭后端和前端进程
 # ============================================================
@@ -103,13 +104,26 @@ NC='\033[0m'
 RUN_BACKEND=true
 RUN_FRONTEND=true
 RUN_REDIS=true
+QUICK_START=false
 for arg in "$@"; do
   case "$arg" in
     --backend-only)  RUN_FRONTEND=false ;;
     --frontend-only) RUN_BACKEND=false ;;
     --no-redis)      RUN_REDIS=false ;;
+    --quick)         QUICK_START=true ;;
   esac
 done
+
+# 快速启动：跳过迁移、单 worker、缩短就绪等待（核心功能尽快可用）
+if [ "$QUICK_START" = true ]; then
+  export SKIP_DB_MIGRATION="${SKIP_DB_MIGRATION:-1}"
+  BACKEND_WORKERS="${BACKEND_WORKERS:-1}"
+  BACKEND_HEALTH_MAX="${BACKEND_HEALTH_MAX:-15}"
+  echo -e "${CYAN}[start.sh] 快速启动模式 (--quick)：跳过 DB 迁移，后端 1 worker，就绪等待 ${BACKEND_HEALTH_MAX}s${NC}"
+else
+  BACKEND_WORKERS="${BACKEND_WORKERS:-2}"
+  BACKEND_HEALTH_MAX="${BACKEND_HEALTH_MAX:-30}"
+fi
 
 # ── 端口占用检查与清理 ──
 kill_port() {
@@ -259,7 +273,7 @@ if [ "$RUN_BACKEND" = true ]; then
 
     while [ "$restarts" -le "$max_restarts" ]; do
       "${PY_CMD[@]}" -m uvicorn src.api.server:app \
-        --host "$host" --port "$port" --workers 2 &
+        --host "$host" --port "$port" --workers "$BACKEND_WORKERS" &
       local bpid=$!
       echo "$bpid" > "$BACKEND_PID_FILE"
       if [ "$restarts" -eq 0 ]; then
@@ -290,9 +304,9 @@ if [ "$RUN_BACKEND" = true ]; then
   _backend_watchdog "$BACKEND_HOST" "$BACKEND_PORT" &
   PIDS+=($!)
 
-  # 等待后端就绪
-  echo -e "${CYAN}[start.sh] 等待后端就绪...${NC}"
-  for i in $(seq 1 30); do
+  # 等待后端就绪（核心功能：/health 可用即可）
+  echo -e "${CYAN}[start.sh] 等待后端就绪 (最多 ${BACKEND_HEALTH_MAX}s)...${NC}"
+  for i in $(seq 1 "$BACKEND_HEALTH_MAX"); do
     if curl -s "http://${BACKEND_HOST}:${BACKEND_PORT}/health" > /dev/null 2>&1; then
       echo -e "${GREEN}[start.sh] 后端已就绪 ✓${NC}"
       break

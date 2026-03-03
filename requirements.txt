@@ -87,6 +87,10 @@ playwright-stealth>=1.0.0
 beautifulsoup4>=4.12.0
 # pyvirtualdisplay>=3.0  # Linux 服务器可选，用于虚拟显示器
 
+# 可选：Cloudflare Turnstile 验证码（文献下载遇到验证码时需安装，提供 twocaptcha 模块）
+# pip install 2captcha-python
+2captcha-python>=2.0.0
+
 # ----------------------------------------------------------
 # Agent & 工作流
 # ----------------------------------------------------------
