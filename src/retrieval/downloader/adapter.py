@@ -6,15 +6,19 @@ Search: delegate to RAG modules (google_search / semantic_scholar / ncbi_search)
 Download: run PaperDownloader in ThreadPoolExecutor (separate event loop).
 """
 
+import hashlib
 import os
 import re
 import asyncio
 import unicodedata
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
 from config.settings import settings
 from src.log import get_logger
+
+from .utils import is_valid_pdf
 
 logger = get_logger(__name__)
 
@@ -42,6 +46,8 @@ def _normalize_to_paper_id(
     if suffix_parts:
         slug = f"{slug}_{'_'.join(suffix_parts)}"
 
+    if not slug or len(slug) < 4:
+        slug = hashlib.md5(title.encode("utf-8")).hexdigest()[:16]
     return slug[:80] if slug else f"paper_{os.urandom(4).hex()}"
 
 
@@ -120,7 +126,17 @@ class ScholarDownloaderAdapter:
         )
 
     def _sync_search_annas(self, query: str, limit: int) -> List[Dict[str, Any]]:
-        return asyncio.run(self._impl_search_annas(query, limit))
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            return loop.run_until_complete(self._impl_search_annas(query, limit))
+        finally:
+            try:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            except Exception:
+                pass
+            loop.close()
+            asyncio.set_event_loop(None)
 
     async def _impl_search_annas(
         self, query: str, limit: int
@@ -188,13 +204,47 @@ class ScholarDownloaderAdapter:
         authors: Optional[List[str]],
         year: Optional[int],
     ) -> Dict[str, Any]:
-        return asyncio.run(
-            self._impl_download(
-                title, doi, pdf_url, annas_md5, authors, year
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            return loop.run_until_complete(
+                self._impl_download(
+                    title, doi, pdf_url, annas_md5, authors, year
+                )
             )
-        )
+        finally:
+            try:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            except Exception:
+                pass
+            loop.close()
+            asyncio.set_event_loop(None)
 
     async def _impl_download(
+        self,
+        title: str,
+        doi: Optional[str],
+        pdf_url: Optional[str],
+        annas_md5: Optional[str],
+        authors: Optional[List[str]],
+        year: Optional[int],
+    ) -> Dict[str, Any]:
+        try:
+            return await asyncio.wait_for(
+                self._impl_download_inner(
+                    title, doi, pdf_url, annas_md5, authors, year
+                ),
+                timeout=300,
+            )
+        except asyncio.TimeoutError:
+            return {
+                "success": False,
+                "paper_id": None,
+                "filepath": None,
+                "message": "下载超时（5分钟）",
+            }
+
+    async def _impl_download_inner(
         self,
         title: str,
         doi: Optional[str],
@@ -208,23 +258,14 @@ class ScholarDownloaderAdapter:
         paper_id = _normalize_to_paper_id(title, authors, year)
         filepath = os.path.join(self.download_dir, f"{paper_id}.pdf")
 
-        if os.path.exists(filepath):
-            try:
-                dl_check = PaperDownloader(
-                    download_dir=self.download_dir,
-                    show_browser=False,
-                    persist_browser=False,
-                )
-                if dl_check.is_valid_pdf_file(filepath):
-                    logger.info("PDF already exists, skip: %s", filepath)
-                    return {
-                        "success": True,
-                        "paper_id": paper_id,
-                        "filepath": filepath,
-                        "message": "已存在，跳过下载",
-                    }
-            except Exception:
-                pass
+        if os.path.exists(filepath) and is_valid_pdf(filepath):
+            logger.info("PDF already exists, skip: %s", filepath)
+            return {
+                "success": True,
+                "paper_id": paper_id,
+                "filepath": filepath,
+                "message": "已存在，跳过下载",
+            }
 
         dl = PaperDownloader(
             download_dir=self.download_dir,
@@ -299,7 +340,7 @@ class ScholarDownloaderAdapter:
                     "message": "下载报告成功但文件不存在",
                 }
 
-            if not dl.is_valid_pdf_file(filepath):
+            if not is_valid_pdf(filepath):
                 try:
                     os.remove(filepath)
                 except OSError:
@@ -367,13 +408,20 @@ class ScholarDownloaderAdapter:
 
 
 _adapter_instance: Optional[ScholarDownloaderAdapter] = None
+_adapter_lock = threading.Lock()
 
 
 def get_adapter() -> ScholarDownloaderAdapter:
     global _adapter_instance
     if _adapter_instance is None:
-        _adapter_instance = ScholarDownloaderAdapter()
+        with _adapter_lock:
+            if _adapter_instance is None:
+                _adapter_instance = ScholarDownloaderAdapter()
     return _adapter_instance
+
+
+def is_adapter_ready() -> bool:
+    return _adapter_instance is not None
 
 
 def shutdown_adapter() -> None:

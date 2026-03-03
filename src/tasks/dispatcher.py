@@ -280,13 +280,22 @@ async def process_download_and_ingest(
     state.status = TaskStatus.completed
     state.finished_at = time.time()
     state.payload["progress"] = 100
-    state.payload["stage"] = "COMPLETED"
+    state.payload["stage"] = "DOWNLOAD_DONE_INGEST_PENDING"
     state.payload["ingest_job_id"] = ingest_job_id
+    state.payload["ingest_poll_url"] = f"/ingest/jobs/{ingest_job_id}"
     state.payload["paper_id"] = paper_id
     state.payload["filepath"] = filepath
     state.payload["collection"] = collection_name
     q.set_state(state)
-    q.push_event(task_id, "done", {"ingest_job_id": ingest_job_id, "paper_id": paper_id})
+    q.push_event(
+        task_id,
+        "done",
+        {
+            "ingest_job_id": ingest_job_id,
+            "paper_id": paper_id,
+            "ingest_poll_url": f"/ingest/jobs/{ingest_job_id}",
+        },
+    )
 
     return {
         **dl_result,

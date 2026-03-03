@@ -3,17 +3,19 @@ Scholar API: search + download + ingest.
 Prefix: /scholar
 """
 
+import asyncio
+import time
 import uuid
 from typing import List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from config.settings import settings
 from src.log import get_logger
 from src.tasks.dispatcher import process_download_and_ingest
 from src.tasks.redis_queue import get_task_queue
-from src.tasks.task_state import TaskKind, TaskStatus
+from src.tasks.task_state import TaskKind, TaskStatus, TaskState
 
 logger = get_logger(__name__)
 router = APIRouter(prefix="/scholar", tags=["scholar"])
@@ -28,10 +30,10 @@ class ScholarSearchRequest(BaseModel):
 
 
 class DownloadRequest(BaseModel):
-    title: str
-    doi: Optional[str] = None
+    title: str = Field(..., min_length=1, max_length=500)
+    doi: Optional[str] = Field(None, pattern=r"^10\.\d{4,}/\S+")
     pdf_url: Optional[str] = None
-    annas_md5: Optional[str] = None
+    annas_md5: Optional[str] = Field(None, pattern=r"^[0-9a-f]{32}$")
     authors: Optional[List[str]] = None
     year: Optional[int] = None
     collection: Optional[str] = None
@@ -130,28 +132,87 @@ async def scholar_download(req: DownloadRequest, background_tasks: BackgroundTas
 
 @router.post("/download/batch")
 async def scholar_batch_download(req: BatchDownloadRequest, background_tasks: BackgroundTasks):
-    """Batch download + ingest; each paper is a separate background task."""
+    """Batch download + ingest; concurrent with semaphore; parent task state for task_id."""
     cfg = getattr(settings, "scholar_downloader", None)
     if not cfg or not cfg.enabled:
         raise HTTPException(status_code=503, detail="Scholar downloader is disabled")
 
     task_id = f"batch_dl_{uuid.uuid4().hex[:8]}"
+    total = len(req.papers)
+    q = get_task_queue()
+    parent = TaskState(
+        task_id=task_id,
+        kind=TaskKind.scholar,
+        status=TaskStatus.running,
+        payload={
+            "total": total,
+            "completed": 0,
+            "failed": 0,
+            "collection": req.collection or "",
+        },
+    )
+    q.set_state(parent)
 
     async def _batch_job():
-        for paper in req.papers:
+        sem = asyncio.Semaphore(req.max_concurrent)
+        completed = 0
+        failed = 0
+        progress_lock = asyncio.Lock()
+
+        async def _one(paper: DownloadRequest):
+            nonlocal completed, failed
             sub_id = f"{task_id}_{uuid.uuid4().hex[:4]}"
-            await process_download_and_ingest(
+            result = await process_download_and_ingest(
                 task_id=sub_id,
                 paper_info=paper.model_dump(),
                 collection=req.collection,
             )
+            async with progress_lock:
+                if result.get("ingest_triggered") or result.get("success"):
+                    completed += 1
+                else:
+                    failed += 1
+                state = q.get_state(task_id)
+                if state:
+                    state.payload["completed"] = completed
+                    state.payload["failed"] = failed
+                    state.payload["total"] = total
+                    q.set_state(state)
+                    q.push_event(
+                        task_id,
+                        "progress",
+                        {"completed": completed, "failed": failed, "total": total},
+                    )
 
-    background_tasks.add_task(_batch_job)
+        await asyncio.gather(*[sem_wrap(sem, _one, p) for p in req.papers])
+
+        state = q.get_state(task_id)
+        if state:
+            state.finished_at = time.time()
+            state.payload["completed"] = completed
+            state.payload["failed"] = failed
+            if failed == total:
+                state.status = TaskStatus.error
+                state.error_message = "所有论文下载均失败"
+            else:
+                state.status = TaskStatus.completed
+            q.set_state(state)
+            q.push_event(
+                task_id,
+                "done",
+                {"completed": completed, "failed": failed, "total": total},
+            )
+
+    async def sem_wrap(sem, coro_fn, paper):
+        async with sem:
+            return await coro_fn(paper)
+
+    background_tasks.add_task(lambda: asyncio.run(_batch_job()))
     return {
         "status": "submitted",
         "task_id": task_id,
-        "total": len(req.papers),
-        "message": f"批量下载任务已投递（{len(req.papers)} 篇）",
+        "total": total,
+        "message": f"批量下载任务已投递（{total} 篇）",
     }
 
 
@@ -183,11 +244,11 @@ async def scholar_task_status(task_id: str):
 
 @router.get("/health")
 async def scholar_health():
-    from src.retrieval.downloader.adapter import _adapter_instance
+    from src.retrieval.downloader.adapter import is_adapter_ready
 
     cfg = getattr(settings, "scholar_downloader", None)
     return {
         "enabled": bool(cfg and cfg.enabled),
-        "adapter_ready": _adapter_instance is not None,
+        "adapter_ready": is_adapter_ready(),
         "download_dir": getattr(cfg, "download_dir", "") if cfg else "",
     }

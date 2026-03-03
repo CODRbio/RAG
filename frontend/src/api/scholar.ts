@@ -25,6 +25,18 @@ export interface DownloadResult {
   message: string;
 }
 
+export interface SubmittedTask {
+  status: 'submitted';
+  task_id: string;
+  message: string;
+}
+
+export function isSubmittedTask(
+  r: SubmittedTask | DownloadResult,
+): r is SubmittedTask {
+  return (r as SubmittedTask).task_id !== undefined;
+}
+
 export interface DownloadTaskStatus {
   task_id: string;
   status: string;
@@ -71,10 +83,7 @@ export async function downloadPaper(params: {
   year?: number;
   collection?: string;
   auto_ingest?: boolean;
-}): Promise<
-  | { status: string; task_id?: string; message?: string }
-  | DownloadResult
-> {
+}): Promise<SubmittedTask | DownloadResult> {
   const res = await client.post('/scholar/download', params);
   return res.data;
 }
