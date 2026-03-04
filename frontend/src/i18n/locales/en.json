@@ -103,7 +103,17 @@
     "libraryPanelTitle": "Library papers",
     "libraryDownloadAll": "Download all",
     "libraryEmpty": "No papers in this library",
-    "libraryDeleteConfirm": "Delete this library and all its papers?"
+    "libraryDeleteConfirm": "Delete this library and all its papers?",
+    "libraryClear": "Clear",
+    "libraryClearConfirm": "Clear this temporary library and all its papers?",
+    "libraryTemporaryBadge": "Temporary",
+    "libraryPermanent": "Permanent",
+    "libraryFolderPath": "Storage path",
+    "libraryFolderPathPlaceholder": "Required, e.g. data/my_lib",
+    "libraryFolderPathPick": "Select",
+    "libraryFolderPathPickHint": "Click «Select» to browse the server filesystem and choose a path",
+    "libraryBrowse": "Browse...",
+    "libraryBrowseError": "Could not open folder browser"
   },
   "sidebar": {
     "brand": "RAG Lab",
@@ -367,6 +377,11 @@
     "hippoRAGDesc": "Auto-fuse graph retrieval for multi-entity + relation queries",
     "graphTopK": "Graph Top-K",
     "graphTopKDesc": "Maximum graph retrieval results added to the candidate pool",
+    "database": "Database",
+    "databaseUrl": "Database path",
+    "databaseUrlPlaceholder": "e.g. sqlite:///data/rag.db",
+    "databaseUrlRestart": "Restart the server for changes to take effect",
+    "databaseSaveError": "Failed to save database config. Please log in first.",
     "saved": "Advanced config saved"
   },
   "research": {
@@ -702,5 +717,15 @@
   "language": {
     "zh": "中文",
     "en": "English"
+  },
+  "folderBrowser": {
+    "title": "Select Folder",
+    "goUp": "Go up",
+    "home": "Home directory",
+    "pathPlaceholder": "/path/to/directory",
+    "go": "Go",
+    "noSubdirs": "No subdirectories",
+    "selected": "Selected path",
+    "select": "Select this folder"
   }
 }

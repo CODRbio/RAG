@@ -103,7 +103,17 @@
     "libraryPanelTitle": "子库文献",
     "libraryDownloadAll": "全部下载",
     "libraryEmpty": "当前子库暂无文献",
-    "libraryDeleteConfirm": "确定删除该子库及其全部文献？"
+    "libraryDeleteConfirm": "确定删除该子库及其全部文献？",
+    "libraryClear": "清空",
+    "libraryClearConfirm": "确定清空该临时子库及其文献？",
+    "libraryTemporaryBadge": "临时",
+    "libraryPermanent": "永久",
+    "libraryFolderPath": "存储路径",
+    "libraryFolderPathPlaceholder": "必填，如：data/my_lib",
+    "libraryFolderPathPick": "选取",
+    "libraryFolderPathPickHint": "点击「选取」在服务器目录中浏览并选择存储路径",
+    "libraryBrowse": "浏览...",
+    "libraryBrowseError": "无法打开文件夹选择"
   },
   "sidebar": {
     "brand": "RAG Lab",
@@ -367,6 +377,11 @@
     "hippoRAGDesc": "多实体 + 关系类查询时自动融合图检索",
     "graphTopK": "图谱 Top-K",
     "graphTopKDesc": "进入候选池的最大图检索结果数",
+    "database": "数据库",
+    "databaseUrl": "数据库路径",
+    "databaseUrlPlaceholder": "如 sqlite:///data/rag.db",
+    "databaseUrlRestart": "修改后需重启服务生效",
+    "databaseSaveError": "保存数据库配置失败，请先登录",
     "saved": "高级配置已保存"
   },
   "research": {
@@ -702,5 +717,15 @@
   "language": {
     "zh": "中文",
     "en": "English"
+  },
+  "folderBrowser": {
+    "title": "选择文件夹",
+    "goUp": "返回上级",
+    "home": "主目录",
+    "pathPlaceholder": "/path/to/directory",
+    "go": "跳转",
+    "noSubdirs": "无子目录",
+    "selected": "已选路径",
+    "select": "选择此文件夹"
   }
 }

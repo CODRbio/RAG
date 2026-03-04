@@ -1,6 +1,7 @@
 {
   "_comment": "复制此文件为 rag_config.local.json，填入真实 API Key。platforms 级配置会自动继承到所有同平台的 provider 变体（-thinking / -vision 等），无需重复填写。",
   "debug": false,
+  "capsolver_extension_path": "extra_tools/CapSolverExtension",
   "database": {
     "url": "sqlite:///data/rag.db"
   },
@@ -30,11 +31,10 @@
     "two_captcha_api_key": ""
   },
   "scholar_downloader": {
-    "enabled": true,
-    "download_dir": "data/raw_papers",
+    "_comment": "敏感项：API Key 与 proxy 仅在此文件填写，勿提交到版本库",
     "annas_archive_api_key": "",
     "twocaptcha_api_key": "",
-    "capsolver_extension_path": "./Extension-capsolver"
+    "proxy": null
   },
   "capsolver": {
     "enabled": true,

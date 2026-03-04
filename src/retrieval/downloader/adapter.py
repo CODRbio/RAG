@@ -51,6 +51,21 @@ def _normalize_to_paper_id(
     return slug[:80] if slug else f"paper_{os.urandom(4).hex()}"
 
 
+def _doi_to_paper_id(doi: str) -> str:
+    """Convert a DOI to a safe filesystem stem (used as paper_id).
+
+    The DOI itself is stored in paper_meta_store keyed by this paper_id so
+    reverse-conversion is not needed. Dedup works through the DB, not filenames.
+
+    Examples:
+        10.1038/s41586-023-06345-3  -> 10.1038_s41586-023-06345-3
+        10.1093/bioinformatics/bty395 -> 10.1093_bioinformatics_bty395
+    """
+    slug = re.sub(r"[^\w\-.]", "_", doi.strip())
+    slug = re.sub(r"_+", "_", slug).strip("_.")
+    return slug[:100] if slug else hashlib.md5(doi.encode()).hexdigest()[:16]
+
+
 class ScholarDownloaderAdapter:
     """
     RAG ↔ PaperDownloader adapter.
@@ -63,10 +78,57 @@ class ScholarDownloaderAdapter:
         self.show_browser = cfg.show_browser
         self.persist_browser = cfg.persist_browser
         self.proxy = cfg.proxy
-        self.extension_path = cfg.capsolver_extension_path
+        self.extension_path = getattr(settings, "capsolver_extension_path", "extra_tools/CapSolverExtension") or "extra_tools/CapSolverExtension"
         self.annas_api_key = cfg.annas_archive_api_key or ""
         self.max_concurrent = cfg.max_concurrent_downloads
         os.makedirs(self.download_dir, exist_ok=True)
+
+        # 与当前项目配置统一：从 RAG settings 构建 downloader 使用的 config 结构
+        api_keys: Dict[str, str] = {
+            "annas_archive": (cfg.annas_archive_api_key or "").strip(),
+            "twocaptcha": (cfg.twocaptcha_api_key or "").strip(),
+        }
+        if not api_keys["twocaptcha"]:
+            cf = getattr(settings, "content_fetcher", None)
+            api_keys["twocaptcha"] = (getattr(cf, "two_captcha_api_key", "") or "").strip()
+        cf = getattr(settings, "content_fetcher", None)
+        api_keys["brightdata"] = (getattr(cf, "brightdata_api_key", "") or "").strip()
+        default_llm = getattr(settings.llm, "default", "deepseek") or "deepseek"
+        try:
+            prov = settings.llm.get_provider(default_llm)
+            llm_key = (prov.get("api_key") or "").strip()
+            if default_llm == "deepseek" and llm_key:
+                api_keys["deepseek"] = llm_key
+            elif default_llm in ("claude", "anthropic") and llm_key:
+                api_keys["anthropic"] = llm_key
+        except Exception:
+            pass
+        llm_provider = "auto"
+        if default_llm == "deepseek" and api_keys.get("deepseek"):
+            llm_provider = "deepseek"
+        elif default_llm in ("claude", "anthropic") and api_keys.get("anthropic"):
+            llm_provider = "anthropic"
+        llm_model: Optional[str] = None
+        if settings.llm.is_available(default_llm):
+            try:
+                llm_model = settings.llm.resolve_model(default_llm, None)
+            except Exception:
+                pass
+        ext_path = (getattr(settings, "capsolver_extension_path", "") or "").strip() or None
+        dl_opts: Dict[str, Any] = {
+            "proxy": cfg.proxy,
+            "capsolver_extension_path": ext_path,
+        }
+        if getattr(cfg, "experience_store_path", None) is not None:
+            dl_opts["experience_store_path"] = cfg.experience_store_path
+        if getattr(cfg, "timeouts", None):
+            dl_opts["timeouts"] = cfg.timeouts
+        initial_config = {
+            "api_keys": api_keys,
+            "llm": {"provider": llm_provider, "model": llm_model},
+            "downloader": dl_opts,
+            "annas_keyword_max_pages": getattr(cfg, "annas_keyword_max_pages", 5),
+        }
 
         from .paper_downloader_refactored import PaperDownloader
 
@@ -75,8 +137,12 @@ class ScholarDownloaderAdapter:
             show_browser=self.show_browser,
             persist_browser=True,
             max_concurrent=self.max_concurrent,
+            download_timeout=getattr(cfg, "download_timeout", 200),
+            max_retries=getattr(cfg, "max_retries", 3),
+            browser_type=getattr(cfg, "browser_type", "chrome") or "chrome",
+            stealth_mode=getattr(cfg, "stealth_mode", True),
+            initial_config=initial_config,
         )
-        self._dl.config.setdefault("api_keys", {})["annas_archive"] = self.annas_api_key
 
         self._bg_loop = asyncio.new_event_loop()
         self._bg_thread = threading.Thread(
@@ -213,10 +279,11 @@ class ScholarDownloaderAdapter:
         annas_md5: Optional[str] = None,
         authors: Optional[List[str]] = None,
         year: Optional[int] = None,
+        download_dir: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Download one paper PDF to download_dir. Returns success, paper_id, filepath, message."""
+        """Download one paper PDF to download_dir (or override). Returns success, paper_id, filepath, message."""
         fut = asyncio.run_coroutine_threadsafe(
-            self._impl_download_inner(title, doi, pdf_url, annas_md5, authors, year),
+            self._impl_download_inner(title, doi, pdf_url, annas_md5, authors, year, download_dir=download_dir),
             self._bg_loop,
         )
         return await asyncio.wrap_future(fut)
@@ -229,13 +296,25 @@ class ScholarDownloaderAdapter:
         annas_md5: Optional[str],
         authors: Optional[List[str]],
         year: Optional[int],
+        download_dir: Optional[str] = None,
     ) -> Dict[str, Any]:
+        target_dir = (download_dir or self.download_dir).rstrip("/")
+
         async def _do_download() -> Dict[str, Any]:
-            paper_id = _normalize_to_paper_id(title, authors, year)
-            filepath = os.path.join(self.download_dir, f"{paper_id}.pdf")
+            os.makedirs(target_dir, exist_ok=True)
+            paper_id = _doi_to_paper_id(doi) if doi else _normalize_to_paper_id(title, authors, year)
+            filepath = os.path.join(target_dir, f"{paper_id}.pdf")
 
             if os.path.exists(filepath) and is_valid_pdf(filepath):
                 logger.info("PDF already exists, skip: %s", filepath)
+                try:
+                    from src.indexing.paper_metadata_store import paper_meta_store
+                    paper_meta_store.upsert(
+                        paper_id, doi=doi or "", title=title,
+                        authors=authors, year=year, source="download",
+                    )
+                except Exception:
+                    pass
                 return {
                     "success": True,
                     "paper_id": paper_id,
@@ -326,6 +405,15 @@ class ScholarDownloaderAdapter:
                     "filepath": None,
                     "message": "下载的文件不是有效 PDF",
                 }
+
+            try:
+                from src.indexing.paper_metadata_store import paper_meta_store
+                paper_meta_store.upsert(
+                    paper_id, doi=doi or "", title=title,
+                    authors=authors, year=year, source="download",
+                )
+            except Exception:
+                pass
 
             return {
                 "success": True,

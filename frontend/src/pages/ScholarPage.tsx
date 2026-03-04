@@ -17,12 +17,14 @@ import {
   BookmarkCheck,
   Trash2,
   FolderPlus,
+  FolderOpen,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useScholarStore } from '../stores/useScholarStore';
 import { useConfigStore } from '../stores/useConfigStore';
 import { useToastStore } from '../stores/useToastStore';
 import { PdfViewerModal } from '../components/ui/PdfViewerModal';
+import { FolderBrowserModal } from '../components/ui/FolderBrowserModal';
 import { getPdfViewUrl } from '../api/scholar';
 import type { ScholarSource, ScholarLibraryPaper } from '../api/scholar';
 
@@ -81,6 +83,7 @@ export function ScholarPage() {
     loadLibraries,
     createLibrary,
     deleteLibrary,
+    clearTemporaryLibrary,
     setActiveLibrary,
     loadLibraryPapers,
     addResultsToLibrary,
@@ -96,6 +99,8 @@ export function ScholarPage() {
   const [showNewLibraryModal, setShowNewLibraryModal] = useState(false);
   const [newLibraryName, setNewLibraryName] = useState('');
   const [newLibraryDesc, setNewLibraryDesc] = useState('');
+  const [newLibraryFolderPath, setNewLibraryFolderPath] = useState('');
+  const [showFolderBrowser, setShowFolderBrowser] = useState(false);
   const [addingToLibrary, setAddingToLibrary] = useState(false);
 
   useEffect(() => {
@@ -354,7 +359,8 @@ export function ScholarPage() {
                 <option value="">{t('scholar.libraryTemporary')}</option>
                 {libraries.map((lib) => (
                   <option key={lib.id} value={lib.id}>
-                    {lib.name} ({lib.paper_count})
+                    {lib.name}
+                    {lib.is_temporary ? ` (${t('scholar.libraryTemporaryBadge')})` : ''} ({lib.paper_count})
                   </option>
                 ))}
               </select>
@@ -415,11 +421,36 @@ export function ScholarPage() {
                   className="w-full rounded-lg border border-slate-600 bg-slate-800/60 px-3 py-2 text-slate-200 text-sm focus:outline-none focus:ring-1 focus:ring-sky-500/50"
                 />
               </div>
+              <div>
+                <label className="block text-xs text-slate-400 mb-1">{t('scholar.libraryFolderPath')}</label>
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={newLibraryFolderPath}
+                    onChange={(e) => setNewLibraryFolderPath(e.target.value)}
+                    placeholder={t('scholar.libraryFolderPathPlaceholder')}
+                    className="flex-1 rounded-lg border border-slate-600 bg-slate-800/60 px-3 py-2 text-slate-200 text-sm focus:outline-none focus:ring-1 focus:ring-sky-500/50"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowFolderBrowser(true)}
+                    className="flex-shrink-0 flex items-center gap-1.5 px-3 py-2 rounded-lg border border-sky-500/60 bg-sky-500/20 text-sky-300 hover:bg-sky-500/30 hover:text-sky-200 text-sm"
+                    title={t('scholar.libraryFolderPathPickHint')}
+                  >
+                    <FolderOpen size={16} />
+                    {t('scholar.libraryFolderPathPick')}
+                  </button>
+                </div>
+                <p className="mt-1 text-[11px] text-slate-500">{t('scholar.libraryFolderPathPickHint')}</p>
+              </div>
             </div>
             <div className="flex justify-end gap-2 mt-6">
               <button
                 type="button"
-                onClick={() => setShowNewLibraryModal(false)}
+                onClick={() => {
+                  setShowNewLibraryModal(false);
+                  setNewLibraryFolderPath('');
+                }}
                 className="px-4 py-2 rounded-lg text-slate-400 hover:bg-slate-700/60 text-sm"
               >
                 {t('common.cancel')}
@@ -429,12 +460,18 @@ export function ScholarPage() {
                 onClick={async () => {
                   const name = newLibraryName.trim();
                   if (!name) return;
-                  const lib = await createLibrary(name, newLibraryDesc.trim() || undefined);
+                  const path = newLibraryFolderPath.trim();
+                  if (!path) {
+                    addToast(t('scholar.libraryFolderPathPlaceholder'), 'error');
+                    return;
+                  }
+                  const lib = await createLibrary(name, newLibraryDesc.trim() || undefined, path, false);
                   if (lib) {
                     setActiveLibrary(lib.id);
                     setShowNewLibraryModal(false);
                     setNewLibraryName('');
                     setNewLibraryDesc('');
+                    setNewLibraryFolderPath('');
                     addToast(t('scholar.libraryCreate'), 'success');
                   }
                 }}
@@ -484,12 +521,23 @@ export function ScholarPage() {
                   <button
                     type="button"
                     onClick={() => {
-                      if (window.confirm(t('scholar.libraryDeleteConfirm'))) {
-                        deleteLibrary(activeLibraryId);
+                      const activeLib = libraries.find((l) => l.id === activeLibraryId);
+                      const isTemp = activeLib?.is_temporary ?? false;
+                      const confirmKey = isTemp ? 'scholar.libraryClearConfirm' : 'scholar.libraryDeleteConfirm';
+                      if (window.confirm(t(confirmKey))) {
+                        if (isTemp) {
+                          clearTemporaryLibrary(activeLibraryId);
+                        } else {
+                          deleteLibrary(activeLibraryId);
+                        }
                       }
                     }}
                     className="p-2 rounded-lg text-slate-400 hover:bg-red-500/20 hover:text-red-400"
-                    title={t('scholar.libraryDelete')}
+                    title={
+                      libraries.find((l) => l.id === activeLibraryId)?.is_temporary
+                        ? t('scholar.libraryClear')
+                        : t('scholar.libraryDelete')
+                    }
                   >
                     <Trash2 size={16} />
                   </button>
@@ -515,6 +563,18 @@ export function ScholarPage() {
                             <p className="text-xs text-slate-500 mt-0.5">
                               {p.authors?.join(', ')} {p.year != null ? ` · ${p.year}` : ''}
                             </p>
+                            {p.doi && (
+                              <a
+                                href={`https://doi.org/${p.doi}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="text-xs text-sky-500/80 hover:text-sky-400 hover:underline truncate block mt-0.5"
+                                title={`DOI: ${p.doi}`}
+                                onClick={(e) => e.stopPropagation()}
+                              >
+                                {p.doi}
+                              </a>
+                            )}
                           </div>
                           <button
                             type="button"
@@ -603,7 +663,16 @@ export function ScholarPage() {
                                 {m.title}
                               </span>
                               {m.doi && (
-                                <span className="text-xs text-slate-500 block mt-0.5 truncate">DOI: {m.doi}</span>
+                                <a
+                                  href={`https://doi.org/${m.doi}`}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="text-xs text-sky-500/80 hover:text-sky-400 hover:underline block mt-0.5 truncate"
+                                  title={`DOI: ${m.doi}`}
+                                  onClick={(e) => e.stopPropagation()}
+                                >
+                                  {m.doi}
+                                </a>
                               )}
                             </td>
                             <td className="py-2 px-3 text-slate-400 text-xs line-clamp-2">{m.authors?.join(', ') || '—'}</td>
@@ -674,6 +743,18 @@ export function ScholarPage() {
                             <div className="flex-1 min-w-0">
                               <p className="text-slate-200 font-medium line-clamp-2">{m.title}</p>
                               <p className="text-xs text-slate-500 mt-1">{m.authors?.join(', ') || '—'}</p>
+                              {m.doi && (
+                                <a
+                                  href={`https://doi.org/${m.doi}`}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="text-xs text-sky-500/80 hover:text-sky-400 hover:underline truncate block mt-0.5"
+                                  title={`DOI: ${m.doi}`}
+                                  onClick={(e) => e.stopPropagation()}
+                                >
+                                  {m.doi}
+                                </a>
+                              )}
                               <div className="flex items-center gap-2 mt-2 flex-wrap">
                                 {m.year && <span className="text-xs text-slate-400">{m.year}</span>}
                                 {m.source && <span className="text-xs text-slate-500">{m.source}</span>}
@@ -834,6 +915,13 @@ export function ScholarPage() {
           title={pdfView.title}
         />
       )}
+
+      <FolderBrowserModal
+        open={showFolderBrowser}
+        onClose={() => setShowFolderBrowser(false)}
+        onSelect={(path) => setNewLibraryFolderPath(path)}
+        initialPath={newLibraryFolderPath || null}
+      />
     </div>
   );
 }

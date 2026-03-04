@@ -1267,12 +1267,12 @@ class PaperDownloader:
         'science': ['science.org', 'sciencemag.org'],
     }
     
-    def __init__(self, download_dir: str = "papers", max_concurrent: int = 5, show_browser: bool = False, 
+    def __init__(self, download_dir: str = "papers", max_concurrent: int = 5, show_browser: bool = False,
                  persist_browser: bool = False, download_timeout: int = 200, timeout: int = 10, max_retries: int = 3,
                  browser_type: str = "chrome", stealth_mode: bool = True, config_path: str = "config.json",
-                 logger: logging.Logger = logger):
+                 initial_config: Optional[Dict[str, Any]] = None, logger: logging.Logger = logger):
         """初始化论文下载器
-        
+
         Args:
             download_dir: 下载文件保存的目录
             max_concurrent: 最大并发下载数
@@ -1282,13 +1282,18 @@ class PaperDownloader:
             max_retries: 最大重试次数
             browser_type: 浏览器类型 ("chrome", "chromium", "firefox")
             stealth_mode: 是否启用隐身模式以避免网站检测自动化
-            config_path: 配置文件路径
+            config_path: 配置文件路径（当 initial_config 为 None 时使用）
+            initial_config: 可选配置字典，与当前项目统一时由 adapter 传入，优先于 config_path
+            logger: 日志记录器
         """
         # 设置日志记录器
         self.logger = logger
-        
-        # 加载配置文件
-        self.config = load_config(config_path)
+
+        # 配置：优先使用 initial_config（与 RAG 项目统一），否则从 config_path 加载
+        if initial_config is not None:
+            self.config = dict(initial_config)
+        else:
+            self.config = load_config(config_path)
         # 统一超时配置（可在 config.json -> downloader.timeouts 覆盖）
         default_timeouts = {
             "session_acquire_timeout": 15,
@@ -1332,7 +1337,13 @@ class PaperDownloader:
         self.browser_type = browser_type.lower()
         self.headless = not show_browser  # 根据 show_browser 设置 headless 属性
         self.stealth_mode = stealth_mode  # 添加 stealth_mode 参数
-        
+        dl_cfg = self.config.get("downloader") or {}
+        self._proxy = dl_cfg.get("proxy") or None
+        if isinstance(self._proxy, str):
+            self._proxy = self._proxy.strip() or None
+        _ext = dl_cfg.get("capsolver_extension_path") or None
+        self._capsolver_extension_path = (_ext or "").strip() or None
+
         # 确保下载目录存在
         os.makedirs(self.download_dir, exist_ok=True)
         self.logger.debug(f"初始化下载目录: {self.download_dir}")
@@ -1397,8 +1408,11 @@ class PaperDownloader:
             if os.path.isabs(configured_path):
                 self.experience_store_path = configured_path
             else:
-                # 相对路径：相对于配置文件所在目录
-                config_dir = os.path.dirname(os.path.abspath(config_path))
+                # 相对路径：相对于 config_path 所在目录；若 initial_config 无路径则相对 download_dir
+                if config_path and os.path.exists(config_path):
+                    config_dir = os.path.dirname(os.path.abspath(config_path))
+                else:
+                    config_dir = self.download_dir
                 self.experience_store_path = os.path.join(config_dir, configured_path)
             self.logger.info(f"[经验库] 使用自定义路径: {self.experience_store_path}")
         else:
@@ -2822,7 +2836,9 @@ class PaperDownloader:
                     stealth_mode=self.stealth_mode,
                     viewport={'width': 1280, 'height': 720},
                     downloads_path=self.download_dir,
-                    timeout=self.download_timeout * 1000
+                    timeout=self.download_timeout * 1000,
+                    proxy=getattr(self, "_proxy", None),
+                    extension_path=getattr(self, "_capsolver_extension_path", None),
                 )
                 
                 session_data = {
@@ -2999,7 +3015,9 @@ class PaperDownloader:
                 stealth_mode=self.stealth_mode,
                 viewport={'width': 1280, 'height': 720},
                 downloads_path=self.download_dir,
-                timeout=30000  # 较短的超时时间
+                timeout=30000,  # 较短的超时时间
+                proxy=getattr(self, "_proxy", None),
+                extension_path=getattr(self, "_capsolver_extension_path", None),
             )
             
             async def cleanup():
@@ -3087,11 +3105,13 @@ class PaperDownloader:
                     self._browser_context = await self.browser_manager.launch_persistent_browser(
                         user_data_dir=self._persistent_user_data_dir,
                         browser_type=self.browser_type,
-                        headless=self.headless,  # 确保这个参数被正确传递和使用
+                        headless=self.headless,
                         stealth_mode=self.stealth_mode,
                         viewport={'width': 1280, 'height': 720},
-                        downloads_path=self.download_dir,  # 使用主下载目录
-                        timeout=self.download_timeout*1000
+                        downloads_path=self.download_dir,
+                        timeout=self.download_timeout * 1000,
+                        proxy=getattr(self, "_proxy", None),
+                        extension_path=getattr(self, "_capsolver_extension_path", None),
                     )
                 else:
                     self._browser_context = await setup_browser(

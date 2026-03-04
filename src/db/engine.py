@@ -49,6 +49,21 @@ def _resolve_db_url() -> str:
     return "sqlite:///data/rag.db"
 
 
+def get_resolved_db_url() -> str:
+    """Return the effective database URL (for display in UI). Does not create the engine."""
+    return _resolve_db_url()
+
+
+def _config_root() -> Path:
+    """Project config directory."""
+    return Path(__file__).resolve().parents[2] / "config"
+
+
+def get_local_config_path() -> Path:
+    """Path to rag_config.local.json (for reading/writing database.url)."""
+    return _config_root() / "rag_config.local.json"
+
+
 def _make_absolute_sqlite_url(url: str) -> str:
     """
     Resolve relative sqlite:/// paths to absolute so the DB is always
@@ -122,6 +137,7 @@ def _ensure_schema_updates() -> None:
     _add_column_if_missing = [
         ("deep_research_jobs", "started_at", "REAL"),
         ("canvases", "preliminary_knowledge", "TEXT NOT NULL DEFAULT ''"),
+        ("scholar_libraries", "folder_path", "TEXT"),
     ]
     with engine.connect() as conn:
         for table, col, col_type in _add_column_if_missing:

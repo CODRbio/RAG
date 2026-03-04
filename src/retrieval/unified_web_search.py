@@ -596,7 +596,58 @@ class UnifiedWebSearcher:
             logger.error(f"Google 批量搜索失败: {e}")
             return []
 
-    async def _search_semantic(
+    async def _search_semantic_relevance(
+        self,
+        searcher,
+        query: str,
+        limit: int,
+        year_start: Optional[int] = None,
+        year_end: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Semantic Scholar relevance only (/paper/search). No snippet, no fallback."""
+        try:
+            return await searcher.search(
+                query, limit=limit, year_start=year_start, year_end=year_end
+            )
+        except Exception as e:
+            logger.error("Semantic Scholar relevance 搜索失败: %s", e)
+            return []
+
+    async def _search_semantic_snippet(
+        self,
+        searcher,
+        query: str,
+        limit: int,
+        year_start: Optional[int] = None,
+        year_end: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Semantic Scholar snippet only (/snippet/search). No relevance, no fallback."""
+        try:
+            return await searcher.search_snippets(
+                query, limit=limit, year_start=year_start, year_end=year_end
+            )
+        except Exception as e:
+            logger.error("Semantic Scholar snippet 搜索失败: %s", e)
+            return []
+
+    async def _search_semantic_bulk(
+        self,
+        searcher,
+        query: str,
+        limit: int,
+        year_start: Optional[int] = None,
+        year_end: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Semantic Scholar bulk only (/paper/search/bulk). Boolean/keyword, no relevance ranking."""
+        try:
+            return await searcher.search_bulk(
+                query, limit=limit, year_start=year_start, year_end=year_end
+            )
+        except Exception as e:
+            logger.error("Semantic Scholar bulk 搜索失败: %s", e)
+            return []
+
+    async def _search_semantic_combined(
         self,
         searcher,
         query: str,
@@ -605,54 +656,45 @@ class UnifiedWebSearcher:
         year_end: Optional[int] = None,
         semantic_query_map: Optional[Dict[str, str]] = None,
     ) -> List[Dict[str, Any]]:
-        """Semantic Scholar 三模式搜索：
+        """Semantic Scholar 组合编排：relevance + snippet 并发，两者都无结果时 bulk 托底。
 
-        1. relevance (/paper/search) + snippet (/snippet/search) 并发执行 —
-           两者互补：relevance 提供摘要，snippet 提供正文片段。
-        2. relevance 无结果时，启动 bulk (/paper/search/bulk) 布尔托底搜索。
-        上层 _merge_and_dedup 按 URL 去重，semantic_snippet 权重略高于 semantic，
-        同一篇论文的正文片段会覆盖其摘要版本。
+        供 chat/DR 的 providers=[\"semantic\"] 使用。上层 _merge_and_dedup 按 URL 去重，
+        semantic_snippet 权重略高于 semantic，同一篇论文的正文片段会覆盖其摘要版本。
         """
         try:
             query_map = semantic_query_map or {}
             relevance_query = str(query_map.get("relevance_query") or query).strip() or query
             bulk_query = str(query_map.get("bulk_query") or query).strip() or query
             relevance_results, snippet_results = await asyncio.gather(
-                searcher.search(relevance_query, limit=limit, year_start=year_start, year_end=year_end),
-                searcher.search_snippets(relevance_query, limit=limit, year_start=year_start, year_end=year_end),
-                return_exceptions=True,
+                self._search_semantic_relevance(
+                    searcher, relevance_query, limit,
+                    year_start=year_start, year_end=year_end,
+                ),
+                self._search_semantic_snippet(
+                    searcher, relevance_query, limit,
+                    year_start=year_start, year_end=year_end,
+                ),
             )
 
             hits: List[Dict[str, Any]] = []
-
-            relevance_count = 0
-            if isinstance(relevance_results, list):
-                relevance_count = len(relevance_results)
-                hits.extend(relevance_results)
-            else:
-                logger.warning("Semantic Scholar relevance 搜索失败: %s", relevance_results)
-
-            snippet_count = 0
-            if isinstance(snippet_results, list):
-                snippet_count = len(snippet_results)
-                hits.extend(snippet_results)
-            else:
-                logger.warning("Semantic Scholar snippet 搜索失败: %s", snippet_results)
+            relevance_count = len(relevance_results)
+            snippet_count = len(snippet_results)
+            hits.extend(relevance_results)
+            hits.extend(snippet_results)
 
             logger.info(
                 "Semantic Scholar 结果: relevance=%d, snippet=%d",
                 relevance_count, snippet_count,
             )
 
-            # relevance + snippet 都无结果时，才用 bulk 布尔托底（按引用量排序）。
-            # 托底场景下两路贡献均为零，故将 limit 翻倍以维持整体结果量。
             if relevance_count == 0 and snippet_count == 0:
                 logger.info(
                     "Semantic Scholar relevance+snippet 均无结果，启动 bulk 托底（limit×2=%d）: %r",
                     limit * 2, bulk_query,
                 )
-                bulk_results = await searcher.search_bulk(
-                    bulk_query, limit=limit * 2, year_start=year_start, year_end=year_end
+                bulk_results = await self._search_semantic_bulk(
+                    searcher, bulk_query, limit * 2,
+                    year_start=year_start, year_end=year_end,
                 )
                 hits.extend(bulk_results)
 
@@ -840,7 +882,7 @@ class UnifiedWebSearcher:
                     for q in semantic_queries:
                         tasks_with_flags.append(
                             (
-                                self._search_semantic(
+                                self._search_semantic_combined(
                                     semantic,
                                     q,
                                     pmax,

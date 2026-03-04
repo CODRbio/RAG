@@ -7,9 +7,11 @@ Google Scholar / Google search use RAG unified_web_search (SerpAPI + Playwright 
 
 import asyncio
 import json
+import os
 import time
 import uuid
 from collections import Counter
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
@@ -54,13 +56,50 @@ class BatchDownloadRequest(BaseModel):
     papers: List[DownloadRequest]
     collection: Optional[str] = None
     max_concurrent: int = 3
+    library_id: Optional[int] = None  # when set and library has folder_path, download to folder_path/pdfs
 
 
 # ─── Scholar sub-libraries ───────────────────────────────────────────────────
 
+# In-memory temporary libraries (24h TTL); key = negative lib_id
+_temp_store: Dict[int, Dict[str, Any]] = {}
+_temp_id_counter = -1
+_temp_paper_id_counter = -1
+TEMP_TTL_SECONDS = 86400  # 24h
+
+
+def _is_temp_library(lib_id: int) -> bool:
+    return lib_id < 0
+
+
+def _purge_expired_temp_libraries() -> None:
+    """Remove temp libraries older than TEMP_TTL_SECONDS."""
+    now = time.time()
+    expired = [k for k, v in _temp_store.items() if (now - v.get("created_at_ts", 0)) > TEMP_TTL_SECONDS]
+    for k in expired:
+        _temp_store.pop(k, None)
+
+
+def _temp_library_response(entry: Dict[str, Any]) -> Dict[str, Any]:
+    meta = entry["meta"]
+    papers = entry.get("papers") or []
+    return {
+        "id": meta["id"],
+        "name": meta["name"],
+        "description": meta.get("description") or "",
+        "paper_count": len(papers),
+        "created_at": meta["created_at"],
+        "updated_at": meta["updated_at"],
+        "is_temporary": True,
+        "folder_path": None,
+    }
+
+
 class CreateLibraryRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
     description: str = Field(default="", max_length=500)
+    folder_path: Optional[str] = Field(default=None, max_length=1024)
+    is_temporary: bool = False
 
 
 class AddPapersToLibraryRequest(BaseModel):
@@ -139,31 +178,19 @@ async def scholar_search(req: ScholarSearchRequest):
         results = [_normalize_web_hit_for_scholar(h, "google") for h in raw_hits]
         return {"results": results, "count": len(results)}
 
-    # Semantic Scholar relevance: relevance + snippet 并发（不做 bulk 托底，用户若需要 bulk 请选 semantic_bulk）
+    # Semantic Scholar relevance only: /paper/search, no snippet, no fallback
     if req.source == "semantic" or req.source == "semantic_relevance":
-        import asyncio as _asyncio
         from src.retrieval.semantic_scholar import semantic_scholar_searcher
 
-        relevance_res, snippet_res = await _asyncio.gather(
-            semantic_scholar_searcher.search(
-                query, limit=req.limit,
-                year_start=req.year_start, year_end=req.year_end,
-            ),
-            semantic_scholar_searcher.search_snippets(
-                query, limit=req.limit,
-                year_start=req.year_start, year_end=req.year_end,
-            ),
-            return_exceptions=True,
+        relevance_res = await semantic_scholar_searcher.search(
+            query, limit=req.limit,
+            year_start=req.year_start, year_end=req.year_end,
         )
-        raw_hits: List[Dict[str, Any]] = []
-        if isinstance(relevance_res, list):
-            raw_hits.extend(relevance_res)
-        else:
+        raw_hits: List[Dict[str, Any]] = (
+            relevance_res if isinstance(relevance_res, list) else []
+        )
+        if not isinstance(relevance_res, list):
             logger.warning("semantic relevance search failed: %s", relevance_res)
-        if isinstance(snippet_res, list):
-            raw_hits.extend(snippet_res)
-        else:
-            logger.warning("semantic snippet search failed: %s", snippet_res)
         results = [_normalize_web_hit_for_scholar(h, "semantic") for h in raw_hits]
         return {"results": results, "count": len(results)}
 
@@ -255,12 +282,25 @@ async def scholar_download(req: DownloadRequest, background_tasks: BackgroundTas
     return result
 
 
+def _resolve_library_download_dir(library_id: Optional[int]) -> Optional[str]:
+    """If library_id is a permanent library with folder_path, return folder_path/pdfs else None."""
+    if library_id is None or _is_temp_library(library_id):
+        return None
+    with Session(get_engine()) as session:
+        lib = session.get(ScholarLibrary, library_id)
+        if not lib or not getattr(lib, "folder_path", None):
+            return None
+        return str(Path(lib.folder_path) / "pdfs")
+
+
 @router.post("/download/batch")
 async def scholar_batch_download(req: BatchDownloadRequest, background_tasks: BackgroundTasks):
     """Batch download + ingest; concurrent with semaphore; parent task state for task_id."""
     cfg = getattr(settings, "scholar_downloader", None)
     if not cfg or not cfg.enabled:
         raise HTTPException(status_code=503, detail="Scholar downloader is disabled")
+
+    batch_download_dir = _resolve_library_download_dir(req.library_id)
 
     task_id = f"batch_dl_{uuid.uuid4().hex[:8]}"
     total = len(req.papers)
@@ -291,6 +331,7 @@ async def scholar_batch_download(req: BatchDownloadRequest, background_tasks: Ba
                 task_id=sub_id,
                 paper_info=paper.model_dump(),
                 collection=req.collection,
+                download_dir=batch_download_dir,
             )
             async with progress_lock:
                 if result.get("ingest_triggered") or result.get("success"):
@@ -376,42 +417,101 @@ async def scholar_task_status(task_id: str):
 
 @router.get("/libraries")
 def list_scholar_libraries():
-    """List all scholar libraries with paper count."""
+    """List all scholar libraries (DB + in-memory temp) with paper count."""
+    _purge_expired_temp_libraries()
+    result: List[Dict[str, Any]] = []
     with Session(get_engine()) as session:
         libs = session.exec(select(ScholarLibrary).order_by(ScholarLibrary.created_at)).all()
-        # Count papers per library in one go
         all_papers = session.exec(select(ScholarLibraryPaper.library_id)).all()
         counts = Counter(all_papers)
-        return [
-            {
+        for lib in libs:
+            result.append({
                 "id": lib.id,
                 "name": lib.name,
                 "description": lib.description or "",
                 "paper_count": counts.get(lib.id, 0),
                 "created_at": lib.created_at,
                 "updated_at": lib.updated_at,
-            }
-            for lib in libs
-        ]
+                "is_temporary": False,
+                "folder_path": getattr(lib, "folder_path", None) or None,
+            })
+    for lib_id, entry in list(_temp_store.items()):
+        result.append(_temp_library_response(entry))
+    return result
 
 
 @router.post("/libraries")
 def create_scholar_library(body: CreateLibraryRequest):
-    """Create a new scholar library."""
+    """Create a new scholar library (temporary in-memory or permanent with optional folder_path)."""
+    name = body.name.strip()
+    description = (body.description or "").strip()
+    if body.is_temporary:
+        global _temp_id_counter, _temp_paper_id_counter
+        _temp_id_counter -= 1
+        lib_id = _temp_id_counter
+        now_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+        _temp_store[lib_id] = {
+            "meta": {
+                "id": lib_id,
+                "name": name,
+                "description": description,
+                "created_at": now_iso,
+                "updated_at": now_iso,
+            },
+            "papers": [],
+            "created_at_ts": time.time(),
+        }
+        return {
+            "id": lib_id,
+            "name": name,
+            "description": description,
+            "created_at": now_iso,
+            "is_temporary": True,
+            "folder_path": None,
+        }
+    # Permanent: require folder_path, create dirs
+    folder_path = (body.folder_path or "").strip()
+    if not folder_path:
+        raise HTTPException(status_code=400, detail="永久库必须提供 folder_path")
+    abspath = Path(folder_path)
+    if not abspath.is_absolute():
+        abspath = Path(os.getcwd()) / folder_path
+    pdfs_path = abspath / "pdfs"
+    try:
+        abspath.mkdir(parents=True, exist_ok=True)
+        pdfs_path.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise HTTPException(status_code=400, detail=f"无法创建目录: {e}")
     with Session(get_engine()) as session:
-        existing = session.exec(select(ScholarLibrary).where(ScholarLibrary.name == body.name)).first()
+        existing = session.exec(select(ScholarLibrary).where(ScholarLibrary.name == name)).first()
         if existing:
             raise HTTPException(status_code=400, detail="库名称已存在")
-        lib = ScholarLibrary(name=body.name.strip(), description=(body.description or "").strip())
+        lib = ScholarLibrary(
+            name=name,
+            description=description,
+            folder_path=str(abspath.resolve()),
+        )
         session.add(lib)
         session.commit()
         session.refresh(lib)
-        return {"id": lib.id, "name": lib.name, "description": lib.description, "created_at": lib.created_at}
+        return {
+            "id": lib.id,
+            "name": lib.name,
+            "description": lib.description or "",
+            "created_at": lib.created_at,
+            "is_temporary": False,
+            "folder_path": lib.folder_path,
+        }
 
 
 @router.delete("/libraries/{lib_id:int}")
 def delete_scholar_library(lib_id: int):
-    """Delete a scholar library and all its papers."""
+    """Delete a scholar library and all its papers (temp or permanent)."""
+    if _is_temp_library(lib_id):
+        if lib_id not in _temp_store:
+            raise HTTPException(status_code=404, detail="库不存在")
+        _temp_store.pop(lib_id, None)
+        return {"ok": True}
     with Session(get_engine()) as session:
         lib = session.get(ScholarLibrary, lib_id)
         if not lib:
@@ -437,9 +537,38 @@ def _paper_from_search_item(item: Dict[str, Any]) -> ScholarLibraryPaper:
     )
 
 
+def _temp_paper_from_search_item(item: Dict[str, Any], lib_id: int) -> Dict[str, Any]:
+    """Build a temp-library paper dict with a negative paper id."""
+    global _temp_paper_id_counter
+    _temp_paper_id_counter -= 1
+    meta = item.get("metadata") or {}
+    authors = meta.get("authors") or []
+    if not isinstance(authors, list):
+        authors = []
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+    return {
+        "id": _temp_paper_id_counter,
+        "library_id": lib_id,
+        "title": (meta.get("title") or "").strip() or "(无标题)",
+        "authors": authors,
+        "year": meta.get("year") if isinstance(meta.get("year"), (int, type(None))) else None,
+        "doi": (meta.get("doi") or "") or "",
+        "pdf_url": (meta.get("pdf_url") or "") or "",
+        "url": (meta.get("url") or "") or "",
+        "source": (meta.get("source") or "") or "",
+        "score": float(item.get("score") or 0),
+        "annas_md5": (meta.get("annas_md5") or "") or "",
+        "added_at": now_iso,
+    }
+
+
 @router.get("/libraries/{lib_id:int}/papers")
 def list_scholar_library_papers(lib_id: int):
-    """List all papers in a scholar library."""
+    """List all papers in a scholar library (temp or permanent)."""
+    if _is_temp_library(lib_id):
+        if lib_id not in _temp_store:
+            raise HTTPException(status_code=404, detail="库不存在")
+        return list(_temp_store[lib_id].get("papers") or [])
     with Session(get_engine()) as session:
         lib = session.get(ScholarLibrary, lib_id)
         if not lib:
@@ -467,6 +596,27 @@ def list_scholar_library_papers(lib_id: int):
 @router.post("/libraries/{lib_id:int}/papers")
 def add_papers_to_scholar_library(lib_id: int, body: AddPapersToLibraryRequest):
     """Add search results to a library. Dedup by DOI then by title."""
+    if _is_temp_library(lib_id):
+        if lib_id not in _temp_store:
+            raise HTTPException(status_code=404, detail="库不存在")
+        entry = _temp_store[lib_id]
+        papers_list = entry.setdefault("papers", [])
+        existing_dois = {p.get("doi") for p in papers_list if p.get("doi")}
+        existing_titles = {str(p.get("title") or "").strip().lower() for p in papers_list}
+        added = 0
+        for item in body.papers:
+            paper_d = _temp_paper_from_search_item(item, lib_id)
+            if paper_d["doi"] and paper_d["doi"] in existing_dois:
+                continue
+            if not paper_d["doi"] and paper_d["title"].strip().lower() in existing_titles:
+                continue
+            papers_list.append(paper_d)
+            if paper_d["doi"]:
+                existing_dois.add(paper_d["doi"])
+            existing_titles.add(paper_d["title"].strip().lower())
+            added += 1
+        entry["meta"]["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+        return {"added": added, "total_requested": len(body.papers)}
     with Session(get_engine()) as session:
         lib = session.get(ScholarLibrary, lib_id)
         if not lib:
@@ -495,6 +645,15 @@ def add_papers_to_scholar_library(lib_id: int, body: AddPapersToLibraryRequest):
 @router.delete("/libraries/{lib_id:int}/papers/{paper_id:int}")
 def remove_paper_from_scholar_library(lib_id: int, paper_id: int):
     """Remove one paper from a scholar library."""
+    if _is_temp_library(lib_id):
+        if lib_id not in _temp_store:
+            raise HTTPException(status_code=404, detail="库不存在")
+        papers_list = _temp_store[lib_id].get("papers") or []
+        for i, p in enumerate(papers_list):
+            if p.get("id") == paper_id:
+                papers_list.pop(i)
+                return {"ok": True}
+        raise HTTPException(status_code=404, detail="文献不存在")
     with Session(get_engine()) as session:
         paper = session.get(ScholarLibraryPaper, paper_id)
         if not paper or paper.library_id != lib_id:

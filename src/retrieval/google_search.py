@@ -348,12 +348,14 @@ def _get_google_search_config() -> Dict[str, Any]:
                 "enabled": getattr(gs, "enabled", True),
                 "scholar_enabled": getattr(gs, "scholar_enabled", True),
                 "google_enabled": getattr(gs, "google_enabled", False),
-                "extension_path": getattr(gs, "extension_path", "extra_tools/CapSolverExtension"),
+                "extension_path": getattr(settings, "capsolver_extension_path", "extra_tools/CapSolverExtension"),
                 "headless": getattr(gs, "headless", None),
                 "proxy": getattr(gs, "proxy", None),
                 "timeout": getattr(gs, "timeout", 60000),
                 "max_results": getattr(gs, "max_results", 5),
                 "user_data_dir": getattr(gs, "user_data_dir", None),
+                "headed_browser_port": getattr(gs, "headed_browser_port", 9223),
+                "start_headed_browser": getattr(gs, "start_headed_browser", False),
             }
     except Exception:
         pass
@@ -368,12 +370,14 @@ def _get_google_search_config() -> Dict[str, Any]:
         "enabled": gs.get("enabled", True),
         "scholar_enabled": gs.get("scholar_enabled", True),
         "google_enabled": gs.get("google_enabled", False),
-        "extension_path": gs.get("extension_path", "extra_tools/CapSolverExtension"),
+        "extension_path": raw.get("capsolver_extension_path", gs.get("extension_path", "extra_tools/CapSolverExtension")),
         "headless": gs.get("headless"),
         "proxy": gs.get("proxy"),
         "timeout": gs.get("timeout", 60000),
         "max_results": min(int(gs.get("max_results", 5)), 20),
         "user_data_dir": gs.get("user_data_dir"),
+        "headed_browser_port": int(gs.get("headed_browser_port", 9223)),
+        "start_headed_browser": bool(gs.get("start_headed_browser", False)),
     }
 
 
@@ -698,31 +702,44 @@ class _BrowserManager:
         
         os.makedirs(user_data_dir, exist_ok=True)
 
-        # 优先连接共享 CDP 浏览器——但需要有头而共享浏览器是无头时跳过，自己 launch 有头实例
-        cdp_url = SharedBrowserService.get_cdp_url()
-        shared_is_headless = getattr(SharedBrowserService, "_headless", True)
-        if cdp_url and (headless or not shared_is_headless):
-            # 共享浏览器可用且模式匹配：直接 CDP 连接
-            logger.info("检测到共享浏览器，使用 CDP 连接: %s (shared_headless=%s, requested_headless=%s)",
-                        cdp_url, shared_is_headless, headless)
-            browser = await self.playwright.chromium.connect_over_cdp(cdp_url)
-            context_options = {
-                "accept_downloads": True,
-                "user_agent": _get_random_user_agent(),
-                "viewport": _get_random_viewport(),
-                "locale": "en-US",
-                "timezone_id": "America/New_York",
-            }
-            if proxy:
-                if proxy.startswith("socks5h://"):
-                    proxy = proxy.replace("socks5h://", "socks5://")
-                context_options["proxy"] = {"server": proxy}
-            context = await browser.new_context(**context_options)
-            self.attach_cdp_browser(browser, context)
-            return context
+        context_options = {
+            "accept_downloads": True,
+            "user_agent": _get_random_user_agent(),
+            "viewport": _get_random_viewport(),
+            "locale": "en-US",
+            "timezone_id": "America/New_York",
+        }
+        if proxy:
+            if proxy.startswith("socks5h://"):
+                proxy = proxy.replace("socks5h://", "socks5://")
+            context_options["proxy"] = {"server": proxy}
 
-        if cdp_url and not headless and shared_is_headless:
-            logger.info("需要有头浏览器但共享浏览器为无头，跳过 CDP 连接，将本地 launch 有头实例")
+        if headless is not False:
+            cdp_url = SharedBrowserService.get_cdp_url_headless()
+            if cdp_url:
+                logger.info("使用无头 CDP 连接: %s", cdp_url)
+                browser = await self.playwright.chromium.connect_over_cdp(cdp_url)
+                context = await browser.new_context(**context_options)
+                self.attach_cdp_browser(browser, context)
+                return context
+        else:
+            cdp_url = SharedBrowserService.get_cdp_url_headed()
+            if not cdp_url:
+                try:
+                    from config.settings import settings
+                    gs = getattr(settings, "google_search", None)
+                    port = getattr(gs, "headed_browser_port", 9223)
+                    await SharedBrowserService.start_headed(port=port)
+                    cdp_url = SharedBrowserService.get_cdp_url_headed()
+                except Exception as e:
+                    logger.warning("懒启动有头 CDP 失败: %s", e)
+            if cdp_url:
+                logger.info("使用有头 CDP 连接: %s", cdp_url)
+                browser = await self.playwright.chromium.connect_over_cdp(cdp_url)
+                context = await browser.new_context(**context_options)
+                self.attach_cdp_browser(browser, context)
+                return context
+            logger.info("有头 CDP 不可用，将本地 launch 有头实例")
 
         context_options = {
             "headless": headless,
@@ -959,22 +976,24 @@ class _ScholarParser:
     
     @staticmethod
     def _extract_doi_from_url(url: Optional[str]) -> Optional[str]:
-        """从 URL 中提取 DOI"""
+        """从 URL 中提取 DOI（doi.org 规范链接 → 任意出版商路径）"""
         if not url:
             return None
-        
+
+        # 1. 标准 doi.org / dx.doi.org 链接（最可靠）
         match = re.search(r'(?:doi\.org|dx\.doi\.org)/+(10\.\d{4,}/[^\s&?#]+)', url, re.I)
         if match:
-            return match.group(1).rstrip('/.')
-        
-        match = re.search(r'/(10\.\d{4,}/[a-zA-Z0-9._\-/()]+)', url)
+            return re.sub(r'[/.),:;\s]+$', '', match.group(1))
+
+        # 2. 出版商 URL 路径中直接嵌入 DOI（如 Springer、Wiley、Frontiers、T&F）
+        match = re.search(r'/(10\.\d{4,}/[a-zA-Z0-9._\-/();:]+)', url)
         if match:
-            doi = match.group(1).rstrip('/.')
-            if '/' in doi and 10 < len(doi) < 100:
-                return re.sub(r'[/.\-]+$', '', doi)
-        
+            doi = re.sub(r'[/.),:;\s]+$', '', match.group(1))
+            if '/' in doi and 10 < len(doi) < 120:
+                return doi
+
         return None
-    
+
     @staticmethod
     def extract_total_results(html_content: str) -> Optional[int]:
         """提取总结果数"""
@@ -1102,8 +1121,8 @@ class GoogleSearcher:
         return bool(self._config.get("google_enabled", False))
     
     def _get_extension_path(self) -> Optional[str]:
-        """获取扩展路径"""
-        ext_path = self._config.get("extension_path", "extra_tools/CapSolverExtension")
+        """获取扩展路径（使用全局 capsolver_extension_path）"""
+        ext_path = getattr(settings, "capsolver_extension_path", None) or self._config.get("extension_path", "extra_tools/CapSolverExtension")
         if ext_path:
             # 支持相对路径
             if not os.path.isabs(ext_path):

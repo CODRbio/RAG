@@ -23,6 +23,7 @@ from src.api.routes_models import router as models_router
 from src.api.routes_ingest import router as ingest_router
 from src.api.routes_graph import router as graph_router
 from src.api.routes_compare import router as compare_router
+from src.api.routes_config import router as config_router
 from src.api.routes_debug import router as debug_router
 from src.api.routes_scholar import router as scholar_router
 from src.api.routes_tasks import router as tasks_router
@@ -92,14 +93,18 @@ async def lifespan(app: FastAPI):
     dl = init_debug_logger(enabled=settings.debug)
     logger.info("[startup] debug mode: %s (log_dir=%s)", "ON" if dl.enabled else "OFF", dl.log_dir)
 
-    # 4. 启动共享浏览器（供 Download / RAG 共用）
-    #    当 google_search.headless 显式设为 false 时以有头模式启动，否则默认无头
+    # 4. 启动共享浏览器：无头实例（默认）+ 可选有头实例（最小化）
     try:
-        _gs_headless = getattr(getattr(settings, "google_search", None), "headless", None)
-        _shared_headless = _gs_headless if _gs_headless is not None else True
-        await SharedBrowserService.start(headless=_shared_headless)
+        await SharedBrowserService.start()
     except Exception as e:
-        logger.warning("[startup] shared browser service start failed, fallback to local launch: %s", e)
+        logger.warning("[startup] shared headless browser start failed, fallback to local launch: %s", e)
+    gs_cfg = getattr(settings, "google_search", None)
+    if getattr(gs_cfg, "start_headed_browser", False):
+        try:
+            headed_port = getattr(gs_cfg, "headed_browser_port", 9223)
+            await SharedBrowserService.start_headed(port=headed_port)
+        except Exception as e:
+            logger.warning("[startup] shared headed browser start failed: %s", e)
 
     # 5. 启动后台任务轮询 Worker
     worker_task = asyncio.create_task(run_background_worker())
@@ -140,6 +145,7 @@ app.add_middleware(
 
 app.include_router(auth_router)
 app.include_router(admin_router)
+app.include_router(config_router)
 app.include_router(project_router)
 app.include_router(chat_router)
 app.include_router(tasks_router)

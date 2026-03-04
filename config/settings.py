@@ -149,16 +149,19 @@ class WebSearchConfig:
 
 @dataclass
 class GoogleSearchConfig:
-    """Google Scholar / Google 搜索配置"""
+    """Google Scholar / Google 搜索配置（CapSolver 扩展路径使用全局 capsolver_extension_path）"""
     enabled: bool = True
     scholar_enabled: bool = True
     google_enabled: bool = False
-    extension_path: str = "extra_tools/CapSolverExtension"
     headless: Optional[bool] = None
     proxy: Optional[str] = None
     timeout: int = 60000
     max_results: int = 5
     user_data_dir: Optional[str] = None
+    headed_browser_port: int = 9223
+    """CDP port for the optional headed (minimized) shared browser."""
+    start_headed_browser: bool = False
+    """Whether to start the headed browser at app startup; if False, it is started on demand."""
 
 
 @dataclass
@@ -221,19 +224,56 @@ class ContentFetcherConfig:
     compress_max_output_words: int = 400
 
 
+# 默认 downloader timeouts（与 paper_downloader_refactored 一致，可被 config 覆盖）
+_SCHOLAR_DOWNLOADER_DEFAULT_TIMEOUTS: Dict[str, int] = {
+    "session_acquire_timeout": 15,
+    "page_create_timeout": 10,
+    "goto_timeout": 20,
+    "load_state_timeout": 10,
+    "redirect_chain_timeout": 15,
+    "page_stable_wait": 2,
+    "cookie_consent_timeout": 8,
+    "cloudflare_timeout": 60,
+    "cloudflare_retry_wait": 10,
+    "captcha_timeout": 60,
+    "download_event_timeout": 15,
+    "inline_pdf_fetch_timeout": 15,
+    "inline_pdf_body_timeout": 10,
+    "button_appear_timeout": 8,
+    "button_click_timeout": 5,
+    "post_click_nav_timeout": 10,
+    "pdf_viewer_timeout": 12,
+    "download_complete_timeout": 20,
+    "download_poll_interval": 1,
+    "rate_limit_wait": 30,
+    "smart_loop_total_timeout": 60,
+    "smart_loop_iteration_wait": 2,
+    "llm_timeout": 20,
+    "paper_total_timeout": 120,
+}
+
+
 @dataclass
 class ScholarDownloaderSettings:
-    """Scholar PDF downloader: download_dir, Anna's Archive, 2Captcha, auto-ingest."""
+    """Scholar PDF downloader: download_dir, Anna's Archive, 2Captcha, auto-ingest. CapSolver 扩展路径使用全局 capsolver_extension_path。"""
     enabled: bool = True
     download_dir: str = "data/raw_papers"
     annas_archive_api_key: str = ""
     twocaptcha_api_key: str = ""
-    capsolver_extension_path: str = "./Extension-capsolver"
     proxy: Optional[str] = None
     max_concurrent_downloads: int = 3
     show_browser: bool = False
     persist_browser: bool = True
     auto_ingest_after_download: bool = True
+    download_timeout: int = 200
+    max_retries: int = 3
+    browser_type: str = "chrome"
+    stealth_mode: bool = True
+    experience_store_path: Optional[str] = None
+    timeouts: Dict[str, Any] = field(default_factory=dict)
+    annas_keyword_max_pages: int = 5
+    use_scihub: bool = True
+    scihub_mirrors: List[str] = field(default_factory=lambda: ["https://sci-hub.st/", "https://sci-hub.ru/"])
 
 
 @dataclass
@@ -458,6 +498,11 @@ def _web_search_from_config() -> Dict[str, Any]:
     return (_RAW_CONFIG.get("web_search") or {})
 
 
+def _get_capsolver_extension_path() -> str:
+    """全局 CapSolver 扩展路径，供 google_search / scholar_downloader 等共用。"""
+    return (str(_RAW_CONFIG.get("capsolver_extension_path") or "extra_tools/CapSolverExtension")).strip()
+
+
 def _google_search_from_config() -> Dict[str, Any]:
     return (_RAW_CONFIG.get("google_search") or {})
 
@@ -667,17 +712,19 @@ class Settings:
             query_expansion_llm=(w.get("query_expansion_llm") or "deepseek").strip(),
             max_queries=min(int(w.get("max_queries", 4)), 8),
         )
+        self.capsolver_extension_path = _get_capsolver_extension_path()
         g = _google_search_from_config()
         self.google_search = GoogleSearchConfig(
             enabled=g.get("enabled", True),
             scholar_enabled=g.get("scholar_enabled", True),
             google_enabled=g.get("google_enabled", False),
-            extension_path=(g.get("extension_path") or "extra_tools/CapSolverExtension").strip(),
             headless=g.get("headless"),
             proxy=g.get("proxy"),
             timeout=int(g.get("timeout", 60000)),
             max_results=min(int(g.get("max_results", 5)), 20),
             user_data_dir=g.get("user_data_dir"),
+            headed_browser_port=int(g.get("headed_browser_port", 9223)),
+            start_headed_browser=bool(g.get("start_headed_browser", False)),
         )
         sp = _serpapi_from_config()
         self.serpapi = SerpAPIConfig(
@@ -823,17 +870,27 @@ class Settings:
             task_state_ttl_seconds=int(tq.get("task_state_ttl_seconds", 86400)),
         )
         sd = _scholar_downloader_from_config()
+        timeouts_raw = sd.get("timeouts") or {}
+        timeouts_merged = {**_SCHOLAR_DOWNLOADER_DEFAULT_TIMEOUTS, **{k: v for k, v in timeouts_raw.items() if isinstance(v, (int, float))}}
         self.scholar_downloader = ScholarDownloaderSettings(
             enabled=bool(sd.get("enabled", True)),
             download_dir=str(sd.get("download_dir", "data/raw_papers")),
             annas_archive_api_key=str(sd.get("annas_archive_api_key", "")),
             twocaptcha_api_key=str(sd.get("twocaptcha_api_key", "")),
-            capsolver_extension_path=str(sd.get("capsolver_extension_path", "./Extension-capsolver")),
             proxy=sd.get("proxy"),
             max_concurrent_downloads=int(sd.get("max_concurrent_downloads", 3)),
             show_browser=bool(sd.get("show_browser", False)),
             persist_browser=bool(sd.get("persist_browser", True)),
             auto_ingest_after_download=bool(sd.get("auto_ingest_after_download", True)),
+            download_timeout=int(sd.get("download_timeout", 200)),
+            max_retries=int(sd.get("max_retries", 3)),
+            browser_type=str(sd.get("browser_type", "chrome")).strip().lower() or "chrome",
+            stealth_mode=bool(sd.get("stealth_mode", True)),
+            experience_store_path=sd.get("experience_store_path"),
+            timeouts=timeouts_merged,
+            annas_keyword_max_pages=int(sd.get("annas_keyword_max_pages", 5)),
+            use_scihub=bool(sd.get("use_scihub", True)),
+            scihub_mirrors=list(sd.get("scihub_mirrors") or ["https://sci-hub.st/", "https://sci-hub.ru/"]),
         )
 
     @property

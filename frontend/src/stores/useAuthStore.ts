@@ -3,6 +3,18 @@ import { persist } from 'zustand/middleware';
 import type { User } from '../types';
 import { login as apiLogin } from '../api/auth';
 
+/** Normalize FastAPI 422 detail (string or array of { msg } objects) to a single string for display. */
+function toLoginErrorMessage(detail: unknown): string {
+  if (typeof detail === 'string') return detail;
+  if (Array.isArray(detail)) {
+    const messages = detail
+      .map((item) => (item && typeof item === 'object' && 'msg' in item ? String((item as { msg: unknown }).msg) : null))
+      .filter(Boolean) as string[];
+    if (messages.length) return messages.join('. ');
+  }
+  return '登录失败';
+}
+
 interface AuthState {
   user: User | null;
   token: string | null;
@@ -35,9 +47,9 @@ export const useAuthStore = create<AuthState>()(
           localStorage.setItem('token', res.token);
           set({ user, token: res.token, isLoading: false });
         } catch (err: unknown) {
-          const message =
-            (err as { response?: { data?: { detail?: string } } })?.response
-              ?.data?.detail || '登录失败';
+          const detail = (err as { response?: { data?: { detail?: unknown } } })
+            ?.response?.data?.detail;
+          const message = toLoginErrorMessage(detail);
           set({ error: message, isLoading: false });
           throw err;
         }

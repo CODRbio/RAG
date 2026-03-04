@@ -411,7 +411,7 @@ class WebContentFetcher:
                 pass
 
             async with async_playwright() as p:
-                cdp_url = SharedBrowserService.get_cdp_url()
+                cdp_url = SharedBrowserService.get_cdp_url_headless()
                 own_browser = False
                 if cdp_url:
                     browser = await p.chromium.connect_over_cdp(cdp_url)
@@ -612,15 +612,23 @@ class WebContentFetcher:
         Returns:
             需要抓取全文的 URL 集合（list）
         """
-        # 只评估 scholar / google 来源且有合法 URL 的条目
+        # 只评估 scholar / google 来源且有合法 URL 或 DOI 的条目；有 DOI 时用 doi.org 链接作为抓取目标
         candidates = []
         for hit in results:
             metadata = hit.get("metadata") or {}
             source = metadata.get("source", "")
             url = (metadata.get("url") or "").strip()
+            doi = (metadata.get("doi") or "").strip()
             snippet = (hit.get("content") or "").strip()
-            if url and source in ("scholar", "google") and snippet:
-                candidates.append({"url": url, "snippet": snippet})
+            if source not in ("scholar", "google") or not snippet:
+                continue
+            # DOI 获取后优先用 doi.org 链接，便于自动拉取
+            if doi and "/" in doi and doi.startswith("10.") and len(doi) < 120:
+                candidate_url = "https://doi.org/" + doi
+            else:
+                candidate_url = url
+            if candidate_url:
+                candidates.append({"url": candidate_url, "snippet": snippet})
 
         if not candidates:
             return []
@@ -725,30 +733,39 @@ class WebContentFetcher:
 
         sem = asyncio.Semaphore(self.max_concurrent)
 
+        def _fetch_url_for_hit(metadata: Dict[str, Any]) -> Optional[str]:
+            """有 DOI 时优先用 doi.org 链接拉取，否则用原始 url。"""
+            url = (metadata.get("url") or "").strip()
+            doi = (metadata.get("doi") or "").strip()
+            if doi and "/" in doi and doi.startswith("10.") and len(doi) < 120:
+                return "https://doi.org/" + doi
+            return url if url else None
+
         async def _process_one(hit: Dict[str, Any]) -> None:
             metadata = hit.get("metadata") or {}
             source = metadata.get("source", "")
             url = (metadata.get("url") or "").strip()
+            fetch_url = _fetch_url_for_hit(metadata)
 
             if not is_force and source not in ("scholar", "google", "serpapi_scholar", "serpapi_google"):
                 return
 
-            if not url or not is_qualifying_url(url, only_academic=self.only_academic):
+            if not fetch_url or not is_qualifying_url(fetch_url, only_academic=self.only_academic):
                 return
 
             # 已经是全文的跳过
             if metadata.get("content_type") == "full_text":
                 return
 
-            # 智能模式：跳过未被 LLM 选中的 URL
-            if urls_to_fetch is not None and url not in urls_to_fetch:
+            # 智能模式：跳过未被 LLM 选中的 URL（LLM 返回的可能是 doi_url 或原始 url）
+            if urls_to_fetch is not None and url not in urls_to_fetch and fetch_url not in urls_to_fetch:
                 return
 
             async with sem:
                 try:
-                    full_text = await self.fetch_content(url)
+                    full_text = await self.fetch_content(fetch_url)
                 except Exception as e:
-                    logger.debug(f"抓取失败 {url}: {e}")
+                    logger.debug(f"抓取失败 {fetch_url}: {e}")
                     return
 
                 if full_text:

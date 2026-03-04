@@ -270,14 +270,17 @@ class BrowserManager:
         """
         await self._ensure_playwright()
 
-        # 优先复用全局共享浏览器（CDP）
-        cdp_url = SharedBrowserService.get_cdp_url()
+        # 按 headless 选择对应 CDP 端点
+        if headless is not False:
+            cdp_url = SharedBrowserService.get_cdp_url_headless()
+        else:
+            cdp_url = SharedBrowserService.get_cdp_url_headed()
         if cdp_url and browser_type in ("chromium", "chrome"):
             logger.info(f"连接共享浏览器 CDP: {cdp_url}")
             browser = await self.playwright.chromium.connect_over_cdp(cdp_url)
             self._cdp_browser_handle = browser
             return browser
-        
+
         # 自动检测显示模式
         if headless is None:
             use_headed, display_mode = ensure_display()
@@ -429,6 +432,7 @@ class BrowserManager:
                                       browser_type: str = "chrome",
                                       headless: Optional[bool] = None,
                                       proxy: Optional[str] = None,
+                                      extension_path: Optional[str] = None,
                                       stealth_mode: bool = True,
                                       user_agent: Optional[str] = None,
                                       viewport: Optional[Dict[str, int]] = None,
@@ -447,6 +451,7 @@ class BrowserManager:
                 - True: 强制无头模式（capsolver 可能无法工作）
                 - False: 强制有头模式
             proxy: 代理服务器地址
+            extension_path: Capsolver 等扩展目录路径，不传则使用默认 extra_tools/CapSolverExtension
             stealth_mode: 是否启用隐身模式
             user_agent: 用户代理
             viewport: 视口大小
@@ -460,8 +465,11 @@ class BrowserManager:
         """
         await self._ensure_playwright()
 
-        # 优先复用全局共享浏览器（CDP）
-        cdp_url = SharedBrowserService.get_cdp_url()
+        # 按 headless 选择对应 CDP 端点
+        if headless is not False:
+            cdp_url = SharedBrowserService.get_cdp_url_headless()
+        else:
+            cdp_url = SharedBrowserService.get_cdp_url_headed()
         if cdp_url and browser_type in ("chromium", "chrome"):
             logger.info(f"通过 CDP 复用共享浏览器: {cdp_url}")
             if user_data_dir:
@@ -483,7 +491,7 @@ class BrowserManager:
             if downloads_path:
                 os.makedirs(downloads_path, exist_ok=True)
             return context
-        
+
         # 自动检测显示模式
         if headless is None:
             use_headed, display_mode = ensure_display()
@@ -648,25 +656,25 @@ class BrowserManager:
             # 重要：Chrome 137+ 已移除 --load-extension 支持
             # 必须使用 Playwright 内置的 Chromium 来加载扩展
             if browser_type == "chrome" or browser_type == "chromium":
-                extension = './Extension-capsolver'
-                extension_path = os.path.abspath(extension)
+                extension = (extension_path or 'extra_tools/CapSolverExtension').strip() or 'extra_tools/CapSolverExtension'
+                resolved_extension_path = os.path.abspath(extension)
                 
                 # 检查扩展目录是否存在
                 load_extension = False
-                if not os.path.exists(extension_path):
-                    logger.warning(f"扩展目录不存在: {extension_path}，将不加载扩展")
-                elif not os.path.exists(os.path.join(extension_path, 'manifest.json')):
-                    logger.warning(f"扩展目录缺少 manifest.json: {extension_path}，将不加载扩展")
+                if not os.path.exists(resolved_extension_path):
+                    logger.warning(f"扩展目录不存在: {resolved_extension_path}，将不加载扩展")
+                elif not os.path.exists(os.path.join(resolved_extension_path, 'manifest.json')):
+                    logger.warning(f"扩展目录缺少 manifest.json: {resolved_extension_path}，将不加载扩展")
                 else:
-                    logger.info(f"加载 capsolver 扩展: {extension_path}")
+                    logger.info(f"加载 capsolver 扩展: {resolved_extension_path}")
                     load_extension = True
                     
                     # 确保 args 存在并添加扩展参数
                     if "args" not in context_options:
                         context_options["args"] = []
                     context_options["args"].extend([
-                        '--disable-extensions-except=' + extension_path,
-                        '--load-extension=' + extension_path,
+                        '--disable-extensions-except=' + resolved_extension_path,
+                        '--load-extension=' + resolved_extension_path,
                     ])
                     
                     # 关键：排除 Playwright 默认的 --disable-extensions 参数

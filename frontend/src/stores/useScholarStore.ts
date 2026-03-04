@@ -25,6 +25,114 @@ import {
 const POLL_INTERVAL_MS = 2000;
 const TERMINAL_STATUSES = new Set(['completed', 'error', 'cancelled']);
 
+// ─── Temp library localStorage helpers ───────────────────────────────────────
+
+const LS_TEMP_LIBS_KEY = 'scholar_temp_libs_v1';
+const LS_TEMP_LIB_SEQ_KEY = 'scholar_temp_lib_seq_v1';
+const LS_TEMP_PAPER_SEQ_KEY = 'scholar_temp_paper_seq_v1';
+const TEMP_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+interface TempLibData {
+  id: number; // negative integer — distinguishes from server permanent libs
+  name: string;
+  description: string;
+  created_at: string;
+  updated_at: string;
+  created_at_ts: number; // Date.now() at creation — used for TTL eviction
+  papers: ScholarLibraryPaper[];
+}
+
+function _nextSeq(key: string): number {
+  try {
+    const seq = parseInt(localStorage.getItem(key) || '0') - 1;
+    localStorage.setItem(key, String(seq));
+    return seq;
+  } catch {
+    return -(Math.abs(Date.now()) % 1_000_000_000);
+  }
+}
+
+function _loadTempLibs(): TempLibData[] {
+  try {
+    const raw = localStorage.getItem(LS_TEMP_LIBS_KEY);
+    if (!raw) return [];
+    const libs: TempLibData[] = JSON.parse(raw);
+    const now = Date.now();
+    const alive = libs.filter((l) => now - l.created_at_ts < TEMP_TTL_MS);
+    if (alive.length !== libs.length) _saveTempLibs(alive);
+    return alive;
+  } catch {
+    return [];
+  }
+}
+
+function _saveTempLibs(libs: TempLibData[]): void {
+  try {
+    localStorage.setItem(LS_TEMP_LIBS_KEY, JSON.stringify(libs));
+  } catch {
+    // localStorage quota exceeded — silently ignore
+  }
+}
+
+function _tempToScholarLibrary(lib: TempLibData): ScholarLibrary {
+  return {
+    id: lib.id,
+    name: lib.name,
+    description: lib.description,
+    paper_count: lib.papers.length,
+    created_at: lib.created_at,
+    updated_at: lib.updated_at,
+    is_temporary: true,
+    folder_path: null,
+  };
+}
+
+function _searchResultToTempPaper(item: ScholarSearchResult, libId: number): ScholarLibraryPaper {
+  const m = item.metadata;
+  return {
+    id: _nextSeq(LS_TEMP_PAPER_SEQ_KEY),
+    library_id: libId,
+    title: (m.title || '').trim() || '(无标题)',
+    authors: m.authors || [],
+    year: typeof m.year === 'number' ? m.year : null,
+    doi: m.doi || null,
+    pdf_url: m.pdf_url || null,
+    url: m.url || null,
+    source: m.source || '',
+    score: item.score || 0,
+    annas_md5: m.annas_md5 || null,
+    added_at: new Date().toISOString(),
+  };
+}
+
+/**
+ * Append items to a temp lib with DOI/title deduplication.
+ * Mutates lib in-place; caller must call _saveTempLibs after.
+ * Returns count of actually added papers.
+ */
+function _appendToTempLib(lib: TempLibData, items: ScholarSearchResult[]): number {
+  const existingDois = new Set(
+    lib.papers.map((p) => (p.doi || '').trim().toLowerCase()).filter(Boolean),
+  );
+  const existingTitles = new Set(lib.papers.map((p) => p.title.trim().toLowerCase()));
+  let added = 0;
+  for (const item of items) {
+    const paper = _searchResultToTempPaper(item, lib.id);
+    const doi = (paper.doi || '').trim().toLowerCase();
+    const title = paper.title.trim().toLowerCase();
+    if (doi && existingDois.has(doi)) continue;
+    if (!doi && existingTitles.has(title)) continue;
+    lib.papers.push(paper);
+    if (doi) existingDois.add(doi);
+    existingTitles.add(title);
+    added++;
+  }
+  if (added > 0) lib.updated_at = new Date().toISOString();
+  return added;
+}
+
+// ─── State interface ──────────────────────────────────────────────────────────
+
 interface ScholarState {
   // Search
   query: string;
@@ -83,8 +191,15 @@ interface ScholarState {
   checkHealth: () => Promise<void>;
 
   loadLibraries: () => Promise<void>;
-  createLibrary: (name: string, description?: string) => Promise<ScholarLibrary | null>;
+  createLibrary: (
+    name: string,
+    description?: string,
+    folderPath?: string | null,
+    isTemporary?: boolean,
+  ) => Promise<ScholarLibrary | null>;
   deleteLibrary: (libId: number) => Promise<void>;
+  /** Clear a temporary library (same as delete; use for UI "Clear" label). */
+  clearTemporaryLibrary: (libId: number) => Promise<void>;
   setActiveLibrary: (libId: number | null) => void;
   loadLibraryPapers: (libId: number) => Promise<void>;
   addResultsToLibrary: (indices: number[]) => Promise<{ added: number } | null>;
@@ -149,6 +264,13 @@ export const useScholarStore = create<ScholarState>()((set, get) => ({
         serpapi_ratio: source === 'google_scholar' || source === 'google' ? serpapiRatio / 100 : undefined,
       });
       set({ results, selectedIndices: [] });
+
+      // Auto-save all results to the active library (fire-and-forget, dedup handled inside)
+      const { activeLibraryId } = get();
+      if (activeLibraryId != null && results.length > 0) {
+        const allIndices = results.map((_, i) => i);
+        get().addResultsToLibrary(allIndices);
+      }
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
       set({ results: [], searchError: message });
@@ -292,23 +414,63 @@ export const useScholarStore = create<ScholarState>()((set, get) => ({
     }
   },
 
+  // ─── Library operations ────────────────────────────────────────────────────
+
   loadLibraries: async () => {
     set({ libraryError: null });
     try {
-      const libraries = await listLibraries();
-      set({ libraries });
+      // Permanent libs come from the server; filter out any old server-side temp libs (negative IDs)
+      const serverLibs = (await listLibraries()).filter((l) => l.id >= 0);
+      // Temp libs live in localStorage
+      const tempLibs = _loadTempLibs().map(_tempToScholarLibrary);
+      set({ libraries: [...tempLibs, ...serverLibs] });
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
-      set({ libraryError: message, libraries: [] });
+      // Even if server fails, show localStorage temp libs
+      const tempLibs = _loadTempLibs().map(_tempToScholarLibrary);
+      set({ libraryError: message, libraries: tempLibs });
     }
   },
 
-  createLibrary: async (name, description) => {
+  createLibrary: async (name, description, folderPath, isTemporary = false) => {
     set({ libraryError: null });
+
+    if (isTemporary) {
+      // Temp library: localStorage only
+      const now = new Date().toISOString();
+      const lib: TempLibData = {
+        id: _nextSeq(LS_TEMP_LIB_SEQ_KEY),
+        name: name.trim(),
+        description: (description || '').trim(),
+        created_at: now,
+        updated_at: now,
+        created_at_ts: Date.now(),
+        papers: [],
+      };
+      const libs = _loadTempLibs();
+      libs.push(lib);
+      _saveTempLibs(libs);
+      const scholLib = _tempToScholarLibrary(lib);
+      set((s) => ({ libraries: [scholLib, ...s.libraries] }));
+      return scholLib;
+    }
+
+    // Permanent library: persist to server DB
     try {
-      const created = await createLibraryApi({ name: name.trim(), description });
+      const created = await createLibraryApi({
+        name: name.trim(),
+        description: description ?? '',
+        folder_path: folderPath ?? undefined,
+        is_temporary: false,
+      });
       await get().loadLibraries();
-      return { ...created, paper_count: 0, updated_at: created.created_at ?? '' } as ScholarLibrary;
+      return {
+        ...created,
+        paper_count: 0,
+        updated_at: created.created_at ?? '',
+        is_temporary: false,
+        folder_path: created.folder_path ?? null,
+      } as ScholarLibrary;
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
       set({ libraryError: message });
@@ -318,6 +480,20 @@ export const useScholarStore = create<ScholarState>()((set, get) => ({
 
   deleteLibrary: async (libId) => {
     set({ libraryError: null });
+
+    if (libId < 0) {
+      // Temp library: remove from localStorage
+      const libs = _loadTempLibs().filter((l) => l.id !== libId);
+      _saveTempLibs(libs);
+      set((s) => ({
+        libraries: s.libraries.filter((l) => l.id !== libId),
+        activeLibraryId: s.activeLibraryId === libId ? null : s.activeLibraryId,
+        libraryPapers: s.activeLibraryId === libId ? [] : s.libraryPapers,
+      }));
+      return;
+    }
+
+    // Permanent library: remove from server DB
     try {
       await deleteLibraryApi(libId);
       set((s) => ({
@@ -331,6 +507,10 @@ export const useScholarStore = create<ScholarState>()((set, get) => ({
     }
   },
 
+  clearTemporaryLibrary: async (libId) => {
+    await get().deleteLibrary(libId);
+  },
+
   setActiveLibrary: (libId) => {
     set({ activeLibraryId: libId, libraryPapers: [], libraryError: null });
     if (libId != null) get().loadLibraryPapers(libId);
@@ -338,6 +518,20 @@ export const useScholarStore = create<ScholarState>()((set, get) => ({
 
   loadLibraryPapers: async (libId) => {
     set({ libraryLoading: true, libraryError: null });
+
+    if (libId < 0) {
+      // Temp library: read from localStorage
+      const libs = _loadTempLibs();
+      const lib = libs.find((l) => l.id === libId);
+      set((s) =>
+        s.activeLibraryId === libId
+          ? { libraryPapers: lib?.papers ?? [], libraryLoading: false }
+          : { libraryLoading: false },
+      );
+      return;
+    }
+
+    // Permanent library: read from server
     try {
       const papers = await getLibraryPapers(libId);
       set((s) => (s.activeLibraryId === libId ? { libraryPapers: papers } : {}));
@@ -354,6 +548,26 @@ export const useScholarStore = create<ScholarState>()((set, get) => ({
     if (activeLibraryId == null) return null;
     const toAdd = indices.map((i) => results[i]).filter(Boolean) as ScholarSearchResult[];
     if (toAdd.length === 0) return null;
+
+    if (activeLibraryId < 0) {
+      // Temp library: write to localStorage
+      const libs = _loadTempLibs();
+      const lib = libs.find((l) => l.id === activeLibraryId);
+      if (!lib) return null;
+      const added = _appendToTempLib(lib, toAdd);
+      _saveTempLibs(libs);
+      // Refresh in-memory state
+      set((s) => ({
+        libraryPapers:
+          s.activeLibraryId === activeLibraryId ? [...lib.papers] : s.libraryPapers,
+        libraries: s.libraries.map((l) =>
+          l.id === activeLibraryId ? { ...l, paper_count: lib.papers.length, updated_at: lib.updated_at } : l,
+        ),
+      }));
+      return { added };
+    }
+
+    // Permanent library: write to server DB
     try {
       const res = await addPapersToLibraryApi(activeLibraryId, toAdd);
       await get().loadLibraryPapers(activeLibraryId);
@@ -365,6 +579,25 @@ export const useScholarStore = create<ScholarState>()((set, get) => ({
   },
 
   removeFromLibrary: async (libId, paperId) => {
+    if (libId < 0) {
+      // Temp library: remove from localStorage
+      const libs = _loadTempLibs();
+      const lib = libs.find((l) => l.id === libId);
+      if (lib) {
+        lib.papers = lib.papers.filter((p) => p.id !== paperId);
+        lib.updated_at = new Date().toISOString();
+        _saveTempLibs(libs);
+        set((s) => ({
+          libraryPapers: s.libraryPapers.filter((p) => p.id !== paperId),
+          libraries: s.libraries.map((l) =>
+            l.id === libId ? { ...l, paper_count: lib.papers.length, updated_at: lib.updated_at } : l,
+          ),
+        }));
+      }
+      return;
+    }
+
+    // Permanent library: remove from server DB
     try {
       await removePaperFromLibraryApi(libId, paperId);
       set((s) => ({
@@ -378,7 +611,7 @@ export const useScholarStore = create<ScholarState>()((set, get) => ({
   },
 
   downloadLibraryBatch: async (collection) => {
-    const { libraryPapers: papers } = get();
+    const { libraryPapers: papers, activeLibraryId } = get();
     if (papers.length === 0) return null;
     const req = papers.map((p) => ({
       title: p.title,
@@ -389,7 +622,12 @@ export const useScholarStore = create<ScholarState>()((set, get) => ({
       year: p.year ?? undefined,
     }));
     try {
-      const res = await batchDownloadPapers(req, { collection, max_concurrent: 3 });
+      const res = await batchDownloadPapers(req, {
+        collection,
+        max_concurrent: 3,
+        // Only pass library_id for permanent libs (server only knows about those)
+        library_id: activeLibraryId != null && activeLibraryId >= 0 ? activeLibraryId : undefined,
+      });
       set((s) => ({
         downloadTasks: {
           ...s.downloadTasks,

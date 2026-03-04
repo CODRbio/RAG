@@ -60,6 +60,8 @@ export interface ScholarLibrary {
   paper_count: number;
   created_at: string;
   updated_at: string;
+  is_temporary?: boolean;
+  folder_path?: string | null;
 }
 
 /** A paper saved in a scholar library. */
@@ -129,12 +131,13 @@ export async function batchDownloadPapers(
     authors?: string[];
     year?: number;
   }>,
-  options?: { collection?: string; max_concurrent?: number },
+  options?: { collection?: string; max_concurrent?: number; library_id?: number },
 ): Promise<{ status: string; task_id: string; total: number; message: string }> {
   const res = await client.post('/scholar/download/batch', {
     papers,
     collection: options?.collection,
     max_concurrent: options?.max_concurrent ?? 3,
+    library_id: options?.library_id,
   });
   return res.data;
 }
@@ -165,10 +168,14 @@ export async function listLibraries(): Promise<ScholarLibrary[]> {
 export async function createLibrary(params: {
   name: string;
   description?: string;
+  folder_path?: string | null;
+  is_temporary?: boolean;
 }): Promise<ScholarLibrary & { id: number }> {
   const res = await client.post<ScholarLibrary & { id: number }>('/scholar/libraries', {
     name: params.name,
     description: params.description ?? '',
+    folder_path: params.folder_path ?? undefined,
+    is_temporary: params.is_temporary ?? false,
   });
   return res.data;
 }

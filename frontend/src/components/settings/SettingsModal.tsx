@@ -1,9 +1,10 @@
-import { Settings, Brain, FileText, Cpu, ChevronDown, ChevronRight, Zap } from 'lucide-react';
+import { Settings, Brain, FileText, Cpu, ChevronDown, ChevronRight, Zap, Database } from 'lucide-react';
 import { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Modal } from '../ui/Modal';
 import { useUIStore, useConfigStore, useToastStore } from '../../stores';
 import { listUltraLiteProviders, type UltraLiteProviderOption } from '../../api/ingest';
+import { getDatabaseConfig, updateDatabaseConfig, DEFAULT_DATABASE_URL } from '../../api/config';
 
 type CiteKeyFormat = 'author_date' | 'numeric' | 'hash';
 type MergeLevel = 'document' | 'chunk';
@@ -34,11 +35,15 @@ export function SettingsModal() {
   );
 
   const [expandedSections, setExpandedSections] = useState<Set<string>>(
-    new Set(['citation', 'reranker', 'graph', 'ultralite'])
+    new Set(['citation', 'reranker', 'graph', 'ultralite', 'database'])
   );
+  const [databaseUrl, setDatabaseUrl] = useState<string>(DEFAULT_DATABASE_URL);
 
   useEffect(() => {
     if (!showSettingsModal) return;
+    getDatabaseConfig()
+      .then((c) => setDatabaseUrl(c.url || DEFAULT_DATABASE_URL))
+      .catch(() => setDatabaseUrl(DEFAULT_DATABASE_URL));
     listUltraLiteProviders(false)
       .then((data) => {
         setUltraLiteOptions(data.providers || []);
@@ -56,10 +61,17 @@ export function SettingsModal() {
     });
   };
 
-  const handleSave = () => {
+  const handleSave = async () => {
     localStorage.setItem('adv_cite_key_format', citeKeyFormat);
     localStorage.setItem('adv_merge_level', mergeLevel);
     localStorage.setItem('adv_reranker_mode', rerankerMode);
+    const urlToSave = databaseUrl.trim() || DEFAULT_DATABASE_URL;
+    try {
+      await updateDatabaseConfig(urlToSave);
+    } catch {
+      addToast(t('settings.databaseSaveError'), 'error');
+      return;
+    }
     addToast(t('settings.saved'), 'success');
     setShowSettingsModal(false);
   };
@@ -248,6 +260,28 @@ export function SettingsModal() {
                 ))}
               </select>
               <p className="text-[10px] text-slate-400">{t('settings.ultraLiteDesc')}</p>
+            </div>
+          )}
+        </div>
+
+        {/* ── 数据库 ── */}
+        <div className="border border-slate-700 rounded-lg p-3 bg-slate-800/50">
+          <SectionHeader
+            id="database"
+            icon={<Database size={14} className="text-emerald-400" />}
+            title={t('settings.database')}
+          />
+          {expandedSections.has('database') && (
+            <div className="space-y-2 pt-2 pl-5">
+              <label className="block text-xs text-slate-300 mb-1.5">{t('settings.databaseUrl')}</label>
+              <input
+                type="text"
+                value={databaseUrl}
+                onChange={(e) => setDatabaseUrl(e.target.value)}
+                placeholder={t('settings.databaseUrlPlaceholder')}
+                className="w-full rounded border border-slate-600 bg-slate-800 text-slate-200 text-sm px-2.5 py-1.5 focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 outline-none"
+              />
+              <p className="text-[10px] text-slate-400">{t('settings.databaseUrlRestart')}</p>
             </div>
           )}
         </div>

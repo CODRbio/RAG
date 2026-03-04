@@ -196,10 +196,11 @@ async def process_download_and_ingest(
     task_id: str,
     paper_info: Dict[str, Any],
     collection: Optional[str] = None,
+    download_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Download one paper PDF then trigger ingest into the given collection.
-    PDF stays in download_dir; state/events written to Redis for GET /scholar/task/{task_id}.
+    PDF stays in download_dir (or library folder); state/events written to Redis for GET /scholar/task/{task_id}.
     """
     from src.retrieval.downloader.adapter import get_adapter
 
@@ -230,6 +231,7 @@ async def process_download_and_ingest(
             annas_md5=paper_info.get("annas_md5"),
             authors=paper_info.get("authors"),
             year=paper_info.get("year"),
+            download_dir=download_dir,
         )
     except Exception as e:
         logger.exception("download_and_ingest download failed task_id=%s: %s", task_id, e)
