@@ -66,14 +66,102 @@ SCIHUB_ERROR = "error"
 # Playwright 版本已废弃（DDoS-Guard 不稳定）
 
 
-def load_config(config_path: str = "config.json") -> dict:
-    """加载配置文件"""
+def _project_config_root() -> str:
+    """项目 config 目录（与 config/settings、src/db/engine 等一致：repo/config）。"""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "config")
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """深度合并 override 到 base，与 config/settings 行为一致。"""
+    result = dict(base)
+    for key, value in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def _load_rag_config() -> Tuple[dict, str]:
+    """
+    加载项目全局配置：config/rag_config.json + config/rag_config.local.json（本地覆盖）。
+    返回 (合并后的原始配置, 使用的 config 目录路径)。
+    """
+    root = _project_config_root()
+    base_path = os.path.join(root, "rag_config.json")
+    local_path = os.path.join(root, "rag_config.local.json")
+    raw = {}
+    if os.path.exists(base_path):
+        try:
+            with open(base_path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except Exception as e:
+            logger.warning(f"加载 {base_path} 失败: {e}")
+    if os.path.exists(local_path):
+        try:
+            with open(local_path, "r", encoding="utf-8") as f:
+                local = json.load(f)
+            raw = _deep_merge(raw, local)
+        except Exception as e:
+            logger.warning(f"加载 {local_path} 失败: {e}")
+    return raw, root
+
+
+def _normalize_rag_config_to_downloader(raw: dict) -> dict:
+    """
+    将 rag_config 结构转为 PaperDownloader 使用的结构：
+    api_keys (twocaptcha, brightdata), downloader (proxy, timeouts, experience_store_path, capsolver_extension_path)。
+    与 adapter 中 initial_config 的构建逻辑对齐。
+    """
+    sd = raw.get("scholar_downloader") or {}
+    cf = raw.get("content_fetcher") or {}
+    twocaptcha = (sd.get("twocaptcha_api_key") or "").strip()
+    if not twocaptcha:
+        twocaptcha = (cf.get("two_captcha_api_key") or "").strip()
+    brightdata = (cf.get("brightdata_api_key") or "").strip()
+    api_keys = {
+        "twocaptcha": twocaptcha,
+        "brightdata": brightdata,
+    }
+    dl = {
+        "proxy": sd.get("proxy"),
+        "experience_store_path": sd.get("experience_store_path"),
+        "timeouts": sd.get("timeouts") or {},
+    }
+    ext = (raw.get("capsolver_extension_path") or sd.get("capsolver_extension_path") or "").strip()
+    if ext:
+        dl["capsolver_extension_path"] = ext
+    return {
+        "api_keys": api_keys,
+        "downloader": dl,
+        "annas_keyword_max_pages": sd.get("annas_keyword_max_pages", 5),
+    }
+
+
+def load_config(config_path: Optional[str] = "config.json") -> dict:
+    """
+    加载配置。与项目全局配置一致：
+    - 若 config_path 为 None、默认 "config.json" 或该路径不存在，则加载
+      config/rag_config.json + config/rag_config.local.json 并归一化为下载器结构。
+    - 否则从给定路径加载；若内容含 scholar_downloader 则同样归一化。
+    """
+    use_project = config_path is None or config_path == "config.json"
+    if use_project or not (config_path and os.path.exists(config_path)):
+        raw, _ = _load_rag_config()
+        if raw:
+            return _normalize_rag_config_to_downloader(raw)
+        if use_project:
+            logger.debug("未找到项目 config，使用空配置")
+        return {}
     try:
-        with open(config_path, 'r', encoding='utf-8') as f:
-            return json.load(f)
+        with open(config_path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
     except Exception as e:
         logger.warning(f"无法加载配置文件 {config_path}: {e}")
         return {}
+    if "scholar_downloader" in loaded or "content_fetcher" in loaded:
+        return _normalize_rag_config_to_downloader(loaded)
+    return loaded
 
 
 # ===== 阶段1：页面分析能力（仅用于诊断日志，不改变流程）=====
@@ -330,10 +418,10 @@ class PageAnalyzer:
                     return elements;
                 }
                 function getKey(el) {
-                    return el.tagName + '|' + (el.href || '') + '|' + (el.innerText || '').slice(0, 50);
+                    return el.tagName + '|' + (el.href || '') + '|' + (el.textContent || '').slice(0, 50);
                 }
                 function isPdfRelated(el) {
-                    const text = (el.innerText || '').toLowerCase();
+                    const text = (el.textContent || '').toLowerCase();
                     const href = (el.href || '').toLowerCase();
                     const className = (el.className || '').toLowerCase();
                     const title = (el.title || '').toLowerCase();
@@ -381,7 +469,7 @@ class PageAnalyzer:
                     results.push({
                         selector: '[data-dl-uid="' + uid + '"]',
                         tag: tag,
-                        text: (el.innerText || el.value || '').slice(0, 100).trim(),
+                        text: (el.textContent || el.value || '').replace(/\\s+/g, ' ').slice(0, 100).trim(),
                         href: isLink ? (el.href || '') : null,
                         is_visible: rect.width > 0 && rect.height > 0 && el.offsetParent !== null,
                         position_y: rect.top + window.scrollY,
@@ -1169,6 +1257,8 @@ class PaperDownloader:
             ],
             'ssrn': [
                 'a[href*="Delivery.cfm"][href*=".pdf"]',
+                'a.abstract-buttons__delivery-button',
+                'button:has-text("Download This Paper")',
             ],
             'science': [
                 'a[data-item-name="download-pdf"]',
@@ -1184,6 +1274,34 @@ class PaperDownloader:
                 'a:has-text("Download full-text PDF")',
                 'a:has-text("Download file PDF")',
                 '.js-target-download-btn',
+            ],
+            'arxiv': [
+                'a.download-pdf',
+                'a[href^="/pdf/"]',
+            ],
+            'biorxiv_medrxiv': [
+                'a.article-dl-pdf-link',
+                'a.article-dl-pdf-link-main',
+                'a[href$=".full.pdf"]',
+            ],
+            'chemrxiv': [
+                'button:has-text("Download PDF")',
+                'a[href*="/api/articles/"][href*="/pdf"]',
+            ],
+            'research_square': [
+                'a[data-test="download-pdf-button"]',
+                'a.download-pdf',
+            ],
+            'osf_preprints': [
+                'a:has-text("Download preprint")',
+                'a.btn-primary:has-text("Download")',
+            ],
+            'pmc': [
+                'a.int-view[href*="/pdf/"]',
+                'a[data-action="pdf_link"]',
+                'a.article-pdf',
+                'a[data-panel-name="article-pdf"]',
+                'a.article-dl-pdf-link-ext',
             ],
         },
         
@@ -1355,6 +1473,12 @@ class PaperDownloader:
         'ssrn': ['ssrn.com'],
         'science': ['science.org', 'sciencemag.org'],
         'researchgate': ['researchgate.net'],
+        'arxiv': ['arxiv.org'],
+        'biorxiv_medrxiv': ['biorxiv.org', 'medrxiv.org'],
+        'chemrxiv': ['chemrxiv.org'],
+        'research_square': ['researchsquare.com'],
+        'osf_preprints': ['osf.io'],
+        'pmc': ['ncbi.nlm.nih.gov/pmc', 'europepmc.org'],
     }
     
     def __init__(self, download_dir: str = "papers", max_concurrent: int = 5, show_browser: bool = False,
@@ -1382,8 +1506,11 @@ class PaperDownloader:
         # 配置：优先使用 initial_config（与 RAG 项目统一），否则从 config_path 加载
         if initial_config is not None:
             self.config = dict(initial_config)
+            self._config_dir = None  # adapter 传入时相对路径用 download_dir
         else:
             self.config = load_config(config_path)
+            # 使用项目 config 时，相对路径以 config 目录为基准
+            self._config_dir = _project_config_root() if (config_path is None or config_path == "config.json") else None
         # 统一超时配置（可在 config.json -> downloader.timeouts 覆盖）
         default_timeouts = {
             "session_acquire_timeout": 15,
@@ -1501,8 +1628,10 @@ class PaperDownloader:
             if os.path.isabs(configured_path):
                 self.experience_store_path = configured_path
             else:
-                # 相对路径：相对于 config_path 所在目录；若 initial_config 无路径则相对 download_dir
-                if config_path and os.path.exists(config_path):
+                # 相对路径：项目 config 目录、或 config_path 所在目录、或 download_dir
+                if getattr(self, "_config_dir", None) and os.path.isdir(self._config_dir):
+                    config_dir = self._config_dir
+                elif config_path and os.path.exists(config_path):
                     config_dir = os.path.dirname(os.path.abspath(config_path))
                 else:
                     config_dir = self.download_dir
@@ -2521,8 +2650,6 @@ class PaperDownloader:
         # 3. 域名特殊处理（某些域名的所有链接都是 PDF）
         pdf_domains = [
             "europepmc.org/articles/",  # Europe PMC 文章页直接是 PDF
-            "biorxiv.org/content/",     # bioRxiv 内容页
-            "medrxiv.org/content/",     # medRxiv 内容页
         ]
         
         for domain_pattern in pdf_domains:
@@ -4573,6 +4700,41 @@ class PaperDownloader:
                 doi = paper.get('doi')
                 source = paper.get('source', '')  # 提取来源标识
                 
+                # ==========================================================
+                # ==== 预印本及开放获取平台 URL 智能推断（绕过渲染，提速核心）====
+                # ==========================================================
+                if not pdf_url and url:
+                    url_lower = url.lower()
+                    
+                    # 1. arXiv: /abs/ -> /pdf/ + .pdf
+                    if 'arxiv.org/abs/' in url_lower:
+                        arxiv_match = re.search(r'arxiv\.org/abs/([a-z\-]+/\d+(?:v\d+)?|\d+\.\d+(?:v\d+)?)', url_lower)
+                        if arxiv_match:
+                            pdf_url = f"https://arxiv.org/pdf/{arxiv_match.group(1)}.pdf"
+                            self.logger.info(f"[智能推断] arXiv PDF直链: {pdf_url}")
+                            
+                    # 2. bioRxiv / medRxiv: 加上 .full.pdf 后缀
+                    elif 'biorxiv.org/content/' in url_lower or 'medrxiv.org/content/' in url_lower:
+                        if not url_lower.endswith('.full.pdf') and not url_lower.endswith('.pdf'):
+                            clean_url = url.split('?')[0].rstrip('/')
+                            pdf_url = f"{clean_url}.full.pdf"
+                            self.logger.info(f"[智能推断] bioRxiv/medRxiv PDF直链: {pdf_url}")
+                            
+                    # 3. OSF Preprints: 提取 ID 后接 /download
+                    elif 'osf.io/' in url_lower and '/download' not in url_lower:
+                        osf_match = re.search(r'osf\.io/(?:preprints/[^/]+/)?([a-zA-Z0-9]{4,6})/?$', url.split('?')[0])
+                        if osf_match:
+                            pdf_url = f"https://osf.io/{osf_match.group(1)}/download"
+                            self.logger.info(f"[智能推断] OSF Preprints PDF直链: {pdf_url}")
+                            
+                    # 4. Research Square: 直接加 .pdf 后缀
+                    elif 'researchsquare.com/article/' in url_lower:
+                        if not url_lower.endswith('.pdf'):
+                            clean_url = url.split('?')[0].rstrip('/')
+                            pdf_url = f"{clean_url}.pdf"
+                            self.logger.info(f"[智能推断] Research Square PDF直链: {pdf_url}")
+                # ==========================================================
+                
                 # 确保至少有URL或DOI
                 if not url and not pdf_url and not doi:
                     self.logger.warning(f"跳过没有URL、PDF链接和DOI的论文: {title}")
@@ -5517,6 +5679,46 @@ class PaperDownloader:
                 except Exception:
                     locator = None
             
+            if locator is None and element.selector and 'data-dl-uid' in element.selector:
+                self.logger.info(f"[点击] 常规定位失败，启动 Shadow DOM 穿透打捞: {element.selector}")
+                uid_match = re.search(r'data-dl-uid="([^"]+)"', element.selector)
+                if uid_match:
+                    uid_str = uid_match.group(1)
+                    try:
+                        async with page.expect_download(timeout=self.timeouts.get("download_event_timeout", 15) * 1000) as dl_info:
+                            clicked_via_js = await page.evaluate('''async (targetUid) => {
+                                function findElementByUid(root, uid) {
+                                    if (root.querySelector && root.querySelector(`[data-dl-uid="${uid}"]`))
+                                        return root.querySelector(`[data-dl-uid="${uid}"]`);
+                                    const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, null, false);
+                                    let node;
+                                    while (node = walker.nextNode()) {
+                                        if (node.shadowRoot) {
+                                            let found = findElementByUid(node.shadowRoot, uid);
+                                            if (found) return found;
+                                        }
+                                    }
+                                    return null;
+                                }
+                                const el = findElementByUid(document.body, targetUid);
+                                if (el) {
+                                    const ev = new MouseEvent('click', { view: window, bubbles: true, cancelable: true, clientX: window.innerWidth/2, clientY: window.innerHeight/2 });
+                                    el.dispatchEvent(ev);
+                                    if (el.firstElementChild) el.firstElementChild.dispatchEvent(ev);
+                                    el.click();
+                                    return true;
+                                }
+                                return false;
+                            }''', uid_str)
+                        if clicked_via_js:
+                            download = await dl_info.value
+                            local_task_dir = task_download_dir or self._create_task_download_dir()[0]
+                            if await self._save_and_validate_download(download, filepath, local_task_dir, "shadow_dom_click"):
+                                self.logger.info("[点击] Shadow DOM 穿透触发下载成功")
+                                return True
+                    except Exception as e:
+                        self.logger.debug(f"[点击] Shadow DOM 探测异常: {e}")
+            
             if locator is None:
                 self.logger.debug(f"[点击] 无法定位元素: {element.selector}")
                 return False
@@ -5837,7 +6039,7 @@ class PaperDownloader:
         except Exception as e:
             self.logger.debug(f"[内联PDF] 查找嵌入PDF失败: {e}")
         
-        # 方法3: JS fetch 作为最后兜底
+        # 方法3: JS fetch 作为最后兜底 (使用原生 FileReader 防大文件内存溢出)
         try:
             pdf_data = await page.evaluate('''async () => {
                 try {
@@ -5845,29 +6047,25 @@ class PaperDownloader:
                         credentials: 'include',
                         headers: { 'Accept': 'application/pdf' }
                     });
+                    if (!response.ok) return null;
                     const blob = await response.blob();
-                    if (blob.type === 'application/pdf' || blob.type.includes('pdf')) {
-                        const buffer = await blob.arrayBuffer();
-                        const bytes = new Uint8Array(buffer);
-                        let binary = '';
-                        for (let i = 0; i < bytes.length; i++) {
-                            binary += String.fromCharCode(bytes[i]);
-                        }
-                        return btoa(binary);
+                    if (blob.type === 'application/pdf' || blob.type.includes('pdf') || blob.size > 1000) {
+                        return await new Promise((resolve, reject) => {
+                            const reader = new FileReader();
+                            reader.onloadend = () => resolve(reader.result.split(',')[1]);
+                            reader.onerror = reject;
+                            reader.readAsDataURL(blob);
+                        });
                     }
-                } catch (e) {
-                    console.error('PDF fetch error:', e);
-                }
+                } catch (e) { console.error('PDF fetch error:', e); }
                 return null;
             }''')
             
             if pdf_data:
-                pdf_bytes = base64.b64decode(pdf_data)
                 with open(filepath, 'wb') as f:
-                    f.write(pdf_bytes)
-                
+                    f.write(base64.b64decode(pdf_data))
                 if self.is_valid_pdf_file(filepath):
-                    self.logger.info(f"[内联PDF] JS fetch 成功")
+                    self.logger.info(f"[内联PDF] JS fetch (FileReader) 成功")
                     return True
                 else:
                     try:
@@ -6019,19 +6217,24 @@ class PaperDownloader:
                 task_popups.append(new_page)
             page.context.on("page", _on_page_created)
 
-            # 全局 XHR/Fetch 底层流量嗅探（拦截后台 Blob 构建前的 PDF 流）
-            sniffed_pdf_urls = []
-            def _on_response_sniff(response):
+            # 全局 XHR/Fetch 底层流量嗅探（直接截取内存二进制流，破解一次性 Token）
+            sniffed_pdf_buffers = []
+            async def _on_response_sniff(response):
                 try:
                     if response.status == 200 and response.request.method not in ("OPTIONS", "HEAD"):
                         ct = (response.headers.get("content-type") or "").lower()
                         req_url = response.url
                         ru = req_url.lower()
-                        if (("application/pdf" in ct or "application/epub" in ct or ru.endswith(".pdf"))
+                        if (("application/pdf" in ct or "application/epub" in ct or ru.split('?')[0].endswith(".pdf"))
                                 and ru != page.url.lower() and not ru.startswith("data:")):
-                            self.logger.info(f"[流量嗅探] 截获后台PDF流: {req_url[:80]}")
-                            if req_url not in sniffed_pdf_urls:
-                                sniffed_pdf_urls.append(req_url)
+                            self.logger.info(f"[流量嗅探] 发现后台深层 PDF 响应: {req_url[:80]}")
+                            try:
+                                body = await response.body()
+                                if body and len(body) > 10240:
+                                    sniffed_pdf_buffers.append((req_url, body))
+                                    self.logger.info(f"[流量嗅探] 成功截获内存二进制流，大小: {len(body)} bytes")
+                            except Exception as body_e:
+                                self.logger.debug(f"[流量嗅探] 提取 Body 失败(流可能未结束或跨域限制): {body_e}")
                 except Exception:
                     pass
             page.on("response", _on_response_sniff)
@@ -6385,8 +6588,21 @@ class PaperDownloader:
                         # citation_pdf_url 隐藏通道（相对路径自动转绝对路径）
                         try:
                             citation_pdf = await page.evaluate("""() => {
-                                const meta = document.querySelector('meta[name="citation_pdf_url"]');
-                                return meta ? new URL(meta.content, document.baseURI).href : null;
+                                const tags = [
+                                    'citation_pdf_url',
+                                    'eprints.document_url',
+                                    'wkhealth_pdf_url',
+                                    'bepress_citation_pdf_url',
+                                    'prism.url'
+                                ];
+                                for (const tag of tags) {
+                                    const meta = document.querySelector(`meta[name="${tag}"]`);
+                                    if (meta && meta.content && meta.content.toLowerCase().endsWith('.pdf')
+                                        && !meta.content.includes('researchgate.net/publication/')) {
+                                        return new URL(meta.content, document.baseURI).href;
+                                    }
+                                }
+                                return null;
                             }""")
                             if citation_pdf:
                                 self.logger.info(f"[Meta] 发现 citation_pdf_url: {citation_pdf[:100]}")
@@ -6424,8 +6640,21 @@ class PaperDownloader:
                     # citation_pdf_url 隐藏通道（相对路径自动转绝对路径）
                     try:
                         citation_pdf = await page.evaluate("""() => {
-                            const meta = document.querySelector('meta[name="citation_pdf_url"]');
-                            return meta ? new URL(meta.content, document.baseURI).href : null;
+                            const tags = [
+                                'citation_pdf_url',
+                                'eprints.document_url',
+                                'wkhealth_pdf_url',
+                                'bepress_citation_pdf_url',
+                                'prism.url'
+                            ];
+                            for (const tag of tags) {
+                                const meta = document.querySelector(`meta[name="${tag}"]`);
+                                if (meta && meta.content && meta.content.toLowerCase().endsWith('.pdf')
+                                    && !meta.content.includes('researchgate.net/publication/')) {
+                                    return new URL(meta.content, document.baseURI).href;
+                                }
+                            }
+                            return null;
                         }""")
                         if citation_pdf:
                             self.logger.info(f"[Meta] 发现 citation_pdf_url: {citation_pdf[:100]}")
@@ -7166,11 +7395,18 @@ class PaperDownloader:
             if not finished:
                 if await _consume_download_event("end-of-flow"):
                     return True
-                for s_url in list(sniffed_pdf_urls):
-                    self.logger.info(f"[网络嗅探] 尝试嗅探到的 URL: {s_url[:80]}")
-                    if await self.download_direct(s_url, filepath, page=page):
-                        if self.is_valid_pdf_file(filepath):
-                            self.logger.info("[网络嗅探] 成功!")
+                if sniffed_pdf_buffers:
+                    for s_url, s_body in sniffed_pdf_buffers:
+                        self.logger.info(f"[网络嗅探] 释放内存截获的 PDF 数据: {s_url[:80]}")
+                        temp_filepath = os.path.join(task_download_dir, "sniffed_memory.pdf")
+                        with open(temp_filepath, 'wb') as f:
+                            f.write(s_body)
+                        if self.is_valid_pdf_file(temp_filepath):
+                            if os.path.exists(filepath):
+                                os.remove(filepath)
+                            shutil.move(temp_filepath, filepath)
+                            self._record_download_success(filepath, url, title=title, authors=authors, method="memory_sniffing")
+                            self.logger.info("[网络嗅探] 内存二进制流兜底落盘成功!")
                             finished = True
                             return True
                 if await _salvage_downloaded_pdf("end-of-flow"):
