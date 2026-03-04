@@ -64,7 +64,7 @@ export interface ScholarLibrary {
   folder_path?: string | null;
 }
 
-/** A paper saved in a scholar library. */
+/** A paper saved in a scholar library (literature catalog). */
 export interface ScholarLibraryPaper {
   id: number;
   library_id: number;
@@ -78,6 +78,8 @@ export interface ScholarLibraryPaper {
   score: number;
   annas_md5: string | null;
   added_at: string;
+  /** ISO timestamp when PDF was downloaded to this library; null if not yet downloaded. */
+  downloaded_at?: string | null;
 }
 
 export type ScholarSource = 'google_scholar' | 'google' | 'semantic' | 'semantic_relevance' | 'semantic_bulk' | 'ncbi' | 'annas_archive';

@@ -14,11 +14,13 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import APIRouter, Body, File, Form, UploadFile, HTTPException
+from fastapi import APIRouter, Body, Depends, File, Form, UploadFile, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 
 from config.settings import settings
+from src.api.routes_auth import get_current_user_id
 from src.log import get_logger
+from src.utils.path_manager import PathManager
 
 logger = get_logger(__name__)
 
@@ -187,10 +189,10 @@ def refresh_collection_scope(name: str, body: Optional[dict] = Body(None)) -> di
 # ============================================================
 
 @router.get("/collections/{name}/papers")
-def list_papers_in_collection(name: str) -> dict:
-    """列出指定集合中已入库的文件列表"""
+def list_papers_in_collection(name: str, user_id: str = Depends(get_current_user_id)) -> dict:
+    """列出指定集合中已入库的文件列表（仅当前用户）"""
     from src.indexing.paper_store import list_papers
-    papers = list_papers(name)
+    papers = list_papers(name, user_id=user_id)
     return {"collection": name, "papers": papers}
 
 
@@ -231,12 +233,12 @@ def delete_paper_from_collection(name: str, paper_id: str) -> dict:
 async def upload_files(
     files: List[UploadFile] = File(...),
     collection: str = Form(""),
+    user_id: str = Depends(get_current_user_id),
 ) -> dict:
     """
-    上传文件（PDF 等），保存到 data/raw_papers/，返回文件信息列表。
+    上传文件（PDF 等），保存到当前用户 raw_papers 目录，返回文件信息列表。
     """
-    raw_papers = settings.path.raw_papers
-    raw_papers.mkdir(parents=True, exist_ok=True)
+    raw_papers = PathManager.get_user_raw_papers_path(user_id)
 
     saved = []
     for f in files:
@@ -428,7 +430,8 @@ def _run_ingest_job(job_id: str, cfg: dict) -> None:
         overlap_sentences=settings.chunk.overlap_sentences,
         table_rows_per_chunk=settings.chunk.table_rows_per_chunk,
     )
-    parsed_dir = settings.path.parsed
+    user_id = cfg.get("user_id", PathManager.DEFAULT_USER_ID)
+    parsed_dir = PathManager.get_user_parsed_path(user_id)
     processed_files = 0
     failed_files = 0
     sample_texts_for_scope: List[str] = []  # 收集片段供入库完成后生成 scope 摘要
@@ -694,6 +697,7 @@ def _run_ingest_job(job_id: str, cfg: dict) -> None:
                     figure_success=figure_success,
                     status="done",
                     content_hash=content_hashes.get(fpath, ""),
+                    user_id=user_id,
                 )
             except Exception as pe:
                 logger.warning("paper_store write failed: %s", pe)
@@ -713,6 +717,7 @@ def _run_ingest_job(job_id: str, cfg: dict) -> None:
                     status="error",
                     error_message=str(e),
                     content_hash=content_hashes.get(fpath, ""),
+                    user_id=user_id,
                 )
             except Exception:
                 pass
@@ -785,28 +790,38 @@ def _run_ingest_job_safe(job_id: str, cfg: dict) -> None:
 
 
 @router.post("/process")
-def process_files(body: dict) -> JSONResponse:
+def process_files(
+    body: dict,
+    user_id: str = Depends(get_current_user_id),
+) -> JSONResponse:
     """创建入库任务并立即返回 job_id（Worker 将自动领取并执行）。"""
     from src.indexing.ingest_job_store import create_job
 
     cfg = _normalize_process_body(body)
+    cfg["user_id"] = user_id
     job = create_job(cfg["collection_name"], cfg, total_files=len(cfg["file_paths"]))
     job_id = job.get("job_id")
     return JSONResponse({"ok": True, "job_id": job_id})
 
 
 @router.get("/jobs")
-def list_ingest_jobs(limit: int = 20, status: Optional[str] = None) -> dict:
+def list_ingest_jobs(
+    limit: int = 20,
+    status: Optional[str] = None,
+    user_id: str = Depends(get_current_user_id),
+) -> dict:
     from src.indexing.ingest_job_store import list_jobs
-    jobs = list_jobs(limit=limit, status=status)
+    jobs = list_jobs(limit=limit, status=status, user_id=user_id)
     return {"jobs": jobs}
 
 
 @router.get("/jobs/{job_id}")
-def get_ingest_job(job_id: str) -> dict:
+def get_ingest_job(job_id: str, user_id: str = Depends(get_current_user_id)) -> dict:
     from src.indexing.ingest_job_store import get_job
     job = get_job(job_id)
     if not job:
+        raise HTTPException(status_code=404, detail="job 不存在")
+    if job.get("user_id") != user_id:
         raise HTTPException(status_code=404, detail="job 不存在")
     return {"job": job}
 

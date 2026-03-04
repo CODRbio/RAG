@@ -263,14 +263,8 @@ export const useScholarStore = create<ScholarState>()((set, get) => ({
         use_serpapi: source === 'google_scholar' || source === 'google' ? useSerpapi : undefined,
         serpapi_ratio: source === 'google_scholar' || source === 'google' ? serpapiRatio / 100 : undefined,
       });
-      set({ results, selectedIndices: [] });
-
-      // Auto-save all results to the active library (fire-and-forget, dedup handled inside)
-      const { activeLibraryId } = get();
-      if (activeLibraryId != null && results.length > 0) {
-        const allIndices = results.map((_, i) => i);
-        get().addResultsToLibrary(allIndices);
-      }
+      // Default: select all; user can deselect then click 加入子库 to add only selected (DOI dedup on server)
+      set({ results, selectedIndices: results.map((_, i) => i) });
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
       set({ results: [], searchError: message });
@@ -279,7 +273,7 @@ export const useScholarStore = create<ScholarState>()((set, get) => ({
     }
   },
 
-  downloadOne: async (index, collection, autoIngest = true) => {
+  downloadOne: async (index, collection, autoIngest = false) => {
     const { results } = get();
     const item = results[index];
     if (!item?.metadata) return null;
@@ -471,8 +465,9 @@ export const useScholarStore = create<ScholarState>()((set, get) => ({
         is_temporary: false,
         folder_path: created.folder_path ?? null,
       } as ScholarLibrary;
-    } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
+    } catch (e: unknown) {
+      const ax = e as { response?: { data?: { detail?: string } }; message?: string };
+      const message = ax.response?.data?.detail ?? ax.message ?? String(e);
       set({ libraryError: message });
       return null;
     }

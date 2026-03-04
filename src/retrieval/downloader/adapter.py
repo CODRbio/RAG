@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional
 
 from config.settings import settings
 from src.log import get_logger
+from src.utils.path_manager import PathManager
 
 from .utils import is_valid_pdf
 
@@ -74,14 +75,13 @@ class ScholarDownloaderAdapter:
 
     def __init__(self) -> None:
         cfg = settings.scholar_downloader
-        self.download_dir = cfg.download_dir
+        self.download_dir = str(PathManager.get_user_raw_papers_path(PathManager.DEFAULT_USER_ID))
         self.show_browser = cfg.show_browser
         self.persist_browser = cfg.persist_browser
         self.proxy = cfg.proxy
         self.extension_path = getattr(settings, "capsolver_extension_path", "extra_tools/CapSolverExtension") or "extra_tools/CapSolverExtension"
         self.annas_api_key = cfg.annas_archive_api_key or ""
         self.max_concurrent = cfg.max_concurrent_downloads
-        os.makedirs(self.download_dir, exist_ok=True)
 
         # 与当前项目配置统一：从 RAG settings 构建 downloader 使用的 config 结构
         api_keys: Dict[str, str] = {

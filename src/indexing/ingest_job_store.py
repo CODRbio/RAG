@@ -19,9 +19,11 @@ from src.db.models import IngestJob, IngestJobEvent
 def create_job(collection: str, payload: Dict[str, Any], total_files: int) -> Dict[str, Any]:
     now = time.time()
     job_id = uuid.uuid4().hex
+    user_id = payload.get("user_id", "default")
     with Session(get_engine()) as session:
         row = IngestJob(
             job_id=job_id,
+            user_id=user_id,
             collection=collection,
             status="pending",
             total_files=int(total_files),
@@ -79,12 +81,15 @@ def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     return row.to_dict()
 
 
-def list_jobs(limit: int = 20, status: Optional[str] = None) -> List[Dict[str, Any]]:
+def list_jobs(limit: int = 20, status: Optional[str] = None, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
     limit = max(1, min(int(limit), 200))
     with Session(get_engine()) as session:
-        stmt = select(IngestJob).order_by(IngestJob.created_at.desc()).limit(limit)
+        stmt = select(IngestJob)
+        if user_id is not None:
+            stmt = stmt.where(IngestJob.user_id == user_id)
         if status:
-            stmt = select(IngestJob).where(IngestJob.status == status).order_by(IngestJob.created_at.desc()).limit(limit)
+            stmt = stmt.where(IngestJob.status == status)
+        stmt = stmt.order_by(IngestJob.created_at.desc()).limit(limit)
         rows = session.exec(stmt).all()
     return [r.to_dict() for r in rows]
 

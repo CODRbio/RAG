@@ -16,14 +16,9 @@ export async function updateDatabaseConfig(url: string): Promise<{ url: string; 
   return res.data;
 }
 
+/** No-op: native folder picker removed (headless/server). Use listDir for path selection or rely on server-managed paths. */
 export async function pickFolder(): Promise<string | null> {
-  try {
-    const res = await client.get<{ path: string }>('/config/pick-folder');
-    return res.data.path ?? null;
-  } catch (e) {
-    if ((e as { response?: { status?: number } })?.response?.status === 204) return null;
-    throw e;
-  }
+  return null;
 }
 
 export interface DirEntry {

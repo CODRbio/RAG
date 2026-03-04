@@ -32,6 +32,7 @@ def create_job(
     request_payload: Optional[Dict[str, Any]] = None,
     job_id: Optional[str] = None,
     status: str = "pending",
+    user_id: str = "default",
 ) -> Dict[str, Any]:
     now = time.time()
     if not job_id:
@@ -39,6 +40,7 @@ def create_job(
     with Session(get_engine()) as session:
         row = DeepResearchJob(
             job_id=job_id,
+            user_id=user_id,
             topic=topic,
             session_id=session_id,
             canvas_id=canvas_id,

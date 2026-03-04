@@ -17,14 +17,12 @@ import {
   BookmarkCheck,
   Trash2,
   FolderPlus,
-  FolderOpen,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useScholarStore } from '../stores/useScholarStore';
 import { useConfigStore } from '../stores/useConfigStore';
 import { useToastStore } from '../stores/useToastStore';
 import { PdfViewerModal } from '../components/ui/PdfViewerModal';
-import { FolderBrowserModal } from '../components/ui/FolderBrowserModal';
 import { getPdfViewUrl } from '../api/scholar';
 import type { ScholarSource, ScholarLibraryPaper } from '../api/scholar';
 
@@ -99,8 +97,6 @@ export function ScholarPage() {
   const [showNewLibraryModal, setShowNewLibraryModal] = useState(false);
   const [newLibraryName, setNewLibraryName] = useState('');
   const [newLibraryDesc, setNewLibraryDesc] = useState('');
-  const [newLibraryFolderPath, setNewLibraryFolderPath] = useState('');
-  const [showFolderBrowser, setShowFolderBrowser] = useState(false);
   const [addingToLibrary, setAddingToLibrary] = useState(false);
 
   useEffect(() => {
@@ -421,35 +417,12 @@ export function ScholarPage() {
                   className="w-full rounded-lg border border-slate-600 bg-slate-800/60 px-3 py-2 text-slate-200 text-sm focus:outline-none focus:ring-1 focus:ring-sky-500/50"
                 />
               </div>
-              <div>
-                <label className="block text-xs text-slate-400 mb-1">{t('scholar.libraryFolderPath')}</label>
-                <div className="flex gap-2">
-                  <input
-                    type="text"
-                    value={newLibraryFolderPath}
-                    onChange={(e) => setNewLibraryFolderPath(e.target.value)}
-                    placeholder={t('scholar.libraryFolderPathPlaceholder')}
-                    className="flex-1 rounded-lg border border-slate-600 bg-slate-800/60 px-3 py-2 text-slate-200 text-sm focus:outline-none focus:ring-1 focus:ring-sky-500/50"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setShowFolderBrowser(true)}
-                    className="flex-shrink-0 flex items-center gap-1.5 px-3 py-2 rounded-lg border border-sky-500/60 bg-sky-500/20 text-sky-300 hover:bg-sky-500/30 hover:text-sky-200 text-sm"
-                    title={t('scholar.libraryFolderPathPickHint')}
-                  >
-                    <FolderOpen size={16} />
-                    {t('scholar.libraryFolderPathPick')}
-                  </button>
-                </div>
-                <p className="mt-1 text-[11px] text-slate-500">{t('scholar.libraryFolderPathPickHint')}</p>
-              </div>
             </div>
             <div className="flex justify-end gap-2 mt-6">
               <button
                 type="button"
                 onClick={() => {
                   setShowNewLibraryModal(false);
-                  setNewLibraryFolderPath('');
                 }}
                 className="px-4 py-2 rounded-lg text-slate-400 hover:bg-slate-700/60 text-sm"
               >
@@ -460,19 +433,16 @@ export function ScholarPage() {
                 onClick={async () => {
                   const name = newLibraryName.trim();
                   if (!name) return;
-                  const path = newLibraryFolderPath.trim();
-                  if (!path) {
-                    addToast(t('scholar.libraryFolderPathPlaceholder'), 'error');
-                    return;
-                  }
-                  const lib = await createLibrary(name, newLibraryDesc.trim() || undefined, path, false);
+                  const lib = await createLibrary(name, newLibraryDesc.trim() || undefined, undefined, false);
                   if (lib) {
                     setActiveLibrary(lib.id);
                     setShowNewLibraryModal(false);
                     setNewLibraryName('');
                     setNewLibraryDesc('');
-                    setNewLibraryFolderPath('');
                     addToast(t('scholar.libraryCreate'), 'success');
+                  } else {
+                    const err = useScholarStore.getState().libraryError;
+                    addToast(err || t('scholar.libraryCreate'), 'error');
                   }
                 }}
                 className="px-4 py-2 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-sm"
@@ -563,6 +533,16 @@ export function ScholarPage() {
                             <p className="text-xs text-slate-500 mt-0.5">
                               {p.authors?.join(', ')} {p.year != null ? ` · ${p.year}` : ''}
                             </p>
+                            <div className="flex flex-wrap items-center gap-1.5 mt-1">
+                              {p.source && (
+                                <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-600/60 text-slate-300">
+                                  {p.source.replace(/_/g, ' ')}
+                                </span>
+                              )}
+                              <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-600/40 text-slate-400">
+                                {p.downloaded_at ? t('scholar.libraryPaperDownloaded') : t('scholar.libraryPaperNotDownloaded')}
+                              </span>
+                            </div>
                             {p.doi && (
                               <a
                                 href={`https://doi.org/${p.doi}`}
@@ -579,8 +559,8 @@ export function ScholarPage() {
                           <button
                             type="button"
                             onClick={() => removeFromLibrary(activeLibraryId, p.id)}
-                            className="p-1 rounded text-slate-400 hover:bg-red-500/20 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity"
-                            title={t('scholar.libraryDelete')}
+                            className="flex-shrink-0 p-1.5 rounded text-slate-400 hover:bg-red-500/20 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity"
+                            title={t('scholar.libraryRemoveFromCatalog')}
                           >
                             <Trash2 size={14} />
                           </button>
@@ -622,7 +602,8 @@ export function ScholarPage() {
                   >
                     {allSelected ? <CheckSquare size={20} /> : <Square size={20} />}
                   </button>
-                  <span className="text-xs text-slate-500">
+                  <span className="font-medium text-slate-200">{t('scholar.searchResultsTitle')}</span>
+                  <span className="text-slate-500 text-sm">
                     {results.length} {t('scholar.resultsCount')}
                   </span>
                 </div>
@@ -916,12 +897,6 @@ export function ScholarPage() {
         />
       )}
 
-      <FolderBrowserModal
-        open={showFolderBrowser}
-        onClose={() => setShowFolderBrowser(false)}
-        onSelect={(path) => setNewLibraryFolderPath(path)}
-        initialPath={newLibraryFolderPath || null}
-      />
     </div>
   );
 }

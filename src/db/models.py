@@ -286,9 +286,11 @@ class Paper(SQLModel, table=True):
     __table_args__ = (
         UniqueConstraint("collection", "paper_id", name="uq_papers_collection_paper"),
         Index("idx_papers_collection", "collection"),
+        Index("idx_papers_user_id", "user_id"),
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: str = Field(default="default", sa_column=Column(Text, nullable=False, server_default="default"))
     collection: str = Field(sa_column=Column(Text, nullable=False))
     paper_id: str = Field(sa_column=Column("paper_id", Text, nullable=False))
     filename: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
@@ -316,9 +318,11 @@ class IngestJob(SQLModel, table=True):
     __tablename__ = "ingest_jobs"
     __table_args__ = (
         Index("idx_ingest_jobs_created_at", "created_at"),
+        Index("idx_ingest_jobs_user_id", "user_id"),
     )
 
     job_id: str = Field(primary_key=True)
+    user_id: str = Field(default="default", sa_column=Column(Text, nullable=False, server_default="default"))
     collection: str = Field(sa_column=Column(Text, nullable=False))
     status: str = Field(default="pending", sa_column=Column(Text, nullable=False, server_default="pending"))
     total_files: int = Field(default=0, sa_column=Column(Integer, nullable=False, server_default="0"))
@@ -376,9 +380,11 @@ class DeepResearchJob(SQLModel, table=True):
     __tablename__ = "deep_research_jobs"
     __table_args__ = (
         Index("idx_dr_jobs_created_at", "created_at"),
+        Index("idx_dr_jobs_user_id", "user_id"),
     )
 
     job_id: str = Field(primary_key=True)
+    user_id: str = Field(default="default", sa_column=Column(Text, nullable=False, server_default="default"))
     topic: str = Field(sa_column=Column(Text, nullable=False))
     session_id: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
     canvas_id: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
@@ -620,9 +626,11 @@ class ScholarLibrary(SQLModel, table=True):
     """Named sub-library for storing search results as download candidates."""
 
     __tablename__ = "scholar_libraries"
+    __table_args__ = (UniqueConstraint("user_id", "name", name="uq_scholar_libraries_user_name"),)
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    name: str = Field(sa_column=Column(Text, nullable=False, unique=True))
+    user_id: str = Field(default="default", sa_column=Column(Text, nullable=False, server_default="default"))
+    name: str = Field(sa_column=Column(Text, nullable=False))
     description: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
     folder_path: Optional[str] = Field(default=None, sa_column=Column(Text, nullable=True))
     created_at: str = Field(default_factory=_now_iso, sa_column=Column(Text, nullable=False))
@@ -652,6 +660,7 @@ class ScholarLibraryPaper(SQLModel, table=True):
     score: float = Field(default=0.0, sa_column=Column(Float, nullable=False, server_default="0"))
     annas_md5: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
     added_at: str = Field(default_factory=_now_iso, sa_column=Column(Text, nullable=False))
+    downloaded_at: Optional[str] = Field(default=None, sa_column=Column(Text, nullable=True))
 
     library: Optional[ScholarLibrary] = Relationship(back_populates="papers")
 

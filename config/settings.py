@@ -264,7 +264,7 @@ class ScholarDownloaderSettings:
     max_concurrent_downloads: int = 3
     show_browser: bool = False
     persist_browser: bool = True
-    auto_ingest_after_download: bool = True
+    auto_ingest_after_download: bool = False
     download_timeout: int = 200
     max_retries: int = 3
     browser_type: str = "chrome"
@@ -881,7 +881,7 @@ class Settings:
             max_concurrent_downloads=int(sd.get("max_concurrent_downloads", 3)),
             show_browser=bool(sd.get("show_browser", False)),
             persist_browser=bool(sd.get("persist_browser", True)),
-            auto_ingest_after_download=bool(sd.get("auto_ingest_after_download", True)),
+            auto_ingest_after_download=bool(sd.get("auto_ingest_after_download", False)),
             download_timeout=int(sd.get("download_timeout", 200)),
             max_retries=int(sd.get("max_retries", 3)),
             browser_type=str(sd.get("browser_type", "chrome")).strip().lower() or "chrome",

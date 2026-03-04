@@ -6,9 +6,6 @@ Prefix: /config
 from __future__ import annotations
 
 import json
-import os
-import subprocess
-import sys
 from pathlib import Path
 from typing import List, Optional
 
@@ -20,25 +17,6 @@ from src.api.routes_auth import get_current_user_id
 router = APIRouter(prefix="/config", tags=["config"])
 
 DEFAULT_DATABASE_URL = "sqlite:///data/rag.db"
-
-# Run tkinter in a subprocess so a crash or no-display does not kill the server worker.
-_PICK_FOLDER_SCRIPT = r"""
-import sys
-try:
-    import tkinter as tk
-    from tkinter import filedialog
-    root = tk.Tk()
-    root.withdraw()
-    root.wm_attributes("-topmost", True)
-    path = filedialog.askdirectory(title="\u9009\u62e9\u5b50\u5e93\u5b58\u50a8\u76ee\u5f55")
-    root.destroy()
-    if path:
-        print(path)
-    sys.exit(0 if path else 1)
-except Exception as e:
-    print(repr(e), file=sys.stderr)
-    sys.exit(2)
-"""
 
 
 @router.get("/database")
@@ -76,48 +54,6 @@ def patch_config_database(
         return {"url": url, "message": "Saved. Restart the server for the change to take effect."}
     except OSError as e:
         raise HTTPException(status_code=500, detail=f"Failed to write config: {e}")
-
-
-@router.get("/pick-folder")
-def pick_folder(_user_id: str = Depends(get_current_user_id)) -> dict:
-    """Open a native OS folder-picker dialog in a subprocess and return the selected path."""
-    try:
-        proc = subprocess.run(
-            [sys.executable, "-c", _PICK_FOLDER_SCRIPT],
-            capture_output=True,
-            text=True,
-            timeout=120,
-            env=None,  # inherit so DISPLAY etc. are available
-        )
-    except subprocess.TimeoutExpired:
-        raise HTTPException(
-            status_code=503,
-            detail="Folder picker timed out. Please enter the path manually in the text field.",
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Folder picker unavailable: {e}. Please enter the path manually in the text field.",
-        )
-
-    if proc.returncode == 1:
-        # User cancelled
-        raise HTTPException(status_code=204, detail="No folder selected")
-    if proc.returncode == 2:
-        raise HTTPException(
-            status_code=503,
-            detail="Folder picker failed (no display or GUI error). Please enter the path manually in the text field.",
-        )
-    if proc.returncode != 0 or not proc.stdout:
-        raise HTTPException(
-            status_code=503,
-            detail="Folder picker did not return a path. Please enter the path manually in the text field.",
-        )
-
-    path = proc.stdout.strip()
-    if not path:
-        raise HTTPException(status_code=204, detail="No folder selected")
-    return {"path": path}
 
 
 @router.get("/list-dir")

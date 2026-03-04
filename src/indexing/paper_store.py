@@ -34,6 +34,7 @@ def upsert_paper(
     status: str = "done",
     error_message: str = "",
     content_hash: str = "",
+    user_id: str = "default",
 ) -> None:
     """插入或更新 paper 记录。"""
     now = time.time()
@@ -44,6 +45,7 @@ def upsert_paper(
         row = session.exec(stmt).first()
         if row is None:
             row = Paper(
+                user_id=user_id,
                 collection=collection,
                 paper_id=paper_id,
                 filename=filename,
@@ -64,6 +66,8 @@ def upsert_paper(
             )
             session.add(row)
         else:
+            if hasattr(row, "user_id"):
+                row.user_id = user_id
             row.filename = filename
             row.file_path = file_path
             if file_size > 0:
@@ -87,14 +91,13 @@ def upsert_paper(
 
 # ── 查询 ──────────────────────────────────────────────────────────────────────
 
-def list_papers(collection: str) -> List[dict]:
-    """列出指定集合中的所有 paper。"""
+def list_papers(collection: str, user_id: Optional[str] = None) -> List[dict]:
+    """列出指定集合中的所有 paper；若提供 user_id 则仅返回该用户的记录。"""
     with Session(get_engine()) as session:
-        stmt = (
-            select(Paper)
-            .where(Paper.collection == collection)
-            .order_by(Paper.created_at.desc())
-        )
+        stmt = select(Paper).where(Paper.collection == collection)
+        if user_id is not None:
+            stmt = stmt.where(Paper.user_id == user_id)
+        stmt = stmt.order_by(Paper.created_at.desc())
         rows = session.exec(stmt).all()
     return [
         {

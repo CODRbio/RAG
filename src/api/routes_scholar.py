@@ -14,13 +14,15 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlmodel import Session, select
 
 from config.settings import settings
+from src.api.routes_auth import get_current_user_id
 from src.db.engine import get_engine
 from src.db.models import ScholarLibrary, ScholarLibraryPaper
+from src.utils.path_manager import PathManager
 from src.log import get_logger
 from src.tasks.dispatcher import process_download_and_ingest
 from src.tasks.redis_queue import get_task_queue
@@ -57,6 +59,7 @@ class BatchDownloadRequest(BaseModel):
     collection: Optional[str] = None
     max_concurrent: int = 3
     library_id: Optional[int] = None  # when set and library has folder_path, download to folder_path/pdfs
+    auto_ingest: bool = False  # when False (default), only download; when True, download then ingest per paper
 
 
 # ─── Scholar sub-libraries ───────────────────────────────────────────────────
@@ -106,6 +109,11 @@ class AddPapersToLibraryRequest(BaseModel):
     papers: List[Dict[str, Any]]  # each item: { content?, score?, metadata: { title, authors?, year?, doi?, pdf_url?, url?, source?, annas_md5? } }
 
 
+class EnrichDoiRequest(BaseModel):
+    """Request body for POST /scholar/enrich-doi: current search results to re-enrich with Crossref."""
+    results: List[Dict[str, Any]] = Field(default_factory=list)
+
+
 def _normalize_web_hit_for_scholar(hit: Dict[str, Any], canonical_source: str) -> Dict[str, Any]:
     """Map unified_web_search hit to Scholar API response shape (content, score, metadata)."""
     meta = (hit.get("metadata") or {}).copy()
@@ -115,6 +123,17 @@ def _normalize_web_hit_for_scholar(hit: Dict[str, Any], canonical_source: str) -
         "score": hit.get("score") or 0.0,
         "metadata": meta,
     }
+
+
+def _enrich_scholar_results_with_crossref(results: List[Dict[str, Any]]) -> None:
+    """In-place: supplement DOI for items missing it via Crossref (title lookup). Default after each search."""
+    if not results:
+        return
+    try:
+        from src.retrieval.dedup import _enrich_web_hits_missing_doi
+        _enrich_web_hits_missing_doi(results, set())
+    except Exception as e:
+        logger.debug("Crossref enrich for scholar results failed (non-fatal): %s", e)
 
 
 @router.post("/search")
@@ -154,6 +173,7 @@ async def scholar_search(req: ScholarSearchRequest):
             use_content_fetcher="off",
         )
         results = [_normalize_web_hit_for_scholar(h, "google_scholar") for h in raw_hits]
+        _enrich_scholar_results_with_crossref(results)
         return {"results": results, "count": len(results)}
     if req.source == "google":
         from src.retrieval.unified_web_search import unified_web_searcher
@@ -176,6 +196,7 @@ async def scholar_search(req: ScholarSearchRequest):
             use_content_fetcher="off",
         )
         results = [_normalize_web_hit_for_scholar(h, "google") for h in raw_hits]
+        _enrich_scholar_results_with_crossref(results)
         return {"results": results, "count": len(results)}
 
     # Semantic Scholar relevance only: /paper/search, no snippet, no fallback
@@ -192,6 +213,7 @@ async def scholar_search(req: ScholarSearchRequest):
         if not isinstance(relevance_res, list):
             logger.warning("semantic relevance search failed: %s", relevance_res)
         results = [_normalize_web_hit_for_scholar(h, "semantic") for h in raw_hits]
+        _enrich_scholar_results_with_crossref(results)
         return {"results": results, "count": len(results)}
 
     # NCBI PubMed (年份过滤) via unified_web_searcher
@@ -209,6 +231,7 @@ async def scholar_search(req: ScholarSearchRequest):
             use_content_fetcher="off",
         )
         results = [_normalize_web_hit_for_scholar(h, "ncbi") for h in raw_hits]
+        _enrich_scholar_results_with_crossref(results)
         return {"results": results, "count": len(results)}
 
     # Semantic Scholar bulk (布尔/关键词，年份过滤) — bulk API 无 snippet，直接走 adapter
@@ -223,15 +246,16 @@ async def scholar_search(req: ScholarSearchRequest):
     else:
         raise HTTPException(status_code=400, detail=f"未知搜索源: {req.source}")
 
+    _enrich_scholar_results_with_crossref(results)
     return {"results": results, "count": len(results)}
 
 
 @router.post("/download")
 async def scholar_download(req: DownloadRequest, background_tasks: BackgroundTasks):
     """
-    Download one paper PDF.
-    If auto_ingest=True (default from config), runs download then ingest in background and returns task_id.
-    Otherwise runs download synchronously and returns result.
+    Download one paper PDF (download only; no vectorization/ingest by default).
+    If auto_ingest=True, runs download then ingest in background and returns task_id.
+    Otherwise (default) runs download only and returns result.
     """
     cfg = getattr(settings, "scholar_downloader", None)
     if not cfg or not cfg.enabled:
@@ -293,9 +317,18 @@ def _resolve_library_download_dir(library_id: Optional[int]) -> Optional[str]:
         return str(Path(lib.folder_path) / "pdfs")
 
 
+def _resolve_permanent_library_folder(user_id: str, name: str) -> Path:
+    """Resolve absolute path for a permanent library (base dir containing pdfs/)."""
+    return PathManager.get_user_library_path(user_id, name)
+
+
 @router.post("/download/batch")
-async def scholar_batch_download(req: BatchDownloadRequest, background_tasks: BackgroundTasks):
-    """Batch download + ingest; concurrent with semaphore; parent task state for task_id."""
+async def scholar_batch_download(
+    req: BatchDownloadRequest,
+    background_tasks: BackgroundTasks,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Batch download; when auto_ingest=True also runs ingest per paper. Default: download only."""
     cfg = getattr(settings, "scholar_downloader", None)
     if not cfg or not cfg.enabled:
         raise HTTPException(status_code=503, detail="Scholar downloader is disabled")
@@ -314,32 +347,48 @@ async def scholar_batch_download(req: BatchDownloadRequest, background_tasks: Ba
             "completed": 0,
             "failed": 0,
             "collection": req.collection or "",
+            "auto_ingest": req.auto_ingest,
         },
     )
     q.set_state(parent)
 
     async def _batch_job():
+        from src.retrieval.downloader.adapter import get_adapter
+
         sem = asyncio.Semaphore(req.max_concurrent)
         completed = 0
         failed = 0
         progress_lock = asyncio.Lock()
+        adapter = get_adapter()
 
         async def _one(paper: DownloadRequest):
             nonlocal completed, failed
-            sub_id = f"{task_id}_{uuid.uuid4().hex[:4]}"
-            result = await process_download_and_ingest(
-                task_id=sub_id,
-                paper_info=paper.model_dump(),
-                collection=req.collection,
-                download_dir=batch_download_dir,
-            )
+            if req.auto_ingest:
+                sub_id = f"{task_id}_{uuid.uuid4().hex[:4]}"
+                result = await process_download_and_ingest(
+                    task_id=sub_id,
+                    paper_info=paper.model_dump(),
+                    collection=req.collection,
+                    download_dir=batch_download_dir,
+                )
+            else:
+                result = await adapter.download_paper(
+                    title=paper.title,
+                    doi=paper.doi,
+                    pdf_url=paper.pdf_url,
+                    annas_md5=paper.annas_md5,
+                    authors=paper.authors,
+                    year=paper.year,
+                    download_dir=batch_download_dir,
+                )
+                result = {**result, "ingest_triggered": False}
             async with progress_lock:
                 if result.get("ingest_triggered") or result.get("success"):
                     completed += 1
                 else:
                     failed += 1
                     logger.warning(
-                        "文献下载/入库失败: %s - %s",
+                        "文献下载失败: %s - %s",
                         paper.title,
                         result.get("message", "未知错误"),
                     )
@@ -416,12 +465,14 @@ async def scholar_task_status(task_id: str):
 # ─── Scholar sub-libraries ───────────────────────────────────────────────────
 
 @router.get("/libraries")
-def list_scholar_libraries():
-    """List all scholar libraries (DB + in-memory temp) with paper count."""
+def list_scholar_libraries(user_id: str = Depends(get_current_user_id)):
+    """List all scholar libraries (DB + in-memory temp) with paper count; DB libs filtered by user_id."""
     _purge_expired_temp_libraries()
     result: List[Dict[str, Any]] = []
     with Session(get_engine()) as session:
-        libs = session.exec(select(ScholarLibrary).order_by(ScholarLibrary.created_at)).all()
+        libs = session.exec(
+            select(ScholarLibrary).where(ScholarLibrary.user_id == user_id).order_by(ScholarLibrary.created_at)
+        ).all()
         all_papers = session.exec(select(ScholarLibraryPaper.library_id)).all()
         counts = Counter(all_papers)
         for lib in libs:
@@ -441,8 +492,11 @@ def list_scholar_libraries():
 
 
 @router.post("/libraries")
-def create_scholar_library(body: CreateLibraryRequest):
-    """Create a new scholar library (temporary in-memory or permanent with optional folder_path)."""
+def create_scholar_library(
+    body: CreateLibraryRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Create a new scholar library (temporary in-memory or permanent; folder_path is optional, computed from user_id + name when omitted)."""
     name = body.name.strip()
     description = (body.description or "").strip()
     if body.is_temporary:
@@ -469,24 +523,29 @@ def create_scholar_library(body: CreateLibraryRequest):
             "is_temporary": True,
             "folder_path": None,
         }
-    # Permanent: require folder_path, create dirs
-    folder_path = (body.folder_path or "").strip()
-    if not folder_path:
-        raise HTTPException(status_code=400, detail="永久库必须提供 folder_path")
-    abspath = Path(folder_path)
-    if not abspath.is_absolute():
-        abspath = Path(os.getcwd()) / folder_path
+    # Permanent: use PathManager when folder_path not provided
+    if (body.folder_path or "").strip():
+        abspath = Path((body.folder_path or "").strip())
+        if not abspath.is_absolute():
+            abspath = Path(os.getcwd()) / abspath
+    else:
+        abspath = _resolve_permanent_library_folder(user_id, name)
     pdfs_path = abspath / "pdfs"
     try:
         abspath.mkdir(parents=True, exist_ok=True)
         pdfs_path.mkdir(parents=True, exist_ok=True)
     except OSError as e:
+        logger.warning("create_scholar_library: 无法创建目录 path=%s err=%s", abspath, e)
         raise HTTPException(status_code=400, detail=f"无法创建目录: {e}")
     with Session(get_engine()) as session:
-        existing = session.exec(select(ScholarLibrary).where(ScholarLibrary.name == name)).first()
+        existing = session.exec(
+            select(ScholarLibrary).where(ScholarLibrary.user_id == user_id, ScholarLibrary.name == name)
+        ).first()
         if existing:
+            logger.info("create_scholar_library: 库名称已存在 user_id=%s name=%s", user_id, name)
             raise HTTPException(status_code=400, detail="库名称已存在")
         lib = ScholarLibrary(
+            user_id=user_id,
             name=name,
             description=description,
             folder_path=str(abspath.resolve()),
@@ -505,7 +564,7 @@ def create_scholar_library(body: CreateLibraryRequest):
 
 
 @router.delete("/libraries/{lib_id:int}")
-def delete_scholar_library(lib_id: int):
+def delete_scholar_library(lib_id: int, user_id: str = Depends(get_current_user_id)):
     """Delete a scholar library and all its papers (temp or permanent)."""
     if _is_temp_library(lib_id):
         if lib_id not in _temp_store:
@@ -514,11 +573,42 @@ def delete_scholar_library(lib_id: int):
         return {"ok": True}
     with Session(get_engine()) as session:
         lib = session.get(ScholarLibrary, lib_id)
-        if not lib:
+        if not lib or getattr(lib, "user_id", None) != user_id:
             raise HTTPException(status_code=404, detail="库不存在")
         session.delete(lib)
         session.commit()
         return {"ok": True}
+
+
+def _scholar_source_priority(source: str) -> int:
+    """Lower = better. Same DOI: prefer google_scholar > google > semantic > ncbi."""
+    s = (source or "").strip().lower()
+    if s in ("google_scholar", "scholar"):
+        return 0
+    if s == "google":
+        return 1
+    if s in ("semantic", "semantic_relevance", "semantic_bulk"):
+        return 2
+    if s == "ncbi":
+        return 3
+    return 4
+
+
+def _dedupe_papers_by_doi_keep_best_source(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """For each DOI keep one paper: the one with best source priority (google_scholar > google > semantic > ncbi). No-DOI items are kept as-is."""
+    if not items:
+        return items
+    no_doi: List[Dict[str, Any]] = []
+    by_doi: Dict[str, Dict[str, Any]] = {}
+    for item in items:
+        meta = item.get("metadata") or {}
+        doi = (meta.get("doi") or "").strip()
+        pri = _scholar_source_priority(meta.get("source") or "")
+        if not doi:
+            no_doi.append(item)
+        elif doi not in by_doi or pri < _scholar_source_priority((by_doi[doi].get("metadata") or {}).get("source") or ""):
+            by_doi[doi] = item
+    return list(by_doi.values()) + no_doi
 
 
 def _paper_from_search_item(item: Dict[str, Any]) -> ScholarLibraryPaper:
@@ -559,11 +649,12 @@ def _temp_paper_from_search_item(item: Dict[str, Any], lib_id: int) -> Dict[str,
         "score": float(item.get("score") or 0),
         "annas_md5": (meta.get("annas_md5") or "") or "",
         "added_at": now_iso,
+        "downloaded_at": None,
     }
 
 
 @router.get("/libraries/{lib_id:int}/papers")
-def list_scholar_library_papers(lib_id: int):
+def list_scholar_library_papers(lib_id: int, user_id: str = Depends(get_current_user_id)):
     """List all papers in a scholar library (temp or permanent)."""
     if _is_temp_library(lib_id):
         if lib_id not in _temp_store:
@@ -571,7 +662,7 @@ def list_scholar_library_papers(lib_id: int):
         return list(_temp_store[lib_id].get("papers") or [])
     with Session(get_engine()) as session:
         lib = session.get(ScholarLibrary, lib_id)
-        if not lib:
+        if not lib or getattr(lib, "user_id", None) != user_id:
             raise HTTPException(status_code=404, detail="库不存在")
         papers = session.exec(select(ScholarLibraryPaper).where(ScholarLibraryPaper.library_id == lib_id)).all()
         return [
@@ -584,51 +675,74 @@ def list_scholar_library_papers(lib_id: int):
                 "doi": p.doi or None,
                 "pdf_url": p.pdf_url or None,
                 "url": p.url or None,
-                "source": p.source,
+                "source": p.source or "",
                 "score": p.score,
                 "annas_md5": p.annas_md5 or None,
                 "added_at": p.added_at,
+                "downloaded_at": getattr(p, "downloaded_at", None),
             }
             for p in papers
         ]
 
 
 @router.post("/libraries/{lib_id:int}/papers")
-def add_papers_to_scholar_library(lib_id: int, body: AddPapersToLibraryRequest):
-    """Add search results to a library. Dedup by DOI then by title."""
+def add_papers_to_scholar_library(lib_id: int, body: AddPapersToLibraryRequest, user_id: str = Depends(get_current_user_id)):
+    """Add search results to a library. Dedup by DOI (keep best source: google_scholar > google > semantic > ncbi), then by title."""
+    papers_to_add = _dedupe_papers_by_doi_keep_best_source(body.papers)
     if _is_temp_library(lib_id):
         if lib_id not in _temp_store:
             raise HTTPException(status_code=404, detail="库不存在")
         entry = _temp_store[lib_id]
         papers_list = entry.setdefault("papers", [])
         existing_dois = {p.get("doi") for p in papers_list if p.get("doi")}
+        existing_by_doi = {p.get("doi"): p for p in papers_list if p.get("doi")}
         existing_titles = {str(p.get("title") or "").strip().lower() for p in papers_list}
         added = 0
-        for item in body.papers:
+        for item in papers_to_add:
             paper_d = _temp_paper_from_search_item(item, lib_id)
             if paper_d["doi"] and paper_d["doi"] in existing_dois:
+                existing = existing_by_doi.get(paper_d["doi"])
+                if existing and _scholar_source_priority(paper_d["source"]) < _scholar_source_priority(existing.get("source") or ""):
+                    idx = next(i for i, p in enumerate(papers_list) if p.get("doi") == paper_d["doi"])
+                    papers_list[idx] = {**paper_d, "id": papers_list[idx]["id"]}
+                    added += 1
                 continue
             if not paper_d["doi"] and paper_d["title"].strip().lower() in existing_titles:
                 continue
             papers_list.append(paper_d)
             if paper_d["doi"]:
                 existing_dois.add(paper_d["doi"])
+                existing_by_doi[paper_d["doi"]] = paper_d
             existing_titles.add(paper_d["title"].strip().lower())
             added += 1
         entry["meta"]["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
         return {"added": added, "total_requested": len(body.papers)}
     with Session(get_engine()) as session:
         lib = session.get(ScholarLibrary, lib_id)
-        if not lib:
+        if not lib or getattr(lib, "user_id", None) != user_id:
             raise HTTPException(status_code=404, detail="库不存在")
-        existing = session.exec(select(ScholarLibraryPaper).where(ScholarLibraryPaper.library_id == lib_id)).all()
+        existing = list(session.exec(select(ScholarLibraryPaper).where(ScholarLibraryPaper.library_id == lib_id)).all())
         existing_dois = {p.doi for p in existing if p.doi}
+        existing_by_doi = {p.doi: p for p in existing if p.doi}
         existing_titles = {p.title.strip().lower() for p in existing}
         added = 0
-        for item in body.papers:
+        for item in papers_to_add:
             paper = _paper_from_search_item(item)
             paper.library_id = lib_id
             if paper.doi and paper.doi in existing_dois:
+                existing_row = existing_by_doi.get(paper.doi)
+                if existing_row and _scholar_source_priority(paper.source) < _scholar_source_priority(existing_row.source or ""):
+                    existing_row.title = paper.title
+                    existing_row.authors = paper.authors
+                    existing_row.year = paper.year
+                    existing_row.doi = paper.doi
+                    existing_row.pdf_url = paper.pdf_url or ""
+                    existing_row.url = paper.url or ""
+                    existing_row.source = paper.source
+                    existing_row.score = paper.score
+                    existing_row.annas_md5 = paper.annas_md5 or ""
+                    session.add(existing_row)
+                    added += 1
                 continue
             if not paper.doi and paper.title.strip().lower() in existing_titles:
                 continue
@@ -636,6 +750,7 @@ def add_papers_to_scholar_library(lib_id: int, body: AddPapersToLibraryRequest):
             session.flush()
             if paper.doi:
                 existing_dois.add(paper.doi)
+                existing_by_doi[paper.doi] = paper
             existing_titles.add(paper.title.strip().lower())
             added += 1
         session.commit()
@@ -643,7 +758,7 @@ def add_papers_to_scholar_library(lib_id: int, body: AddPapersToLibraryRequest):
 
 
 @router.delete("/libraries/{lib_id:int}/papers/{paper_id:int}")
-def remove_paper_from_scholar_library(lib_id: int, paper_id: int):
+def remove_paper_from_scholar_library(lib_id: int, paper_id: int, user_id: str = Depends(get_current_user_id)):
     """Remove one paper from a scholar library."""
     if _is_temp_library(lib_id):
         if lib_id not in _temp_store:
@@ -655,6 +770,9 @@ def remove_paper_from_scholar_library(lib_id: int, paper_id: int):
                 return {"ok": True}
         raise HTTPException(status_code=404, detail="文献不存在")
     with Session(get_engine()) as session:
+        lib = session.get(ScholarLibrary, lib_id)
+        if not lib or getattr(lib, "user_id", None) != user_id:
+            raise HTTPException(status_code=404, detail="库不存在")
         paper = session.get(ScholarLibraryPaper, paper_id)
         if not paper or paper.library_id != lib_id:
             raise HTTPException(status_code=404, detail="文献不存在")

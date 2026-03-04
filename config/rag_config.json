@@ -193,7 +193,7 @@
     "max_concurrent_downloads": 3,
     "show_browser": false,
     "persist_browser": true,
-    "auto_ingest_after_download": true,
+    "auto_ingest_after_download": false,
     "download_timeout": 200,
     "max_retries": 3,
     "browser_type": "chrome",
