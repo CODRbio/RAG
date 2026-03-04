@@ -76,9 +76,10 @@
     "llm_text_model": null,
     "llm_vision_model": null,
     "llm_vision_concurrency": 1,
-    "llm_text_max_tokens": 800,
-    "llm_vision_max_tokens": 1536,
-    "llm_json_repair_max_tokens": 1024,
+    "_llm_max_tokens_note": "以下 max_tokens 仅为参考上限，实际由各 provider 能力决定；设为较大值表示不刻意限制输出长度。",
+    "llm_text_max_tokens": 65536,
+    "llm_vision_max_tokens": 65536,
+    "llm_json_repair_max_tokens": 8192,
     "llm_temperature": 0.1,
     "llm_max_retries": 2,
     "enrich_tables": true,
@@ -185,6 +186,7 @@
     "compress_max_output_words": 400
   },
   "scholar_downloader": {
+    "llm_provider": "qwen-thinking",
     "enabled": true,
     "download_dir": "data/raw_papers",
     "annas_archive_api_key": "",
@@ -333,7 +335,8 @@
       },
       "llm": {
         "provider": "deepseek",
-        "max_tokens": 1000
+        "_max_tokens_note": "仅供参考；实际上限由所选 provider 决定。",
+        "max_tokens": 65536
       }
     }
   },

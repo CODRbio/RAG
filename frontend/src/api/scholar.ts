@@ -119,6 +119,8 @@ export async function downloadPaper(params: {
   year?: number;
   collection?: string;
   auto_ingest?: boolean;
+  llm_provider?: string | null;
+  model_override?: string | null;
 }): Promise<SubmittedTask | DownloadResult> {
   const res = await client.post('/scholar/download', params);
   return res.data;
@@ -133,13 +135,21 @@ export async function batchDownloadPapers(
     authors?: string[];
     year?: number;
   }>,
-  options?: { collection?: string; max_concurrent?: number; library_id?: number },
+  options?: {
+    collection?: string;
+    max_concurrent?: number;
+    library_id?: number;
+    llm_provider?: string | null;
+    model_override?: string | null;
+  },
 ): Promise<{ status: string; task_id: string; total: number; message: string }> {
   const res = await client.post('/scholar/download/batch', {
     papers,
     collection: options?.collection,
     max_concurrent: options?.max_concurrent ?? 3,
     library_id: options?.library_id,
+    llm_provider: options?.llm_provider ?? undefined,
+    model_override: options?.model_override ?? undefined,
   });
   return res.data;
 }
@@ -207,4 +217,28 @@ export async function removePaperFromLibrary(
   paperId: number,
 ): Promise<void> {
   await client.delete(`/scholar/libraries/${libId}/papers/${paperId}`);
+}
+
+export interface ExtractDoiDedupResult {
+  extracted_count: number;
+  removed_count: number;
+}
+
+export async function extractDoiAndDedupLibrary(
+  libId: number,
+): Promise<ExtractDoiDedupResult> {
+  const res = await client.post<ExtractDoiDedupResult>(
+    `/scholar/libraries/${libId}/extract-doi-dedup`,
+  );
+  return res.data;
+}
+
+export async function extractDoiAndDedupPapers(
+  papers: ScholarLibraryPaper[],
+): Promise<{ papers: ScholarLibraryPaper[] } & ExtractDoiDedupResult> {
+  const res = await client.post<{ papers: ScholarLibraryPaper[] } & ExtractDoiDedupResult>(
+    '/scholar/papers/extract-doi-dedup',
+    { papers },
+  );
+  return res.data;
 }

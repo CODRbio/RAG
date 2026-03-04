@@ -197,6 +197,8 @@ async def process_download_and_ingest(
     paper_info: Dict[str, Any],
     collection: Optional[str] = None,
     download_dir: Optional[str] = None,
+    llm_provider: Optional[str] = None,
+    model_override: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Download one paper PDF then trigger ingest into the given collection.
@@ -232,6 +234,8 @@ async def process_download_and_ingest(
             authors=paper_info.get("authors"),
             year=paper_info.get("year"),
             download_dir=download_dir,
+            llm_provider=llm_provider,
+            model_override=model_override,
         )
     except Exception as e:
         logger.exception("download_and_ingest download failed task_id=%s: %s", task_id, e)

@@ -274,6 +274,7 @@ class ScholarDownloaderSettings:
     annas_keyword_max_pages: int = 5
     use_scihub: bool = True
     scihub_mirrors: List[str] = field(default_factory=lambda: ["https://sci-hub.st/", "https://sci-hub.ru/"])
+    llm_provider: str = "qwen-thinking"  # LLM for downloader assist (button detection); UI can override per request
 
 
 @dataclass
@@ -891,6 +892,7 @@ class Settings:
             annas_keyword_max_pages=int(sd.get("annas_keyword_max_pages", 5)),
             use_scihub=bool(sd.get("use_scihub", True)),
             scihub_mirrors=list(sd.get("scihub_mirrors") or ["https://sci-hub.st/", "https://sci-hub.ru/"]),
+            llm_provider=str(sd.get("llm_provider", "qwen-thinking")),
         )
 
     @property

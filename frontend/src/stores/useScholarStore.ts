@@ -20,6 +20,8 @@ import {
   getLibraryPapers,
   addPapersToLibrary as addPapersToLibraryApi,
   removePaperFromLibrary as removePaperFromLibraryApi,
+  extractDoiAndDedupLibrary,
+  extractDoiAndDedupPapers,
 } from '../api/scholar';
 
 const POLL_INTERVAL_MS = 2000;
@@ -165,6 +167,11 @@ interface ScholarState {
   libraryLoading: boolean;
   libraryError: string | null;
 
+  // LLM for downloader assist (provider + model; used when calling download API)
+  selectedScholarLlmProvider: string;
+  selectedScholarLlmModel: string;
+  setScholarLlm: (provider: string, model: string) => void;
+
   // Actions
   setQuery: (q: string) => void;
   setSource: (s: ScholarSource) => void;
@@ -206,6 +213,8 @@ interface ScholarState {
   removeFromLibrary: (libId: number, paperId: number) => Promise<void>;
   /** Batch download all papers in the active library; returns task_id if submitted. */
   downloadLibraryBatch: (collection?: string) => Promise<string | null>;
+  /** Extract DOI + dedupe for active library; returns stats or null. */
+  extractDoiAndDedup: () => Promise<{ extracted_count: number; removed_count: number } | null>;
 }
 
 export const useScholarStore = create<ScholarState>()((set, get) => ({
@@ -230,6 +239,10 @@ export const useScholarStore = create<ScholarState>()((set, get) => ({
   libraryPapers: [],
   libraryLoading: false,
   libraryError: null,
+
+  selectedScholarLlmProvider: '',
+  selectedScholarLlmModel: '',
+  setScholarLlm: (provider, model) => set({ selectedScholarLlmProvider: provider, selectedScholarLlmModel: model }),
 
   setQuery: (q) => set({ query: q }),
   setSource: (s) => set({ source: s }),
@@ -274,7 +287,7 @@ export const useScholarStore = create<ScholarState>()((set, get) => ({
   },
 
   downloadOne: async (index, collection, autoIngest = false) => {
-    const { results } = get();
+    const { results, selectedScholarLlmProvider, selectedScholarLlmModel } = get();
     const item = results[index];
     if (!item?.metadata) return null;
     const m = item.metadata;
@@ -288,6 +301,8 @@ export const useScholarStore = create<ScholarState>()((set, get) => ({
         year: m.year ?? undefined,
         collection,
         auto_ingest: autoIngest,
+        llm_provider: selectedScholarLlmProvider || undefined,
+        model_override: selectedScholarLlmModel || undefined,
       });
       if (isSubmittedTask(res)) {
         set((s) => ({
@@ -303,7 +318,7 @@ export const useScholarStore = create<ScholarState>()((set, get) => ({
   },
 
   downloadSelected: async (collection) => {
-    const { results, selectedIndices } = get();
+    const { results, selectedIndices, selectedScholarLlmProvider, selectedScholarLlmModel } = get();
     if (selectedIndices.length === 0) return null;
     const papers = selectedIndices
       .map((i) => results[i]?.metadata)
@@ -318,7 +333,12 @@ export const useScholarStore = create<ScholarState>()((set, get) => ({
       }));
     if (papers.length === 0) return null;
     try {
-      const res = await batchDownloadPapers(papers, { collection, max_concurrent: 3 });
+      const res = await batchDownloadPapers(papers, {
+        collection,
+        max_concurrent: 3,
+        llm_provider: selectedScholarLlmProvider || undefined,
+        model_override: selectedScholarLlmModel || undefined,
+      });
       set((s) => ({
         downloadTasks: {
           ...s.downloadTasks,
@@ -605,8 +625,43 @@ export const useScholarStore = create<ScholarState>()((set, get) => ({
     }
   },
 
+  extractDoiAndDedup: async () => {
+    const { activeLibraryId, libraryPapers } = get();
+    if (activeLibraryId == null) return null;
+    if (activeLibraryId >= 0) {
+      try {
+        const stats = await extractDoiAndDedupLibrary(activeLibraryId);
+        await get().loadLibraryPapers(activeLibraryId);
+        await get().loadLibraries();
+        return stats;
+      } catch {
+        return null;
+      }
+    }
+    // Client temp library: call papers endpoint and update localStorage
+    try {
+      const res = await extractDoiAndDedupPapers(libraryPapers);
+      const libs = _loadTempLibs();
+      const lib = libs.find((l) => l.id === activeLibraryId);
+      if (lib) {
+        lib.papers = res.papers;
+        lib.updated_at = new Date().toISOString();
+        _saveTempLibs(libs);
+        set((s) => ({
+          libraryPapers: s.activeLibraryId === activeLibraryId ? res.papers : s.libraryPapers,
+          libraries: s.libraries.map((l) =>
+            l.id === activeLibraryId ? { ...l, paper_count: res.papers.length, updated_at: lib.updated_at } : l,
+          ),
+        }));
+      }
+      return { extracted_count: res.extracted_count, removed_count: res.removed_count };
+    } catch {
+      return null;
+    }
+  },
+
   downloadLibraryBatch: async (collection) => {
-    const { libraryPapers: papers, activeLibraryId } = get();
+    const { libraryPapers: papers, activeLibraryId, selectedScholarLlmProvider, selectedScholarLlmModel } = get();
     if (papers.length === 0) return null;
     const req = papers.map((p) => ({
       title: p.title,
@@ -620,8 +675,9 @@ export const useScholarStore = create<ScholarState>()((set, get) => ({
       const res = await batchDownloadPapers(req, {
         collection,
         max_concurrent: 3,
-        // Only pass library_id for permanent libs (server only knows about those)
         library_id: activeLibraryId != null && activeLibraryId >= 0 ? activeLibraryId : undefined,
+        llm_provider: selectedScholarLlmProvider || undefined,
+        model_override: selectedScholarLlmModel || undefined,
       });
       set((s) => ({
         downloadTasks: {

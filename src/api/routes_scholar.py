@@ -12,7 +12,7 @@ import time
 import uuid
 from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -52,6 +52,8 @@ class DownloadRequest(BaseModel):
     year: Optional[int] = None
     collection: Optional[str] = None
     auto_ingest: Optional[bool] = None
+    llm_provider: Optional[str] = Field(None, description="LLM provider for downloader assist (e.g. qwen-thinking); uses config default if not set")
+    model_override: Optional[str] = Field(None, description="Model override for downloader LLM; uses provider default if not set")
 
 
 class BatchDownloadRequest(BaseModel):
@@ -60,6 +62,8 @@ class BatchDownloadRequest(BaseModel):
     max_concurrent: int = 3
     library_id: Optional[int] = None  # when set and library has folder_path, download to folder_path/pdfs
     auto_ingest: bool = False  # when False (default), only download; when True, download then ingest per paper
+    llm_provider: Optional[str] = Field(None, description="LLM provider for downloader assist; applies to all papers in batch")
+    model_override: Optional[str] = Field(None, description="Model override for downloader LLM; applies to all papers in batch")
 
 
 # ─── Scholar sub-libraries ───────────────────────────────────────────────────
@@ -107,6 +111,11 @@ class CreateLibraryRequest(BaseModel):
 
 class AddPapersToLibraryRequest(BaseModel):
     papers: List[Dict[str, Any]]  # each item: { content?, score?, metadata: { title, authors?, year?, doi?, pdf_url?, url?, source?, annas_md5? } }
+
+
+class ExtractDoiDedupPapersRequest(BaseModel):
+    """Request body for POST /scholar/papers/extract-doi-dedup (client temp library)."""
+    papers: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class EnrichDoiRequest(BaseModel):
@@ -286,6 +295,8 @@ async def scholar_download(req: DownloadRequest, background_tasks: BackgroundTas
             task_id=task_id,
             paper_info=req.model_dump(),
             collection=req.collection,
+            llm_provider=getattr(req, "llm_provider", None),
+            model_override=getattr(req, "model_override", None),
         )
         return {
             "status": "submitted",
@@ -302,6 +313,8 @@ async def scholar_download(req: DownloadRequest, background_tasks: BackgroundTas
         annas_md5=req.annas_md5,
         authors=req.authors,
         year=req.year,
+        llm_provider=getattr(req, "llm_provider", None),
+        model_override=getattr(req, "model_override", None),
     )
     return result
 
@@ -370,6 +383,8 @@ async def scholar_batch_download(
                     paper_info=paper.model_dump(),
                     collection=req.collection,
                     download_dir=batch_download_dir,
+                    llm_provider=getattr(req, "llm_provider", None) or getattr(paper, "llm_provider", None),
+                    model_override=getattr(req, "model_override", None) or getattr(paper, "model_override", None),
                 )
             else:
                 result = await adapter.download_paper(
@@ -380,6 +395,8 @@ async def scholar_batch_download(
                     authors=paper.authors,
                     year=paper.year,
                     download_dir=batch_download_dir,
+                    llm_provider=getattr(req, "llm_provider", None) or getattr(paper, "llm_provider", None),
+                    model_override=getattr(req, "model_override", None) or getattr(paper, "model_override", None),
                 )
                 result = {**result, "ingest_triggered": False}
             async with progress_lock:
@@ -611,6 +628,61 @@ def _dedupe_papers_by_doi_keep_best_source(items: List[Dict[str, Any]]) -> List[
     return list(by_doi.values()) + no_doi
 
 
+def _extract_doi_and_dedup_library_papers(
+    papers: List[Dict[str, Any]], use_crossref: bool = True
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """
+    In-place fill missing DOIs (from url/title, then optionally Crossref), normalize all DOIs,
+    then dedupe by normalized DOI keeping one per DOI by source priority.
+    papers: list of library-paper dicts (flat: id, title, doi, url, source, ...).
+    Returns (deduped_list, {"extracted_count": int, "removed_count": int}).
+    """
+    from src.retrieval.dedup import (
+        _crossref_lookup_by_title,
+        _extract_doi_from_text,
+        normalize_doi,
+    )
+
+    extracted_count = 0
+    for p in papers:
+        doi_raw = (p.get("doi") or "").strip()
+        ndoi = normalize_doi(doi_raw)
+        if ndoi:
+            p["doi"] = ndoi
+            continue
+        url = (p.get("url") or "").strip()
+        title = (p.get("title") or "").strip()
+        ndoi = _extract_doi_from_text(url or title)
+        if ndoi:
+            p["doi"] = ndoi
+            extracted_count += 1
+            continue
+        if use_crossref and title:
+            try:
+                cr = _crossref_lookup_by_title(title)
+                if cr and cr.get("doi"):
+                    p["doi"] = cr["doi"]
+                    extracted_count += 1
+            except Exception as e:
+                logger.debug("Crossref lookup for library paper failed: %s", e)
+
+    by_ndoi: Dict[str, Dict[str, Any]] = {}
+    no_doi_list: List[Dict[str, Any]] = []
+    for p in papers:
+        ndoi = normalize_doi(p.get("doi") or "")
+        if not ndoi:
+            no_doi_list.append(p)
+        else:
+            src = (p.get("source") or "").strip()
+            if ndoi not in by_ndoi or _scholar_source_priority(src) < _scholar_source_priority(
+                (by_ndoi[ndoi].get("source") or "").strip()
+            ):
+                by_ndoi[ndoi] = p
+    deduped = list(by_ndoi.values()) + no_doi_list
+    removed_count = len(papers) - len(deduped)
+    return deduped, {"extracted_count": extracted_count, "removed_count": removed_count}
+
+
 def _paper_from_search_item(item: Dict[str, Any]) -> ScholarLibraryPaper:
     meta = item.get("metadata") or {}
     authors = meta.get("authors") or []
@@ -779,6 +851,71 @@ def remove_paper_from_scholar_library(lib_id: int, paper_id: int, user_id: str =
         session.delete(paper)
         session.commit()
         return {"ok": True}
+
+
+@router.post("/libraries/{lib_id:int}/extract-doi-dedup")
+def extract_doi_dedup_library(lib_id: int, user_id: str = Depends(get_current_user_id)):
+    """Extract missing DOIs (from url/title + optional Crossref), normalize, dedupe by DOI; update library in place."""
+    if _is_temp_library(lib_id):
+        if lib_id not in _temp_store:
+            raise HTTPException(status_code=404, detail="库不存在")
+        papers = list(_temp_store[lib_id].get("papers") or [])
+        # Copy so we can mutate; preserve structure (authors may be list)
+        papers = [dict(p) for p in papers]
+        deduped, stats = _extract_doi_and_dedup_library_papers(papers)
+        _temp_store[lib_id]["papers"] = deduped
+        _temp_store[lib_id]["meta"]["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+        return {"extracted_count": stats["extracted_count"], "removed_count": stats["removed_count"]}
+    with Session(get_engine()) as session:
+        lib = session.get(ScholarLibrary, lib_id)
+        if not lib or getattr(lib, "user_id", None) != user_id:
+            raise HTTPException(status_code=404, detail="库不存在")
+        rows = list(session.exec(select(ScholarLibraryPaper).where(ScholarLibraryPaper.library_id == lib_id)).all())
+        papers = [
+            {
+                "id": p.id,
+                "library_id": p.library_id,
+                "title": p.title,
+                "authors": p.get_authors(),
+                "year": p.year,
+                "doi": p.doi or "",
+                "pdf_url": p.pdf_url or "",
+                "url": p.url or "",
+                "source": p.source or "",
+                "score": p.score,
+                "annas_md5": p.annas_md5 or "",
+                "added_at": p.added_at,
+                "downloaded_at": getattr(p, "downloaded_at", None),
+            }
+            for p in rows
+        ]
+        deduped, stats = _extract_doi_and_dedup_library_papers(papers)
+        ids_to_keep = {p["id"] for p in deduped}
+        by_id = {p["id"]: p for p in deduped}
+        for row in rows:
+            if row.id not in ids_to_keep:
+                session.delete(row)
+            else:
+                d = by_id.get(row.id)
+                if d and (d.get("doi") or "") != (row.doi or ""):
+                    row.doi = d.get("doi") or ""
+        session.commit()
+        return {"extracted_count": stats["extracted_count"], "removed_count": stats["removed_count"]}
+
+
+@router.post("/papers/extract-doi-dedup")
+def extract_doi_dedup_papers(
+    body: ExtractDoiDedupPapersRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Return papers with DOIs filled and deduped by DOI (for client-side temp libraries). No DB mutation."""
+    papers = [dict(p) for p in (body.papers or [])]
+    deduped, stats = _extract_doi_and_dedup_library_papers(papers)
+    return {
+        "papers": deduped,
+        "extracted_count": stats["extracted_count"],
+        "removed_count": stats["removed_count"],
+    }
 
 
 @router.get("/health")

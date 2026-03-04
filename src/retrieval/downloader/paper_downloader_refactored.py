@@ -21,7 +21,8 @@ import signal
 from urllib.parse import quote, urljoin, urlparse
 from .browser_manager import BrowserManager, simulate_human_behavior, setup_browser
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
-from .log_utils import setup_logger, cleanup_old_logs
+from src.log import get_logger
+from src.llm.llm_manager import get_manager
 import logging
 from bs4 import BeautifulSoup
 try:
@@ -52,8 +53,8 @@ except Exception:
 from datetime import datetime
 import random
 
-# 配置日志
-logger = setup_logger('PaperDownloader', level = "INFO")
+# 配置日志（与项目 src.log 统一）
+logger = get_logger("scholar_downloader.PaperDownloader")
 
 # Sci-Hub 下载结果原因码（用于省钱：遇到明确 not_in_db 时跳过 Bright Data + Sci-Hub）
 SCIHUB_OK = "ok"
@@ -848,36 +849,34 @@ class ExperienceStore:
 
 
 class LLMAssistant:
-    """LLM辅助：在常规方法失败时分析页面并建议操作"""
-    
-    def __init__(self, api_key: str, logger: logging.Logger, model: str = None, provider: str = "auto",
+    """LLM辅助：在常规方法失败时分析页面并建议操作。使用项目 src.llm 框架，支持多 provider/模型与统一配置。"""
+
+    _PROMPT_TEMPLATE_CACHE: Optional[str] = None
+
+    def __init__(self, logger: logging.Logger, provider: Optional[str] = None, model: Optional[str] = None,
                  timeout: int = 20):
-        self.api_key = api_key
         self.logger = logger
-        self.enabled = bool(api_key)
-        self.timeout = timeout
-        
-        # 自动检测 provider
-        if provider == "auto" and api_key:
-            if api_key.startswith("sk-") and len(api_key) > 20:
-                # DeepSeek API key 格式通常是 sk- 开头
-                self.provider = "deepseek"
-                self.model = model or "deepseek-chat"
-            else:
-                # Anthropic API key 格式
-                self.provider = "anthropic"
-                self.model = model or "claude-sonnet-4-20250514"
-        else:
-            self.provider = provider if provider != "auto" else "anthropic"
-            self.model = model or ("deepseek-chat" if self.provider == "deepseek" else "claude-sonnet-4-20250514")
-        
-        if not self.enabled:
-            self.logger.info("[LLM] 未配置API密钥，LLM辅助功能禁用")
-        else:
-            self.logger.info(f"[LLM] 使用 {self.provider} API，模型: {self.model}")
+        self._client = None
+        self._model = model
+        self._timeout = timeout
+        self.enabled = False
+        try:
+            manager = get_manager()
+            # 兼容旧配置：anthropic -> claude
+            resolved_provider = (provider or "qwen-thinking").strip()
+            if resolved_provider == "anthropic":
+                resolved_provider = "claude"
+            self._client = manager.get_client(resolved_provider)
+            self._model = model
+            self.enabled = True
+            self.logger.info(f"[LLM] 使用项目 LLM 框架，provider: {resolved_provider}")
+        except Exception as e:
+            self.logger.info(f"[LLM] 未配置或不可用，LLM辅助功能禁用: {e}")
     
-    async def analyze_and_suggest(self, page, analysis: PageAnalysis, 
-                                   action_history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    async def analyze_and_suggest(self, page, analysis: PageAnalysis,
+                                   action_history: List[Dict[str, Any]],
+                                   llm_provider_override: Optional[str] = None,
+                                   model_override: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
         调用LLM分析页面并建议下一步操作
         
@@ -885,6 +884,8 @@ class LLMAssistant:
             page: Playwright页面对象
             analysis: PageAnalysis对象
             action_history: 已尝试的操作历史
+            llm_provider_override: 本次调用使用的 provider（覆盖实例默认）
+            model_override: 本次调用使用的 model（覆盖实例默认）
         
         Returns:
             建议的操作 {type, selector, reason} 或 None
@@ -899,8 +900,12 @@ class LLMAssistant:
             # 2. 构建prompt
             prompt = self._build_prompt(page_summary, analysis, action_history)
             
-            # 3. 调用LLM
-            response = await self._call_llm(prompt)
+            # 3. 调用LLM（支持单次 override）
+            response = await self._call_llm(
+                prompt,
+                provider_override=llm_provider_override,
+                model_override=model_override,
+            )
             
             # 4. 解析响应
             suggestion = self._parse_response(response)
@@ -976,101 +981,69 @@ class LLMAssistant:
         except Exception:
             return {'url': page.url, 'title': '', 'buttons': [], 'links': [], 'text_hints': []}
     
-    def _build_prompt(self, page_summary: Dict, analysis: PageAnalysis, 
+    def _build_prompt(self, page_summary: Dict, analysis: PageAnalysis,
                       action_history: List[Dict]) -> str:
-        """构建LLM prompt"""
-        
+        """构建LLM prompt（模板来自 src/prompts/downloader_llm_assist.txt）"""
+        if LLMAssistant._PROMPT_TEMPLATE_CACHE is None:
+            prompt_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "..", "..", "prompts", "downloader_llm_assist.txt"
+            )
+            try:
+                with open(prompt_path, "r", encoding="utf-8") as f:
+                    LLMAssistant._PROMPT_TEMPLATE_CACHE = f.read()
+            except Exception as e:
+                self.logger.warning(f"[LLM] 加载 prompt 模板失败，使用内联模板: {e}")
+                LLMAssistant._PROMPT_TEMPLATE_CACHE = (
+                    "你是一个PDF下载助手。分析以下网页信息，告诉我下一步该怎么做才能下载PDF。\n\n"
+                    "## 当前页面\nURL: {url}\n标题: {title}\n\n## 页面元素\n按钮: {buttons_json}\n"
+                    "相关链接: {links_json}\n关键词检测: {text_hints}\n\n## 检测到的问题\n{blockers_str}\n\n"
+                    "## 已尝试的操作\n{history_str}\n\n请返回JSON格式的建议（只返回JSON，不要其他文字）:\n"
+                    '{{"action": {{"type": "click|navigate|give_up", "selector": "...", "url": "...", "reason": "..."}}, "confidence": 0-100}}'
+                )
         history_str = ""
         if action_history:
             history_str = "\n".join([
                 f"  - {a.get('type', '?')}: {a.get('selector', a.get('text', '?'))[:40]} -> {a.get('result', '?')}"
-                for a in action_history[-5:]  # 只显示最近5个
+                for a in action_history[-5:]
             ])
         else:
             history_str = "  (无)"
-        
-        blockers_str = ', '.join([b.type.value for b in analysis.blockers]) if analysis.blockers else "无"
-        
-        prompt = f"""你是一个PDF下载助手。分析以下网页信息，告诉我下一步该怎么做才能下载PDF。
-
-## 当前页面
-URL: {page_summary.get('url', '')[:100]}
-标题: {page_summary.get('title', '')[:80]}
-
-## 页面元素
-按钮: {json.dumps(page_summary.get('buttons', [])[:10], ensure_ascii=False)}
-相关链接: {json.dumps(page_summary.get('links', [])[:10], ensure_ascii=False)}
-关键词检测: {page_summary.get('text_hints', [])}
-
-## 检测到的问题
-{blockers_str}
-
-## 已尝试的操作
-{history_str}
-
-请返回JSON格式的建议（只返回JSON，不要其他文字）:
-{{
-    "action": {{
-        "type": "click|navigate|give_up",
-        "selector": "CSS选择器（如果type是click）",
-        "url": "目标URL（如果type是navigate）",
-        "reason": "简短解释"
-    }},
-    "confidence": 0-100
-}}
-
-注意：
-1. 如果检测到付费墙/需要登录，type应为"give_up"
-2. 优先选择明确包含"pdf"或"download"的元素
-3. 如果是PDF查看器页面，找下载/保存按钮
-4. selector要尽量精确，优先用class或id"""
-        
-        return prompt
+        blockers_str = ", ".join([b.type.value for b in analysis.blockers]) if analysis.blockers else "无"
+        return LLMAssistant._PROMPT_TEMPLATE_CACHE.format(
+            url=(page_summary.get("url") or "")[:100],
+            title=(page_summary.get("title") or "")[:80],
+            buttons_json=json.dumps(page_summary.get("buttons", [])[:10], ensure_ascii=False),
+            links_json=json.dumps(page_summary.get("links", [])[:10], ensure_ascii=False),
+            text_hints=page_summary.get("text_hints", []),
+            blockers_str=blockers_str,
+            history_str=history_str,
+        )
     
-    async def _call_llm(self, prompt: str) -> str:
-        """调用LLM API"""
-        if self.provider == "deepseek":
-            # DeepSeek API
-            url = "https://api.deepseek.com/v1/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json"
-            }
-            data = {
-                "model": self.model,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 1000,
-                "temperature": 0.3
-            }
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, headers=headers, json=data, timeout=self.timeout) as resp:
-                    if resp.status != 200:
-                        error_text = await resp.text()
-                        raise Exception(f"DeepSeek API返回 {resp.status}: {error_text[:200]}")
-                    result = await resp.json()
-                    # DeepSeek 返回格式: {choices: [{message: {content: "..."}}]}
-                    return result.get('choices', [{}])[0].get('message', {}).get('content', '')
-        else:
-            # Anthropic API
-            url = "https://api.anthropic.com/v1/messages"
-            headers = {
-                "x-api-key": self.api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json"
-            }
-            data = {
-                "model": self.model,
-                "max_tokens": 500,
-                "messages": [{"role": "user", "content": prompt}]
-            }
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, headers=headers, json=data, timeout=self.timeout) as resp:
-                    if resp.status != 200:
-                        raise Exception(f"Anthropic API返回 {resp.status}")
-                    result = await resp.json()
-                    return result.get('content', [{}])[0].get('text', '')
+    async def _call_llm(self, prompt: str,
+                        provider_override: Optional[str] = None,
+                        model_override: Optional[str] = None) -> str:
+        """调用项目 LLM 框架（同步 client.chat 放入 asyncio.to_thread 避免阻塞事件循环）。
+        单次调用可传入 provider_override / model_override 覆盖实例默认。"""
+        client = self._client
+        model = self._model
+        if provider_override:
+            try:
+                from src.llm.llm_manager import get_manager
+                client = get_manager().get_client(provider_override)
+                model = model_override or self._model
+            except Exception as e:
+                self.logger.debug(f"[LLM] override provider 不可用，使用默认: {e}")
+        elif model_override:
+            model = model_override
+        if not client:
+            return ""
+        messages = [{"role": "user", "content": prompt}]
+        try:
+            resp = await asyncio.to_thread(client.chat, messages, model=model)
+            return (resp.get("final_text") or "").strip()
+        except Exception as e:
+            self.logger.debug(f"[LLM] 调用失败: {e}")
+            return ""
     
     def _parse_response(self, response: str) -> Optional[Dict[str, Any]]:
         """解析LLM响应（支持 DeepSeek thinking 模式）"""
@@ -1642,18 +1615,13 @@ class PaperDownloader:
             self.experience_store_path = os.path.join(self.download_dir, ".experience_store.json")
         self.experience_store = ExperienceStore(self.experience_store_path, self.logger)
 
-        # LLM辅助（阶段3，可选）
-        # 优先读取 deepseek，否则读取 anthropic（向后兼容）
-        api_keys = self.config.get("api_keys", {})
-        llm_api_key = api_keys.get("deepseek", "") or api_keys.get("anthropic", "")
-        llm_provider = self.config.get("llm", {}).get("provider", "auto")  # 可选配置：auto/deepseek/anthropic
-        llm_model = self.config.get("llm", {}).get("model", None)  # 可选配置：自定义模型
+        # LLM辅助（阶段3，可选）— 使用项目 src.llm 框架，provider/model 从 config 传入，API key 由框架统一加载
+        llm_cfg = self.config.get("llm", {})
         self.llm_assistant = LLMAssistant(
-            llm_api_key,
             self.logger,
-            model=llm_model,
-            provider=llm_provider,
-            timeout=self.timeouts.get("llm_timeout", 20)
+            provider=llm_cfg.get("provider"),
+            model=llm_cfg.get("model"),
+            timeout=self.timeouts.get("llm_timeout", 20),
         )
 
         # 其他初始化代码...
@@ -5526,7 +5494,11 @@ class PaperDownloader:
             self.logger.info(f"[智能循环] 常规方法失败，尝试LLM分析...")
             try:
                 analysis = await self.page_analyzer.analyze(page)
-                suggestion = await self.llm_assistant.analyze_and_suggest(page, analysis, action_history)
+                override = getattr(self, "_current_llm_override", None) or (None, None)
+                suggestion = await self.llm_assistant.analyze_and_suggest(
+                    page, analysis, action_history,
+                    llm_provider_override=override[0], model_override=override[1],
+                )
                 
                 if suggestion and suggestion.get('type') == 'click':
                     selector = suggestion.get('selector')
@@ -6154,11 +6126,13 @@ class PaperDownloader:
         elements.sort(key=lambda x: x.score, reverse=True)
         return elements
 
-    async def find_and_download_pdf_with_browser(self, url: str, filepath: str, 
-                                           title: Optional[str] = None, 
+    async def find_and_download_pdf_with_browser(self, url: str, filepath: str,
+                                           title: Optional[str] = None,
                                            authors: Optional[List[str]] = None,
                                            year: Optional[int] = None,
-                                           source: Optional[str] = None) -> bool:
+                                           source: Optional[str] = None,
+                                           llm_provider: Optional[str] = None,
+                                           model_override: Optional[str] = None) -> bool:
         """使用浏览器查找并下载PDF文件
         
         查找页面中的PDF下载链接按钮，点击后下载PDF文件
@@ -6169,10 +6143,26 @@ class PaperDownloader:
             title: 论文标题
             authors: 作者列表
             year: 发表年份
+            llm_provider: 可选，本任务使用的 LLM 提供商（覆盖默认）
+            model_override: 可选，本任务使用的模型（覆盖提供商默认）
             
         Returns:
             bool: 是否下载成功
         """
+        self._current_llm_override = (llm_provider, model_override) if (llm_provider or model_override) else None
+        try:
+            return await self._find_and_download_pdf_with_browser_impl(
+                url, filepath, title=title, authors=authors, year=year, source=source
+            )
+        finally:
+            self._current_llm_override = None
+
+    async def _find_and_download_pdf_with_browser_impl(self, url: str, filepath: str,
+                                           title: Optional[str] = None,
+                                           authors: Optional[List[str]] = None,
+                                           year: Optional[int] = None,
+                                           source: Optional[str] = None) -> bool:
+        """Implementation of find_and_download_pdf_with_browser (after setting _current_llm_override)."""
         self.logger.info(f"尝试查找并下载PDF: {url}")
         downloads_dir = os.path.dirname(filepath)
         os.makedirs(downloads_dir, exist_ok=True)

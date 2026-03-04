@@ -93,27 +93,7 @@ class ScholarDownloaderAdapter:
             api_keys["twocaptcha"] = (getattr(cf, "two_captcha_api_key", "") or "").strip()
         cf = getattr(settings, "content_fetcher", None)
         api_keys["brightdata"] = (getattr(cf, "brightdata_api_key", "") or "").strip()
-        default_llm = getattr(settings.llm, "default", "deepseek") or "deepseek"
-        try:
-            prov = settings.llm.get_provider(default_llm)
-            llm_key = (prov.get("api_key") or "").strip()
-            if default_llm == "deepseek" and llm_key:
-                api_keys["deepseek"] = llm_key
-            elif default_llm in ("claude", "anthropic") and llm_key:
-                api_keys["anthropic"] = llm_key
-        except Exception:
-            pass
-        llm_provider = "auto"
-        if default_llm == "deepseek" and api_keys.get("deepseek"):
-            llm_provider = "deepseek"
-        elif default_llm in ("claude", "anthropic") and api_keys.get("anthropic"):
-            llm_provider = "anthropic"
-        llm_model: Optional[str] = None
-        if settings.llm.is_available(default_llm):
-            try:
-                llm_model = settings.llm.resolve_model(default_llm, None)
-            except Exception:
-                pass
+        default_llm = getattr(cfg, "llm_provider", None) or "qwen-thinking"
         ext_path = (getattr(settings, "capsolver_extension_path", "") or "").strip() or None
         dl_opts: Dict[str, Any] = {
             "proxy": cfg.proxy,
@@ -125,7 +105,7 @@ class ScholarDownloaderAdapter:
             dl_opts["timeouts"] = cfg.timeouts
         initial_config = {
             "api_keys": api_keys,
-            "llm": {"provider": llm_provider, "model": llm_model},
+            "llm": {"provider": default_llm},
             "downloader": dl_opts,
             "annas_keyword_max_pages": getattr(cfg, "annas_keyword_max_pages", 5),
         }
@@ -280,10 +260,17 @@ class ScholarDownloaderAdapter:
         authors: Optional[List[str]] = None,
         year: Optional[int] = None,
         download_dir: Optional[str] = None,
+        llm_provider: Optional[str] = None,
+        model_override: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Download one paper PDF to download_dir (or override). Returns success, paper_id, filepath, message."""
         fut = asyncio.run_coroutine_threadsafe(
-            self._impl_download_inner(title, doi, pdf_url, annas_md5, authors, year, download_dir=download_dir),
+            self._impl_download_inner(
+                title, doi, pdf_url, annas_md5, authors, year,
+                download_dir=download_dir,
+                llm_provider=llm_provider,
+                model_override=model_override,
+            ),
             self._bg_loop,
         )
         return await asyncio.wrap_future(fut)
@@ -297,6 +284,8 @@ class ScholarDownloaderAdapter:
         authors: Optional[List[str]],
         year: Optional[int],
         download_dir: Optional[str] = None,
+        llm_provider: Optional[str] = None,
+        model_override: Optional[str] = None,
     ) -> Dict[str, Any]:
         target_dir = (download_dir or self.download_dir).rstrip("/")
 
@@ -343,7 +332,8 @@ class ScholarDownloaderAdapter:
                 try:
                     await asyncio.sleep(random.uniform(1.0, 3.0))
                     success = await self._dl.find_and_download_pdf_with_browser(
-                        pdf_url, filepath, title=title, authors=authors, year=year
+                        pdf_url, filepath, title=title, authors=authors, year=year,
+                        llm_provider=llm_provider, model_override=model_override,
                     )
                     if success:
                         message = "PDF URL 直接下载"

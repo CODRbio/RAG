@@ -17,7 +17,10 @@ import {
   BookmarkCheck,
   Trash2,
   FolderPlus,
+  RefreshCw,
+  FileSearch,
 } from 'lucide-react';
+import { listLLMProviders, type LLMProviderInfo } from '../api/ingest';
 import { useTranslation } from 'react-i18next';
 import { useScholarStore } from '../stores/useScholarStore';
 import { useConfigStore } from '../stores/useConfigStore';
@@ -34,6 +37,27 @@ const SOURCE_OPTIONS: { value: ScholarSource; labelKey: string }[] = [
   { value: 'ncbi', labelKey: 'scholar.sourcePubMed' },
   { value: 'annas_archive', labelKey: 'scholar.sourceAnnasArchive' },
 ];
+
+function scholarLlmGroupLabel(id: string): string {
+  const base = id.split('-')[0].toLowerCase();
+  const labels: Record<string, string> = {
+    openai: 'OpenAI',
+    deepseek: 'DeepSeek',
+    claude: 'Claude',
+    gemini: 'Gemini',
+    kimi: 'Kimi',
+    qwen: 'Qwen',
+    perplexity: 'Perplexity',
+    sonar: 'Perplexity',
+  };
+  return labels[base] || id;
+}
+
+function scholarLlmProviderOptionLabel(id: string): string {
+  const base = scholarLlmGroupLabel(id);
+  const suffix = id.split('-').slice(1).join('-');
+  return suffix ? `${base} · ${suffix}` : base;
+}
 
 export function ScholarPage() {
   const { t } = useTranslation();
@@ -87,6 +111,10 @@ export function ScholarPage() {
     addResultsToLibrary,
     removeFromLibrary,
     downloadLibraryBatch,
+    extractDoiAndDedup,
+    selectedScholarLlmProvider,
+    selectedScholarLlmModel,
+    setScholarLlm,
   } = useScholarStore();
 
   const [tasksPanelOpen, setTasksPanelOpen] = useState(true);
@@ -94,10 +122,13 @@ export function ScholarPage() {
   const [pdfView, setPdfView] = useState<{ paperId: string; title: string } | null>(null);
   const [downloadingIndex, setDownloadingIndex] = useState<number | null>(null);
   const [downloadingBatch, setDownloadingBatch] = useState(false);
+  const [extractDoiDedupLoading, setExtractDoiDedupLoading] = useState(false);
   const [showNewLibraryModal, setShowNewLibraryModal] = useState(false);
   const [newLibraryName, setNewLibraryName] = useState('');
   const [newLibraryDesc, setNewLibraryDesc] = useState('');
   const [addingToLibrary, setAddingToLibrary] = useState(false);
+  const [llmProviders, setLlmProviders] = useState<LLMProviderInfo[]>([]);
+  const [isRefreshingLlm, setIsRefreshingLlm] = useState(false);
 
   useEffect(() => {
     checkHealth();
@@ -106,6 +137,20 @@ export function ScholarPage() {
   useEffect(() => {
     if (scholarHealth?.enabled) loadLibraries();
   }, [scholarHealth?.enabled, loadLibraries]);
+
+  const loadLlmProviders = useCallback(async (force = false) => {
+    if (force) setIsRefreshingLlm(true);
+    try {
+      const data = await listLLMProviders();
+      if (data?.providers?.length) setLlmProviders(data.providers);
+    } finally {
+      if (force) setIsRefreshingLlm(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (scholarHealth?.enabled) loadLlmProviders();
+  }, [scholarHealth?.enabled, loadLlmProviders]);
 
   const isResultInLibrary = useCallback(
     (title: string, doi: string | null, libPapers: ScholarLibraryPaper[]) => {
@@ -361,6 +406,73 @@ export function ScholarPage() {
                 ))}
               </select>
             </div>
+            {/* Download assist LLM (same list as RAG model selector) */}
+            <div>
+              <label className="block text-xs font-medium text-slate-400 mb-1 whitespace-nowrap">{t('scholar.llmForDownloadLabel')}</label>
+              <div className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-600/80 bg-slate-800/60">
+                <Sparkles size={13} className="text-rose-400 shrink-0" />
+                <select
+                  value={selectedScholarLlmProvider}
+                  onChange={(e) => {
+                    const p = e.target.value;
+                    const prov = llmProviders.find((x) => x.id === p);
+                    setScholarLlm(p, prov?.default_model ?? '');
+                  }}
+                  className="bg-transparent text-xs font-medium text-slate-200 focus:outline-none cursor-pointer appearance-none pr-2 min-w-[100px]"
+                  style={{
+                    backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 24 24' fill='none' stroke='%239ca3af' stroke-width='2'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E")`,
+                    backgroundRepeat: 'no-repeat',
+                    backgroundPosition: 'right 0 center',
+                  }}
+                >
+                  <option value="">{t('scholar.llmDefault')}</option>
+                  {Array.from(
+                    llmProviders.reduce((acc, p) => {
+                      const g = scholarLlmGroupLabel(p.id);
+                      if (!acc.has(g)) acc.set(g, []);
+                      acc.get(g)!.push(p);
+                      return acc;
+                    }, new Map<string, LLMProviderInfo[]>()),
+                  ).map(([group, providers]) => (
+                    <optgroup key={group} label={group} className="bg-slate-800">
+                      {providers.map((p) => (
+                        <option key={p.id} value={p.id} className="bg-slate-800 text-slate-200">
+                          {scholarLlmProviderOptionLabel(p.id)}
+                        </option>
+                      ))}
+                    </optgroup>
+                  ))}
+                </select>
+                <span className="text-slate-600 text-xs select-none">/</span>
+                <select
+                  value={selectedScholarLlmModel}
+                  onChange={(e) => setScholarLlm(selectedScholarLlmProvider, e.target.value)}
+                  disabled={!selectedScholarLlmProvider}
+                  className="bg-transparent text-xs font-medium text-slate-200 focus:outline-none cursor-pointer appearance-none pr-2 min-w-[110px] disabled:opacity-60"
+                  style={{
+                    backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 24 24' fill='none' stroke='%239ca3af' stroke-width='2'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E")`,
+                    backgroundRepeat: 'no-repeat',
+                    backgroundPosition: 'right 0 center',
+                  }}
+                >
+                  <option value="">{t('scholar.llmModelDefault')}</option>
+                  {(llmProviders.find((p) => p.id === selectedScholarLlmProvider)?.models ?? []).map((m) => (
+                    <option key={m} value={m} className="bg-slate-800 text-slate-200">
+                      {m}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  onClick={() => loadLlmProviders(true)}
+                  disabled={isRefreshingLlm}
+                  className="text-slate-400 hover:text-sky-300 disabled:opacity-60 transition-colors"
+                  title={t('scholar.llmRefresh')}
+                >
+                  <RefreshCw size={12} className={isRefreshingLlm ? 'animate-spin' : ''} />
+                </button>
+              </div>
+            </div>
             <div className="pt-6">
               <button
                 type="button"
@@ -487,6 +599,38 @@ export function ScholarPage() {
                   >
                     <Download size={16} />
                     {t('scholar.libraryDownloadAll')}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      setExtractDoiDedupLoading(true);
+                      try {
+                        const stats = await extractDoiAndDedup();
+                        if (stats != null) {
+                          addToast(
+                            t('scholar.libraryExtractDoiDedupSuccess', {
+                              extracted: stats.extracted_count,
+                              removed: stats.removed_count,
+                            }),
+                            'success',
+                          );
+                        } else {
+                          addToast(t('scholar.downloadFailed'), 'error');
+                        }
+                      } finally {
+                        setExtractDoiDedupLoading(false);
+                      }
+                    }}
+                    disabled={libraryPapers.length === 0 || libraryLoading || extractDoiDedupLoading}
+                    className="flex items-center justify-center gap-2 px-3 py-2 rounded-lg border border-slate-500/60 bg-slate-700/50 hover:bg-slate-600/50 disabled:opacity-60 text-slate-200 text-sm font-medium"
+                    title={t('scholar.libraryExtractDoiDedup')}
+                  >
+                    {extractDoiDedupLoading ? (
+                      <Loader2 size={16} className="animate-spin" />
+                    ) : (
+                      <FileSearch size={16} />
+                    )}
+                    <span className="hidden sm:inline">{t('scholar.libraryExtractDoiDedup')}</span>
                   </button>
                   <button
                     type="button"
