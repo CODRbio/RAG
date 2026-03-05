@@ -29,55 +29,6 @@ from src.log import get_logger
 logger = get_logger(__name__)
 
 
-def _extract_doi_from_pdf_tiered(pdf_path: Path) -> tuple[str | None, str | None]:
-    """
-    Extract DOI from a PDF using 3-tier strategy. Returns (doi, title).
-    Title is used for CrossRef fallback; may be None.
-    """
-    # Tier 1: native metadata
-    try:
-        from src.parser.pdf_parser import extract_native_metadata
-        meta = extract_native_metadata(pdf_path)
-        if meta.get("doi"):
-            return meta.get("doi"), meta.get("title")
-    except Exception:
-        pass
-
-    # Tier 2: first-page text scan with DOI regex
-    try:
-        import fitz
-        from src.retrieval.dedup import _DOI_RE
-        with fitz.open(str(pdf_path)) as doc:
-            if len(doc) > 0:
-                page = doc[0]
-                text = page.get_text() or ""
-                m = _DOI_RE.search(text)
-                if m:
-                    doi = m.group(1).rstrip(".:")
-                    return doi, None
-    except Exception:
-        pass
-
-    # Tier 3: title -> CrossRef (need a title from tier 1 or tier 2)
-    title = None
-    try:
-        from src.parser.pdf_parser import extract_native_metadata
-        meta = extract_native_metadata(pdf_path)
-        title = meta.get("title", "").strip() or None
-    except Exception:
-        pass
-    if not title or len(title) < 10:
-        return None, None
-    try:
-        from src.retrieval.dedup import _crossref_lookup_by_title
-        cr = _crossref_lookup_by_title(title)
-        if cr and cr.get("doi"):
-            return cr["doi"], title
-    except Exception:
-        pass
-    return None, None
-
-
 def _file_hash(path: Path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -202,12 +153,13 @@ def main() -> int:
         content_hashes[str(pdf_path)] = file_hash
 
         # DOI: fast path from paper_meta_store (e.g. written by adapter at download time)
+        from src.retrieval.dedup import extract_doi_from_pdf_tiered
         candidate_doi: str | None = None
         meta = paper_meta_store.get(paper_id)
         if meta and meta.get("doi"):
             candidate_doi = meta["doi"]
         if not candidate_doi:
-            candidate_doi, _ = _extract_doi_from_pdf_tiered(pdf_path)
+            candidate_doi, _ = extract_doi_from_pdf_tiered(pdf_path)
 
         norm_doi = _normalize_doi(candidate_doi) if candidate_doi else ""
 

@@ -20,7 +20,7 @@ import re
 import signal
 from urllib.parse import quote, urljoin, urlparse
 from .browser_manager import BrowserManager, simulate_human_behavior, setup_browser
-from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError, Error as PlaywrightError
 from src.log import get_logger
 from src.llm.llm_manager import get_manager
 import logging
@@ -459,7 +459,18 @@ class PageAnalyzer:
                     const isLink = tag === 'a' && el.hasAttribute('href');
                     const isBtn = tag === 'button' || el.getAttribute('role') === 'button' ||
                                   (tag === 'input' && (el.type === 'button' || el.type === 'submit'));
-                    if (!isLink && !isBtn) return;
+                    const className = typeof el.className === 'string' ? el.className.toLowerCase() : '';
+                    const exactText = (el.textContent || '').trim().toLowerCase();
+                    const isPseudoBtn = (tag === 'div' || tag === 'span' || tag === 'p') && (
+                        exactText.includes('download free pdf') ||
+                        exactText.includes('download pdf') ||
+                        className.includes('ds-work-cover') ||
+                        className.includes('ds2-5-button') ||
+                        className.includes('toolbarbutton') ||
+                        className.includes('js-swp-download-button') ||
+                        (exactText.length > 0 && exactText.length < 50 && (className.includes('btn') || className.includes('button') || className.includes('download')))
+                    );
+                    if (!isLink && !isBtn && !isPseudoBtn) return;
                     if (!isPdfRelated(el)) return;
                     const key = getKey(el);
                     if (seen.has(key)) return;
@@ -517,7 +528,11 @@ class PageAnalyzer:
         attr_aria = attrs.get("aria-label", "").lower()
         
         combined_all = f"{text} {href} {attr_class} {attr_title} {attr_aria}"
-        
+
+        # Academia early-pass: bypass all traps (ds-work-cover contains 'cover' which would zero score)
+        if 'ds-work-cover' in attr_class or text == 'download free pdf':
+            return max(0, min(85, 100))
+
         # ====== 一票否决：陷阱/付费墙/引文导出（最优先检查）======
         TRAP_KEYWORDS = [
             'request full-text', 'request full text', 'ask author',
@@ -560,7 +575,11 @@ class PageAnalyzer:
         selector = getattr(elem, 'selector', '') or ''
         if '#pdflink' in selector.lower():
             score += 85
-        
+
+        # Academia.edu ds2-5-button / ToolbarButton 高分保送
+        if any(cls in attr_class for cls in ['ds2-5-button', 'toolbarbutton']):
+            score += 85
+
         # ====== 基础加分逻辑 ======
         if "pdf" in text:
             score += 25
@@ -946,7 +965,15 @@ class LLMAssistant:
                 let btnCount = 0, linkCount = 0;
                 allNodes.forEach(el => {
                     const tag = (el.tagName || '').toLowerCase();
-                    if (btnCount < 15 && (tag === 'button' || el.getAttribute('role') === 'button')) {
+                    const className = typeof el.className === 'string' ? el.className.toLowerCase() : '';
+                    const exactText = (el.innerText || '').trim().toLowerCase();
+                    const isBtn = tag === 'button' || el.getAttribute('role') === 'button';
+                    const isPseudoBtn = (tag === 'div' || tag === 'span' || tag === 'button') && (
+                        exactText.includes('download free pdf') || exactText.includes('download pdf') ||
+                        className.includes('ds-work-cover') || className.includes('ds2-5-button') || className.includes('toolbarbutton') ||
+                        (exactText.length > 0 && exactText.length < 50 && (className.includes('btn') || className.includes('button') || className.includes('download')))
+                    );
+                    if (btnCount < 15 && (isBtn || isPseudoBtn)) {
                         const text = (el.innerText || '').trim().slice(0, 50);
                         if (text) {
                             result.buttons.push({
@@ -1276,6 +1303,14 @@ class PaperDownloader:
                 'a[data-panel-name="article-pdf"]',
                 'a.article-dl-pdf-link-ext',
             ],
+            'academia': [
+                'button.ds2-5-button:has-text("Download PDF")',
+                'button[class*="ToolbarButton"]:has-text("Download PDF")',
+                'button.ds2-5-button',
+                'a.js-swp-download-button',
+                'div.ds-work-cover--hover-container',
+                'div.js-swp-download-button',
+            ],
         },
         
         # 通用选择器（按类型分组）
@@ -1452,6 +1487,7 @@ class PaperDownloader:
         'research_square': ['researchsquare.com'],
         'osf_preprints': ['osf.io'],
         'pmc': ['ncbi.nlm.nih.gov/pmc', 'europepmc.org'],
+        'academia': ['academia.edu'],
     }
     
     def __init__(self, download_dir: str = "papers", max_concurrent: int = 5, show_browser: bool = False,
@@ -1558,12 +1594,19 @@ class PaperDownloader:
         self._context_lock = asyncio.Lock()  # 添加锁来保护context的创建和使用
         self._active_pages = set()  # 跟踪所有活动的页面
         
-        # 会话池相关属性（解决 cookie/重定向问题 + PDF 设置生效）
+        # 会话池相关属性（单上下文多标签：共享 cookie/登录态）
+        self._shared_browser_context = None  # 唯一的全局浏览器上下文，所有 slot 共享
         self._session_pool_size = max_concurrent  # 会话池大小与并发数保持一致
         self._session_pool: asyncio.Queue = asyncio.Queue()  # 会话队列
         self._session_pool_data: List[Dict] = []  # 会话元数据 [{context, user_data_dir, index, last_used}]
         self._session_pool_initialized = False  # 会话池是否已初始化
-        
+        self._pool_was_headless: Optional[bool] = None  # 会话池当前使用的 headless（用于检测 override 变更后重建）
+        self._show_browser_override: Optional[bool] = None  # 运行时覆盖：有头/无头（由前端或 API 设置）
+        self._warmed_domains: Set[str] = set()  # 全局预热域名集合，所有 slot 共享（一处验证处处放行）
+        # 防并发惊群：按域名排队，仅第一个任务执行预热，其余等待后直接放行
+        self._domain_locks: Dict[str, asyncio.Lock] = {}
+        self._domain_locks_lock = asyncio.Lock()
+
         # 动态资源管理（优化：空闲超时自动释放）
         self._session_idle_timeout = 60  # 会话空闲超时（秒），空闲超过此时间后关闭
         self._cleanup_task: Optional[asyncio.Task] = None  # 清理任务
@@ -1625,6 +1668,16 @@ class PaperDownloader:
         )
 
         # 其他初始化代码...
+
+    def set_show_browser_override(self, value: Optional[bool]) -> None:
+        """运行时覆盖：有头(True)/无头(False)。由 API 请求传入，影响下次会话池创建或重建。"""
+        self._show_browser_override = value
+
+    def get_effective_headless(self) -> bool:
+        """当前应使用的 headless：有 override 时用 override，否则用初始化时的 headless。"""
+        if self._show_browser_override is not None:
+            return not self._show_browser_override
+        return self.headless
 
 # 拦截script，用于获取 Cloudflare JS Challenge 参数，包括非常关键的sitekey，后续将用于解决验证码
     # 保留原生 render 调用，防止页面卡死；参数挂载到全局变量供 Python 轮询（比 console.log 稳定）
@@ -3009,73 +3062,64 @@ class PaperDownloader:
         self.logger.debug(f"已写入 PDF 首选项到: {preferences_path}")
 
     async def _init_session_pool(self):
-        """初始化浏览器会话池（动态模式：按需创建，空闲释放）
-        
-        创建多个独立的持久化浏览器上下文，每个有独立的用户数据目录。
-        这样可以：
-        1. 保持 cookie/session（解决重定向问题）
-        2. 正确应用 PDF 下载首选项
-        3. 避免锁文件冲突（独立目录）
+        """初始化浏览器会话池（单上下文多标签模式：一个浏览器，N 个 slot，共享 cookie/登录态）
+
+        只创建一个持久化浏览器上下文，所有并发任务共享同一上下文下的多个页面。
+        这样：一处登录/过盾，所有 slot 共享；内存占用大幅降低。
         """
         self.logger.debug(f"[DEBUG] _init_session_pool called, already_initialized={self._session_pool_initialized}")
         if self._session_pool_initialized:
             return
-        
-        self.logger.info(f"正在初始化会话池，大小: {self._session_pool_size}")
-        
-        for i in range(self._session_pool_size):
-            # 每个会话有独立的用户数据目录
-            user_data_dir = os.path.join(
-                os.path.dirname(self.download_dir), 
-                ".browser_data", 
-                f"session_pool_{i}"
+
+        self.logger.info(f"正在初始化会话池（单上下文多标签），大小: {self._session_pool_size}")
+
+        # 单一共享用户数据目录 → 所有 slot 共享 cookie / Cloudflare / 登录态
+        user_data_dir = os.path.join(
+            os.path.dirname(self.download_dir),
+            ".browser_data",
+            "shared_session",
+        )
+        shared_downloads_dir = os.path.join(self.download_dir, ".shared_downloads")
+        os.makedirs(user_data_dir, exist_ok=True)
+        os.makedirs(shared_downloads_dir, exist_ok=True)
+
+        self._clean_lock_files_in_dir(user_data_dir)
+        self._write_pdf_preferences(user_data_dir, custom_download_dir=shared_downloads_dir)
+
+        try:
+            effective_headless = self.get_effective_headless()
+            self._shared_browser_context = await self.browser_manager.launch_persistent_browser(
+                user_data_dir=user_data_dir,
+                browser_type=self.browser_type,
+                headless=effective_headless,
+                stealth_mode=self.stealth_mode,
+                viewport={'width': 1280, 'height': 720},
+                downloads_path=shared_downloads_dir,
+                timeout=self.download_timeout * 1000,
+                proxy=getattr(self, "_proxy", None),
+                extension_path=getattr(self, "_capsolver_extension_path", None),
             )
-            # 为当前 Session 创建专属的物理下载沙盒（并发隔离）
-            session_downloads_dir = os.path.join(self.download_dir, f".session_{i}_downloads")
-            os.makedirs(user_data_dir, exist_ok=True)
-            os.makedirs(session_downloads_dir, exist_ok=True)
-            
-            # 清理锁文件
-            self._clean_lock_files_in_dir(user_data_dir)
-            
-            # 写入 PDF 首选项（必须在启动浏览器之前），使用专属沙盒
-            self._write_pdf_preferences(user_data_dir, custom_download_dir=session_downloads_dir)
-            
-            try:
-                # 启动持久化上下文，原生隐式下载也落入沙盒
-                context = await self.browser_manager.launch_persistent_browser(
-                    user_data_dir=user_data_dir,
-                    browser_type=self.browser_type,
-                    headless=self.headless,
-                    stealth_mode=self.stealth_mode,
-                    viewport={'width': 1280, 'height': 720},
-                    downloads_path=session_downloads_dir,
-                    timeout=self.download_timeout * 1000,
-                    proxy=getattr(self, "_proxy", None),
-                    extension_path=getattr(self, "_capsolver_extension_path", None),
-                )
-                
-                session_data = {
-                    'context': context,
-                    'user_data_dir': user_data_dir,
-                    'session_downloads_dir': session_downloads_dir,
-                    'index': i,
-                    'last_used': time.time(),  # 记录最后使用时间
-                    'in_use': False,  # 是否正在使用
-                    'warmed_domains': set(),  # 已预热的域名集合
-                }
-                self._session_pool_data.append(session_data)
-                await self._session_pool.put(session_data)
-                self.logger.info(f"会话池 [{i}] 初始化成功: {user_data_dir}")
-                
-            except Exception as e:
-                self.logger.error(f"会话池 [{i}] 初始化失败: {e}")
-                # 继续初始化其他会话
-        
+        except Exception as e:
+            self.logger.error(f"创建共享浏览器上下文失败: {e}")
+            return
+
+        # 池中只放 N 个轻量 slot 元数据，都指向同一 context（实际 page 在 _acquire 时由 context.new_page() 创建）
+        for i in range(self._session_pool_size):
+            slot = {
+                'context': self._shared_browser_context,
+                'user_data_dir': user_data_dir,
+                'session_downloads_dir': shared_downloads_dir,
+                'index': i,
+                'last_used': time.time(),
+                'in_use': False,
+            }
+            self._session_pool_data.append(slot)
+            await self._session_pool.put(slot)
+
         self._session_pool_initialized = True
-        self.logger.info(f"会话池初始化完成，可用会话数: {self._session_pool.qsize()}")
-        
-        # 启动后台清理任务
+        self._pool_was_headless = self.get_effective_headless()
+        self.logger.info(f"会话池初始化完成（单上下文），可用 slot 数: {self._session_pool.qsize()}，headless={self._pool_was_headless}")
+
         self._start_cleanup_task()
 
     def _start_cleanup_task(self):
@@ -3119,6 +3163,12 @@ class PaperDownloader:
         """
         # 更新最后活动时间
         self._last_activity_time = time.time()
+        
+        # 若运行时覆盖了有头/无头，且与当前池不一致，则关闭池以便下次用新模式重建
+        effective = self.get_effective_headless()
+        if self._session_pool_initialized and self._pool_was_headless is not None and effective != self._pool_was_headless:
+            self.logger.info("有头/无头设置变更，关闭会话池以便用新模式重建")
+            await self._close_session_pool()
         
         # 如果会话池已关闭，重新初始化
         if not self._session_pool_initialized:
@@ -3185,22 +3235,27 @@ class PaperDownloader:
                 self._session_pool.get_nowait()
             except Exception:
                 break
-        
+
+        # 关闭唯一的共享浏览器上下文
+        if self._shared_browser_context:
+            try:
+                await asyncio.wait_for(self._shared_browser_context.close(), timeout=5)
+            except Exception as e:
+                self.logger.warning(f"关闭共享浏览器上下文时出错: {e}")
+            self._shared_browser_context = None
+
+        self._warmed_domains.clear()
         self._session_pool_initialized = False
+        self._pool_was_headless = None
         self.logger.info("会话池已关闭，资源已释放")
 
     async def _close_single_session(self, session_data: Dict):
-        """关闭单个会话（辅助方法）"""
+        """关闭单个会话（辅助方法）。单上下文模式下 slot 不拥有 context，不在此处关闭 context。"""
         try:
-            context = session_data.get('context')
-            if context:
-                # 快速关闭：直接关闭上下文（会自动关闭所有页面）
-                await asyncio.wait_for(context.close(), timeout=5)
-                self.logger.debug(f"已关闭会话 [{session_data['index']}]")
-        except asyncio.TimeoutError:
-            self.logger.warning(f"关闭会话 [{session_data.get('index', '?')}] 超时，强制跳过")
+            session_data['in_use'] = False
+            self.logger.debug(f"已释放 slot [{session_data.get('index', '?')}]")
         except Exception as e:
-            self.logger.warning(f"关闭会话 [{session_data.get('index', '?')}] 时出错: {e}")
+            self.logger.warning(f"释放 slot [{session_data.get('index', '?')}] 时出错: {e}")
 
     async def _create_lightweight_context(self):
         """创建轻量级临时上下文（非持久化，下载完立即释放）
@@ -3226,7 +3281,7 @@ class PaperDownloader:
             context = await self.browser_manager.launch_persistent_browser(
                 user_data_dir=temp_dir,
                 browser_type=self.browser_type,
-                headless=self.headless,
+                headless=self.get_effective_headless(),
                 stealth_mode=self.stealth_mode,
                 viewport={'width': 1280, 'height': 720},
                 downloads_path=self.download_dir,
@@ -3319,7 +3374,7 @@ class PaperDownloader:
                     self._browser_context = await self.browser_manager.launch_persistent_browser(
                         user_data_dir=self._persistent_user_data_dir,
                         browser_type=self.browser_type,
-                        headless=self.headless,
+                        headless=self.get_effective_headless(),
                         stealth_mode=self.stealth_mode,
                         viewport={'width': 1280, 'height': 720},
                         downloads_path=self.download_dir,
@@ -3330,7 +3385,7 @@ class PaperDownloader:
                 else:
                     self._browser_context = await setup_browser(
                         browser_type=self.browser_type,
-                        headless=self.headless,  # 确保这个参数被正确传递和使用
+                        headless=self.get_effective_headless(),
                         browser_channel=self.browser_type,
                         stealth_mode=self.stealth_mode,
                         user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
@@ -3521,35 +3576,39 @@ class PaperDownloader:
                     return False
                 parsed = urlparse(url)
                 domain = parsed.netloc
-                warmed_domains = session.get('warmed_domains', set()) if session else set()
+                warmed_domains = self._warmed_domains
 
-                if domain in warmed_domains:
-                    self.logger.info(f"域名 {domain} 已预热过，跳过")
+                async with self._domain_locks_lock:
+                    if domain not in self._domain_locks:
+                        self._domain_locks[domain] = asyncio.Lock()
+
+                if domain not in warmed_domains:
+                    async with self._domain_locks[domain]:
+                        if domain not in warmed_domains:
+                            base_url = f"{parsed.scheme}://{parsed.netloc}"
+                            self.logger.info(f"首入域名，执行全局探路预热：{base_url}")
+                            self.logger.debug(f"[DEBUG] 预热访问: base_url={base_url}")
+                            try:
+                                warmup_response = await page.goto(
+                                    base_url,
+                                    wait_until="domcontentloaded",
+                                    timeout=self.timeouts.get("goto_timeout", 20) * 1000
+                                )
+                                self.logger.debug(f"[DEBUG] 预热完成: status={warmup_response.status if warmup_response else None}, url={page.url}")
+                                await self._handle_cookie_consent(page, context_label="预热")
+                                cf_success, _ = await self.solve_cloudflare_if_needed(
+                                    page, task_download_dir=task_download_dir
+                                )
+                                if not cf_success:
+                                    self.logger.warning("预热页面 Cloudflare 验证解决失败，继续尝试")
+                                warmed_domains.add(domain)
+                                self.logger.info("预热完成，开始访问 PDF URL")
+                            except Exception as e:
+                                self.logger.warning(f"预热访问失败（不影响后续流程）: {e}")
+                        else:
+                            self.logger.info(f"域名 {domain} 已被前面的排队任务预热，直接放行")
                 else:
-                    base_url = f"{parsed.scheme}://{parsed.netloc}"
-                    self.logger.info(f"预热：先访问主站 {base_url} 处理 cookie")
-                    self.logger.debug(f"[DEBUG] 预热访问: base_url={base_url}")
-                    warmup_response = await page.goto(
-                        base_url,
-                        wait_until="domcontentloaded",
-                        timeout=self.timeouts.get("goto_timeout", 20) * 1000
-                    )
-                    self.logger.debug(f"[DEBUG] 预热完成: status={warmup_response.status if warmup_response else None}, url={page.url}")
-
-                    # 尝试处理 cookie 同意弹窗
-                    await self._handle_cookie_consent(page, context_label="预热")
-
-                    # 检测并处理预热页面的 Cloudflare 验证
-                    cf_success, _ = await self.solve_cloudflare_if_needed(
-                        page, task_download_dir=task_download_dir
-                    )
-                    if not cf_success:
-                        self.logger.warning("预热页面 Cloudflare 验证解决失败，继续尝试")
-
-                    warmed_domains.add(domain)
-                    if session:
-                        session['warmed_domains'] = warmed_domains
-                    self.logger.info("预热完成，开始访问 PDF URL")
+                    self.logger.info(f"域名 {domain} 已预热过，跳过")
             except Exception as warmup_e:
                 self.logger.warning(f"预热访问失败，继续尝试直接下载: {warmup_e}")
             
@@ -3559,7 +3618,22 @@ class PaperDownloader:
                 captured_downloads.append(download)
                 self.logger.debug(f"[下载监听] 捕获下载事件: {download.suggested_filename}")
             page.on("download", _on_download_capture)
-            
+
+            sniffed_pdf_buffers_simple = []
+            async def _on_response_sniff_simple(response):
+                try:
+                    if response.status == 200 and response.request.method not in ("OPTIONS", "HEAD"):
+                        ct = (response.headers.get("content-type") or "").lower()
+                        ru = response.url.lower()
+                        if ("application/pdf" in ct or ru.split('?')[0].endswith(".pdf")) and not ru.startswith("data:"):
+                            body = await response.body()
+                            if body and len(body) > 10240:
+                                self.logger.info(f"[流量嗅探] pdf_download_with_browser 截获 PDF: {response.url[:80]}")
+                                sniffed_pdf_buffers_simple.append((response.url, body))
+                except Exception:
+                    pass
+            page.on("response", _on_response_sniff_simple)
+
             # 尝试初始下载
             self.logger.info("开始尝试初始下载")
             response = None
@@ -3743,6 +3817,26 @@ class PaperDownloader:
                         ):
                             finished = True
                             break
+                    if not finished and sniffed_pdf_buffers_simple:
+                        for s_url, s_body in list(sniffed_pdf_buffers_simple):
+                            temp = os.path.join(task_download_dir, "sniffed_simple.pdf")
+                            try:
+                                with open(temp, 'wb') as f:
+                                    f.write(s_body)
+                                if self.is_valid_pdf_file(temp):
+                                    if os.path.exists(filepath):
+                                        os.remove(filepath)
+                                    shutil.move(temp, filepath)
+                                    self.logger.info(f"⚡ [极速落盘-simple] 内存流兜底落盘成功 -> {os.path.basename(filepath)}")
+                                    finished = True
+                                    break
+                                else:
+                                    try:
+                                        os.remove(temp)
+                                    except Exception:
+                                        pass
+                            except Exception as e:
+                                self.logger.debug(f"内存流兜底落盘失败: {e}")
                     if not finished and await self._check_download_in_progress(
                         filepath, task_download_dir=task_download_dir
                     ):
@@ -4726,8 +4820,9 @@ class PaperDownloader:
                 
                 # ===== 简化后的下载顺序 =====
                 # 优先级：pdf_link 直链 > 浏览器 > DOI/Sci-Hub > Anna's Archive
-                
-                if pdf_url:
+                # Academia.edu 多为付费：有 pdf_url 时先走 DOI/Sci-Hub，最后再试 Academia 兜底
+                is_academia_pdf = bool(pdf_url and "academia.edu" in (pdf_url or "").lower())
+                if pdf_url and not is_academia_pdf:
                     # 有 pdf_url：先尝试免费方法
                     self.logger.debug(f"检测到 pdf_url: {pdf_url}")
                     is_likely_pdf = self._is_likely_pdf_url(pdf_url)
@@ -4814,8 +4909,8 @@ class PaperDownloader:
                     except Exception as e:
                         self.logger.warning(f"Semantic Scholar：DOI 解析下载失败（继续后续策略）: {e}")
 
-                if not success and not pdf_url and doi:
-                    # 没有 pdf_url：提前查询 Anna MD5（后续 Sci-Hub 仅在有 MD5 时尝试）
+                if not success and (not pdf_url or is_academia_pdf) and doi:
+                    # 没有 pdf_url 或仅有 Academia pdf_url：提前查询 Anna MD5（后续 Sci-Hub 仅在有 MD5 时尝试）
                     try:
                         if not annas_md5:
                             md5 = await self._annas_search_md5(doi)
@@ -4881,6 +4976,17 @@ class PaperDownloader:
                             await asyncio.sleep(1)
                     else:
                         self.logger.info("已跳过 Sci-Hub（需要 MD5 才尝试）")
+
+                # Academia 兜底：pdf_url 为 academia.edu 时，前面已跳过直链/浏览器，此处最后再试
+                if not success and pdf_url and is_academia_pdf:
+                    try:
+                        self.logger.info("Academia 兜底：尝试通过浏览器下载: %s", pdf_url[:60] + "..." if len(pdf_url or "") > 60 else pdf_url)
+                        success = await self.pdf_download_with_browser(pdf_url, filepath)
+                        if success:
+                            stats['success'] += 1
+                            await asyncio.sleep(1)
+                    except Exception as e:
+                        self.logger.warning("Academia 兜底下载失败: %s", e)
                 
                 # 注意：Anna's Archive API 下载已移除自动调用
                 # 只有用户手动选择"失败且有MD5"的论文并点击"Anna's Retry"时才会触发
@@ -5176,7 +5282,50 @@ class PaperDownloader:
         except Exception as e:
             self.logger.debug(f"[下载验证] 失败({reason}): {e}")
             return False
-    
+
+    async def _check_and_save_all(
+        self,
+        sniffed_pdf_buffers: list,
+        captured_downloads: list,
+        filepath: str,
+        task_download_dir: str,
+        reason: str,
+        wait_time: float = 0.0,
+    ) -> bool:
+        """统一落盘接管：内存嗅探流优先，其次 Download 事件，可选轮询等待。"""
+        start_t = time.time()
+        while True:
+            # 1. Memory-sniffed stream (zero-wait, highest priority)
+            while sniffed_pdf_buffers:
+                s_url, s_body = sniffed_pdf_buffers.pop(0)
+                self.logger.info(f"[网络嗅探-优先] 提取内存流落盘 ({reason}): {s_url[:80]}")
+                temp = os.path.join(task_download_dir, "sniffed_memory.pdf")
+                try:
+                    with open(temp, 'wb') as f:
+                        f.write(s_body)
+                    if self.is_valid_pdf_file(temp):
+                        if os.path.exists(filepath):
+                            os.remove(filepath)
+                        shutil.move(temp, filepath)
+                        self.logger.info(f"⚡ [极速落盘] 内存流落盘成功 -> {os.path.basename(filepath)}")
+                        return True
+                    else:
+                        try:
+                            os.remove(temp)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    self.logger.debug(f"内存流落盘失败: {e}")
+            # 2. Download event
+            while captured_downloads:
+                dl = captured_downloads.pop(0)
+                if await self._save_and_validate_download(dl, filepath, task_download_dir, f"event_{reason}"):
+                    return True
+            if wait_time <= 0 or (time.time() - start_t) >= wait_time:
+                break
+            await asyncio.sleep(0.3)
+        return False
+
     async def _check_download_in_task_dir(self, task_download_dir: str) -> bool:
         """检查任务目录中是否有下载正在进行
         
@@ -5216,15 +5365,17 @@ class PaperDownloader:
 
     # ==================== 阶段2：智能下载循环 ====================
     
-    async def _smart_download_loop(self, page, filepath: str, url: str, 
-                                   title: Optional[str] = None, 
+    async def _smart_download_loop(self, page, filepath: str, url: str,
+                                   title: Optional[str] = None,
                                    authors: Optional[List[str]] = None,
                                    max_iterations: int = 6,
                                    max_total_time: Optional[int] = None,
                                    task_download_dir: Optional[str] = None,
                                    session_downloads_dir: Optional[str] = None,
                                    initial_main_files: Optional[set] = None,
-                                   task_start_time: Optional[float] = None) -> bool:
+                                   task_start_time: Optional[float] = None,
+                                   sniffed_pdf_buffers: Optional[list] = None,
+                                   captured_downloads: Optional[list] = None) -> bool:
         """
         智能下载循环：根据页面分析结果决定下一步操作
         
@@ -5304,7 +5455,16 @@ class PaperDownloader:
             if url_key in visited_urls and iteration > 0:
                 self.logger.debug(f"[智能循环] URL重复访问，尝试不同策略")
             visited_urls.add(url_key)
-            
+
+            # Drain any buffers captured by the sniffer or download handler before expensive page analysis
+            if (sniffed_pdf_buffers is not None or captured_downloads is not None) and task_download_dir:
+                if await self._check_and_save_all(
+                    sniffed_pdf_buffers or [], captured_downloads or [],
+                    filepath, task_download_dir, f"smart_loop_iter_{iteration}"
+                ):
+                    self.logger.info("[智能循环] 嗅探/下载缓冲区中已有 PDF，极速落盘成功")
+                    return True
+
             # 1. 分析当前页面
             analysis = await self.page_analyzer.analyze(page)
             
@@ -5914,12 +6074,10 @@ class PaperDownloader:
         timeout = timeout or self.timeouts.get("download_complete_timeout", 20)
         poll_interval = self.timeouts.get("download_poll_interval", 1)
 
-        # 收集有效的沙盒目录
+        # 仅扫描本任务专属 task_download_dir，禁止扫描共享目录（避免跨任务抢夺文件）
         safe_dirs = []
         if task_download_dir and os.path.exists(task_download_dir):
             safe_dirs.append(task_download_dir)
-        if session_downloads_dir and os.path.exists(session_downloads_dir):
-            safe_dirs.append(session_downloads_dir)
 
         if not safe_dirs:
             return False
@@ -6289,7 +6447,32 @@ class PaperDownloader:
                     return False
 
             async def _consume_download_event(reason: str) -> bool:
-                """消费队列中积压的下载事件，直到找到合法的 PDF"""
+                """消费内存嗅探流（优先）或下载事件队列，直到找到合法的 PDF"""
+                nonlocal finished
+                # 1. 内存嗅探流（最高优先级，立即消费，无需等待磁盘落盘）
+                while sniffed_pdf_buffers:
+                    s_url, s_body = sniffed_pdf_buffers.pop(0)
+                    self.logger.info(f"[网络嗅探-优先] 提取内存流落盘 ({reason}): {s_url[:80]}")
+                    temp = os.path.join(task_download_dir, "sniffed_memory.pdf")
+                    try:
+                        with open(temp, 'wb') as f:
+                            f.write(s_body)
+                        if self.is_valid_pdf_file(temp):
+                            if os.path.exists(filepath):
+                                os.remove(filepath)
+                            shutil.move(temp, filepath)
+                            self._record_download_success(filepath, url, title=title, authors=authors, method=f"memory_sniffing:{reason}")
+                            finished = True
+                            self.logger.info(f"⚡ [极速落盘] 内存流落盘成功 -> {os.path.basename(filepath)}")
+                            return True
+                        else:
+                            try:
+                                os.remove(temp)
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        self.logger.debug(f"内存流落盘失败: {e}")
+                # 2. Download 事件队列
                 success = False
                 while captured_downloads:
                     dl = captured_downloads.pop(0)
@@ -6297,6 +6480,17 @@ class PaperDownloader:
                         success = True
                         break
                 return success
+
+            async def _consume_download_event_with_wait(reason: str, wait_time: float = 2.0) -> bool:
+                """Like _consume_download_event, but polls up to wait_time seconds."""
+                start_t = time.time()
+                while True:
+                    if await _consume_download_event(reason):
+                        return True
+                    if (time.time() - start_t) >= wait_time:
+                        break
+                    await asyncio.sleep(0.3)
+                return False
 
             async def _log_analysis(tag: str, level: str = "info") -> None:
                 try:
@@ -6321,13 +6515,11 @@ class PaperDownloader:
                 return tail
 
             async def _salvage_downloaded_pdf(reason: str) -> bool:
-                """并发安全打捞：只扫描隔离沙盒，严禁扫描主目录。"""
+                """并发安全打捞：仅扫描本任务 task_download_dir，严禁扫描共享目录（避免跨任务抢夺）。"""
                 nonlocal finished
                 if os.path.exists(filepath) and self.is_valid_pdf_file(filepath):
                     return True
-                safe_dirs = [task_download_dir]
-                if session_downloads_dir:
-                    safe_dirs.append(session_downloads_dir)
+                safe_dirs = [task_download_dir] if task_download_dir else []
                 task_candidates = []
                 for s_dir in safe_dirs:
                     if not s_dir or not os.path.exists(s_dir):
@@ -6385,39 +6577,43 @@ class PaperDownloader:
                 except Exception as e:
                     self.logger.warning(f"playwright-stealth 应用失败，将继续执行（不致命）: {e}")
             
-            # 预热步骤：先访问网站主页处理 cookie 同意，避免阻塞
+            # 预热步骤（防惊群：按域名排队，仅排头兵执行预热）
             try:
                 parsed = urlparse(url)
                 domain = parsed.netloc
-                warmed_domains = session.get('warmed_domains', set()) if session else set()
+                warmed_domains = self._warmed_domains
 
-                if domain in warmed_domains:
-                    self.logger.info(f"域名 {domain} 已预热过，跳过")
+                async with self._domain_locks_lock:
+                    if domain not in self._domain_locks:
+                        self._domain_locks[domain] = asyncio.Lock()
+
+                if domain not in warmed_domains:
+                    async with self._domain_locks[domain]:
+                        if domain not in warmed_domains:
+                            base_url = f"{parsed.scheme}://{parsed.netloc}"
+                            self.logger.info(f"首入域名，执行全局探路预热：{base_url}")
+                            try:
+                                warmup_response = await page.goto(
+                                    base_url,
+                                    wait_until="domcontentloaded",
+                                    timeout=self.timeouts.get("goto_timeout", 20) * 1000
+                                )
+                                self.logger.debug(f"预热完成: status={warmup_response.status if warmup_response else None}")
+                                await self._handle_cookie_consent(page, context_label="预热")
+                                await _consume_download_event("warmup")
+                                cf_success, _ = await self.solve_cloudflare_if_needed(
+                                    page, task_download_dir=task_download_dir
+                                )
+                                if not cf_success:
+                                    self.logger.warning("预热页面 Cloudflare 验证解决失败，继续尝试")
+                                warmed_domains.add(domain)
+                                self.logger.info("预热完成，开始访问论文页面")
+                            except Exception as e:
+                                self.logger.warning(f"预热访问失败（不影响后续流程）: {e}")
+                        else:
+                            self.logger.info(f"域名 {domain} 已被前面的排队任务预热，直接放行")
                 else:
-                    base_url = f"{parsed.scheme}://{parsed.netloc}"
-                    self.logger.info(f"预热：先访问主站 {base_url} 处理 cookie")
-                    warmup_response = await page.goto(
-                        base_url,
-                        wait_until="domcontentloaded",
-                        timeout=self.timeouts.get("goto_timeout", 20) * 1000
-                    )
-                    self.logger.debug(f"预热完成: status={warmup_response.status if warmup_response else None}")
-
-                    # 尝试处理 cookie 同意弹窗
-                    await self._handle_cookie_consent(page, context_label="预热")
-                    await _consume_download_event("warmup")
-
-                    # 检测并处理预热页面的 Cloudflare 验证
-                    cf_success, _ = await self.solve_cloudflare_if_needed(
-                        page, task_download_dir=task_download_dir
-                    )
-                    if not cf_success:
-                        self.logger.warning("预热页面 Cloudflare 验证解决失败，继续尝试")
-
-                    warmed_domains.add(domain)
-                    if session:
-                        session['warmed_domains'] = warmed_domains
-                    self.logger.info("预热完成，开始访问论文页面")
+                    self.logger.info(f"域名 {domain} 已预热过，跳过")
             except Exception as warmup_e:
                 self.logger.warning(f"预热访问失败，继续尝试直接访问: {warmup_e}")
             
@@ -6511,7 +6707,14 @@ class PaperDownloader:
 
                         download_timeout_ms = self.timeouts.get("download_event_timeout", 15) * 1000
                         async with page.expect_download(timeout=download_timeout_ms) as download_info:
-                            await page.goto(pdfdirect_url, wait_until="domcontentloaded")
+                            try:
+                                await page.goto(pdfdirect_url, wait_until="domcontentloaded")
+                            except Exception as goto_err:
+                                err_lower = str(goto_err).lower()
+                                if "download is starting" in err_lower or "net::err_aborted" in err_lower:
+                                    self.logger.info("Wiley pdfdirect 导航触发下载流，正常接收中...")
+                                else:
+                                    raise
                             await self._handle_cookie_consent(page, context_label="Wiley pdfdirect")
                             # 检测并处理 Cloudflare 验证
                             cf_success, cf_file = await self.solve_cloudflare_if_needed(
@@ -6527,8 +6730,17 @@ class PaperDownloader:
                             return True
                         else:
                             self.logger.warning("Wiley pdfdirect 下载文件无效，继续走原有流程")
+                except PlaywrightTimeoutError:
+                    # expect_download timed out: no native download event, but sniffer might have captured the body
+                    if await _consume_download_event("wiley-pdfdirect-sniffed"):
+                        return True
+                    self.logger.debug("Wiley pdfdirect: expect_download 超时且嗅探器未截获")
                 except Exception as wiley_direct_e:
                     self.logger.warning(f"Wiley pdfdirect 尝试失败（继续走原有流程）: {wiley_direct_e}")
+                    # Still try draining in case the download/sniff completed during the exception
+                    await asyncio.sleep(0.5)
+                    if await _consume_download_event("wiley-pdfdirect-fallback"):
+                        return True
             
             # 尝试访问URL，如果直接触发下载则捕获
             response = None
@@ -6598,7 +6810,13 @@ class PaperDownloader:
                                 self.logger.info(f"[Meta] 发现 citation_pdf_url: {citation_pdf[:100]}")
                                 try:
                                     async with page.expect_download(timeout=15000) as meta_dl_info:
-                                        await page.goto(citation_pdf, wait_until="domcontentloaded")
+                                        try:
+                                            await page.goto(citation_pdf, wait_until="domcontentloaded")
+                                        except Exception as goto_e:
+                                            if any(x in str(goto_e).lower() for x in ["download is starting", "net::err_aborted"]):
+                                                self.logger.info("[Meta] citation_pdf 导航触发下载流")
+                                            else:
+                                                raise
                                     if await self._save_and_validate_download(
                                         await meta_dl_info.value, filepath, task_download_dir, "meta_citation"
                                     ):
@@ -6625,7 +6843,7 @@ class PaperDownloader:
                     if cf_file and self.is_valid_pdf_file(cf_file):
                         self.logger.info(f"导航后 Cloudflare 验证触发下载: {cf_file}")
                         return True
-                    if await _consume_download_event("goto-article"):
+                    if await _consume_download_event_with_wait("goto-article", 1.5):
                         return True
                     # citation_pdf_url 隐藏通道（相对路径自动转绝对路径）
                     try:
@@ -6650,7 +6868,13 @@ class PaperDownloader:
                             self.logger.info(f"[Meta] 发现 citation_pdf_url: {citation_pdf[:100]}")
                             try:
                                 async with page.expect_download(timeout=15000) as meta_dl_info:
-                                    await page.goto(citation_pdf, wait_until="domcontentloaded")
+                                    try:
+                                        await page.goto(citation_pdf, wait_until="domcontentloaded")
+                                    except Exception as goto_e:
+                                        if any(x in str(goto_e).lower() for x in ["download is starting", "net::err_aborted"]):
+                                            self.logger.info("[Meta] citation_pdf 导航触发下载流")
+                                        else:
+                                            raise
                                 if await self._save_and_validate_download(
                                     await meta_dl_info.value, filepath, task_download_dir, "meta_citation"
                                 ):
@@ -6720,7 +6944,9 @@ class PaperDownloader:
                     task_download_dir=task_download_dir,
                     session_downloads_dir=session_downloads_dir,
                     initial_main_files=initial_main_files,
-                    task_start_time=task_start_time
+                    task_start_time=task_start_time,
+                    sniffed_pdf_buffers=sniffed_pdf_buffers,
+                    captured_downloads=captured_downloads,
                 )
                 if smart_success:
                     self._record_download_success(
@@ -6736,7 +6962,7 @@ class PaperDownloader:
             else:
                 await asyncio.sleep(2)
                 await self._handle_cookie_consent(page, context_label="页面稳定后")
-                if await _consume_download_event("after-stabilize"):
+                if await _consume_download_event_with_wait("after-stabilize", 1.5):
                     return True
                 
                 # ========== 阶段2：智能循环优先（非DOI链接）==========
@@ -6746,7 +6972,9 @@ class PaperDownloader:
                     task_download_dir=task_download_dir,
                     session_downloads_dir=session_downloads_dir,
                     initial_main_files=initial_main_files,
-                    task_start_time=task_start_time
+                    task_start_time=task_start_time,
+                    sniffed_pdf_buffers=sniffed_pdf_buffers,
+                    captured_downloads=captured_downloads,
                 )
                 if smart_success:
                     self._record_download_success(

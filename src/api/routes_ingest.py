@@ -281,6 +281,9 @@ def _normalize_process_body(body: dict) -> dict:
     enrich_tables = body.get("enrich_tables", not skip_enrichment)
     enrich_figures = body.get("enrich_figures", not skip_enrichment)
     actual_skip = bool(skip_enrichment and (not enrich_tables) and (not enrich_figures))
+    # 入库前按 DOI / content_hash 去重（与文献检索 dedup 一致，避免重复入库）
+    skip_duplicate_doi = body.get("skip_duplicate_doi", True)
+    skip_unchanged = bool(body.get("skip_unchanged", False))
     return {
         "file_paths": file_paths,
         "collection_name": collection_name,
@@ -288,6 +291,8 @@ def _normalize_process_body(body: dict) -> dict:
         "enrich_tables": bool(enrich_tables),
         "enrich_figures": bool(enrich_figures),
         "actual_skip": actual_skip,
+        "skip_duplicate_doi": skip_duplicate_doi,
+        "skip_unchanged": skip_unchanged,
         "llm_text_provider": (body.get("llm_text_provider") or "").strip() or None,
         "llm_text_model": (body.get("llm_text_model") or "").strip() or None,
         "llm_text_concurrency": body.get("llm_text_concurrency"),
@@ -300,6 +305,62 @@ def _normalize_process_body(body: dict) -> dict:
 def _emit_job_event(job_id: str, event: str, data: dict) -> None:
     from src.indexing.ingest_job_store import append_event
     append_event(job_id, event, data)
+
+
+def _filter_files_by_dedup(
+    file_paths: List[str],
+    content_hashes: dict,
+    collection_name: str,
+    *,
+    skip_duplicate_doi: bool = True,
+    skip_unchanged: bool = False,
+) -> tuple[List[str], dict, dict]:
+    """
+    入库前按 DOI（主）与 content_hash（次）去重，与 paper_metadata 中已持久化的 DOI 一致。
+    返回 (filtered_file_paths, filtered_content_hashes, stats).
+    """
+    from src.indexing.paper_store import list_papers
+    from src.indexing.paper_metadata_store import paper_meta_store
+    from src.retrieval.dedup import normalize_doi, extract_doi_from_pdf_tiered
+
+    stats = {"skipped_doi": 0, "skipped_unchanged": 0, "remaining": 0}
+    if not skip_duplicate_doi and not skip_unchanged:
+        return file_paths, content_hashes, stats
+
+    existing_dois: set = set(paper_meta_store.all_dois()) if skip_duplicate_doi else set()
+    papers_in_collection = list_papers(collection_name) if skip_unchanged else []
+    existing_paper_ids = {p.get("paper_id") or "" for p in papers_in_collection if p.get("paper_id")}
+    existing_hashes = {p.get("paper_id") or "": (p.get("content_hash") or "") or "" for p in papers_in_collection}
+
+    filtered: List[str] = []
+    for fpath in file_paths:
+        pdf_path = Path(fpath)
+        paper_id = pdf_path.stem
+        file_hash = content_hashes.get(fpath, "")
+
+        if skip_duplicate_doi and existing_dois:
+            candidate_doi = None
+            meta = paper_meta_store.get(paper_id)
+            if meta and meta.get("doi"):
+                candidate_doi = meta["doi"]
+            if not candidate_doi:
+                candidate_doi, _ = extract_doi_from_pdf_tiered(pdf_path)
+            norm_doi = normalize_doi(candidate_doi) if candidate_doi else ""
+            if norm_doi and norm_doi in existing_dois:
+                stats["skipped_doi"] += 1
+                continue
+
+        if skip_unchanged and paper_id in existing_paper_ids:
+            stored_hash = existing_hashes.get(paper_id) or ""
+            if stored_hash and file_hash and stored_hash == file_hash:
+                stats["skipped_unchanged"] += 1
+                continue
+
+        filtered.append(fpath)
+
+    stats["remaining"] = len(filtered)
+    new_hashes = {p: content_hashes.get(p, "") for p in filtered}
+    return filtered, new_hashes, stats
 
 
 def _finalize_cancelled_job(
@@ -364,6 +425,8 @@ def _run_ingest_job(job_id: str, cfg: dict) -> None:
     enrich_tables = cfg["enrich_tables"]
     enrich_figures = cfg["enrich_figures"]
     actual_skip = cfg["actual_skip"]
+    skip_duplicate_doi = cfg.get("skip_duplicate_doi", True)
+    skip_unchanged = cfg.get("skip_unchanged", False)
     llm_text_provider = cfg["llm_text_provider"]
     llm_text_model = cfg["llm_text_model"]
     llm_text_concurrency = cfg["llm_text_concurrency"]
@@ -384,6 +447,26 @@ def _run_ingest_job(job_id: str, cfg: dict) -> None:
         _emit_job_event(job_id, "error", {"message": msg})
         _emit_job_event(job_id, "done", {"total_files": total, "total_chunks": 0, "total_upserted": 0, "errors": [{"stage": "init", "error": str(e)}]})
         update_job(job_id, status="error", error_message=str(e), message=msg, finished_at=time.time())
+        return
+
+    # 入库前按 DOI / content_hash 去重（与 paper_metadata 一致，已获得的 DOI 长期化用于检索 dedup）
+    file_paths, content_hashes, dedup_stats = _filter_files_by_dedup(
+        file_paths,
+        content_hashes,
+        collection_name,
+        skip_duplicate_doi=skip_duplicate_doi,
+        skip_unchanged=skip_unchanged,
+    )
+    total = len(file_paths)
+    if dedup_stats.get("skipped_doi") or dedup_stats.get("skipped_unchanged"):
+        _emit_job_event(job_id, "dedup", {
+            "skipped_doi": dedup_stats.get("skipped_doi", 0),
+            "skipped_unchanged": dedup_stats.get("skipped_unchanged", 0),
+            "remaining": total,
+        })
+    if total == 0:
+        _emit_job_event(job_id, "done", {"total_files": 0, "total_chunks": 0, "total_upserted": 0, "errors": [], "dedup": dedup_stats})
+        update_job(job_id, status="done", processed_files=0, failed_files=0, total_chunks=0, total_upserted=0, message="全部被去重跳过", finished_at=time.time())
         return
 
     config_path = Path(__file__).resolve().parents[2] / "config" / "rag_config.json"
@@ -608,8 +691,19 @@ def _run_ingest_job(job_id: str, cfg: dict) -> None:
         })
 
         try:
+            # 若解析结果无 DOI，尝试从 PDF 回填（与入库前去重同源），便于长期化供检索 dedup
+            if not doc_metadata.get("doi") or not doc_metadata.get("title"):
+                try:
+                    from src.retrieval.dedup import extract_doi_from_pdf_tiered
+                    backfill_doi, backfill_title = extract_doi_from_pdf_tiered(pdf_path)
+                    if backfill_doi and not doc_metadata.get("doi"):
+                        doc_metadata["doi"] = backfill_doi
+                    if backfill_title and not doc_metadata.get("title"):
+                        doc_metadata["title"] = backfill_title
+                except Exception as e:
+                    logger.debug("DOI backfill from PDF for %s: %s", file_name, e)
             rows = _build_rows(chunks, doc_id, collection_name, doc_metadata=doc_metadata)
-            # 写入 DOI/Title 到 SQLite 持久化存储（供跨源去重使用）
+            # 将 DOI/Title/Authors/Year 持久化到 paper_metadata（跨源去重 + 长期化）
             if doc_metadata.get("doi") or doc_metadata.get("title"):
                 _update_paper_metadata(doc_id, doc_metadata)
             texts = [r.pop("_text_for_embed") for r in rows]
@@ -903,13 +997,22 @@ def _truncate(content: str, max_len: int = 65000) -> str:
 
 
 def _update_paper_metadata(doc_id: str, doc_metadata: dict) -> None:
-    """写入论文 DOI/Title 到 SQLite 持久化存储（供跨源去重使用）"""
+    """写入论文 DOI/Title/Authors/Year 到 paper_metadata（供跨源去重与长期化）"""
     try:
         from src.indexing.paper_metadata_store import paper_meta_store
+        authors = doc_metadata.get("authors")
+        if isinstance(authors, list):
+            pass
+        elif authors is not None:
+            authors = [authors] if isinstance(authors, str) else None
+        else:
+            authors = None
         paper_meta_store.upsert(
             paper_id=doc_id,
             doi=doc_metadata.get("doi"),
             title=doc_metadata.get("title"),
+            authors=authors,
+            year=doc_metadata.get("year"),
             source="ingestion",
         )
     except Exception as e:

@@ -80,6 +80,8 @@ export interface ScholarLibraryPaper {
   added_at: string;
   /** ISO timestamp when PDF was downloaded to this library; null if not yet downloaded. */
   downloaded_at?: string | null;
+  /** DOI-based filename stem for opening PDF from library folder (permanent lib only). */
+  paper_id?: string | null;
 }
 
 export type ScholarSource = 'google_scholar' | 'google' | 'semantic' | 'semantic_relevance' | 'semantic_bulk' | 'ncbi' | 'annas_archive';
@@ -121,6 +123,8 @@ export async function downloadPaper(params: {
   auto_ingest?: boolean;
   llm_provider?: string | null;
   model_override?: string | null;
+  show_browser?: boolean | null;
+  include_academia?: boolean;
 }): Promise<SubmittedTask | DownloadResult> {
   const res = await client.post('/scholar/download', params);
   return res.data;
@@ -134,6 +138,7 @@ export async function batchDownloadPapers(
     annas_md5?: string;
     authors?: string[];
     year?: number;
+    library_paper_id?: number;
   }>,
   options?: {
     collection?: string;
@@ -141,6 +146,8 @@ export async function batchDownloadPapers(
     library_id?: number;
     llm_provider?: string | null;
     model_override?: string | null;
+    show_browser?: boolean | null;
+    include_academia?: boolean;
   },
 ): Promise<{ status: string; task_id: string; total: number; message: string }> {
   const res = await client.post('/scholar/download/batch', {
@@ -150,6 +157,8 @@ export async function batchDownloadPapers(
     library_id: options?.library_id,
     llm_provider: options?.llm_provider ?? undefined,
     model_override: options?.model_override ?? undefined,
+    show_browser: options?.show_browser ?? undefined,
+    include_academia: options?.include_academia ?? false,
   });
   return res.data;
 }
@@ -164,10 +173,29 @@ export async function getScholarHealth(): Promise<ScholarHealth> {
   return res.data;
 }
 
-/** PDF 查看 URL（供 PdfViewerModal 使用） */
+/** PDF 查看 URL（供 PdfViewerModal 使用，全局 raw_papers） */
 export function getPdfViewUrl(paperId: string): string {
   const base = import.meta.env.VITE_API_BASE_URL || '/api';
   return `${base}/graph/pdf/${encodeURIComponent(paperId)}`;
+}
+
+/** PDF 查看 URL（文献库本地 PDF，永久库 pdfs 目录） */
+export function getLibraryPdfViewUrl(libId: number, paperId: string): string {
+  const base = import.meta.env.VITE_API_BASE_URL || '/api';
+  return `${base}/scholar/libraries/${libId}/pdf/${encodeURIComponent(paperId)}`;
+}
+
+/**
+ * Fetch a PDF URL with auth (Bearer) and return a blob URL for use in <Document> / iframe.
+ * Caller must revoke the returned URL with URL.revokeObjectURL when done (e.g. when modal closes).
+ * Accepts full URL (from getLibraryPdfViewUrl); normalizes to path for axios baseURL.
+ */
+export async function fetchPdfAsBlobUrl(url: string): Promise<string> {
+  let path = url;
+  if (url.startsWith('http')) path = new URL(url).pathname;
+  if (path.startsWith('/api')) path = path.slice(4) || '/';
+  const res = await client.get<Blob>(path, { responseType: 'blob' });
+  return URL.createObjectURL(res.data);
 }
 
 // ─── Scholar sub-libraries ───────────────────────────────────────────────────
@@ -239,6 +267,23 @@ export async function extractDoiAndDedupPapers(
   const res = await client.post<{ papers: ScholarLibraryPaper[] } & ExtractDoiDedupResult>(
     '/scholar/papers/extract-doi-dedup',
     { papers },
+  );
+  return res.data;
+}
+
+export interface PdfRenameDedupResult {
+  renamed: number;
+  removed: number;
+  no_doi: number;
+  /** Count of library papers marked as downloaded (badge sync). */
+  synced_downloaded?: number;
+}
+
+export async function pdfRenameDedup(
+  libId: number,
+): Promise<PdfRenameDedupResult> {
+  const res = await client.post<PdfRenameDedupResult>(
+    `/scholar/libraries/${libId}/pdf-rename-dedup`,
   );
   return res.data;
 }

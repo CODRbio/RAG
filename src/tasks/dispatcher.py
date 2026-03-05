@@ -192,17 +192,44 @@ async def run_unified_chat_worker_once() -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+_SCHOLAR_DOWNLOAD_HEARTBEAT_INTERVAL = 5  # seconds
+
+_STRATEGY_PROGRESS = {"annas_md5": 10, "pdf_url": 20, "sci_hub": 30, "annas_doi": 40}
+
+
+def _mark_library_paper_downloaded(library_paper_id: int) -> None:
+    """Set ScholarLibraryPaper.downloaded_at so the frontend badge updates."""
+    try:
+        from sqlmodel import Session
+
+        from src.db.engine import get_engine
+        from src.db.models import ScholarLibraryPaper
+
+        with Session(get_engine()) as session:
+            row = session.get(ScholarLibraryPaper, library_paper_id)
+            if row:
+                row.downloaded_at = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+                session.add(row)
+                session.commit()
+    except Exception as e:
+        logger.warning("_mark_library_paper_downloaded failed: %s", e)
+
+
 async def process_download_and_ingest(
     task_id: str,
     paper_info: Dict[str, Any],
     collection: Optional[str] = None,
     download_dir: Optional[str] = None,
+    library_paper_id: Optional[int] = None,
     llm_provider: Optional[str] = None,
     model_override: Optional[str] = None,
+    show_browser: Optional[bool] = None,
+    include_academia: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     Download one paper PDF then trigger ingest into the given collection.
     PDF stays in download_dir (or library folder); state/events written to Redis for GET /scholar/task/{task_id}.
+    Pushes progress and heartbeat events for SSE stream stability.
     """
     from src.retrieval.downloader.adapter import get_adapter
 
@@ -224,8 +251,49 @@ async def process_download_and_ingest(
     q.set_state(state)
     q.push_event(task_id, "progress", {"progress": 10, "stage": "DOWNLOADING"})
 
+    heartbeat_stop = asyncio.Event()
+    heartbeat_task: Optional[asyncio.Task] = None
+
+    async def _heartbeat_loop() -> None:
+        while not heartbeat_stop.is_set():
+            try:
+                await asyncio.wait_for(heartbeat_stop.wait(), timeout=_SCHOLAR_DOWNLOAD_HEARTBEAT_INTERVAL)
+            except asyncio.TimeoutError:
+                pass
+            if heartbeat_stop.is_set():
+                break
+            s = q.get_state(task_id)
+            if s and s.is_terminal():
+                break
+            elapsed = time.time() - float(state.started_at or state.created_at or time.time())
+            q.push_event(
+                task_id,
+                "heartbeat",
+                {"elapsed_s": round(elapsed, 1), "stage": state.payload.get("stage", "DOWNLOADING")},
+            )
+
+    def _progress_callback(data: Dict[str, Any]) -> None:
+        stage = data.get("stage")
+        strategy = data.get("strategy")
+        if stage == "strategy_start" and strategy:
+            pct = _STRATEGY_PROGRESS.get(strategy, 10)
+            state.payload["progress"] = pct
+            state.payload["stage"] = "DOWNLOADING"
+            state.payload["strategy"] = strategy
+            q.set_state(state)
+            q.push_event(task_id, "progress", {"progress": pct, "stage": "DOWNLOADING", "strategy": strategy})
+        elif stage == "strategy_done" and strategy:
+            q.push_event(
+                task_id,
+                "progress",
+                {"progress": _STRATEGY_PROGRESS.get(strategy, 10), "stage": "DOWNLOADING", "strategy": strategy, "success": data.get("success")},
+            )
+        elif stage == "validating":
+            q.push_event(task_id, "progress", {"progress": 45, "stage": "DOWNLOADING", "message": "validating"})
+
     adapter = get_adapter()
     try:
+        heartbeat_task = asyncio.create_task(_heartbeat_loop())
         dl_result = await adapter.download_paper(
             title=paper_info.get("title", ""),
             doi=paper_info.get("doi"),
@@ -236,8 +304,18 @@ async def process_download_and_ingest(
             download_dir=download_dir,
             llm_provider=llm_provider,
             model_override=model_override,
+            progress_callback=_progress_callback,
+            show_browser=show_browser,
+            include_academia=bool(include_academia),
         )
     except Exception as e:
+        heartbeat_stop.set()
+        if heartbeat_task:
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
         logger.exception("download_and_ingest download failed task_id=%s: %s", task_id, e)
         state.status = TaskStatus.error
         state.finished_at = time.time()
@@ -248,6 +326,14 @@ async def process_download_and_ingest(
         q.set_state(state)
         q.push_event(task_id, "error", {"message": state.error_message})
         return {"success": False, "message": str(e)}
+    finally:
+        heartbeat_stop.set()
+        if heartbeat_task:
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
 
     if not dl_result.get("success"):
         state.status = TaskStatus.error
@@ -283,6 +369,9 @@ async def process_download_and_ingest(
         },
     )
 
+    if library_paper_id is not None:
+        _mark_library_paper_downloaded(library_paper_id)
+
     state.status = TaskStatus.completed
     state.finished_at = time.time()
     state.payload["progress"] = 100
@@ -317,11 +406,10 @@ def _trigger_ingest_pipeline(
     collection_name: str,
     metadata: Dict[str, Any],
 ) -> str:
-    """Start ingest job in a background thread; returns ingest job_id."""
+    """Start ingest job in a background thread; returns ingest job_id (from create_job so it is trackable)."""
     from src.api.routes_ingest import _run_ingest_job_safe
     from src.indexing.ingest_job_store import create_job
 
-    job_id = f"scholar_{uuid.uuid4().hex[:8]}"
     ingest_cfg = {
         "file_paths": [filepath],
         "collection_name": collection_name,
@@ -336,8 +424,12 @@ def _trigger_ingest_pipeline(
         "llm_vision_model": None,
         "llm_vision_concurrency": None,
     }
-
-    create_job(collection_name, {**ingest_cfg, "source": "scholar_download", "metadata": metadata}, total_files=1)
+    payload = {**ingest_cfg, "source": "scholar_download", "metadata": metadata}
+    created = create_job(collection_name, payload, total_files=1)
+    job_id = (created or {}).get("job_id")
+    if not job_id:
+        job_id = uuid.uuid4().hex
+        logger.warning("create_job did not return job_id, using fallback %s", job_id)
 
     thread = threading.Thread(
         target=_run_ingest_job_safe,

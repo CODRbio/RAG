@@ -7,12 +7,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
 from collections import OrderedDict, defaultdict
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from typing import Any, Dict, List, Optional, Set, Tuple
+import socket
+from urllib.error import URLError
 from urllib.parse import unquote, urlparse, urlencode
 from urllib.request import Request, urlopen
 
@@ -86,6 +88,54 @@ _ARXIV_ID_RE = re.compile(
     r"(?:arxiv\.org/(?:abs|pdf)/)?(\d{4}\.\d{4,5}(?:v\d+)?)",
     re.IGNORECASE,
 )
+
+
+def extract_doi_from_pdf_tiered(pdf_path: "Path") -> Tuple[Optional[str], Optional[str]]:
+    """
+    从 PDF 分层提取 DOI（及可选 title）。供入库前去重、DOI 回填等使用。
+    Tier 1: 原生 PDF 元数据；Tier 2: 首页正文 DOI 正则；Tier 3: 标题 → CrossRef。
+    返回 (doi, title)，无则为 None。
+    """
+    from pathlib import Path
+    path = Path(pdf_path) if not isinstance(pdf_path, Path) else pdf_path
+    if not path.exists():
+        return None, None
+    # Tier 1: native metadata
+    try:
+        from src.parser.pdf_parser import extract_native_metadata
+        meta = extract_native_metadata(path)
+        if meta.get("doi"):
+            return meta.get("doi"), meta.get("title") or None
+    except Exception:
+        pass
+    # Tier 2: first-page text scan
+    try:
+        import fitz
+        with fitz.open(str(path)) as doc:
+            if len(doc) > 0:
+                text = doc[0].get_text() or ""
+                m = _DOI_RE.search(text)
+                if m:
+                    return m.group(1).rstrip(".:"), None
+    except Exception:
+        pass
+    # Tier 3: title -> CrossRef
+    title = None
+    try:
+        from src.parser.pdf_parser import extract_native_metadata
+        meta = extract_native_metadata(path)
+        title = (meta.get("title") or "").strip() or None
+    except Exception:
+        pass
+    if not title or len(title) < 10:
+        return None, None
+    try:
+        cr = _crossref_lookup_by_title(title)
+        if cr and cr.get("doi"):
+            return cr["doi"], title
+    except Exception:
+        pass
+    return None, None
 
 
 def extract_arxiv_id(meta: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -170,11 +220,13 @@ def merge_metadata_by_priority(winner_hit: Dict[str, Any], loser_hit: Dict[str, 
 
 
 def _fingerprint(text: str) -> str:
-    """简单 hash 指纹（用于去重）"""
+    """稳定且抗干扰的 hash 指纹（确定性，跨进程一致；抗空格/标点差异）"""
     if not text or not isinstance(text, str):
         return ""
-    t = text.strip()[:512]
-    return str(hash(t))
+    t = re.sub(r"[\W_]+", "", text.lower())[:1024]
+    if not t:
+        return ""
+    return hashlib.md5(t.encode("utf-8")).hexdigest()
 
 
 # ── 跨源去重 ──────────────────────────────────────────
@@ -251,7 +303,7 @@ def _crossref_lookup_by_title(title: str) -> Optional[Dict[str, Any]]:
     except Exception:
         pass
 
-    # L3: 实际 API 请求
+    # L3: 实际 API 请求（urlopen 自带 timeout，无需线程池）
     def _request() -> Dict[str, Any]:
         qs = urlencode({"query.bibliographic": title, "rows": 3})
         req = Request(
@@ -259,17 +311,17 @@ def _crossref_lookup_by_title(title: str) -> Optional[Dict[str, Any]]:
             headers={"User-Agent": "DeepSea-RAG/1.0", "Accept": "application/json"},
             method="GET",
         )
-        with urlopen(req, timeout=_CROSSREF_TIMEOUT_SECONDS) as resp:
-            if getattr(resp, "status", 200) != 200:
-                return {}
-            return json.loads(resp.read().decode("utf-8"))
+        try:
+            with urlopen(req, timeout=_CROSSREF_TIMEOUT_SECONDS) as resp:
+                if getattr(resp, "status", 200) != 200:
+                    return {}
+                return json.loads(resp.read().decode("utf-8"))
+        except (URLError, socket.timeout, Exception):
+            return {}
 
-    try:
-        with ThreadPoolExecutor(max_workers=1) as ex:
-            fut = ex.submit(_request)
-            data = fut.result(timeout=float(_CROSSREF_TIMEOUT_SECONDS + 1))
-        items = (data.get("message") or {}).get("items") or []
-    except (FuturesTimeoutError, Exception):
+    data = _request()
+    items = (data.get("message") or {}).get("items") or []
+    if not items:
         _crossref_lru[key] = None
         try:
             _get_paper_meta_store().crossref_put(title, None)
@@ -403,27 +455,17 @@ def cross_source_dedup(
     """
     拦截网络搜索中与本地文库重叠的文献。
 
-    通过 DOI / arXiv ID / Title 黑名单过滤 web_hits。snippet 不参与过滤，原样保留。
+    通过 DOI / arXiv ID / Title 黑名单过滤 web_hits。snippet 旁路放行。
+    单遍遍历保持 Reranker 原始相关性顺序，避免 snippet 被挪到末尾遭截断。
     """
     if not web_hits:
         return web_hits
 
-    # snippet 旁路：不参与过滤，最终拼回
-    snippets: List[Dict[str, Any]] = []
-    non_snippets: List[Dict[str, Any]] = []
-    for h in web_hits:
-        src = (h.get("metadata") or {}).get("source", "")
-        if src == "semantic_snippet":
-            snippets.append(h)
-        else:
-            non_snippets.append(h)
-
+    non_snippets = [h for h in web_hits if (h.get("metadata") or {}).get("source", "") != "semantic_snippet"]
     if not local_chunks or not non_snippets:
-        return non_snippets + snippets
+        return web_hits
 
     store = _get_paper_meta_store()
-
-    # 构建本地 DOI + Title 黑名单（SQLite + 当前批次）
     local_dois: Set[str] = set(store.all_dois())
     local_titles: Set[str] = set(store.all_normalized_titles())
     local_arxivs: Set[str] = set()
@@ -440,23 +482,23 @@ def cross_source_dedup(
         if arxiv:
             local_arxivs.add(arxiv)
 
-    if not local_dois and not local_titles and not local_arxivs:
-        return non_snippets + snippets
-
-    # 仅对 non_snippets 回填 DOI
     crossref_lookups, crossref_resolved = _enrich_web_hits_missing_doi(non_snippets, local_titles)
 
-    filtered: List[Dict[str, Any]] = []
-    for hit in non_snippets:
+    filtered_hits: List[Dict[str, Any]] = []
+    removed = 0
+    for hit in web_hits:
         meta = hit.get("metadata") or {}
+        if meta.get("source") == "semantic_snippet":
+            filtered_hits.append(hit)
+            continue
         web_doi = normalize_doi(meta.get("doi"))
         web_title = normalize_title(meta.get("title") or hit.get("title") or "")
         web_arxiv = extract_arxiv_id(meta)
         if (web_doi and web_doi in local_dois) or (web_title and web_title in local_titles) or (web_arxiv and web_arxiv in local_arxivs):
+            removed += 1
             continue
-        filtered.append(hit)
+        filtered_hits.append(hit)
 
-    removed = len(non_snippets) - len(filtered)
     if removed > 0:
         logger.info(
             "cross_source_dedup: removed=%d, local_doi=%d, local_title=%d, local_arxiv=%d, crossref_lookups=%d, crossref_resolved=%d",
@@ -467,7 +509,7 @@ def cross_source_dedup(
             crossref_lookups,
             crossref_resolved,
         )
-    return filtered + snippets
+    return filtered_hits
 
 
 # ── 指纹去重 + 单文档上限 ─────────────────────────────
@@ -475,35 +517,46 @@ def cross_source_dedup(
 def dedup_and_diversify(
     candidates: List[Dict],
     per_doc_cap: int = 3,
+    top_doc_cap: int = 8,
 ) -> List[Dict]:
     """
-    去重 + 单文档上限
-    
-    Args:
-        candidates: 已按 rerank score 排序的候选列表
-        per_doc_cap: 单文档最多保留条数
-    
-    Returns:
-        去重且满足 per_doc_cap 的结果
+    去重 + 单文档上限 + 重复时融合元数据（merge_metadata_by_priority）。
+    doc_id 兜底 url/doi，防止网页切片绕过 per_doc_cap。
+    榜首特权：排名第一的文档（首个出现的非空 doc_id）允许最多 top_doc_cap 条，
+    其余文档受 per_doc_cap 限制，兼顾核心证据深度与多源交叉验证。
     """
-    seen_fingerprints: set = set()
+    seen_fingerprints: Dict[str, Dict] = {}
     per_doc_count: Dict[str, int] = defaultdict(int)
     output: List[Dict] = []
+    best_doc_id: Optional[str] = None
 
     for c in candidates:
         text = c.get("content") or c.get("raw_content") or ""
         fp = _fingerprint(text)
+        meta = c.get("metadata", {}) or {}
+        doc_id = (
+            meta.get("doc_id")
+            or meta.get("paper_id")
+            or normalize_url(meta.get("url"))
+            or normalize_doi(meta.get("doi"))
+            or ""
+        )
+
+        if doc_id and best_doc_id is None:
+            best_doc_id = doc_id
+
         if fp and fp in seen_fingerprints:
+            winner = seen_fingerprints[fp]
+            merge_metadata_by_priority(winner_hit=winner, loser_hit=c)
             continue
 
-        meta = c.get("metadata", {}) or {}
-        doc_id = meta.get("doc_id") or meta.get("paper_id") or ""
-        if per_doc_cap > 0 and doc_id and per_doc_count[doc_id] >= per_doc_cap:
+        current_cap = top_doc_cap if (doc_id and doc_id == best_doc_id) else per_doc_cap
+        if current_cap > 0 and doc_id and per_doc_count[doc_id] >= current_cap:
             continue
 
         output.append(c)
         if fp:
-            seen_fingerprints.add(fp)
+            seen_fingerprints[fp] = c
         if doc_id:
             per_doc_count[doc_id] += 1
 

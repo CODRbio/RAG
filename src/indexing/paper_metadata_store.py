@@ -253,6 +253,17 @@ class PaperMetadataStore:
             ).all()
         return set(rows)
 
+    def get_paper_ids_by_doi(self, doi: str) -> List[str]:
+        """Return all paper_ids that have the given (normalized) DOI. Used to skip re-download when the same paper exists under another filename."""
+        ndoi = _normalize_doi(doi)
+        if not ndoi:
+            return []
+        with Session(get_engine()) as session:
+            rows = session.exec(
+                select(PaperMetadata.paper_id).where(PaperMetadata.normalized_doi == ndoi)
+            ).all()
+        return list(rows)
+
     def _row_to_dict(self, row: PaperMetadata) -> Dict[str, Any]:
         authors = None
         if row.authors:

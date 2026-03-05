@@ -22,6 +22,7 @@ import {
   removePaperFromLibrary as removePaperFromLibraryApi,
   extractDoiAndDedupLibrary,
   extractDoiAndDedupPapers,
+  pdfRenameDedup as pdfRenameDedupApi,
 } from '../api/scholar';
 
 const POLL_INTERVAL_MS = 2000;
@@ -135,7 +136,11 @@ function _appendToTempLib(lib: TempLibData, items: ScholarSearchResult[]): numbe
 
 // ─── State interface ──────────────────────────────────────────────────────────
 
+type PendingDownloadAndOpen = { taskId: string; libId: number | null; paperId: string; title: string };
+
 interface ScholarState {
+  /** paper_id -> true for papers whose download-and-open task ended in error */
+  downloadAndOpenFailures: Record<string, true>;
   // Search
   query: string;
   source: ScholarSource;
@@ -171,6 +176,14 @@ interface ScholarState {
   selectedScholarLlmProvider: string;
   selectedScholarLlmModel: string;
   setScholarLlm: (provider: string, model: string) => void;
+
+  // 有头/无头：default=配置默认, headed=有头, headless=无头
+  scholarBrowserMode: 'default' | 'headed' | 'headless';
+  setScholarBrowserMode: (mode: 'default' | 'headed' | 'headless') => void;
+
+  // Academia.edu 下载开关（默认关闭：跳过 Academia 避免卡住）
+  includeAcademia: boolean;
+  setIncludeAcademia: (v: boolean) => void;
 
   // Actions
   setQuery: (q: string) => void;
@@ -215,6 +228,19 @@ interface ScholarState {
   downloadLibraryBatch: (collection?: string) => Promise<string | null>;
   /** Extract DOI + dedupe for active library; returns stats or null. */
   extractDoiAndDedup: () => Promise<{ extracted_count: number; removed_count: number } | null>;
+  /** PDF rename and dedup for permanent library folder; returns stats or null. */
+  pdfRenameDedup: () => Promise<{ renamed: number; removed: number; no_doi: number; synced_downloaded?: number } | null>;
+  /** Download one library paper then open PDF when done. Sets openPdfAfterDownload on completion. */
+  downloadLibraryPaperAndOpen: (paper: ScholarLibraryPaper) => Promise<string | null>;
+  /** Set when a download-and-open task completes; page opens modal then clears. */
+  openPdfAfterDownload: { libId: number | null; paperId: string; title: string } | null;
+  clearOpenPdfAfterDownload: () => void;
+
+  /** Internal: set by downloadLibraryPaperAndOpen, consumed by pollTask. */
+  pendingDownloadAndOpen: PendingDownloadAndOpen | null;
+
+  /** Clear the failure flag for a paper (called before retry). */
+  clearDownloadAndOpenFailure: (paperId: string) => void;
 }
 
 export const useScholarStore = create<ScholarState>()((set, get) => ({
@@ -240,9 +266,19 @@ export const useScholarStore = create<ScholarState>()((set, get) => ({
   libraryLoading: false,
   libraryError: null,
 
+  openPdfAfterDownload: null,
+  pendingDownloadAndOpen: null as PendingDownloadAndOpen | null,
+  downloadAndOpenFailures: {} as Record<string, true>,
+
   selectedScholarLlmProvider: '',
   selectedScholarLlmModel: '',
   setScholarLlm: (provider, model) => set({ selectedScholarLlmProvider: provider, selectedScholarLlmModel: model }),
+
+  scholarBrowserMode: 'default' as const,
+  setScholarBrowserMode: (mode) => set({ scholarBrowserMode: mode }),
+
+  includeAcademia: false,
+  setIncludeAcademia: (v) => set({ includeAcademia: v }),
 
   setQuery: (q) => set({ query: q }),
   setSource: (s) => set({ source: s }),
@@ -287,10 +323,11 @@ export const useScholarStore = create<ScholarState>()((set, get) => ({
   },
 
   downloadOne: async (index, collection, autoIngest = false) => {
-    const { results, selectedScholarLlmProvider, selectedScholarLlmModel } = get();
+    const { results, selectedScholarLlmProvider, selectedScholarLlmModel, scholarBrowserMode, includeAcademia } = get();
     const item = results[index];
     if (!item?.metadata) return null;
     const m = item.metadata;
+    const showBrowser = scholarBrowserMode === 'default' ? undefined : scholarBrowserMode === 'headed';
     try {
       const res = await downloadPaper({
         title: m.title,
@@ -303,6 +340,8 @@ export const useScholarStore = create<ScholarState>()((set, get) => ({
         auto_ingest: autoIngest,
         llm_provider: selectedScholarLlmProvider || undefined,
         model_override: selectedScholarLlmModel || undefined,
+        show_browser: showBrowser,
+        include_academia: includeAcademia,
       });
       if (isSubmittedTask(res)) {
         set((s) => ({
@@ -318,7 +357,7 @@ export const useScholarStore = create<ScholarState>()((set, get) => ({
   },
 
   downloadSelected: async (collection) => {
-    const { results, selectedIndices, selectedScholarLlmProvider, selectedScholarLlmModel } = get();
+    const { results, selectedIndices, selectedScholarLlmProvider, selectedScholarLlmModel, scholarBrowserMode, includeAcademia } = get();
     if (selectedIndices.length === 0) return null;
     const papers = selectedIndices
       .map((i) => results[i]?.metadata)
@@ -332,12 +371,15 @@ export const useScholarStore = create<ScholarState>()((set, get) => ({
         year: m!.year ?? undefined,
       }));
     if (papers.length === 0) return null;
+    const showBrowser = scholarBrowserMode === 'default' ? undefined : scholarBrowserMode === 'headed';
     try {
       const res = await batchDownloadPapers(papers, {
         collection,
         max_concurrent: 3,
         llm_provider: selectedScholarLlmProvider || undefined,
         model_override: selectedScholarLlmModel || undefined,
+        show_browser: showBrowser,
+        include_academia: includeAcademia,
       });
       set((s) => ({
         downloadTasks: {
@@ -361,6 +403,31 @@ export const useScholarStore = create<ScholarState>()((set, get) => ({
       }));
       if (TERMINAL_STATUSES.has(status.status)) {
         get().stopPolling(taskId);
+        const { pendingDownloadAndOpen, activeLibraryId } = get();
+        if (activeLibraryId != null) {
+          get().loadLibraryPapers(activeLibraryId);
+        }
+        if (pendingDownloadAndOpen && pendingDownloadAndOpen.taskId === taskId) {
+          if (status.status === 'completed') {
+            set({
+              openPdfAfterDownload: {
+                libId: pendingDownloadAndOpen.libId,
+                paperId: pendingDownloadAndOpen.paperId,
+                title: pendingDownloadAndOpen.title,
+              },
+              pendingDownloadAndOpen: null,
+            });
+          } else {
+            // error or cancelled — restore button and mark as failed
+            set((s) => ({
+              pendingDownloadAndOpen: null,
+              downloadAndOpenFailures: {
+                ...s.downloadAndOpenFailures,
+                [pendingDownloadAndOpen.paperId]: true,
+              },
+            }));
+          }
+        }
       }
     } catch {
       get().stopPolling(taskId);
@@ -660,8 +727,79 @@ export const useScholarStore = create<ScholarState>()((set, get) => ({
     }
   },
 
+  pdfRenameDedup: async () => {
+    const { activeLibraryId } = get();
+    if (activeLibraryId == null || activeLibraryId < 0) return null;
+    try {
+      const stats = await pdfRenameDedupApi(activeLibraryId);
+      await get().loadLibraryPapers(activeLibraryId);
+      await get().loadLibraries();
+      return stats;
+    } catch {
+      return null;
+    }
+  },
+
+  downloadLibraryPaperAndOpen: async (paper) => {
+    const { activeLibraryId, selectedScholarLlmProvider, selectedScholarLlmModel, scholarBrowserMode, includeAcademia } = get();
+    if (activeLibraryId == null || !paper.paper_id) return null;
+    const libId = activeLibraryId >= 0 ? activeLibraryId : null;
+    const showBrowser = scholarBrowserMode === 'default' ? undefined : scholarBrowserMode === 'headed';
+    try {
+      const res = await batchDownloadPapers(
+        [
+          {
+            title: paper.title,
+            doi: paper.doi ?? undefined,
+            pdf_url: paper.pdf_url ?? undefined,
+            annas_md5: paper.annas_md5 ?? undefined,
+            authors: paper.authors?.length ? paper.authors : undefined,
+            year: paper.year ?? undefined,
+            library_paper_id: paper.id,
+          },
+        ],
+        {
+          library_id: libId ?? undefined,
+          llm_provider: selectedScholarLlmProvider || undefined,
+          model_override: selectedScholarLlmModel || undefined,
+          show_browser: showBrowser,
+          include_academia: includeAcademia,
+        },
+      );
+      set((s) => ({
+        downloadTasks: {
+          ...s.downloadTasks,
+          [res.task_id]: {
+            task_id: res.task_id,
+            status: 'running',
+            payload: { total: 1, completed: 0, failed: 0 },
+          },
+        },
+        pendingDownloadAndOpen: {
+          taskId: res.task_id,
+          libId,
+          paperId: paper.paper_id,
+          title: paper.title,
+        },
+      }));
+      get().startPolling(res.task_id);
+      return res.task_id;
+    } catch {
+      return null;
+    }
+  },
+
+  clearOpenPdfAfterDownload: () => set({ openPdfAfterDownload: null }),
+
+  clearDownloadAndOpenFailure: (paperId) =>
+    set((s) => {
+      const next = { ...s.downloadAndOpenFailures };
+      delete next[paperId];
+      return { downloadAndOpenFailures: next };
+    }),
+
   downloadLibraryBatch: async (collection) => {
-    const { libraryPapers: papers, activeLibraryId, selectedScholarLlmProvider, selectedScholarLlmModel } = get();
+    const { libraryPapers: papers, activeLibraryId, selectedScholarLlmProvider, selectedScholarLlmModel, scholarBrowserMode, includeAcademia } = get();
     if (papers.length === 0) return null;
     const req = papers.map((p) => ({
       title: p.title,
@@ -670,7 +808,9 @@ export const useScholarStore = create<ScholarState>()((set, get) => ({
       annas_md5: p.annas_md5 ?? undefined,
       authors: p.authors?.length ? p.authors : undefined,
       year: p.year ?? undefined,
+      library_paper_id: p.id,
     }));
+    const showBrowser = scholarBrowserMode === 'default' ? undefined : scholarBrowserMode === 'headed';
     try {
       const res = await batchDownloadPapers(req, {
         collection,
@@ -678,6 +818,8 @@ export const useScholarStore = create<ScholarState>()((set, get) => ({
         library_id: activeLibraryId != null && activeLibraryId >= 0 ? activeLibraryId : undefined,
         llm_provider: selectedScholarLlmProvider || undefined,
         model_override: selectedScholarLlmModel || undefined,
+        show_browser: showBrowser,
+        include_academia: includeAcademia,
       });
       set((s) => ({
         downloadTasks: {

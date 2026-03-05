@@ -26,7 +26,7 @@ import { useScholarStore } from '../stores/useScholarStore';
 import { useConfigStore } from '../stores/useConfigStore';
 import { useToastStore } from '../stores/useToastStore';
 import { PdfViewerModal } from '../components/ui/PdfViewerModal';
-import { getPdfViewUrl } from '../api/scholar';
+import { getPdfViewUrl, getLibraryPdfViewUrl, fetchPdfAsBlobUrl } from '../api/scholar';
 import type { ScholarSource, ScholarLibraryPaper } from '../api/scholar';
 
 const SOURCE_OPTIONS: { value: ScholarSource; labelKey: string }[] = [
@@ -112,17 +112,29 @@ export function ScholarPage() {
     removeFromLibrary,
     downloadLibraryBatch,
     extractDoiAndDedup,
+    pdfRenameDedup,
+    downloadLibraryPaperAndOpen,
+    openPdfAfterDownload,
+    clearOpenPdfAfterDownload,
+    pendingDownloadAndOpen,
+    downloadAndOpenFailures,
+    clearDownloadAndOpenFailure,
     selectedScholarLlmProvider,
     selectedScholarLlmModel,
     setScholarLlm,
+    scholarBrowserMode,
+    setScholarBrowserMode,
+    includeAcademia,
+    setIncludeAcademia,
   } = useScholarStore();
 
   const [tasksPanelOpen, setTasksPanelOpen] = useState(true);
   const [libraryPanelOpen, setLibraryPanelOpen] = useState(true);
-  const [pdfView, setPdfView] = useState<{ paperId: string; title: string } | null>(null);
+  const [pdfView, setPdfView] = useState<{ paperId: string; title: string; pdfUrl?: string } | null>(null);
   const [downloadingIndex, setDownloadingIndex] = useState<number | null>(null);
   const [downloadingBatch, setDownloadingBatch] = useState(false);
   const [extractDoiDedupLoading, setExtractDoiDedupLoading] = useState(false);
+  const [pdfRenameDedupLoading, setPdfRenameDedupLoading] = useState(false);
   const [showNewLibraryModal, setShowNewLibraryModal] = useState(false);
   const [newLibraryName, setNewLibraryName] = useState('');
   const [newLibraryDesc, setNewLibraryDesc] = useState('');
@@ -137,6 +149,34 @@ export function ScholarPage() {
   useEffect(() => {
     if (scholarHealth?.enabled) loadLibraries();
   }, [scholarHealth?.enabled, loadLibraries]);
+
+  useEffect(() => {
+    if (!openPdfAfterDownload) return;
+    const url =
+      openPdfAfterDownload.libId != null
+        ? getLibraryPdfViewUrl(openPdfAfterDownload.libId, openPdfAfterDownload.paperId)
+        : getPdfViewUrl(openPdfAfterDownload.paperId);
+    const isLibraryPdf = url.includes('/scholar/libraries/');
+    if (isLibraryPdf) {
+      fetchPdfAsBlobUrl(url)
+        .then((blobUrl) => {
+          setPdfView({
+            paperId: openPdfAfterDownload.paperId,
+            title: openPdfAfterDownload.title,
+            pdfUrl: blobUrl,
+          });
+        })
+        .catch(() => {})
+        .finally(() => clearOpenPdfAfterDownload());
+    } else {
+      setPdfView({
+        paperId: openPdfAfterDownload.paperId,
+        title: openPdfAfterDownload.title,
+        pdfUrl: url,
+      });
+      clearOpenPdfAfterDownload();
+    }
+  }, [openPdfAfterDownload, clearOpenPdfAfterDownload]);
 
   const loadLlmProviders = useCallback(async (force = false) => {
     if (force) setIsRefreshingLlm(true);
@@ -473,6 +513,32 @@ export function ScholarPage() {
                 </button>
               </div>
             </div>
+            {/* 下载器浏览器：有头/无头 */}
+            <div>
+              <label className="block text-xs font-medium text-slate-400 mb-1">{t('scholar.browserModeLabel')}</label>
+              <select
+                value={scholarBrowserMode}
+                onChange={(e) => setScholarBrowserMode(e.target.value as 'default' | 'headed' | 'headless')}
+                className="w-full rounded-lg border border-slate-600/80 bg-slate-800/60 px-3 py-2.5 text-slate-200 text-sm focus:outline-none focus:ring-1 focus:ring-sky-500/50 min-w-[100px]"
+              >
+                <option value="default">{t('scholar.browserModeDefault')}</option>
+                <option value="headless">{t('scholar.browserModeHeadless')}</option>
+                <option value="headed">{t('scholar.browserModeHeaded')}</option>
+              </select>
+            </div>
+            {/* Academia.edu 下载开关 */}
+            <div className="flex items-center gap-2">
+              <input
+                id="include-academia-toggle"
+                type="checkbox"
+                checked={includeAcademia}
+                onChange={(e) => setIncludeAcademia(e.target.checked)}
+                className="w-3.5 h-3.5 rounded border-slate-500 bg-slate-700 text-sky-500 focus:ring-sky-500/40 focus:ring-1 cursor-pointer flex-shrink-0"
+              />
+              <label htmlFor="include-academia-toggle" className="text-xs text-slate-400 cursor-pointer select-none leading-tight">
+                {t('scholar.includeAcademia')}
+              </label>
+            </div>
             <div className="pt-6">
               <button
                 type="button"
@@ -632,6 +698,42 @@ export function ScholarPage() {
                     )}
                     <span className="hidden sm:inline">{t('scholar.libraryExtractDoiDedup')}</span>
                   </button>
+                  {activeLibraryId != null && activeLibraryId >= 0 && (
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        setPdfRenameDedupLoading(true);
+                        try {
+                          const stats = await pdfRenameDedup();
+                          if (stats != null) {
+                            addToast(
+                              t('scholar.pdfRenameDedupSuccess', {
+                                renamed: stats.renamed,
+                                removed: stats.removed,
+                                no_doi: stats.no_doi,
+                                synced_downloaded: stats.synced_downloaded ?? 0,
+                              }),
+                              'success',
+                            );
+                          } else {
+                            addToast(t('scholar.downloadFailed'), 'error');
+                          }
+                        } finally {
+                          setPdfRenameDedupLoading(false);
+                        }
+                      }}
+                      disabled={libraryLoading || pdfRenameDedupLoading}
+                      className="flex items-center justify-center gap-2 px-3 py-2 rounded-lg border border-slate-500/60 bg-slate-700/50 hover:bg-slate-600/50 disabled:opacity-60 text-slate-200 text-sm font-medium"
+                      title={t('scholar.pdfRenameDedup')}
+                    >
+                      {pdfRenameDedupLoading ? (
+                        <Loader2 size={16} className="animate-spin" />
+                      ) : (
+                        <RefreshCw size={16} />
+                      )}
+                      <span className="hidden sm:inline">{t('scholar.pdfRenameDedup')}</span>
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={() => {
@@ -671,9 +773,21 @@ export function ScholarPage() {
                           className="flex items-start gap-2 rounded-lg border border-slate-600/60 bg-slate-800/50 p-2 text-sm group"
                         >
                           <div className="flex-1 min-w-0">
-                            <p className="text-slate-200 line-clamp-2" title={p.title}>
-                              {p.title}
-                            </p>
+                            {p.url ? (
+                              <a
+                                href={p.url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="text-slate-200 line-clamp-2 hover:text-sky-300 hover:underline block"
+                                title={p.title}
+                              >
+                                {p.title}
+                              </a>
+                            ) : (
+                              <p className="text-slate-200 line-clamp-2" title={p.title}>
+                                {p.title}
+                              </p>
+                            )}
                             <p className="text-xs text-slate-500 mt-0.5">
                               {p.authors?.join(', ')} {p.year != null ? ` · ${p.year}` : ''}
                             </p>
@@ -683,9 +797,74 @@ export function ScholarPage() {
                                   {p.source.replace(/_/g, ' ')}
                                 </span>
                               )}
-                              <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-600/40 text-slate-400">
-                                {p.downloaded_at ? t('scholar.libraryPaperDownloaded') : t('scholar.libraryPaperNotDownloaded')}
-                              </span>
+                              {p.pdf_url && (
+                                <a
+                                  href={p.pdf_url}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-600/50 text-sky-400 hover:bg-slate-600/70 hover:text-sky-300"
+                                  title={t('scholar.openPdfLink')}
+                                  onClick={(e) => e.stopPropagation()}
+                                >
+                                  <FileText size={10} />
+                                  PDF
+                                </a>
+                              )}
+                              {p.downloaded_at && p.paper_id ? (
+                                <button
+                                  type="button"
+                                  onClick={async () => {
+                                    const url =
+                                      activeLibraryId != null && activeLibraryId >= 0
+                                        ? getLibraryPdfViewUrl(activeLibraryId, p.paper_id!)
+                                        : getPdfViewUrl(p.paper_id!);
+                                    const pdfUrl = url.includes('/scholar/libraries/')
+                                      ? await fetchPdfAsBlobUrl(url).catch(() => url)
+                                      : url;
+                                    setPdfView({ paperId: p.paper_id!, title: p.title, pdfUrl });
+                                  }}
+                                  className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-600/40 text-green-500 hover:bg-slate-600/60 cursor-pointer"
+                                  title={t('scholar.openPdf')}
+                                >
+                                  {t('scholar.libraryPaperDownloaded')}
+                                </button>
+                              ) : !p.downloaded_at && p.paper_id ? (
+                                (() => {
+                                  const isPending = pendingDownloadAndOpen?.paperId === p.paper_id;
+                                  const isFailed = !isPending && !!downloadAndOpenFailures[p.paper_id!];
+                                  return (
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        if (isFailed) clearDownloadAndOpenFailure(p.paper_id!);
+                                        downloadLibraryPaperAndOpen(p);
+                                      }}
+                                      disabled={isPending}
+                                      className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium disabled:opacity-70 ${
+                                        isFailed
+                                          ? 'bg-red-500/20 text-red-400 hover:bg-red-500/30 hover:text-red-300'
+                                          : 'bg-slate-600/50 text-sky-400 hover:bg-slate-600/70 hover:text-sky-300'
+                                      }`}
+                                      title={isFailed ? t('scholar.downloadAndOpenFailed') : t('scholar.downloadAndOpen')}
+                                    >
+                                      {isPending ? (
+                                        <Loader2 size={10} className="animate-spin" />
+                                      ) : isFailed ? (
+                                        <AlertCircle size={10} />
+                                      ) : (
+                                        <Download size={10} />
+                                      )}
+                                      {isFailed ? t('scholar.downloadAndOpenFailed') : t('scholar.downloadAndOpen')}
+                                    </button>
+                                  );
+                                })()
+                              ) : (
+                                <span
+                                  className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-600/40 ${p.downloaded_at ? 'text-green-500' : 'text-slate-400'}`}
+                                >
+                                  {p.downloaded_at ? t('scholar.libraryPaperDownloaded') : t('scholar.libraryPaperNotDownloaded')}
+                                </span>
+                              )}
                             </div>
                             {p.doi && (
                               <a
@@ -1035,8 +1214,11 @@ export function ScholarPage() {
       {pdfView && (
         <PdfViewerModal
           open={!!pdfView}
-          onClose={() => setPdfView(null)}
-          pdfUrl={getPdfViewUrl(pdfView.paperId)}
+          onClose={() => {
+            if (pdfView?.pdfUrl?.startsWith?.('blob:')) URL.revokeObjectURL(pdfView.pdfUrl);
+            setPdfView(null);
+          }}
+          pdfUrl={'pdfUrl' in pdfView && pdfView.pdfUrl ? pdfView.pdfUrl : getPdfViewUrl(pdfView.paperId)}
           title={pdfView.title}
         />
       )}

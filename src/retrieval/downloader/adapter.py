@@ -13,7 +13,7 @@ import asyncio
 import random
 import unicodedata
 import threading
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from config.settings import settings
 from src.log import get_logger
@@ -22,6 +22,14 @@ from src.utils.path_manager import PathManager
 from .utils import is_valid_pdf
 
 logger = get_logger(__name__)
+
+# Academia.edu PDFs often require paid access; prefer DOI/Sci-Hub/Anna's first, use Academia as fallback.
+ACADEMIA_DOMAIN = "academia.edu"
+
+
+def _is_academia_pdf_url(url: Optional[str]) -> bool:
+    """True if the URL is an Academia.edu PDF/page (deprioritize: try other sources first)."""
+    return bool(url and ACADEMIA_DOMAIN in (url or "").lower())
 
 
 def _normalize_to_paper_id(
@@ -262,14 +270,23 @@ class ScholarDownloaderAdapter:
         download_dir: Optional[str] = None,
         llm_provider: Optional[str] = None,
         model_override: Optional[str] = None,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        show_browser: Optional[bool] = None,
+        include_academia: bool = False,
     ) -> Dict[str, Any]:
-        """Download one paper PDF to download_dir (or override). Returns success, paper_id, filepath, message."""
+        """Download one paper PDF to download_dir (or override). Returns success, paper_id, filepath, message.
+        If progress_callback is set, it is called with e.g. {"stage": "strategy_start", "strategy": "annas_md5"}.
+        show_browser: optional override for headed(True)/headless(False); affects browser launch.
+        include_academia: when False (default), Academia.edu pdf_url is skipped entirely to avoid hangs."""
         fut = asyncio.run_coroutine_threadsafe(
             self._impl_download_inner(
                 title, doi, pdf_url, annas_md5, authors, year,
                 download_dir=download_dir,
                 llm_provider=llm_provider,
                 model_override=model_override,
+                progress_callback=progress_callback,
+                show_browser=show_browser,
+                include_academia=include_academia,
             ),
             self._bg_loop,
         )
@@ -286,8 +303,14 @@ class ScholarDownloaderAdapter:
         download_dir: Optional[str] = None,
         llm_provider: Optional[str] = None,
         model_override: Optional[str] = None,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        show_browser: Optional[bool] = None,
+        include_academia: bool = False,
     ) -> Dict[str, Any]:
+        if show_browser is not None:
+            self._dl.set_show_browser_override(show_browser)
         target_dir = (download_dir or self.download_dir).rstrip("/")
+        cb = progress_callback
 
         async def _do_download() -> Dict[str, Any]:
             os.makedirs(target_dir, exist_ok=True)
@@ -311,6 +334,29 @@ class ScholarDownloaderAdapter:
                     "message": "已存在，跳过下载",
                 }
 
+            # Same paper may exist under a different paper_id (e.g. different title normalization). Look up by DOI.
+            if doi:
+                try:
+                    from src.indexing.paper_metadata_store import paper_meta_store
+                    for pid in paper_meta_store.get_paper_ids_by_doi(doi):
+                        if pid == paper_id:
+                            continue
+                        candidate_path = os.path.join(target_dir, f"{pid}.pdf")
+                        if os.path.exists(candidate_path) and is_valid_pdf(candidate_path):
+                            logger.info("PDF already exists (same DOI), skip: %s", candidate_path)
+                            paper_meta_store.upsert(
+                                pid, doi=doi or "", title=title,
+                                authors=authors, year=year, source="download",
+                            )
+                            return {
+                                "success": True,
+                                "paper_id": pid,
+                                "filepath": candidate_path,
+                                "message": "已存在（同 DOI），跳过下载",
+                            }
+                except Exception as e:
+                    logger.debug("DOI-based skip check failed (non-fatal): %s", e)
+
             # Make sure shared browser context is healthy; no-op when already ready.
             await self._dl.initialize()
 
@@ -318,29 +364,48 @@ class ScholarDownloaderAdapter:
             message = ""
 
             if annas_md5 and self.annas_api_key:
+                if cb:
+                    cb({"stage": "strategy_start", "strategy": "annas_md5"})
                 try:
                     ok, _reason, _ = await self._dl.download_with_annas_archive(
                         annas_md5, filepath, title=title, authors=authors, year=year
                     )
+                    if cb:
+                        cb({"stage": "strategy_done", "strategy": "annas_md5", "success": ok})
                     if ok:
                         success = True
                         message = "Anna's Archive (MD5)"
                 except Exception as e:
+                    if cb:
+                        cb({"stage": "strategy_done", "strategy": "annas_md5", "success": False})
                     logger.warning("Anna's MD5 download failed: %s", e)
 
-            if not success and pdf_url:
+            # When pdf_url is Academia.edu: skip entirely if include_academia=False (default).
+            # When allowed, still defer to last (after DOI/Sci-Hub/Anna's).
+            pdf_url_is_academia = _is_academia_pdf_url(pdf_url)
+            if pdf_url_is_academia and not include_academia:
+                logger.info("Academia.edu pdf_url skipped (include_academia=False): %s", (pdf_url or "")[:80])
+            if not success and pdf_url and not pdf_url_is_academia:
+                if cb:
+                    cb({"stage": "strategy_start", "strategy": "pdf_url"})
                 try:
                     await asyncio.sleep(random.uniform(1.0, 3.0))
                     success = await self._dl.find_and_download_pdf_with_browser(
                         pdf_url, filepath, title=title, authors=authors, year=year,
                         llm_provider=llm_provider, model_override=model_override,
                     )
+                    if cb:
+                        cb({"stage": "strategy_done", "strategy": "pdf_url", "success": success})
                     if success:
                         message = "PDF URL 直接下载"
                 except Exception as e:
+                    if cb:
+                        cb({"stage": "strategy_done", "strategy": "pdf_url", "success": False})
                     logger.warning("PDF URL download failed: %s", e)
 
             if not success and doi:
+                if cb:
+                    cb({"stage": "strategy_start", "strategy": "sci_hub"})
                 try:
                     await asyncio.sleep(random.uniform(1.5, 3.5))
                     success = await self._dl.download_with_sci_hub(
@@ -350,23 +415,52 @@ class ScholarDownloaderAdapter:
                         authors=authors,
                         year=year,
                     )
+                    if cb:
+                        cb({"stage": "strategy_done", "strategy": "sci_hub", "success": success})
                     if success:
                         message = "Sci-Hub"
                 except Exception as e:
+                    if cb:
+                        cb({"stage": "strategy_done", "strategy": "sci_hub", "success": False})
                     logger.warning("Sci-Hub download failed: %s", e)
 
             if not success and doi and self.annas_api_key:
+                if cb:
+                    cb({"stage": "strategy_start", "strategy": "annas_doi"})
                 try:
                     md5 = await self._dl._annas_search_md5(doi)
                     if md5:
                         ok, _, _ = await self._dl.download_with_annas_archive(
                             md5, filepath, title=title, authors=authors, year=year
                         )
+                        if cb:
+                            cb({"stage": "strategy_done", "strategy": "annas_doi", "success": bool(ok)})
                         if ok:
                             success = True
                             message = "Anna's Archive (DOI)"
                 except Exception as e:
+                    if cb:
+                        cb({"stage": "strategy_done", "strategy": "annas_doi", "success": False})
                     logger.warning("Anna's DOI search failed: %s", e)
+
+            # Academia fallback: only when explicitly enabled and all other strategies failed.
+            if not success and pdf_url and pdf_url_is_academia and include_academia:
+                if cb:
+                    cb({"stage": "strategy_start", "strategy": "pdf_url"})
+                try:
+                    await asyncio.sleep(random.uniform(1.0, 3.0))
+                    success = await self._dl.find_and_download_pdf_with_browser(
+                        pdf_url, filepath, title=title, authors=authors, year=year,
+                        llm_provider=llm_provider, model_override=model_override,
+                    )
+                    if cb:
+                        cb({"stage": "strategy_done", "strategy": "pdf_url", "success": success})
+                    if success:
+                        message = "PDF URL 直接下载 (Academia 兜底)"
+                except Exception as e:
+                    if cb:
+                        cb({"stage": "strategy_done", "strategy": "pdf_url", "success": False})
+                    logger.warning("PDF URL (Academia) download failed: %s", e)
 
             if not success:
                 return {
@@ -384,6 +478,8 @@ class ScholarDownloaderAdapter:
                     "message": "下载报告成功但文件不存在",
                 }
 
+            if cb:
+                cb({"stage": "validating"})
             if not is_valid_pdf(filepath):
                 try:
                     os.remove(filepath)

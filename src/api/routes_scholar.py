@@ -14,7 +14,8 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlmodel import Session, select
 
@@ -52,8 +53,11 @@ class DownloadRequest(BaseModel):
     year: Optional[int] = None
     collection: Optional[str] = None
     auto_ingest: Optional[bool] = None
+    library_paper_id: Optional[int] = Field(None, description="ScholarLibraryPaper.id; when set, downloaded_at is written on success")
     llm_provider: Optional[str] = Field(None, description="LLM provider for downloader assist (e.g. qwen-thinking); uses config default if not set")
     model_override: Optional[str] = Field(None, description="Model override for downloader LLM; uses provider default if not set")
+    show_browser: Optional[bool] = Field(None, description="有头(True)/无头(False)；不传则用配置默认")
+    include_academia: bool = Field(False, description="是否允许尝试 Academia.edu 下载（默认跳过，避免卡住）")
 
 
 class BatchDownloadRequest(BaseModel):
@@ -64,6 +68,8 @@ class BatchDownloadRequest(BaseModel):
     auto_ingest: bool = False  # when False (default), only download; when True, download then ingest per paper
     llm_provider: Optional[str] = Field(None, description="LLM provider for downloader assist; applies to all papers in batch")
     model_override: Optional[str] = Field(None, description="Model override for downloader LLM; applies to all papers in batch")
+    show_browser: Optional[bool] = Field(None, description="有头(True)/无头(False)；不传则用配置默认")
+    include_academia: bool = Field(False, description="是否允许尝试 Academia.edu 下载（默认跳过，避免卡住）")
 
 
 # ─── Scholar sub-libraries ───────────────────────────────────────────────────
@@ -295,8 +301,11 @@ async def scholar_download(req: DownloadRequest, background_tasks: BackgroundTas
             task_id=task_id,
             paper_info=req.model_dump(),
             collection=req.collection,
+            library_paper_id=getattr(req, "library_paper_id", None),
             llm_provider=getattr(req, "llm_provider", None),
             model_override=getattr(req, "model_override", None),
+            show_browser=getattr(req, "show_browser", None),
+            include_academia=getattr(req, "include_academia", False),
         )
         return {
             "status": "submitted",
@@ -315,6 +324,8 @@ async def scholar_download(req: DownloadRequest, background_tasks: BackgroundTas
         year=req.year,
         llm_provider=getattr(req, "llm_provider", None),
         model_override=getattr(req, "model_override", None),
+        show_browser=getattr(req, "show_browser", None),
+        include_academia=getattr(req, "include_academia", False),
     )
     return result
 
@@ -333,6 +344,89 @@ def _resolve_library_download_dir(library_id: Optional[int]) -> Optional[str]:
 def _resolve_permanent_library_folder(user_id: str, name: str) -> Path:
     """Resolve absolute path for a permanent library (base dir containing pdfs/)."""
     return PathManager.get_user_library_path(user_id, name)
+
+
+def _pdf_rename_dedup_library_folder(pdfs_dir: str) -> dict:
+    """Scan pdfs in folder: extract DOI, rename to DOI-based stem, remove duplicate PDFs. Returns {renamed, removed, no_doi}."""
+    from src.indexing.paper_metadata_store import paper_meta_store
+    from src.retrieval.dedup import extract_doi_from_pdf_tiered, normalize_doi
+    from src.retrieval.downloader.adapter import _doi_to_paper_id
+    from src.retrieval.downloader.utils import is_valid_pdf
+
+    pdfs_path = Path(pdfs_dir)
+    seen_dois: Dict[str, Path] = {}
+    renamed = removed = no_doi = 0
+
+    for pdf in sorted(pdfs_path.glob("*.pdf")):
+        if not is_valid_pdf(str(pdf)):
+            continue
+        doi, _title = extract_doi_from_pdf_tiered(pdf)
+        if not doi:
+            no_doi += 1
+            continue
+        new_stem = _doi_to_paper_id(doi)
+        new_path = pdfs_path / f"{new_stem}.pdf"
+        ndoi = normalize_doi(doi)
+        if not ndoi:
+            no_doi += 1
+            continue
+        if ndoi in seen_dois:
+            # Only remove if this is a different file from the one we kept (same path = already kept, do not delete)
+            kept = seen_dois[ndoi]
+            try:
+                if pdf.resolve() != kept.resolve():
+                    pdf.unlink(missing_ok=True)
+                    removed += 1
+            except OSError:
+                pass
+            continue
+        seen_dois[ndoi] = new_path
+        if pdf != new_path:
+            if new_path.exists():
+                try:
+                    pdf.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                removed += 1
+            else:
+                try:
+                    pdf.rename(new_path)
+                    renamed += 1
+                except OSError:
+                    continue
+        try:
+            paper_meta_store.upsert(new_stem, doi=doi, source="pdf_rename_dedup")
+        except Exception:
+            pass
+
+    return {"renamed": renamed, "removed": removed, "no_doi": no_doi}
+
+
+def _sync_library_paper_downloaded_at(lib_id: int, pdfs_dir: str) -> int:
+    """Set downloaded_at for ScholarLibraryPaper rows where the PDF exists on disk (by DOI → paper_id). Returns count updated."""
+    from src.retrieval.downloader.adapter import _doi_to_paper_id
+    from src.retrieval.downloader.utils import is_valid_pdf
+
+    pdfs_path = Path(pdfs_dir)
+    if not pdfs_path.is_dir():
+        return 0
+    now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+    updated = 0
+    with Session(get_engine()) as session:
+        rows = list(session.exec(select(ScholarLibraryPaper).where(ScholarLibraryPaper.library_id == lib_id)).all())
+        for row in rows:
+            doi = (row.doi or "").strip()
+            if not doi or getattr(row, "downloaded_at", None):
+                continue
+            paper_id = _doi_to_paper_id(doi)
+            candidate = pdfs_path / f"{paper_id}.pdf"
+            if candidate.is_file() and is_valid_pdf(str(candidate)):
+                row.downloaded_at = now
+                session.add(row)
+                updated += 1
+        if updated:
+            session.commit()
+    return updated
 
 
 @router.post("/download/batch")
@@ -368,6 +462,35 @@ async def scholar_batch_download(
     async def _batch_job():
         from src.retrieval.downloader.adapter import get_adapter
 
+        batch_start = time.time()
+        heartbeat_stop = asyncio.Event()
+        _BATCH_HEARTBEAT_INTERVAL = 5
+
+        async def _batch_heartbeat() -> None:
+            while not heartbeat_stop.is_set():
+                try:
+                    await asyncio.wait_for(heartbeat_stop.wait(), timeout=_BATCH_HEARTBEAT_INTERVAL)
+                except asyncio.TimeoutError:
+                    pass
+                if heartbeat_stop.is_set():
+                    break
+                s = q.get_state(task_id)
+                if s and s.status in (TaskStatus.completed, TaskStatus.error):
+                    break
+                elapsed = time.time() - batch_start
+                payload = s.payload if s else {}
+                q.push_event(
+                    task_id,
+                    "heartbeat",
+                    {
+                        "completed": payload.get("completed", 0),
+                        "failed": payload.get("failed", 0),
+                        "total": total,
+                        "elapsed_s": round(elapsed, 1),
+                    },
+                )
+
+        heartbeat_task = asyncio.create_task(_batch_heartbeat())
         sem = asyncio.Semaphore(req.max_concurrent)
         completed = 0
         failed = 0
@@ -376,6 +499,7 @@ async def scholar_batch_download(
 
         async def _one(paper: DownloadRequest):
             nonlocal completed, failed
+            include_academia = getattr(req, "include_academia", False)
             if req.auto_ingest:
                 sub_id = f"{task_id}_{uuid.uuid4().hex[:4]}"
                 result = await process_download_and_ingest(
@@ -383,8 +507,11 @@ async def scholar_batch_download(
                     paper_info=paper.model_dump(),
                     collection=req.collection,
                     download_dir=batch_download_dir,
+                    library_paper_id=getattr(paper, "library_paper_id", None),
                     llm_provider=getattr(req, "llm_provider", None) or getattr(paper, "llm_provider", None),
                     model_override=getattr(req, "model_override", None) or getattr(paper, "model_override", None),
+                    show_browser=getattr(req, "show_browser", None),
+                    include_academia=include_academia,
                 )
             else:
                 result = await adapter.download_paper(
@@ -397,8 +524,14 @@ async def scholar_batch_download(
                     download_dir=batch_download_dir,
                     llm_provider=getattr(req, "llm_provider", None) or getattr(paper, "llm_provider", None),
                     model_override=getattr(req, "model_override", None) or getattr(paper, "model_override", None),
+                    show_browser=getattr(req, "show_browser", None),
+                    include_academia=include_academia,
                 )
                 result = {**result, "ingest_triggered": False}
+                # Update downloaded_at for the library paper row when download succeeds
+                if result.get("success") and paper.library_paper_id is not None:
+                    from src.tasks.dispatcher import _mark_library_paper_downloaded
+                    _mark_library_paper_downloaded(paper.library_paper_id)
             async with progress_lock:
                 if result.get("ingest_triggered") or result.get("success"):
                     completed += 1
@@ -421,7 +554,21 @@ async def scholar_batch_download(
                         {"completed": completed, "failed": failed, "total": total},
                     )
 
-        await asyncio.gather(*[sem_wrap(sem, _one, p) for p in req.papers])
+        try:
+            await asyncio.gather(*[sem_wrap(sem, _one, p) for p in req.papers])
+        finally:
+            heartbeat_stop.set()
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
+
+        if req.library_id is not None and not _is_temp_library(req.library_id) and batch_download_dir:
+            try:
+                _sync_library_paper_downloaded_at(req.library_id, batch_download_dir)
+            except Exception as e:
+                logger.warning("batch post-sync downloaded_at failed: %s", e)
 
         state = q.get_state(task_id)
         if state:
@@ -451,6 +598,75 @@ async def scholar_batch_download(
         "total": total,
         "message": f"批量下载任务已投递（{total} 篇）",
     }
+
+
+_SCHOLAR_SSE_HEARTBEAT_INTERVAL = 5  # seconds: keep SSE connection alive during long downloads
+
+
+def _scholar_event_stream(task_id: str, q, after_id: str = "-"):
+    """SSE event stream for scholar tasks: read events from Redis, emit heartbeat when idle."""
+    last_id = after_id
+    last_sent_at = time.monotonic()
+    yield ": stream-init\n\n"
+    last_sent_at = time.monotonic()
+    while True:
+        events = q.read_events(task_id, after_id=last_id)
+        for ev in events:
+            last_id = ev.get("id", last_id)
+            typ = ev.get("type", "message")
+            data = ev.get("data", {})
+            yield f"id: {last_id}\nevent: {typ}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+            last_sent_at = time.monotonic()
+            if typ in ("done", "error", "cancelled", "timeout"):
+                return
+
+        state = q.get_state(task_id)
+        if state and state.is_terminal():
+            events = q.read_events(task_id, after_id=last_id)
+            for ev in events:
+                last_id = ev.get("id", last_id)
+                typ = ev.get("type", "message")
+                data = ev.get("data", {})
+                yield f"id: {last_id}\nevent: {typ}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+                if typ in ("done", "error", "cancelled", "timeout"):
+                    return
+            yield f"event: {state.status.value}\ndata: {json.dumps({'status': state.status.value}, ensure_ascii=False)}\n\n"
+            return
+
+        if time.monotonic() - last_sent_at >= _SCHOLAR_SSE_HEARTBEAT_INTERVAL:
+            yield ": heartbeat\n\n"
+            last_sent_at = time.monotonic()
+
+        time.sleep(0.3)
+
+
+@router.get("/task/{task_id}/stream")
+def scholar_task_stream(task_id: str, request: Request):
+    """SSE stream for download+ingest task; supports Last-Event-ID / after_id for resume."""
+    try:
+        q = get_task_queue()
+    except Exception as e:
+        logger.warning("scholar stream get_task_queue failed: %s", e)
+        raise HTTPException(status_code=503, detail="Task store unavailable")
+    state = q.get_state(task_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="任务不存在或已过期")
+    if state.kind != TaskKind.scholar:
+        raise HTTPException(status_code=400, detail="Not a scholar task")
+    after_id = (
+        request.headers.get("Last-Event-ID")
+        or request.query_params.get("after_id")
+        or "-"
+    )
+    return StreamingResponse(
+        _scholar_event_stream(task_id, q, after_id),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @router.get("/task/{task_id}")
@@ -611,8 +827,13 @@ def _scholar_source_priority(source: str) -> int:
     return 4
 
 
+def _is_academia_pdf_url(url: Optional[str]) -> bool:
+    """True if pdf_url points to Academia.edu (deprioritize when merging by DOI)."""
+    return bool(url and "academia.edu" in (url or "").lower())
+
+
 def _dedupe_papers_by_doi_keep_best_source(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """For each DOI keep one paper: the one with best source priority (google_scholar > google > semantic > ncbi). No-DOI items are kept as-is."""
+    """For each DOI keep one paper: best source priority; when equal, prefer non-Academia pdf_url (Academia often paywalled). No-DOI items kept as-is."""
     if not items:
         return items
     no_doi: List[Dict[str, Any]] = []
@@ -623,7 +844,25 @@ def _dedupe_papers_by_doi_keep_best_source(items: List[Dict[str, Any]]) -> List[
         pri = _scholar_source_priority(meta.get("source") or "")
         if not doi:
             no_doi.append(item)
-        elif doi not in by_doi or pri < _scholar_source_priority((by_doi[doi].get("metadata") or {}).get("source") or ""):
+            continue
+        existing = by_doi.get(doi)
+        if existing is None:
+            by_doi[doi] = item
+            continue
+        existing_meta = existing.get("metadata") or {}
+        existing_pri = _scholar_source_priority(existing_meta.get("source") or "")
+        item_pdf = (meta.get("pdf_url") or "").strip()
+        existing_pdf = (existing_meta.get("pdf_url") or "").strip()
+        # Prefer higher source priority; when equal, prefer non-Academia pdf_url
+        take_item = (
+            pri < existing_pri
+            or (
+                pri == existing_pri
+                and _is_academia_pdf_url(existing_pdf)
+                and not _is_academia_pdf_url(item_pdf)
+            )
+        )
+        if take_item:
             by_doi[doi] = item
     return list(by_doi.values()) + no_doi
 
@@ -674,10 +913,22 @@ def _extract_doi_and_dedup_library_papers(
             no_doi_list.append(p)
         else:
             src = (p.get("source") or "").strip()
-            if ndoi not in by_ndoi or _scholar_source_priority(src) < _scholar_source_priority(
-                (by_ndoi[ndoi].get("source") or "").strip()
-            ):
+            existing = by_ndoi.get(ndoi)
+            if existing is None:
                 by_ndoi[ndoi] = p
+            else:
+                existing_pri = _scholar_source_priority((existing.get("source") or "").strip())
+                pri = _scholar_source_priority(src)
+                take_p = (
+                    pri < existing_pri
+                    or (
+                        pri == existing_pri
+                        and _is_academia_pdf_url(existing.get("pdf_url"))
+                        and not _is_academia_pdf_url(p.get("pdf_url"))
+                    )
+                )
+                if take_p:
+                    by_ndoi[ndoi] = p
     deduped = list(by_ndoi.values()) + no_doi_list
     removed_count = len(papers) - len(deduped)
     return deduped, {"extracted_count": extracted_count, "removed_count": removed_count}
@@ -725,13 +976,26 @@ def _temp_paper_from_search_item(item: Dict[str, Any], lib_id: int) -> Dict[str,
     }
 
 
+def _doi_to_paper_id_for_api(doi: str) -> str:
+    """DOI to paper_id stem for API (delegate to adapter)."""
+    from src.retrieval.downloader.adapter import _doi_to_paper_id
+    return _doi_to_paper_id(doi)
+
+
 @router.get("/libraries/{lib_id:int}/papers")
 def list_scholar_library_papers(lib_id: int, user_id: str = Depends(get_current_user_id)):
     """List all papers in a scholar library (temp or permanent)."""
     if _is_temp_library(lib_id):
         if lib_id not in _temp_store:
             raise HTTPException(status_code=404, detail="库不存在")
-        return list(_temp_store[lib_id].get("papers") or [])
+        papers = list(_temp_store[lib_id].get("papers") or [])
+        out = []
+        for p in papers:
+            d = dict(p)
+            doi = (d.get("doi") or "").strip()
+            d["paper_id"] = _doi_to_paper_id_for_api(doi) if doi else None
+            out.append(d)
+        return out
     with Session(get_engine()) as session:
         lib = session.get(ScholarLibrary, lib_id)
         if not lib or getattr(lib, "user_id", None) != user_id:
@@ -752,9 +1016,35 @@ def list_scholar_library_papers(lib_id: int, user_id: str = Depends(get_current_
                 "annas_md5": p.annas_md5 or None,
                 "added_at": p.added_at,
                 "downloaded_at": getattr(p, "downloaded_at", None),
+                "paper_id": _doi_to_paper_id_for_api(p.doi) if (p.doi and (p.doi or "").strip()) else None,
             }
             for p in papers
         ]
+
+
+@router.get("/libraries/{lib_id:int}/pdf/{paper_id:path}")
+def get_library_pdf(lib_id: int, paper_id: str, user_id: str = Depends(get_current_user_id)):
+    """Serve PDF from a permanent library's pdfs folder. paper_id is the filename stem (e.g. DOI-based)."""
+    if _is_temp_library(lib_id):
+        raise HTTPException(status_code=400, detail="临时库无本地 PDF")
+    with Session(get_engine()) as session:
+        lib = session.get(ScholarLibrary, lib_id)
+    if not lib or getattr(lib, "user_id", None) != user_id:
+        raise HTTPException(status_code=404, detail="库不存在")
+    pdfs_dir = _resolve_library_download_dir(lib_id)
+    if not pdfs_dir:
+        raise HTTPException(status_code=400, detail="该库无 PDF 目录")
+    # Sanitize: only allow safe filename stem (no path segments)
+    if ".." in paper_id or "/" in paper_id or "\\" in paper_id:
+        raise HTTPException(status_code=400, detail="无效 paper_id")
+    pdf_path = Path(pdfs_dir) / f"{paper_id}.pdf"
+    if not pdf_path.is_file():
+        raise HTTPException(status_code=404, detail="PDF 未找到")
+    return FileResponse(
+        path=str(pdf_path),
+        media_type="application/pdf",
+        filename=f"{paper_id}.pdf",
+    )
 
 
 @router.post("/libraries/{lib_id:int}/papers")
@@ -901,6 +1191,25 @@ def extract_doi_dedup_library(lib_id: int, user_id: str = Depends(get_current_us
                     row.doi = d.get("doi") or ""
         session.commit()
         return {"extracted_count": stats["extracted_count"], "removed_count": stats["removed_count"]}
+
+
+@router.post("/libraries/{lib_id:int}/pdf-rename-dedup")
+def pdf_rename_dedup_library(lib_id: int, user_id: str = Depends(get_current_user_id)):
+    """Scan pdfs/ folder: extract DOI, rename to DOI-based stem, remove duplicate PDFs."""
+    if _is_temp_library(lib_id):
+        raise HTTPException(status_code=400, detail="仅永久库支持此操作")
+    with Session(get_engine()) as session:
+        lib = session.get(ScholarLibrary, lib_id)
+    if not lib or getattr(lib, "user_id", None) != user_id:
+        raise HTTPException(status_code=404, detail="库不存在")
+    pdfs_dir = _resolve_library_download_dir(lib_id)
+    if not pdfs_dir or not Path(pdfs_dir).is_dir():
+        raise HTTPException(status_code=400, detail="该库无 PDF 文件夹")
+    stats = _pdf_rename_dedup_library_folder(pdfs_dir)
+    # Sync ScholarLibraryPaper.downloaded_at so frontend "已下载" badges update after rename
+    synced = _sync_library_paper_downloaded_at(lib_id, pdfs_dir)
+    stats["synced_downloaded"] = synced
+    return stats
 
 
 @router.post("/papers/extract-doi-dedup")
