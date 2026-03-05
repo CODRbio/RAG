@@ -13,7 +13,7 @@ import re
 from collections import OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from typing import Any, Dict, List, Optional, Set, Tuple
-from urllib.parse import urlencode
+from urllib.parse import unquote, urlparse, urlencode
 from urllib.request import Request, urlopen
 
 logger = logging.getLogger(__name__)
@@ -63,14 +63,15 @@ def _get_paper_meta_store():
 
 def normalize_doi(doi: Optional[str]) -> str:
     """
-    归一化 DOI：小写、去空白、去 URL 前缀。
-    '10.1038/ismej.2016.124' / 'https://doi.org/10.1038/ISMEJ.2016.124' → '10.1038/ismej.2016.124'
+    归一化 DOI：小写、去空白、去 URL 前缀、解码 %2F 等。
+    '10.1038/ismej.2016.124' / 'https://doi.org/10.1038%2FISMEJ.2016.124' → '10.1038/ismej.2016.124'
     """
     if not doi or not isinstance(doi, str):
         return ""
-    d = doi.strip().lower()
-    d = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", d)
-    return d.rstrip("/.")
+    d = unquote(doi.strip())
+    d = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", d, flags=re.IGNORECASE)
+    m = _DOI_RE.search(d)
+    return (m.group(1).lower().rstrip("/.") if m else d.lower().rstrip("/."))
 
 
 def normalize_title(title: str) -> str:
@@ -78,6 +79,94 @@ def normalize_title(title: str) -> str:
     if not title or not isinstance(title, str):
         return ""
     return re.sub(r"[^a-z0-9]+", "", title.lower())
+
+
+# arXiv ID: YYMM.NNNNN or YYMM.NNNNNvN
+_ARXIV_ID_RE = re.compile(
+    r"(?:arxiv\.org/(?:abs|pdf)/)?(\d{4}\.\d{4,5}(?:v\d+)?)",
+    re.IGNORECASE,
+)
+
+
+def extract_arxiv_id(meta: Optional[Dict[str, Any]]) -> Optional[str]:
+    """
+    从 metadata 或 URL 中提取规范化 arXiv ID（YYMM.NNNNN 或 YYMM.NNNNNvN）。
+    返回小写字符串，无则返回 None。
+    """
+    if not meta:
+        return None
+    raw = meta.get("arxiv_id") or meta.get("arxiv")
+    if raw and isinstance(raw, str):
+        m = _ARXIV_ID_RE.search(raw.strip())
+        return m.group(1).lower() if m else raw.strip().lower()
+    url = meta.get("url") or ""
+    if url:
+        m = _ARXIV_ID_RE.search(url)
+        return m.group(1).lower() if m else None
+    return None
+
+
+def normalize_url(url: Optional[str]) -> Optional[str]:
+    """
+    规范化 URL：去掉 www.、末尾 /、UTM 等追踪参数、锚点。
+    返回 netloc+path 小写，无则返回 None。
+    """
+    if not url or not isinstance(url, str):
+        return None
+    url = url.strip()
+    if not url:
+        return None
+    parsed = urlparse(url)
+    netloc = (parsed.netloc or "").replace("www.", "").lower()
+    path = (parsed.path or "").rstrip("/")
+    if not netloc and not path:
+        return None
+    return f"{netloc}{path}".lower()
+
+
+# 用于 merge 时判定来源优先级（整数越大越优先）
+_SOURCE_PRIORITY_MAP = {
+    "scholar": 10,
+    "serpapi_scholar": 10,
+    "semantic": 7,
+    "semantic_bulk": 6,
+    "ncbi": 5,
+    "tavily": 3,
+    "web": 3,
+    "google": 2,
+    "serpapi_google": 2,
+}
+
+
+def _source_priority(source: str) -> int:
+    """返回来源优先级（越大越优先）。semantic_snippet 不参与 merge，不在此列。"""
+    return _SOURCE_PRIORITY_MAP.get(source or "", 1)
+
+
+# 合并时从 loser 补入 winner 的空字段
+_MERGE_FIELDS = [
+    "pdf_url", "doi", "abstract", "authors", "year",
+    "pmid", "arxiv_id", "corpus_id", "venue", "cited_by",
+]
+
+
+def merge_metadata_by_priority(winner_hit: Dict[str, Any], loser_hit: Dict[str, Any]) -> None:
+    """
+    将 loser_hit 中有价值且 winner 中为空的字段补入 winner（原地修改 winner）。
+    url 仅在 winner 完全无 url 时补入。
+    """
+    w_meta = winner_hit.get("metadata") or {}
+    l_meta = loser_hit.get("metadata") or {}
+    for key in _MERGE_FIELDS:
+        if not w_meta.get(key) and l_meta.get(key) is not None:
+            w_meta[key] = l_meta[key]
+    if not w_meta.get("url") and l_meta.get("url"):
+        w_meta["url"] = l_meta["url"]
+    winner_hit["metadata"] = w_meta
+    # 顶层字段（部分 provider 把 url/title 放在顶层）
+    for key in ("url", "title", "doi", "abstract"):
+        if not winner_hit.get(key) and loser_hit.get(key):
+            winner_hit[key] = loser_hit[key]
 
 
 def _fingerprint(text: str) -> str:
@@ -255,6 +344,8 @@ def _enrich_web_hits_missing_doi(
     resolved = 0
     for hit in web_hits:
         meta = hit.get("metadata") or {}
+        if meta.get("source") == "semantic_snippet":
+            continue
         if normalize_doi(meta.get("doi")):
             continue
 
@@ -295,6 +386,16 @@ def _enrich_web_hits_missing_doi(
 
     return lookups, resolved
 
+def _extract_local_arxiv(chunk: Any) -> Optional[str]:
+    """从本地 chunk（dict 或 EvidenceChunk）提取 arxiv_id。"""
+    if isinstance(chunk, dict):
+        return extract_arxiv_id(chunk.get("metadata"))
+    meta = getattr(chunk, "metadata", None) or {}
+    if not isinstance(meta, dict):
+        return None
+    return extract_arxiv_id(meta)
+
+
 def cross_source_dedup(
     local_chunks: List[Any],
     web_hits: List[Dict[str, Any]],
@@ -302,64 +403,71 @@ def cross_source_dedup(
     """
     拦截网络搜索中与本地文库重叠的文献。
 
-    通过 DOI 匹配构建"本地黑名单"，过滤掉 web_hits 中已存在于本地的结果，
-    把上下文 Token 留给真正的增量信息。
-
-    Args:
-        local_chunks: 本地检索结果（通常是 EvidenceChunk）
-        web_hits: 网络搜索结果（raw dicts from UnifiedWebSearch）
-
-    Returns:
-        过滤后的 web_hits（仅保留本地不存在的文献）
+    通过 DOI / arXiv ID / Title 黑名单过滤 web_hits。snippet 不参与过滤，原样保留。
     """
-    if not local_chunks or not web_hits:
+    if not web_hits:
         return web_hits
+
+    # snippet 旁路：不参与过滤，最终拼回
+    snippets: List[Dict[str, Any]] = []
+    non_snippets: List[Dict[str, Any]] = []
+    for h in web_hits:
+        src = (h.get("metadata") or {}).get("source", "")
+        if src == "semantic_snippet":
+            snippets.append(h)
+        else:
+            non_snippets.append(h)
+
+    if not local_chunks or not non_snippets:
+        return non_snippets + snippets
 
     store = _get_paper_meta_store()
 
-    # 构建本地 DOI + Title 黑名单
-    # 基础集合：从 SQLite 全量拉取（已有索引，毫秒级）
-    local_dois: Set[str] = store.all_dois()
-    local_titles: Set[str] = store.all_normalized_titles()
+    # 构建本地 DOI + Title 黑名单（SQLite + 当前批次）
+    local_dois: Set[str] = set(store.all_dois())
+    local_titles: Set[str] = set(store.all_normalized_titles())
+    local_arxivs: Set[str] = set()
 
-    # 再从当前检索结果中补充（可能有新入库但还未写 SQLite 的）
     for c in local_chunks:
-        doi_raw, title_raw, doc_id = _extract_local_fields(c)
+        doi_raw, title_raw, _ = _extract_local_fields(c)
         doi = normalize_doi(doi_raw)
         if doi:
             local_dois.add(doi)
         nt = normalize_title(title_raw)
         if nt:
             local_titles.add(nt)
+        arxiv = _extract_local_arxiv(c)
+        if arxiv:
+            local_arxivs.add(arxiv)
 
-    if not local_dois and not local_titles:
-        return web_hits
+    if not local_dois and not local_titles and not local_arxivs:
+        return non_snippets + snippets
 
-    # 先为无 DOI 的 web hit 尝试补 DOI（URL / CrossRef）
-    crossref_lookups, crossref_resolved = _enrich_web_hits_missing_doi(web_hits, local_titles)
+    # 仅对 non_snippets 回填 DOI
+    crossref_lookups, crossref_resolved = _enrich_web_hits_missing_doi(non_snippets, local_titles)
 
-    # 过滤 web_hits
-    before = len(web_hits)
     filtered: List[Dict[str, Any]] = []
-    for hit in web_hits:
+    for hit in non_snippets:
         meta = hit.get("metadata") or {}
         web_doi = normalize_doi(meta.get("doi"))
         web_title = normalize_title(meta.get("title") or hit.get("title") or "")
-        if (web_doi and web_doi in local_dois) or (web_title and web_title in local_titles):
+        web_arxiv = extract_arxiv_id(meta)
+        if (web_doi and web_doi in local_dois) or (web_title and web_title in local_titles) or (web_arxiv and web_arxiv in local_arxivs):
             continue
         filtered.append(hit)
 
-    removed = before - len(filtered)
+    removed = len(non_snippets) - len(filtered)
     if removed > 0:
         logger.info(
-            "cross_source_dedup: removed=%d, local_doi=%d, local_title=%d, crossref_lookups=%d, crossref_resolved=%d",
+            "cross_source_dedup: removed=%d, local_doi=%d, local_title=%d, local_arxiv=%d, crossref_lookups=%d, crossref_resolved=%d",
             removed,
             len(local_dois),
             len(local_titles),
+            len(local_arxivs),
             crossref_lookups,
             crossref_resolved,
         )
-    return filtered
+    return filtered + snippets
 
 
 # ── 指纹去重 + 单文档上限 ─────────────────────────────

@@ -38,6 +38,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from config.settings import settings
 from src.log import get_logger
+from src.retrieval.dedup import (
+    extract_arxiv_id,
+    merge_metadata_by_priority,
+    normalize_doi,
+    normalize_url,
+    _source_priority,
+)
 
 logger = get_logger(__name__)
 
@@ -171,43 +178,81 @@ def _get_source_weight(source: str) -> float:
 
 def _merge_and_dedup(all_hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    合并并去重搜索结果
-    
-    规则：
-    - 按 URL 去重
-    - 同一 URL 被多个来源返回时，保留权重高的来源版本
-    - 不做排序（由后续 reranker 处理）
-    
-    Args:
-        all_hits: 所有来源的搜索结果
-    
-    Returns:
-        去重后的结果列表
+    三键去重（URL + DOI + arXiv ID）+ 交叉注册 + 按来源优先级 Merge。
+    semantic_snippet 不参与去重，直接旁路到输出末尾。
     """
-    # url -> (hit, source_weight)
-    seen_urls: Dict[str, Tuple[Dict, float]] = {}
-    # 无 URL 的结果单独收集
-    no_url_hits: List[Dict] = []
-    
+    snippet_passthrough: List[Dict[str, Any]] = []
+    no_key_hits: List[Dict[str, Any]] = []
+    merged_hits: List[Dict[str, Any]] = []
+    seen_urls: Dict[str, Dict[str, Any]] = {}
+    seen_dois: Dict[str, Dict[str, Any]] = {}
+    seen_arxivs: Dict[str, Dict[str, Any]] = {}
+
+    def register(h: Dict[str, Any], target: Dict[str, Any]) -> None:
+        """将 hit 的 url/doi/arxiv 键注册到三个 seen 字典，均指向 target。"""
+        meta = h.get("metadata") or {}
+        u = normalize_url(meta.get("url") or h.get("url"))
+        d = normalize_doi(meta.get("doi") or h.get("doi"))
+        a = extract_arxiv_id(meta)
+        if u:
+            seen_urls[u] = target
+        if d:
+            seen_dois[d] = target
+        if a:
+            seen_arxivs[a] = target
+
+    def replace_in_seen(old_hit: Dict[str, Any], new_hit: Dict[str, Any]) -> None:
+        """把所有指向 old_hit 的键改为指向 new_hit。"""
+        for d in (seen_urls, seen_dois, seen_arxivs):
+            for k in list(d.keys()):
+                if d[k] is old_hit:
+                    d[k] = new_hit
+
     for hit in all_hits:
-        metadata = hit.get("metadata", {}) or {}
-        url = (metadata.get("url") or "").strip()
-        source = metadata.get("source", "")
-        weight = _get_source_weight(source)
-        
-        if not url:
-            no_url_hits.append(hit)
+        meta = hit.get("metadata") or {}
+        source = meta.get("source", "")
+
+        if source == "semantic_snippet":
+            snippet_passthrough.append(hit)
             continue
-        
-        # URL 去重：保留权重高的
-        if url not in seen_urls or weight > seen_urls[url][1]:
-            seen_urls[url] = (hit, weight)
-    
-    # 合并结果（先有 URL 的，再无 URL 的）
-    results = [item[0] for item in seen_urls.values()]
-    results.extend(no_url_hits)
-    
-    return results
+
+        url_norm = normalize_url(meta.get("url") or hit.get("url"))
+        doi_norm = normalize_doi(meta.get("doi") or hit.get("doi"))
+        arxiv = extract_arxiv_id(meta)
+
+        if not url_norm and not doi_norm and not arxiv:
+            no_key_hits.append(hit)
+            continue
+
+        existing: Optional[Dict[str, Any]] = None
+        if url_norm and url_norm in seen_urls:
+            existing = seen_urls[url_norm]
+        elif doi_norm and doi_norm in seen_dois:
+            existing = seen_dois[doi_norm]
+        elif arxiv and arxiv in seen_arxivs:
+            existing = seen_arxivs[arxiv]
+
+        if existing is None:
+            merged_hits.append(hit)
+            register(hit, hit)
+            continue
+
+        pri_new = _source_priority(source)
+        pri_old = _source_priority((existing.get("metadata") or {}).get("source", ""))
+
+        if pri_new > pri_old:
+            merge_metadata_by_priority(hit, existing)
+            replace_in_seen(existing, hit)
+            for i, h in enumerate(merged_hits):
+                if h is existing:
+                    merged_hits[i] = hit
+                    break
+            register(hit, hit)
+        else:
+            merge_metadata_by_priority(existing, hit)
+            register(hit, existing)
+
+    return merged_hits + no_key_hits + snippet_passthrough
 
 
 @dataclass
