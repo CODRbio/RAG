@@ -1,0 +1,343 @@
+{
+  "pdf_selectors": {
+    "site_specific": {
+      "wiley": [
+        "a[data-test-id=\"article-pdf-link\"]",
+        "a[href*=\"/doi/pdfdirect/\"]",
+        "a[href*=\"/doi/epdf/\"]",
+        "a[href*=\"/doi/pdf/\"]",
+        "a.coolBar__ctrl.pdf-download",
+        "a[title=\"ePDF\"][class*=\"coolBar\"]",
+        "a.coolBar__ctrl[href*=\"/doi/epdf/\"]"
+      ],
+      "cedar_digital_commons": [
+        "a#pdf",
+        "a.btn[href*=\"viewcontent\"]",
+        "a[href*=\"viewcontent.cgi\"]",
+        "a.btn:has-text(\"Download\")"
+      ],
+      "springer_nature": [
+        "a[data-track-action=\"download pdf\"]",
+        "a[data-track-action=\"Pdf download\"]",
+        "a[data-track=\"pdf download\"]",
+        "a[data-test=\"pdf-link\"]",
+        "a[href*=\"/content/pdf/\"][href$=\".pdf\"]",
+        "a.c-pdf-download__link[href*=\"/pdf/\"][data-article-pdf=\"true\"]",
+        "a.u-button[data-article-pdf=\"true\"][data-test=\"pdf-link\"]",
+        "div.c-pdf-download a.c-pdf-download__link[href*=\"/pdf/\"]",
+        "a.c-pdf-download__link"
+      ],
+      "elsevier": [
+        "[data-aa-name=\"srm-pdf-download\"]",
+        "[data-test-id=\"pdf-link\"]",
+        "button#pdfLink",
+        "a#pdfLink",
+        "a[href*=\"pdfft\"][data-internalname]",
+        "a[data-aa-name=\"btn-download-pdf\"]",
+        "a[title=\"Download full text\"]",
+        "a.link-button[href*=\"pdfft\"]",
+        "a.link-button[aria-label*=\"View PDF\"]",
+        "a.link-button-primary[href*=\"pdfft\"]",
+        "button#pdf-download-button"
+      ],
+      "frontiersin": [
+        "button[data-test-id=\"download-pdf-btn\"]",
+        "a[data-action=\"download-pdf\"]",
+        "a.download-files-pdf"
+      ],
+      "ojs_pkp": [
+        "a.download",
+        ".galley-link.download",
+        "a.obj_galley_link",
+        "a.obj_galley_link.pdf",
+        "a.download span.label"
+      ],
+      "mdpi": [
+        "a.UD_ArticlePDF",
+        ".article-pdf-download a",
+        "a[href*=\"/pdf\"]:not([href*=\"flyer\"])",
+        "a.download-pdf-link",
+        "a[title=\"Download PDF\"]"
+      ],
+      "bmc": [
+        "a.c-pdf-download__link[href*=\"content/pdf\"]"
+      ],
+      "cambridge": [
+        "a[href*=\"/core/services/aop-cambridge-core/content/view\"]"
+      ],
+      "oxford": [
+        "a.article-pdfLink",
+        "a[href*=\"/article-pdf/\"]"
+      ],
+      "jstor": [
+        "a.download-pdf"
+      ],
+      "taylor_francis": [
+        "a.show-pdf[href*=\"/epdf/\"]"
+      ],
+      "ieee": [
+        "a.doc-actions-link.stats-document-lh-action-downloadPdf_3"
+      ],
+      "sage": [
+        "a#downloadPdfUrl[href*=\"/pdf/\"]"
+      ],
+      "proquest": [
+        "a.contents-menu-tab-title[href*=\"fulltextPDF\"]",
+        "a[id*=\"addFlashPageParameterformat_fulltextPDF\"]",
+        "a[title*=\"Full text - PDF from ProQuest\"]"
+      ],
+      "pnas": [
+        "a[data-panel-name=\"article-pdf\"]",
+        "a[data-title=\"Download PDF\"]",
+        "a[href*=\"/doi/pdf/\"]",
+        "a.btn--pdf[href*=\"/doi/pdf/\"]"
+      ],
+      "the_innovation": [
+        "a[href^=\"/data/article/\"][href*=\"/preview/pdf/\"]",
+        "span.hidden-lg a[href*=\"/pdf/\"]"
+      ],
+      "ssrn": [
+        "a[href*=\"Delivery.cfm\"][href*=\".pdf\"]",
+        "a.abstract-buttons__delivery-button",
+        "button:has-text(\"Download This Paper\")"
+      ],
+      "science": [
+        "a[data-item-name=\"download-pdf\"]",
+        "a[data-toggle=\"tooltip\"][title*=\"PDF\"]",
+        "a[href*=\"/doi/pdf/\"]",
+        "a.article-tools__pdf",
+        "a.btn[aria-label=\"PDF\"]"
+      ],
+      "researchgate": [
+        "a[data-testid=\"pdf-download-button\"]",
+        "button:has-text(\"Download full-text PDF\")",
+        "a.nova-legacy-c-button[href*=\"fulltext\"]",
+        "a:has-text(\"Download full-text PDF\")",
+        "a:has-text(\"Download file PDF\")",
+        ".js-target-download-btn"
+      ],
+      "arxiv": [
+        "a.download-pdf",
+        "a[href^=\"/pdf/\"]"
+      ],
+      "biorxiv_medrxiv": [
+        "a.article-dl-pdf-link",
+        "a.article-dl-pdf-link-main",
+        "a[href$=\".full.pdf\"]"
+      ],
+      "chemrxiv": [
+        "button:has-text(\"Download PDF\")",
+        "a[href*=\"/api/articles/\"][href*=\"/pdf\"]"
+      ],
+      "research_square": [
+        "a[data-test=\"download-pdf-button\"]",
+        "a.download-pdf"
+      ],
+      "osf_preprints": [
+        "a:has-text(\"Download preprint\")",
+        "a.btn-primary:has-text(\"Download\")"
+      ],
+      "pmc": [
+        "a.int-view[href*=\"/pdf/\"]",
+        "a[data-action=\"pdf_link\"]",
+        "a.article-pdf",
+        "a[data-panel-name=\"article-pdf\"]",
+        "a.article-dl-pdf-link-ext"
+      ],
+      "academia": [
+        "button.ds2-5-button:has-text(\"Download PDF\")",
+        "button[class*=\"ToolbarButton\"]:has-text(\"Download PDF\")",
+        "button.ds2-5-button",
+        "a.js-swp-download-button",
+        "div.ds-work-cover--hover-container",
+        "div.js-swp-download-button"
+      ]
+    },
+    "generic": {
+      "direct_links": [
+        "a[href$=\".pdf\"]",
+        "a[href*=\"/pdf/\"][download]",
+        "a[download]",
+        "a[download][href*=\".pdf\"]",
+        "a[href*=\"/pdf/\"][href*=\"download\"]",
+        "a[href*=\".pdf\"][target=\"_blank\"]",
+        "a[href*=\"/doi/pdf/\"]"
+      ],
+      "buttons": [
+        "button[title*=\"Download\"]",
+        "button[title*=\"download\"]",
+        "button:has-text(\"Download\")",
+        "button:has-text(\"Download PDF\")",
+        "button:has-text(\"Open PDF\")",
+        "button:has-text(\"Open\")",
+        "button:has-text(\"打开\")",
+        "button:has-text(\"下载\")",
+        "button:has-text(\"打开 PDF\")",
+        "button:has-text(\"下载 PDF\")",
+        "button[aria-label*=\"PDF\"]",
+        "button#open-button"
+      ],
+      "links": [
+        "a[title*=\"PDF\"]",
+        "a[title*=\"pdf\"]",
+        "a[title*=\"Download PDF\"]",
+        "a[title*=\"download PDF\"]",
+        "a:has-text(\"Download\")",
+        "a:has-text(\"Download PDF\")",
+        "a:has-text(\"Open PDF\")",
+        "a:has-text(\"打开\")",
+        "a:has-text(\"Download This Paper\")",
+        "a:has-text(\"Open PDF in Browser\")",
+        "a.pdf-download",
+        ".download-pdf-btn",
+        "a.btn[href*=\"pdf\"]",
+        "a:has(button#open-button)",
+        "[data-testid=\"download-pdf\"]",
+        "div.article-content a[href*=\"pdf\"]",
+        ".download-link[href*=\"pdf\"]",
+        "div.download-pdf a",
+        "a.c-pdf-download__link[href*=\".pdf\"]"
+      ],
+      "text_matchers": [
+        ":text(\"View PDF\")",
+        ":text(\"Download PDF\")",
+        ":text(\"Full Text PDF\")"
+      ]
+    },
+    "dropdown_triggers": [
+      "button:has-text(\"Download article\")",
+      "button:has-text(\"Download\")",
+      "[aria-haspopup=\"true\"]:has-text(\"Download\")",
+      "button:has-text(\"下载文章\")",
+      "button.ActionsDropDown__button"
+    ],
+    "dropdown_pdf_links": [
+      "a:has-text(\"Download PDF\")",
+      "a:has-text(\"PDF\")",
+      "a[href*=\".pdf\"]",
+      "a:has-text(\"下载 PDF\")",
+      "a[data-event*=\"pdf\"]",
+      ".ActionsDropDown__menu a[href*=\"/pdf\"]"
+    ],
+    "modal_buttons": [
+      ".modal button:has-text(\"打开\")",
+      ".modal button:has-text(\"下载\")",
+      ".modal button:has-text(\"Open\")",
+      ".modal button:has-text(\"Download\")",
+      ".modal a:has-text(\"Open PDF\")",
+      ".dialog button:has-text(\"打开\")",
+      ".dialog button:has-text(\"Open\")",
+      "[role=\"dialog\"] button:has-text(\"打开\")",
+      "[role=\"dialog\"] button:has-text(\"Open\")",
+      "[role=\"dialog\"] button:has-text(\"Download\")",
+      ".overlay button:has-text(\"打开\")",
+      ".overlay button:has-text(\"Open\")",
+      ".popup button:has-text(\"打开\")",
+      ".popup button:has-text(\"Open\")"
+    ],
+    "center_buttons": [
+      ".pdf-container button:has-text(\"打开\")",
+      ".pdf-viewer button:has-text(\"打开\")",
+      ".pdf-container button:has-text(\"Open\")",
+      ".pdf-viewer button:has-text(\"Open\")",
+      "#pdf-viewer button",
+      ".reader-body button:has-text(\"打开\")",
+      ".reader-body button:has-text(\"Open\")",
+      "button:has-text(\"打开\")",
+      "button:has-text(\"下载\")",
+      "button.open-pdf",
+      "button.view-pdf",
+      "a.open-pdf-link"
+    ]
+  },
+  "site_url_patterns": {
+    "wiley": ["onlinelibrary.wiley.com"],
+    "cedar_digital_commons": ["cedar", "digitalcommons"],
+    "springer_nature": ["springer.com", "nature.com", "link.springer.com"],
+    "elsevier": ["sciencedirect.com", "elsevier.com"],
+    "frontiersin": ["frontiersin.org"],
+    "ojs_pkp": ["europeanjournaloftaxonomy.eu", "mapress.com", "biotaxa.org"],
+    "mdpi": ["mdpi.com"],
+    "bmc": ["biomedcentral.com", "bmj.com"],
+    "cambridge": ["cambridge.org"],
+    "oxford": ["academic.oup.com", "oxfordjournals.org"],
+    "jstor": ["jstor.org"],
+    "taylor_francis": ["tandfonline.com"],
+    "ieee": ["ieeexplore.ieee.org"],
+    "sage": ["sagepub.com"],
+    "proquest": ["proquest.com"],
+    "pnas": ["pnas.org"],
+    "the_innovation": ["the-innovation.org"],
+    "ssrn": ["ssrn.com"],
+    "science": ["science.org", "sciencemag.org"],
+    "researchgate": ["researchgate.net"],
+    "arxiv": ["arxiv.org"],
+    "biorxiv_medrxiv": ["biorxiv.org", "medrxiv.org"],
+    "chemrxiv": ["chemrxiv.org"],
+    "research_square": ["researchsquare.com"],
+    "osf_preprints": ["osf.io"],
+    "pmc": ["ncbi.nlm.nih.gov/pmc", "europepmc.org"],
+    "academia": ["academia.edu"]
+  },
+  "multi_step_sites": {
+    "wiley": {
+      "detect_contains": ["onlinelibrary.wiley.com"],
+      "steps": [
+        {
+          "selector": "div.coolBar__section.coolBar--download.PdfLink a.coolBar__ctrl.pdf-download, a.coolBar__ctrl.pdf-download, a[title=\"ePDF\"].coolBar__ctrl, a:has-text(\"Download PDF\")",
+          "wait": 2
+        },
+        {
+          "selector": "a[href*=\"pdfdirect\"][href*=\"download=true\"], a[href*=\"pdfdirect\"], a[aria-label*=\"Download\"]",
+          "wait": 2
+        }
+      ]
+    },
+    "elife": {
+      "detect_contains": ["elife"],
+      "steps": [
+        {
+          "selector": "a.button.button--default.button--action.icon.icon-download#button-action-download",
+          "wait": 1
+        },
+        {
+          "selector": "a.article-download-links-list__link:has-text(\"Article PDF\")",
+          "wait": 1
+        }
+      ]
+    },
+    "zootaxa": {
+      "detect_contains": ["mapress.com"],
+      "steps": [
+        { "selector": "a.obj_galley_link.pdf", "wait": 1 },
+        { "selector": "a.download[download]", "wait": 1 }
+      ]
+    },
+    "atypon_publishers": {
+      "detect_contains": ["science.org", "pnas.org", "tandfonline.com"],
+      "steps": [
+        {
+          "selector": "a[data-item-name=\"download-pdf\"], a[data-panel-name=\"article-pdf\"], a[data-toggle=\"tooltip\"][title*=\"PDF\"]",
+          "wait": 2
+        },
+        {
+          "selector": "a.btn-primary:has-text(\"Proceed\"), button:has-text(\"Accept and Download\"), form#pdf-terms input[type=\"submit\"]",
+          "wait": 2
+        }
+      ]
+    },
+    "researchgate": {
+      "detect_contains": ["researchgate.net"],
+      "steps": [
+        {
+          "selector": "a[data-testid=\"pdf-download-button\"], a:has-text(\"Download full-text PDF\"), button:has-text(\"Download full-text PDF\"), a.nova-legacy-c-button[href*=\"download\"]",
+          "wait": 2
+        },
+        {
+          "selector": "button:has-text(\"Download without\"), span:has-text(\"Download without\"), button:has-text(\"Continue to download\")",
+          "wait": 2
+        }
+      ]
+    }
+  }
+}

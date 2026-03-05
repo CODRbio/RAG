@@ -4,7 +4,6 @@ import json
 import time
 import hashlib
 import uuid
-from time import sleep
 import argparse
 import shutil
 import subprocess
@@ -1085,11 +1084,29 @@ class LLMAssistant:
                 response = response.strip()
                 self.logger.debug(f"[LLM] 已移除 thinking 标签，剩余内容长度: {len(response)}")
             
-            # 尝试提取JSON（可能在最后）
-            # 方法1: 查找最后一个完整的 { ... } 块（支持嵌套）
-            # 从后往前找第一个 {，然后匹配到对应的 }
+            # 去除markdown代码块
+            if response.startswith('```'):
+                response = re.sub(r'^```\w*\n?', '', response)
+                response = re.sub(r'\n?```$', '', response)
+                response = response.strip()
+
+            # 优先：从左到右扫描 JSON 起点，逐个尝试解析后缀，兼容前置解释文本
+            for idx, ch in enumerate(response):
+                if ch != "{":
+                    continue
+                candidate = response[idx:].strip()
+                try:
+                    data = json.loads(candidate)
+                    action = data.get('action', {})
+                    if action.get('type') in ['click', 'navigate', 'give_up']:
+                        return action
+                except Exception:
+                    continue
+
+            # 回退：保留原逆向大括号提取逻辑
             brace_count = 0
             start_idx = -1
+            extracted = response
             for i in range(len(response) - 1, -1, -1):
                 if response[i] == '}':
                     if brace_count == 0:
@@ -1098,24 +1115,14 @@ class LLMAssistant:
                 elif response[i] == '{':
                     brace_count -= 1
                     if brace_count == 0 and start_idx != -1:
-                        # 找到了完整的 JSON 对象
-                        response = response[i:start_idx + 1]
+                        extracted = response[i:start_idx + 1]
                         break
-            
-            # 去除markdown代码块
-            if response.startswith('```'):
-                response = re.sub(r'^```\w*\n?', '', response)
-                response = re.sub(r'\n?```$', '', response)
-                response = response.strip()
-            
-            # 尝试解析JSON
-            data = json.loads(response)
+
+            data = json.loads(extracted)
             action = data.get('action', {})
-            
             if action.get('type') in ['click', 'navigate', 'give_up']:
                 return action
-            else:
-                self.logger.debug(f"[LLM] 解析出的 action.type 无效: {action.get('type')}")
+            self.logger.debug(f"[LLM] 解析出的 action.type 无效: {action.get('type')}")
             
         except json.JSONDecodeError as e:
             # JSON解析失败，尝试更宽松的提取
@@ -1144,6 +1151,25 @@ class LLMAssistant:
             self.logger.debug(f"[LLM] 解析响应失败: {e}")
         
         return None
+
+
+@dataclass
+class _PaperDownloadContext:
+    paper: Dict
+    filepath: str
+    title: str
+    authors: List[str]
+    year: Optional[int]
+    url: Optional[str]
+    pdf_url: Optional[str]
+    doi: Optional[str]
+    source: str
+    is_likely_pdf: bool
+    is_ssrn: bool
+    is_academia_pdf: bool
+    is_semantic_source: bool
+    force_pdf_attempt: bool
+    annas_md5: Optional[str] = None
 
 
 # 通过该下载器下载的论文会保存在download_dir目录下，download_dir目录下会创建一个tmp目录，用于下载临时文件
@@ -1520,6 +1546,12 @@ class PaperDownloader:
             self.config = load_config(config_path)
             # 使用项目 config 时，相对路径以 config 目录为基准
             self._config_dir = _project_config_root() if (config_path is None or config_path == "config.json") else None
+        selector_cfg = self._load_selector_config()
+        self.pdf_selectors = selector_cfg.get("pdf_selectors", self.PDF_SELECTORS)
+        self.site_url_patterns = selector_cfg.get("site_url_patterns", self.SITE_URL_PATTERNS)
+        self.multi_step_sites = self._build_multi_step_sites(
+            selector_cfg.get("multi_step_sites", {})
+        )
         # 统一超时配置（可在 config.json -> downloader.timeouts 覆盖）
         default_timeouts = {
             "session_acquire_timeout": 15,
@@ -1583,13 +1615,17 @@ class PaperDownloader:
             file_handler.setLevel(logging.DEBUG)
             formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
             file_handler.setFormatter(formatter)
-            self.logger.addHandler(file_handler)
+            if not any(
+                isinstance(h, logging.FileHandler)
+                and getattr(h, "baseFilename", "") == debug_log_path
+                for h in self.logger.handlers
+            ):
+                self.logger.addHandler(file_handler)
             self.debug_log_file = debug_log_path
             self.logger.debug(f"=== Debug 模式已启用，日志文件: {debug_log_path} ===")
         
         # 持久化浏览器相关属性
         self._persistent_user_data_dir = os.path.join(os.path.dirname(self.download_dir), ".browser_data")
-        self._browser_context = None  # 统一的浏览器上下文（兼容旧逻辑）
         self._browser_manager = None  # 浏览器管理器
         self._context_lock = asyncio.Lock()  # 添加锁来保护context的创建和使用
         self._active_pages = set()  # 跟踪所有活动的页面
@@ -1603,6 +1639,7 @@ class PaperDownloader:
         self._pool_was_headless: Optional[bool] = None  # 会话池当前使用的 headless（用于检测 override 变更后重建）
         self._show_browser_override: Optional[bool] = None  # 运行时覆盖：有头/无头（由前端或 API 设置）
         self._warmed_domains: Set[str] = set()  # 全局预热域名集合，所有 slot 共享（一处验证处处放行）
+        self._http_session: Optional[aiohttp.ClientSession] = None
         # 防并发惊群：按域名排队，仅第一个任务执行预热，其余等待后直接放行
         self._domain_locks: Dict[str, asyncio.Lock] = {}
         self._domain_locks_lock = asyncio.Lock()
@@ -1611,7 +1648,6 @@ class PaperDownloader:
         self._session_idle_timeout = 60  # 会话空闲超时（秒），空闲超过此时间后关闭
         self._cleanup_task: Optional[asyncio.Task] = None  # 清理任务
         self._last_activity_time = time.time()  # 最后活动时间
-        self._use_lightweight_mode = True  # 轻量模式：单次下载使用临时上下文，快速释放
         
         # 下载历史
         self.history_file = os.path.join(self.download_dir, ".download_history.json")
@@ -1705,6 +1741,84 @@ class PaperDownloader:
     """
 
     # ==================== 选择器辅助方法 ====================
+    def _default_multi_step_site_config(self) -> Dict[str, Dict[str, Any]]:
+        return {
+            "wiley": {
+                "detect_contains": ["onlinelibrary.wiley.com"],
+                "steps": [
+                    {"selector": 'div.coolBar__section.coolBar--download.PdfLink a.coolBar__ctrl.pdf-download, a.coolBar__ctrl.pdf-download, a[title="ePDF"].coolBar__ctrl, a:has-text("Download PDF")', "wait": 2},
+                    {"selector": 'a[href*="pdfdirect"][href*="download=true"], a[href*="pdfdirect"], a[aria-label*="Download"]', "wait": 2},
+                ],
+            },
+            "elife": {
+                "detect_contains": ["elife"],
+                "steps": [
+                    {"selector": 'a.button.button--default.button--action.icon.icon-download#button-action-download', "wait": 1},
+                    {"selector": 'a.article-download-links-list__link:has-text("Article PDF")', "wait": 1},
+                ],
+            },
+            "zootaxa": {
+                "detect_contains": ["mapress.com"],
+                "steps": [
+                    {"selector": "a.obj_galley_link.pdf", "wait": 1},
+                    {"selector": "a.download[download]", "wait": 1},
+                ],
+            },
+            "atypon_publishers": {
+                "detect_contains": ["science.org", "pnas.org", "tandfonline.com"],
+                "steps": [
+                    {"selector": 'a[data-item-name="download-pdf"], a[data-panel-name="article-pdf"], a[data-toggle="tooltip"][title*="PDF"]', "wait": 2},
+                    {"selector": 'a.btn-primary:has-text("Proceed"), button:has-text("Accept and Download"), form#pdf-terms input[type="submit"]', "wait": 2},
+                ],
+            },
+            "researchgate": {
+                "detect_contains": ["researchgate.net"],
+                "steps": [
+                    {"selector": 'a[data-testid="pdf-download-button"], a:has-text("Download full-text PDF"), button:has-text("Download full-text PDF"), a.nova-legacy-c-button[href*="download"]', "wait": 2},
+                    {"selector": 'button:has-text("Download without"), span:has-text("Download without"), button:has-text("Continue to download")', "wait": 2},
+                ],
+            },
+        }
+
+    def _build_multi_step_sites(self, config: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        built: Dict[str, Dict[str, Any]] = {}
+        for site_id, site_cfg in (config or {}).items():
+            detect_contains = [
+                str(item).lower()
+                for item in (site_cfg.get("detect_contains") or [])
+                if str(item).strip()
+            ]
+            steps = site_cfg.get("steps") or []
+            if not steps:
+                continue
+
+            def _make_detect(patterns: List[str]):
+                return lambda u: any(p in (u or "").lower() for p in patterns)
+
+            detect = _make_detect(detect_contains)
+            built[site_id] = {"detect": detect, "steps": steps}
+
+        return built or self.MULTI_STEP_SITES
+
+    def _load_selector_config(self) -> Dict[str, Any]:
+        defaults = {
+            "pdf_selectors": self.PDF_SELECTORS,
+            "site_url_patterns": self.SITE_URL_PATTERNS,
+            "multi_step_sites": self._default_multi_step_site_config(),
+        }
+        config_path = os.path.join(_project_config_root(), "pdf_selectors.json")
+        if not os.path.exists(config_path):
+            return defaults
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if not isinstance(loaded, dict):
+                self.logger.warning("pdf_selectors.json 格式错误（非对象），将使用内置默认配置")
+                return defaults
+            return _deep_merge(defaults, loaded)
+        except Exception as e:
+            self.logger.warning("加载 pdf_selectors.json 失败，使用内置默认配置: %s", e)
+            return defaults
     
     def _match_site(self, url: str, site_key: str) -> bool:
         """检查URL是否匹配指定网站
@@ -1716,11 +1830,11 @@ class PaperDownloader:
         Returns:
             bool: 是否匹配
         """
-        if site_key not in self.SITE_URL_PATTERNS:
+        if site_key not in self.site_url_patterns:
             return False
         
         url_lower = url.lower()
-        patterns = self.SITE_URL_PATTERNS[site_key]
+        patterns = self.site_url_patterns[site_key]
         return any(pattern in url_lower for pattern in patterns)
     
     def _get_site_specific_selectors(self, url: str) -> list:
@@ -1732,7 +1846,7 @@ class PaperDownloader:
         Returns:
             list: 网站特定的选择器列表
         """
-        for site_key, selectors in self.PDF_SELECTORS['site_specific'].items():
+        for site_key, selectors in self.pdf_selectors['site_specific'].items():
             if self._match_site(url, site_key):
                 self.logger.debug(f"匹配到网站特定选择器: {site_key}")
                 return selectors
@@ -1755,10 +1869,10 @@ class PaperDownloader:
             selectors.extend(site_specific)
         
         # 2. 通用选择器（按优先级添加）
-        selectors.extend(self.PDF_SELECTORS['generic']['direct_links'])
-        selectors.extend(self.PDF_SELECTORS['generic']['buttons'])
-        selectors.extend(self.PDF_SELECTORS['generic']['links'])
-        selectors.extend(self.PDF_SELECTORS['generic']['text_matchers'])
+        selectors.extend(self.pdf_selectors['generic']['direct_links'])
+        selectors.extend(self.pdf_selectors['generic']['buttons'])
+        selectors.extend(self.pdf_selectors['generic']['links'])
+        selectors.extend(self.pdf_selectors['generic']['text_matchers'])
         
         return selectors
 
@@ -1849,7 +1963,7 @@ class PaperDownloader:
                     continue
             
             # ===== 方法2：检测弹窗/模态框中的按钮 =====
-            modal_selectors = self.PDF_SELECTORS['modal_buttons']
+            modal_selectors = self.pdf_selectors['modal_buttons']
             
             for selector in modal_selectors:
                 try:
@@ -1867,7 +1981,7 @@ class PaperDownloader:
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
             await asyncio.sleep(0.5)
             
-            center_button_selectors = self.PDF_SELECTORS['center_buttons']
+            center_button_selectors = self.pdf_selectors['center_buttons']
             
             for selector in center_button_selectors:
                 try:
@@ -1925,7 +2039,7 @@ class PaperDownloader:
             
             # ===== 方法5：处理下拉菜单式下载按钮 =====
             # 某些网站（如Frontiersin）需要先点击下拉菜单触发器，再点击PDF链接
-            dropdown_triggers = self.PDF_SELECTORS['dropdown_triggers']
+            dropdown_triggers = self.pdf_selectors['dropdown_triggers']
             
             for trigger in dropdown_triggers:
                 try:
@@ -1936,7 +2050,7 @@ class PaperDownloader:
                         await asyncio.sleep(0.5)  # 等待下拉菜单展开
                         
                         # 在下拉菜单中查找PDF链接
-                        pdf_link_selectors = self.PDF_SELECTORS['dropdown_pdf_links']
+                        pdf_link_selectors = self.pdf_selectors['dropdown_pdf_links']
                         
                         for pdf_selector in pdf_link_selectors:
                             try:
@@ -2563,25 +2677,38 @@ class PaperDownloader:
         if not content:
             if headers is None:
                 headers = {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
                     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                     'Accept-Language': 'en-US,en;q=0.5',
                     'Connection': 'keep-alive',
                     'Upgrade-Insecure-Requests': '1'
                 }
             try:
-                timeout = aiohttp.ClientTimeout(total=min(self.download_timeout, 60))
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.get(url, headers=headers, ssl=False) as response:
-                        status = response.status
-                        if status == 200:
-                            content = await response.read()
-                        else:
-                            self.logger.warning(f"下载失败，HTTP状态码: {response.status}")
-                            return False
+                session = self._http_session
+                owns_session = False
+                if session is None or session.closed:
+                    timeout = aiohttp.ClientTimeout(total=min(self.download_timeout, 60))
+                    session = aiohttp.ClientSession(timeout=timeout)
+                    owns_session = True
+                ssl_skip_domains = {"sci-hub.st", "sci-hub.se", "libgen.rs"}
+                parsed = urlparse(url)
+                use_ssl = parsed.hostname not in ssl_skip_domains if parsed.hostname else True
+                async with session.get(url, headers=headers, ssl=use_ssl) as response:
+                    status = response.status
+                    if status == 200:
+                        content = await response.read()
+                    else:
+                        self.logger.warning(f"下载失败，HTTP状态码: {response.status}")
+                        return False
             except Exception as e:
                 self.logger.error(f"直接下载过程中出错: {str(e)}")
                 return False
+            finally:
+                if owns_session:
+                    try:
+                        await session.close()
+                    except Exception:
+                        pass
 
         try:
             if content and status == 200:
@@ -3257,57 +3384,6 @@ class PaperDownloader:
         except Exception as e:
             self.logger.warning(f"释放 slot [{session_data.get('index', '?')}] 时出错: {e}")
 
-    async def _create_lightweight_context(self):
-        """创建轻量级临时上下文（非持久化，下载完立即释放）
-        
-        适用于：
-        - 单次下载任务
-        - 不需要保持 cookie 的场景
-        - 需要快速释放资源的场景
-        
-        Returns:
-            (context, cleanup_func) - 上下文和清理函数
-        """
-        self.logger.debug("创建轻量级临时上下文")
-        
-        try:
-            # 使用临时目录
-            temp_dir = tempfile.mkdtemp(prefix="browser_temp_")
-            
-            # 写入 PDF 首选项
-            self._write_pdf_preferences(temp_dir)
-            
-            # 创建临时持久化上下文（为了正确处理下载）
-            context = await self.browser_manager.launch_persistent_browser(
-                user_data_dir=temp_dir,
-                browser_type=self.browser_type,
-                headless=self.get_effective_headless(),
-                stealth_mode=self.stealth_mode,
-                viewport={'width': 1280, 'height': 720},
-                downloads_path=self.download_dir,
-                timeout=30000,  # 较短的超时时间
-                proxy=getattr(self, "_proxy", None),
-                extension_path=getattr(self, "_capsolver_extension_path", None),
-            )
-            
-            async def cleanup():
-                """清理临时上下文和目录"""
-                try:
-                    await asyncio.wait_for(context.close(), timeout=5)
-                except Exception:
-                    pass
-                try:
-                    shutil.rmtree(temp_dir, ignore_errors=True)
-                except Exception:
-                    pass
-                self.logger.debug("轻量级上下文已清理")
-            
-            return context, cleanup
-            
-        except Exception as e:
-            self.logger.error(f"创建轻量级上下文失败: {e}")
-            return None, None
-
     def set_idle_timeout(self, timeout_seconds: int):
         """动态设置空闲超时时间
         
@@ -3326,79 +3402,23 @@ class PaperDownloader:
         """
         self.logger.info("强制释放所有浏览器资源...")
         
-        # 关闭会话池
+        # 关闭会话池（唯一的浏览器上下文由会话池管理）
         if self._session_pool_initialized:
             await self._close_session_pool()
-        
-        # 关闭旧的浏览器上下文（兼容）
-        if self._browser_context:
-            try:
-                await asyncio.wait_for(self._browser_context.close(), timeout=5)
-            except Exception:
-                pass
-            self._browser_context = None
         
         self.logger.info("所有浏览器资源已释放")
 
     # ==================== 会话池相关方法结束 ====================
 
     async def get_browser_context(self):
-        """获取或创建浏览器上下文"""
-        async with self._context_lock:
-            if self._browser_context is not None:
-                try:
-                    # 验证现有的会话是否有效
-                    page = await self._browser_context.new_page()
-                    await page.goto('about:blank')
-                    await page.close()
-                    self.logger.info("使用现有的浏览器上下文")
-                    return self._browser_context
-                except Exception as e:
-                    # 会话已失效，需要重新创建
-                    self.logger.warning(f"现有浏览器上下文已失效，需要重新创建: {str(e)}")
-                    try:
-                        await self._browser_context.close()
-                    except Exception:
-                        pass
-                    self._browser_context = None
-                    self._browser_manager = None
+        """获取共享浏览器上下文（兼容接口）
 
-            try:
-                if self.persist_browser:
-                    # 确保用户数据目录存在
-                    os.makedirs(self._persistent_user_data_dir, exist_ok=True)
-                    
-                    # 清理锁定文件
-                    self._clean_lock_files_in_dir(self._persistent_user_data_dir)
-                    
-                    self._browser_context = await self.browser_manager.launch_persistent_browser(
-                        user_data_dir=self._persistent_user_data_dir,
-                        browser_type=self.browser_type,
-                        headless=self.get_effective_headless(),
-                        stealth_mode=self.stealth_mode,
-                        viewport={'width': 1280, 'height': 720},
-                        downloads_path=self.download_dir,
-                        timeout=self.download_timeout * 1000,
-                        proxy=getattr(self, "_proxy", None),
-                        extension_path=getattr(self, "_capsolver_extension_path", None),
-                    )
-                else:
-                    self._browser_context = await setup_browser(
-                        browser_type=self.browser_type,
-                        headless=self.get_effective_headless(),
-                        browser_channel=self.browser_type,
-                        stealth_mode=self.stealth_mode,
-                        user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-                        viewport={'width': 1280, 'height': 720},
-                        downloads_path=self.download_dir
-                    )
-                self.logger.info("成功创建浏览器上下文")
-                return self._browser_context
-            except Exception as e:
-                self.logger.error(f"创建浏览器上下文失败: {str(e)}")
-                self._browser_context = None
-                self._browser_manager = None
-                return None
+        所有浏览器操作统一通过会话池管理。此方法确保会话池已初始化，
+        然后返回池内唯一的共享上下文。不应再单独创建 context。
+        """
+        if not self._session_pool_initialized:
+            await self._init_session_pool()
+        return self._shared_browser_context
 
     async def cleanup_resources(self, force_close=False, ask_user=False):
         """清理所有资源，包括浏览器上下文和临时文件"""
@@ -3451,49 +3471,30 @@ class PaperDownloader:
             self.logger.info("资源部分清理完成（保留浏览器会话以完成下载）")
             return
 
-        # 关闭会话池（新增）
+        # 关闭会话池（单上下文多页面：统一入口）
         if self._session_pool_initialized:
             try:
                 await self._close_session_pool()
             except Exception as e:
                 self.logger.warning(f"关闭会话池时出错: {e}")
 
-        # 关闭所有活动页面（兼容旧逻辑）
-        if self._browser_context:
+        if self._http_session is not None:
             try:
-                # 获取所有页面（包括blank页面）
-                all_pages = self._browser_context.pages
-                for page in all_pages:
-                    try:
-                        # 先导航到空白页，确保页面完全卸载
-                        try:
-                            await page.goto('about:blank', timeout=3000)
-                        except Exception:
-                            pass
-                        await page.close()
-                        self.logger.debug(f"已关闭页面")
-                    except Exception as e:
-                        self.logger.warning(f"关闭页面时出错: {str(e)}")
-                
-                # 增加延迟到 2 秒，让浏览器完成所有后台操作
-                # 这对于 persistent context 的优雅关闭很重要
-                await asyncio.sleep(2.0)
-                
+                if not self._http_session.closed:
+                    await self._http_session.close()
             except Exception as e:
-                self.logger.error(f"关闭页面时出错: {str(e)}")
+                self.logger.warning(f"关闭 aiohttp 会话失败: {e}")
+            finally:
+                self._http_session = None
 
-        # 关闭浏览器（通过 BrowserManager 统一管理，避免双重关闭）
-        # 对于 persistent context，_browser_context 和 browser_manager.browsers[0] 是同一个对象
-        # 只通过 browser_manager.close() 关闭一次，避免崩溃
+        # 关闭浏览器（通过 BrowserManager 统一管理，清理底层 Playwright 进程）
         if self.browser_manager is not None:
             try:
                 self.logger.info("正在关闭 BrowserManager...")
                 await self.browser_manager.close()
-                self._browser_context = None  # 清除引用
                 self.logger.info("BrowserManager 已关闭")
             except Exception as e:
                 self.logger.warning(f"关闭 BrowserManager 时出错: {str(e)}")
-                self._browser_context = None
 
         # 清理残留的任务临时目录
         try:
@@ -3534,7 +3535,7 @@ class PaperDownloader:
         task_download_dir, task_start_time, initial_main_files = self._create_task_download_dir()
         
         try:
-            # 从会话池获取上下文（替代单一 _browser_context）
+            # 从会话池获取上下文
             session = await self._acquire_session()
             if session is None:
                 self.logger.error("无法从会话池获取浏览器上下文")
@@ -3915,9 +3916,13 @@ class PaperDownloader:
         if title:
             # 清理标题，移除非法字符
             clean_title = re.sub(r'[\\/*?:"<>|]', "", title)
-            # 缩短标题（最多50个字符）
-            if len(clean_title) > 35:
-                clean_title = "_".join(clean_title.split(" ")[0:6])
+            # 缩短标题（英文优先按词截断；中文/无空格场景按字符截断）
+            if len(clean_title) > 50:
+                words = clean_title.split()
+                if len(words) > 1:
+                    clean_title = "_".join(words[:6])
+                if len(clean_title) > 50:
+                    clean_title = clean_title[:50]
             
             filename_parts.append(clean_title)
         
@@ -4690,13 +4695,141 @@ class PaperDownloader:
         
         return stats
 
+    async def _strategy_direct_pdf(self, ctx: _PaperDownloadContext) -> bool:
+        if not ctx.pdf_url:
+            return False
+        self.logger.info(f"尝试直接下载PDF链接: {ctx.pdf_url}")
+        return await self.download_direct(
+            ctx.pdf_url,
+            ctx.filepath,
+            title=ctx.title,
+            authors=ctx.authors,
+            year=ctx.year,
+        )
+
+    async def _strategy_browser_pdf_url(self, ctx: _PaperDownloadContext) -> bool:
+        if not ctx.pdf_url:
+            return False
+        self.logger.info(f"尝试通过浏览器下载PDF链接: {ctx.pdf_url}")
+        return await self.pdf_download_with_browser(ctx.pdf_url, ctx.filepath)
+
+    async def _strategy_brightdata_pdf_url(self, ctx: _PaperDownloadContext) -> bool:
+        if not ctx.pdf_url:
+            return False
+        max_retries = 3 if "researchgate.net" in (ctx.pdf_url or "").lower() else 1
+        for attempt in range(max_retries):
+            if attempt > 0:
+                self.logger.info(f"ResearchGate 重试 ({attempt + 1}/{max_retries}): {ctx.pdf_url[:60]}...")
+                await asyncio.sleep(2)
+            else:
+                self.logger.info(f"尝试BrightData下载pdf_url: {ctx.pdf_url}")
+
+            if await self.download_with_solver(
+                ctx.pdf_url,
+                ctx.filepath,
+                title=ctx.title,
+                authors=ctx.authors,
+                year=ctx.year,
+            ):
+                return True
+        return False
+
+    async def _strategy_ssrn(self, ctx: _PaperDownloadContext) -> bool:
+        if not ctx.pdf_url:
+            return False
+        self.logger.info(f"检测到 SSRN pdf_url，使用页面查找 PDF: {ctx.pdf_url}")
+        return await self.find_and_download_pdf_with_browser(
+            ctx.pdf_url,
+            ctx.filepath,
+            title=ctx.title,
+            authors=ctx.authors,
+            year=ctx.year,
+            source=ctx.source,
+        )
+
+    async def _strategy_semantic_doi(self, ctx: _PaperDownloadContext) -> bool:
+        if not ctx.doi:
+            return False
+        doi_str = str(ctx.doi).strip()
+        doi_url = doi_str if doi_str.lower().startswith("http") else f"https://doi.org/{doi_str}"
+        self.logger.info(f"Semantic Scholar：尝试通过 DOI 解析下载: {doi_url}")
+        return await self.find_and_download_pdf_with_browser(
+            doi_url,
+            ctx.filepath,
+            title=ctx.title,
+            authors=ctx.authors,
+            year=ctx.year,
+            source=ctx.source,
+        )
+
+    async def _strategy_browser_url(self, ctx: _PaperDownloadContext) -> bool:
+        if not ctx.url:
+            return False
+        if ctx.is_semantic_source and "semanticscholar.org" in ctx.url.lower():
+            self.logger.info("检测到Semantic Scholar链接，跳过页面抓取，继续其他策略")
+            return False
+        self.logger.info(f"尝试从论文页面查找PDF: {ctx.url}")
+        return await self.find_and_download_pdf_with_browser(
+            ctx.url,
+            ctx.filepath,
+            title=ctx.title,
+            authors=ctx.authors,
+            year=ctx.year,
+            source=ctx.source,
+        )
+
+    async def _strategy_scihub(self, ctx: _PaperDownloadContext) -> bool:
+        scihub_input = ctx.doi or ctx.url
+        if not scihub_input:
+            return False
+
+        annas_md5 = ctx.annas_md5
+        if not annas_md5:
+            try:
+                annas_query = ctx.doi or ctx.title
+                if annas_query:
+                    md5 = await self._annas_search_md5(annas_query)
+                    if md5:
+                        annas_md5 = md5
+                        ctx.paper["annas_md5"] = md5
+                        self.logger.info(f"Anna's Archive 找到 MD5: {md5}（已保存，供后续手动重试）")
+                    else:
+                        self.logger.info("Anna's Archive 未匹配 MD5，跳过 Sci-Hub 以节省资源")
+                else:
+                    self.logger.info("缺少 DOI/标题，无法查询 MD5，跳过 Sci-Hub 以节省资源")
+            except Exception as e:
+                self.logger.warning(f"Anna's MD5 搜索失败: {e}")
+                annas_md5 = None
+
+        if not annas_md5:
+            self.logger.info("已跳过 Sci-Hub（需要 MD5 才尝试）")
+            return False
+
+        self.logger.info(f"尝试BrightData + Sci-Hub下载: {scihub_input}")
+        return await self.download_with_sci_hub(
+            scihub_input,
+            ctx.filepath,
+            title=ctx.title,
+            authors=ctx.authors,
+            year=ctx.year,
+        )
+
+    async def _strategy_academia(self, ctx: _PaperDownloadContext) -> bool:
+        if not ctx.pdf_url:
+            return False
+        short_url = ctx.pdf_url[:60] + "..." if len(ctx.pdf_url) > 60 else ctx.pdf_url
+        self.logger.info("Academia 兜底：尝试通过浏览器下载: %s", short_url)
+        return await self.pdf_download_with_browser(ctx.pdf_url, ctx.filepath)
+
     async def _download_paper(self, paper: Dict, semaphore: asyncio.Semaphore, stats: Dict[str, int]) -> None:
         """下载单篇论文"""
         title = paper.get('title', '').strip()
         authors = paper.get('authors', [])
         year = paper.get('year')
-        url = paper.get('url', '')
-        paper_id = paper.get('id', '')
+        url = paper.get('url') or paper.get('link')
+        pdf_url = paper.get('pdf_url') or paper.get('pdf_link')
+        doi = paper.get('doi')
+        source = paper.get('source', '')
         
         # 生成文件名
         filename = self._generate_filename(title, authors, year)
@@ -4750,18 +4883,7 @@ class PaperDownloader:
                     self.logger.warning(f"删除无效文件失败: {str(e)}")
 
         try:
-            async with semaphore:  # 后续的下载逻辑保持不变
-                # 提取论文信息
-                title = paper.get('title')
-                authors = paper.get('authors', [])
-                year = paper.get('year')
-                
-                # 直接映射字段名
-                url = paper.get('url') or paper.get('link')
-                pdf_url = paper.get('pdf_url') or paper.get('pdf_link')
-                doi = paper.get('doi')
-                source = paper.get('source', '')  # 提取来源标识
-                
+            async with semaphore:
                 # ==========================================================
                 # ==== 预印本及开放获取平台 URL 智能推断（绕过渲染，提速核心）====
                 # ==========================================================
@@ -4803,198 +4925,74 @@ class PaperDownloader:
                     stats['skipped'] += 1
                     return
                 
-                success = False
                 annas_md5 = paper.get('annas_md5')
                 is_semantic_source = source == "Semantic Scholar"
                 is_semantic_link = bool(url and "semanticscholar.org" in url.lower())
                 if is_semantic_source and is_semantic_link:
                     self.logger.info("Semantic Scholar 来源链接不作为下载入口，将仅使用 pdf_url/doi")
                     url = None
-                scihub_input = doi or url
+                is_academia_pdf = bool(pdf_url and "academia.edu" in (pdf_url or "").lower())
+                is_likely_pdf = bool(pdf_url and self._is_likely_pdf_url(pdf_url))
+                is_ssrn = bool(pdf_url and self._is_ssrn_url(pdf_url))
+                force_pdf_attempt = bool(is_semantic_source and pdf_url and not is_likely_pdf)
                 
-                # 使用共享的浏览器上下文
-                if self._browser_context is None:
-                    self.logger.error("浏览器上下文未初始化")
+                # 确保会话池已就绪
+                if not self._session_pool_initialized:
+                    self.logger.error("浏览器会话池未初始化")
                     stats['failed'] += 1
                     return
-                
-                # ===== 简化后的下载顺序 =====
-                # 优先级：pdf_link 直链 > 浏览器 > DOI/Sci-Hub > Anna's Archive
-                # Academia.edu 多为付费：有 pdf_url 时先走 DOI/Sci-Hub，最后再试 Academia 兜底
-                is_academia_pdf = bool(pdf_url and "academia.edu" in (pdf_url or "").lower())
-                if pdf_url and not is_academia_pdf:
-                    # 有 pdf_url：先尝试免费方法
-                    self.logger.debug(f"检测到 pdf_url: {pdf_url}")
-                    is_likely_pdf = self._is_likely_pdf_url(pdf_url)
-                    is_ssrn = self._is_ssrn_url(pdf_url)
-                    force_pdf_attempt = is_semantic_source and not is_likely_pdf
-                    self.logger.debug(f"URL 识别结果: is_pdf={is_likely_pdf}, is_ssrn={is_ssrn}")
-                    
-                    # 1) 直接下载（扩展支持：不仅 .pdf，也包括其他可能的 PDF URL）
-                    if not success and (is_likely_pdf or force_pdf_attempt):
-                        try:
-                            self.logger.info(f"尝试直接下载PDF链接: {pdf_url}")
-                            success = await self.download_direct(pdf_url, filepath, title=title, authors=authors, year=year)
-                            if success:
-                                stats['success'] += 1
-                                await asyncio.sleep(1)
-                        except Exception as e:
-                            self.logger.warning(f"PDF直链下载失败: {str(e)}")
 
-                    # 2) 浏览器下载 pdf_url（带预热和 cookie 处理）
-                    if not success and (is_likely_pdf or force_pdf_attempt):
-                        try:
-                            self.logger.info(f"尝试通过浏览器下载PDF链接: {pdf_url}")
-                            success = await self.pdf_download_with_browser(pdf_url, filepath)
-                            if success:
-                                stats['success'] += 1
-                                await asyncio.sleep(1)
-                        except Exception as e:
-                            self.logger.warning(f"浏览器下载pdf_url失败: {str(e)}")
+                ctx = _PaperDownloadContext(
+                    paper=paper,
+                    filepath=filepath,
+                    title=title,
+                    authors=authors,
+                    year=year,
+                    url=url,
+                    pdf_url=pdf_url,
+                    doi=doi,
+                    source=source,
+                    is_likely_pdf=is_likely_pdf,
+                    is_ssrn=is_ssrn,
+                    is_academia_pdf=is_academia_pdf,
+                    is_semantic_source=is_semantic_source,
+                    force_pdf_attempt=force_pdf_attempt,
+                    annas_md5=annas_md5,
+                )
 
-                    # 3) BrightData 下载 pdf_url（付费）
-                    if not success and (is_likely_pdf or force_pdf_attempt):
-                        # ResearchGate 需要多次重试（偶发返回空响应）
-                        max_retries = 3 if 'researchgate.net' in pdf_url.lower() else 1
-                        
-                        for attempt in range(max_retries):
-                            try:
-                                if attempt > 0:
-                                    self.logger.info(f"ResearchGate 重试 ({attempt + 1}/{max_retries}): {pdf_url[:60]}...")
-                                    await asyncio.sleep(2)  # 重试前等待
-                                else:
-                                    self.logger.info(f"尝试BrightData下载pdf_url: {pdf_url}")
-                                
-                                success = await self.download_with_solver(pdf_url, filepath, title=title, authors=authors, year=year)
-                                if success:
-                                    stats['success'] += 1
-                                    break
-                            except Exception as e:
-                                self.logger.warning(f"BrightData下载pdf_url失败 (尝试 {attempt + 1}/{max_retries}): {str(e)}")
-                        
-                        if success:
-                            await asyncio.sleep(1)
+                strategies: List[Tuple[str, Any]] = []
+                if ctx.pdf_url and not ctx.is_academia_pdf:
+                    self.logger.debug(f"检测到 pdf_url: {ctx.pdf_url}")
+                    self.logger.debug(
+                        f"URL 识别结果: is_pdf={ctx.is_likely_pdf}, is_ssrn={ctx.is_ssrn}"
+                    )
+                    if ctx.is_likely_pdf or ctx.force_pdf_attempt:
+                        strategies.extend([
+                            ("direct_pdf_url", self._strategy_direct_pdf),
+                            ("browser_pdf_url", self._strategy_browser_pdf_url),
+                            ("brightdata_pdf_url", self._strategy_brightdata_pdf_url),
+                        ])
+                    if ctx.is_ssrn and not ctx.is_likely_pdf:
+                        strategies.append(("ssrn", self._strategy_ssrn))
+                if ctx.is_semantic_source and ctx.doi:
+                    strategies.append(("semantic_doi", self._strategy_semantic_doi))
+                if ctx.url:
+                    strategies.append(("browser_url", self._strategy_browser_url))
+                if ctx.doi or ctx.url:
+                    strategies.append(("scihub", self._strategy_scihub))
+                if ctx.pdf_url and ctx.is_academia_pdf:
+                    strategies.append(("academia", self._strategy_academia))
 
-                    # 4) SSRN 特殊处理：pdf_url 指向页面但包含 PDF 下载链接
-                    if not success and is_ssrn and not is_likely_pdf:
-                        try:
-                            self.logger.info(f"检测到 SSRN pdf_url，使用页面查找 PDF: {pdf_url}")
-                            success = await self.find_and_download_pdf_with_browser(
-                                pdf_url, filepath, title=title, authors=authors, year=year, source=source
-                            )
-                            if success:
-                                stats['success'] += 1
-                                await asyncio.sleep(1)
-                        except Exception as e:
-                            self.logger.warning(f"SSRN pdf_url 页面查找 PDF 失败: {str(e)}")
-                            await asyncio.sleep(1)
-
-                # Semantic Scholar 专属：pdf_url 失败/缺失后，尝试 doi.org 解析跳转下载
-                # 说明：仅对 Semantic Scholar 生效；其他来源保持原有逻辑不变
-                if not success and is_semantic_source and doi:
+                for name, strategy_fn in strategies:
                     try:
-                        doi_str = str(doi).strip()
-                        # 兼容：如果上游已给出 doi.org URL，则直接使用；否则拼接成可访问链接
-                        if doi_str.lower().startswith("http"):
-                            doi_url = doi_str
-                        else:
-                            doi_url = f"https://doi.org/{doi_str}"
-                        self.logger.info(f"Semantic Scholar：尝试通过 DOI 解析下载: {doi_url}")
-                        success = await self.find_and_download_pdf_with_browser(
-                            doi_url, filepath, title=title, authors=authors, year=year, source=source
-                        )
-                        if success:
+                        if await strategy_fn(ctx):
                             stats['success'] += 1
-                            await asyncio.sleep(1)
+                            return
                     except Exception as e:
-                        self.logger.warning(f"Semantic Scholar：DOI 解析下载失败（继续后续策略）: {e}")
+                        self.logger.warning("策略 %s 失败: %s", name, e)
 
-                if not success and (not pdf_url or is_academia_pdf) and doi:
-                    # 没有 pdf_url 或仅有 Academia pdf_url：提前查询 Anna MD5（后续 Sci-Hub 仅在有 MD5 时尝试）
-                    try:
-                        if not annas_md5:
-                            md5 = await self._annas_search_md5(doi)
-                            if md5:
-                                annas_md5 = md5
-                                paper['annas_md5'] = md5
-                                self.logger.info(f"Anna's Archive 找到 MD5: {md5}（已保存，供后续 Sci-Hub 使用）")
-                            else:
-                                self.logger.info("Anna's Archive 未匹配 MD5，后续将跳过 Sci-Hub")
-                    except Exception as e:
-                        self.logger.warning(f"DOI 下载前 MD5 查询失败: {str(e)}")
-                        self.logger.info("Anna's MD5 查询失败，后续将跳过 Sci-Hub")
-                        await asyncio.sleep(1)
-
-                if not success and url:
-                    # 没有 pdf_url 或 pdf_url 下载失败：尝试从论文页面查找 PDF
-                    if is_semantic_source and is_semantic_link and not pdf_url:
-                        self.logger.info("检测到Semantic Scholar链接，跳过页面抓取，继续其他策略")
-                    else:
-                        try:
-                            self.logger.info(f"尝试从论文页面查找PDF: {url}")
-                            success = await self.find_and_download_pdf_with_browser(
-                                url, filepath, title=title, authors=authors, year=year, source=source
-                            )
-                            if success:
-                                stats['success'] += 1
-                                await asyncio.sleep(1)
-                        except Exception as e:
-                            self.logger.warning(f"浏览器查找PDF失败: {str(e)}")
-                            await asyncio.sleep(1)
-
-                # 4) BrightData + Sci-Hub（付费，通过 sci-hub.st）：仅在已有 Anna MD5 且前序均失败后尝试
-                if not success and scihub_input:
-                    # 搜索 Anna's Archive 获取 MD5（只搜索不下载，用于决定是否允许 Sci-Hub）
-                    try:
-                        if not annas_md5:
-                            annas_query = doi or title
-                            if annas_query:
-                                md5 = await self._annas_search_md5(annas_query)
-                                if md5:
-                                    annas_md5 = md5
-                                    paper['annas_md5'] = md5
-                                    self.logger.info(f"Anna's Archive 找到 MD5: {md5}（已保存，供后续手动重试）")
-                                else:
-                                    self.logger.info("Anna's Archive 未匹配 MD5，跳过 Sci-Hub 以节省资源")
-                            else:
-                                self.logger.info("缺少 DOI/标题，无法查询 MD5，跳过 Sci-Hub 以节省资源")
-                    except Exception as e:
-                        self.logger.warning(f"Anna's MD5 搜索失败: {e}")
-                        annas_md5 = None
-                    
-                    if annas_md5:
-                        try:
-                            self.logger.info(f"尝试BrightData + Sci-Hub下载: {scihub_input}")
-                            success = await self.download_with_sci_hub(
-                                scihub_input, filepath, title=title, authors=authors, year=year
-                            )
-                            if success:
-                                stats['success'] += 1
-                                await asyncio.sleep(1)
-                        except Exception as e:
-                            self.logger.warning(f"BrightData + Sci-Hub下载失败: {str(e)}")
-                            await asyncio.sleep(1)
-                    else:
-                        self.logger.info("已跳过 Sci-Hub（需要 MD5 才尝试）")
-
-                # Academia 兜底：pdf_url 为 academia.edu 时，前面已跳过直链/浏览器，此处最后再试
-                if not success and pdf_url and is_academia_pdf:
-                    try:
-                        self.logger.info("Academia 兜底：尝试通过浏览器下载: %s", pdf_url[:60] + "..." if len(pdf_url or "") > 60 else pdf_url)
-                        success = await self.pdf_download_with_browser(pdf_url, filepath)
-                        if success:
-                            stats['success'] += 1
-                            await asyncio.sleep(1)
-                    except Exception as e:
-                        self.logger.warning("Academia 兜底下载失败: %s", e)
-                
-                # 注意：Anna's Archive API 下载已移除自动调用
-                # 只有用户手动选择"失败且有MD5"的论文并点击"Anna's Retry"时才会触发
-              
-                # 所有方法都失败
-                if not success:
-                    self.logger.error(f"所有下载方法均失败: {title}")
-                    stats['failed'] += 1
+                self.logger.error(f"所有下载方法均失败: {title}")
+                stats['failed'] += 1
         except Exception as e:
             self.logger.error(f"下载论文时发生未处理的异常: {str(e)}")
             stats['failed'] += 1
@@ -5349,9 +5347,12 @@ class PaperDownloader:
         return False
 
     async def initialize(self):
-        """初始化浏览器上下文"""
-        if self._browser_context is None:
-            await self.get_browser_context()
+        """初始化 HTTP 会话和浏览器会话池（单上下文多页面模式）"""
+        if self._http_session is None or self._http_session.closed:
+            timeout = aiohttp.ClientTimeout(total=min(self.download_timeout, 60))
+            self._http_session = aiohttp.ClientSession(timeout=timeout)
+        if not self._session_pool_initialized:
+            await self._init_session_pool()
 
     def clean_browser_lock_files(self):
         """清理浏览器的锁定文件"""
@@ -6336,7 +6337,7 @@ class PaperDownloader:
         task_popups = []  # 本次任务衍生的弹窗，finally 中统一关闭防泄漏
         
         try:
-            # 从并发池获取隔离会话（替代单一 _browser_context）
+            # 从并发池获取隔离会话
             session = await self._acquire_session()
             if session is None:
                 self.logger.error("无法从会话池获取浏览器上下文")
@@ -7019,7 +7020,7 @@ class PaperDownloader:
             else:
                 self.logger.warning("Cloudflare 验证码解决失败，继续尝试其他方法")
             # 检查是否是需要多步操作的站点（使用类配置）
-            for site_id, site_config in self.MULTI_STEP_SITES.items():
+            for site_id, site_config in self.multi_step_sites.items():
                 if site_config['detect'](url):
                     self.logger.info(f"检测到需要多步操作的站点: {site_id}")
                     wiley_pdfdirect_fallback_logged = False
@@ -7904,6 +7905,10 @@ async def main():
                 except Exception as e:
                     logger.error(f"处理文件时出错 ({json_file}): {str(e)}")
                     continue
+                finally:
+                    if downloader is not None:
+                        downloader.stop_auto_save()
+                        downloader.save_download_history()
             
             # 显示总统计信息
             success_rate = (total_stats['success'] / total_stats['total']) * 100 if total_stats['total'] > 0 else 0
@@ -7967,10 +7972,10 @@ async def main():
             except Exception as e:
                 logger.error(f"处理文件时出错: {str(e)}")
                 return 1
-        
-        # 保存历史记录
-        downloader.save_download_history()
-        downloader.stop_auto_save()
+            finally:
+                if downloader is not None:
+                    downloader.stop_auto_save()
+                    downloader.save_download_history()
         
         return 0
         
