@@ -5,6 +5,7 @@
 # 用法:
 #   bash scripts/start.sh              # 默认端口（后端 9999，前端 5173）
 #   bash scripts/start.sh --quick     # 快速启动：跳过 DB 迁移、1 个 worker、缩短就绪等待
+#   bash scripts/start.sh --debug    # 调试模式：后端与日志从启动起即为 DEBUG 级别
 #   bash scripts/start.sh --backend-only   # 仅启动后端
 #   bash scripts/start.sh --frontend-only  # 仅启动前端
 #   bash scripts/start.sh --no-redis       # 不自动检查/拉起 Redis（不推荐）
@@ -48,6 +49,16 @@ fi
 # 依赖 transformers/huggingface_hub 的默认缓存机制，不支持传 cache_dir，因此需要靠 HF_HOME 统一控制。
 export MODEL_CACHE_ROOT="${MODEL_CACHE_ROOT:-$HOME/Hug}"
 export HF_HOME="${HF_HOME:-$MODEL_CACHE_ROOT}"
+
+# ── Node/Playwright 降噪 ──
+# Playwright Python 会拉起内置 node driver；某些依赖会触发 Node 的 DEP0169
+# (url.parse) 弃用告警。这里统一注入 NODE_OPTIONS，避免前端/后端重复刷屏。
+case " ${NODE_OPTIONS:-} " in
+  *" --disable-warning=DEP0169 "*) ;;
+  *)
+    export NODE_OPTIONS="${NODE_OPTIONS:+${NODE_OPTIONS} }--disable-warning=DEP0169"
+    ;;
+esac
 
 # ── macOS 编译环境（torch C++ extension / ColBERT） ──
 # ColBERT(ColBERT/Stanford) 在 CPU 路径会 JIT 编译 C++ 扩展 segmented_maxsim_cpp。
@@ -105,14 +116,22 @@ RUN_BACKEND=true
 RUN_FRONTEND=true
 RUN_REDIS=true
 QUICK_START=false
+DEBUG_MODE=false
 for arg in "$@"; do
   case "$arg" in
     --backend-only)  RUN_FRONTEND=false ;;
     --frontend-only) RUN_BACKEND=false ;;
     --no-redis)      RUN_REDIS=false ;;
     --quick)         QUICK_START=true ;;
+    --debug)         DEBUG_MODE=true ;;
   esac
 done
+
+# 调试模式：从启动起即把日志设为 DEBUG（环境变量供 app 读取，uvicorn 用 --log-level）
+if [ "$DEBUG_MODE" = true ]; then
+  export RAG_LOG_LEVEL="${RAG_LOG_LEVEL:-DEBUG}"
+  echo -e "${CYAN}[start.sh] 调试模式 (--debug)：RAG_LOG_LEVEL=${RAG_LOG_LEVEL}，uvicorn --log-level debug${NC}"
+fi
 
 # 快速启动：跳过迁移、单 worker、缩短就绪等待（核心功能尽快可用）
 if [ "$QUICK_START" = true ]; then
@@ -272,8 +291,10 @@ if [ "$RUN_BACKEND" = true ]; then
     local restarts=0
 
     while [ "$restarts" -le "$max_restarts" ]; do
+      UVICORN_EXTRA=()
+      [ "${RAG_LOG_LEVEL:-}" = "DEBUG" ] && UVICORN_EXTRA=(--log-level debug)
       "${PY_CMD[@]}" -m uvicorn src.api.server:app \
-        --host "$host" --port "$port" --workers "$BACKEND_WORKERS" &
+        --host "$host" --port "$port" --workers "$BACKEND_WORKERS" "${UVICORN_EXTRA[@]}" &
       local bpid=$!
       echo "$bpid" > "$BACKEND_PID_FILE"
       if [ "$restarts" -eq 0 ]; then

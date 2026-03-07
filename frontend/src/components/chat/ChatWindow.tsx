@@ -1,9 +1,9 @@
 import { useRef, useEffect, useState, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
-import { MessageSquare, FileSearch, Copy, Download, ExternalLink, FileText, User, Calendar, GitCompareArrows, BookOpen, Database, Globe } from 'lucide-react';
+import { MessageSquare, FileSearch, Copy, Download, ExternalLink, FileText, User, Calendar, GitCompareArrows, BookOpen, Database, Globe, BookmarkPlus, Loader2 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { useChatStore, useConfigStore, useToastStore, useCompareStore } from '../../stores';
+import { useChatStore, useConfigStore, useToastStore, useCompareStore, useScholarStore } from '../../stores';
 import type { Source, DeepResearchJobInfo, ResearchDashboardData } from '../../types';
 import { cancelDeepResearchJob, getDeepResearchJob, streamDeepResearchEvents, listDeepResearchJobs } from '../../api/chat';
 import { DEEP_RESEARCH_JOB_KEY } from '../workflow/deep-research/types';
@@ -13,6 +13,7 @@ import { ToolTracePanel } from './ToolTracePanel';
 import { AgentDebugPanel } from './AgentDebugPanel';
 import { ResearchProgressPanel } from '../research/ResearchProgressPanel';
 import { PdfViewerModal } from '../ui/PdfViewerModal';
+import { ScholarLibrarySelectModal } from '../scholar/ScholarLibrarySelectModal';
 
 /** 格式化消息时间，便于查找：同天只显示时分，否则显示日期+时分 */
 function formatMessageTime(iso?: string | null): string {
@@ -150,6 +151,7 @@ export function ChatWindow() {
   const researchDashboard = useChatStore((s) => s.researchDashboard);
   const toolTrace = useChatStore((s) => s.toolTrace);
   const agentDebugMode = useConfigStore((s) => s.ragConfig.agentDebugMode);
+  const currentCollection = useConfigStore((s) => s.currentCollection);
   const sessionId = useChatStore((s) => s.sessionId);
   const setShowDeepResearchDialog = useChatStore((s) => s.setShowDeepResearchDialog);
   const setDeepResearchTopic = useChatStore((s) => s.setDeepResearchTopic);
@@ -160,11 +162,20 @@ export function ChatWindow() {
   // LocalDbChoiceDialog 由 App.tsx 全局挂载，ChatWindow 不再处理内联按钮
   const addToast = useToastStore((s) => s.addToast);
   const addComparePreselected = useCompareStore((s) => s.addComparePreselected);
+  const libraries = useScholarStore((s) => s.libraries);
+  const activeLibraryId = useScholarStore((s) => s.activeLibraryId);
+  const loadLibraries = useScholarStore((s) => s.loadLibraries);
+  const addSourcesToLibrary = useScholarStore((s) => s.addSourcesToLibrary);
   const scrollRef = useRef<HTMLDivElement>(null);
   const [backgroundJob, setBackgroundJob] = useState<DeepResearchJobInfo | null>(null);
   const [stoppingJobId, setStoppingJobId] = useState<string | null>(null);
   const [showBackgroundLogs, setShowBackgroundLogs] = useState(false);
   const [backgroundEventLines, setBackgroundEventLines] = useState<string[]>([]);
+  const [showLibrarySelectModal, setShowLibrarySelectModal] = useState(false);
+  const [pendingImportSources, setPendingImportSources] = useState<Source[]>([]);
+  const [loadingLibraryChoices, setLoadingLibraryChoices] = useState(false);
+  const [importingSources, setImportingSources] = useState(false);
+  const [importingMessageId, setImportingMessageId] = useState<string | null>(null);
   const lastBackgroundEventIdRef = useRef(0);
   const trackedBackgroundJobIdRef = useRef<string | null>(null);
 
@@ -401,7 +412,8 @@ export function ChatWindow() {
       }
 
       const apiBase = import.meta.env.VITE_API_BASE_URL || '/api';
-      const pdfUrl = `${apiBase}/graph/pdf/${encodeURIComponent(src.doc_id)}`;
+      const collectionQuery = currentCollection ? `?collection=${encodeURIComponent(currentCollection)}` : '';
+      const pdfUrl = `${apiBase}/graph/pdf/${encodeURIComponent(src.doc_id)}${collectionQuery}`;
 
       setPdfModal({
         open: true,
@@ -413,7 +425,58 @@ export function ChatWindow() {
     } catch {
       addToast('PDF 溯源失败：无法获取 chunk 信息', 'error');
     }
-  }, [addToast]);
+  }, [addToast, currentCollection]);
+
+  const getDefaultScholarLibraryId = useCallback((): number | null => {
+    if (activeLibraryId != null && libraries.some((lib) => lib.id === activeLibraryId)) {
+      return activeLibraryId;
+    }
+    const permanent = libraries.filter((lib) => !lib.is_temporary);
+    if (permanent.length > 0) return permanent[0].id;
+    return libraries[0]?.id ?? null;
+  }, [activeLibraryId, libraries]);
+
+  const handleImportSourcesClick = useCallback(async (messageKey: string, sources: Source[]) => {
+    const candidateSources = (sources || []).filter((s) => s && (s.title || s.doi || s.url || s.doc_id));
+    if (candidateSources.length === 0) {
+      addToast('当前回答没有可导入的文献信息', 'info');
+      return;
+    }
+    setImportingMessageId(messageKey);
+    setLoadingLibraryChoices(true);
+    try {
+      await loadLibraries();
+      setPendingImportSources(candidateSources);
+      setShowLibrarySelectModal(true);
+    } catch {
+      addToast('加载文献库失败，请稍后重试', 'error');
+    } finally {
+      setLoadingLibraryChoices(false);
+      setImportingMessageId(null);
+    }
+  }, [addToast, loadLibraries]);
+
+  const handleConfirmImportSources = useCallback(async (libraryId: number) => {
+    if (!pendingImportSources.length) return;
+    setImportingSources(true);
+    try {
+      const res = await addSourcesToLibrary(pendingImportSources, libraryId);
+      if (!res) {
+        addToast('导入失败，请重试', 'error');
+        return;
+      }
+      const ignored = Math.max(0, (res.requested || 0) - res.added);
+      if (ignored > 0) {
+        addToast(`导入完成：新增 ${res.added}，忽略重复 ${ignored}`, 'success');
+      } else {
+        addToast(`导入完成：新增 ${res.added}`, 'success');
+      }
+      setShowLibrarySelectModal(false);
+      setPendingImportSources([]);
+    } finally {
+      setImportingSources(false);
+    }
+  }, [addSourcesToLibrary, addToast, pendingImportSources]);
 
   const showBackgroundBanner = Boolean(backgroundJob) && !deepResearchActive && !researchDashboard;
 
@@ -615,8 +678,20 @@ export function ChatWindow() {
             {/* 引用来源 - 显示完整信息 */}
             {msg.sources && msg.sources.length > 0 && (
               <div className="mt-4 pt-3 border-t border-slate-700/30 space-y-2">
-                <div className="text-[11px] font-bold uppercase tracking-wider text-slate-500 flex items-center gap-1.5 mb-3">
-                  <FileSearch size={12} className="text-sky-500" /> {t('chat.references')} ({msg.sources.length})
+                <div className="text-[11px] font-bold uppercase tracking-wider text-slate-500 flex items-center justify-between gap-2 mb-3">
+                  <span className="flex items-center gap-1.5">
+                    <FileSearch size={12} className="text-sky-500" /> {t('chat.references')} ({msg.sources.length})
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => handleImportSourcesClick(msg.id || `${index}`, msg.sources || [])}
+                    disabled={importingSources || importingMessageId === (msg.id || `${index}`)}
+                    className="text-[10px] normal-case px-2 py-1 rounded-md border border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/10 disabled:opacity-50 inline-flex items-center gap-1"
+                    title="将本轮引用文献批量导入文献库"
+                  >
+                    {importingMessageId === (msg.id || `${index}`) ? <Loader2 size={11} className="animate-spin" /> : <BookmarkPlus size={11} />}
+                    导入文献库
+                  </button>
                 </div>
                 <SourceBreakdownBar sources={msg.sources} providerStats={msg.providerStats} />
                 <div className="space-y-2">
@@ -732,6 +807,20 @@ export function ChatWindow() {
         pageNumber={pdfModal.pageNumber}
         bbox={pdfModal.bbox}
         title={pdfModal.title}
+      />
+      <ScholarLibrarySelectModal
+        open={showLibrarySelectModal}
+        libraries={libraries}
+        defaultLibraryId={getDefaultScholarLibraryId()}
+        importCount={pendingImportSources.length}
+        loading={loadingLibraryChoices || importingSources}
+        timeoutSeconds={10}
+        onClose={() => {
+          if (importingSources) return;
+          setShowLibrarySelectModal(false);
+          setPendingImportSources([]);
+        }}
+        onConfirm={handleConfirmImportSources}
       />
     </div>
   );

@@ -7,6 +7,9 @@ const BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api';
 export interface CollectionInfo {
   name: string;
   count: number;
+  associated_library_id?: number | null;
+  associated_library_name?: string | null;
+  binding_ready?: boolean;
 }
 
 export async function listCollections(): Promise<CollectionInfo[]> {
@@ -20,6 +23,45 @@ export async function createCollection(name: string, recreate = false): Promise<
 
 export async function deleteCollection(name: string): Promise<void> {
   await client.delete(`/ingest/collections/${encodeURIComponent(name)}`);
+}
+
+export async function ensureCollectionLibraryBinding(name: string): Promise<{
+  ok: boolean;
+  collection: string;
+  binding_id: number;
+  associated_library_id: number;
+  associated_library_name: string;
+  binding_created: boolean;
+  library_created: boolean;
+}> {
+  const res = await client.post(`/ingest/collections/${encodeURIComponent(name)}/binding/ensure`);
+  return res.data;
+}
+
+export async function repairCollectionLibraryBinding(
+  name: string,
+  options?: { max_scan?: number; auto_create_binding?: boolean },
+): Promise<{
+  ok: boolean;
+  collection: string;
+  library_id: number;
+  library_name: string;
+  scanned: number;
+  matched_by_doi: number;
+  matched_by_title: number;
+  created_library_records: number;
+  copied_pdfs: number;
+  conflicts: number;
+  skipped: number;
+}> {
+  const res = await client.post(
+    `/ingest/collections/${encodeURIComponent(name)}/library-repair`,
+    {
+      max_scan: options?.max_scan ?? 200,
+      auto_create_binding: options?.auto_create_binding ?? true,
+    },
+  );
+  return res.data;
 }
 
 /** 获取集合的覆盖范围摘要（用于「查询与库是否匹配」判断） */

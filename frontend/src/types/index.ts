@@ -702,6 +702,23 @@ export interface DeepResearchDefaults {
   ultra_lite_provider?: string | null;
 }
 
+export type ScholarDownloadStrategyId =
+  | 'direct_download'
+  | 'playwright_download'
+  | 'browser_lookup'
+  | 'sci_hub'
+  | 'brightdata'
+  | 'anna';
+
+export interface ScholarDownloaderDefaults {
+  includeAcademia: boolean;
+  assistLlmEnabled: boolean;
+  llmProvider: string;
+  llmModel: string;
+  browserMode: 'headed' | 'headless';
+  strategyOrder: ScholarDownloadStrategyId[];
+}
+
 // ============================================================
 // Workflow
 // ============================================================

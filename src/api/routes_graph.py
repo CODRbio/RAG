@@ -6,11 +6,13 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
 
 from config.settings import settings
+from src.api.routes_auth import get_optional_user_id
 from src.log import get_logger
+from src.services.collection_library_binding_service import resolve_bound_library_for_collection
 
 logger = get_logger(__name__)
 
@@ -304,9 +306,23 @@ def graph_chunk_detail(
 
 
 @router.get("/pdf/{paper_id}")
-def graph_pdf_stream(paper_id: str):
+def graph_pdf_stream(
+    paper_id: str,
+    collection: Optional[str] = Query(None, description="Optional collection for collection-aware library PDF resolution"),
+    user_id: Optional[str] = Depends(get_optional_user_id),
+):
     """返回原始 PDF 文件流，供前端 PDF 高亮溯源使用。"""
     pdf_path = settings.path.raw_papers / f"{paper_id}.pdf"
+
+    if user_id and (collection or "").strip():
+        try:
+            bound_lib = resolve_bound_library_for_collection(user_id, collection, auto_create=False)
+            if bound_lib and getattr(bound_lib, "folder_path", None):
+                candidate = Path(bound_lib.folder_path) / "pdfs" / f"{paper_id}.pdf"
+                if candidate.exists():
+                    pdf_path = candidate
+        except Exception as e:
+            logger.debug("collection-aware pdf resolve failed collection=%s paper=%s err=%s", collection, paper_id, e)
 
     if not pdf_path.exists():
         from src.indexing.paper_store import get_paper_by_id

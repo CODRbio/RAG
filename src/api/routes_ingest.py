@@ -16,10 +16,18 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Body, Depends, File, Form, UploadFile, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
+from sqlmodel import Session
 
 from config.settings import settings
 from src.api.routes_auth import get_current_user_id
+from src.db.engine import get_engine
 from src.log import get_logger
+from src.services.collection_library_binding_service import (
+    delete_collection_binding,
+    ensure_collection_binding,
+    get_collection_binding,
+    repair_collection_library_links,
+)
 from src.utils.path_manager import PathManager
 
 logger = get_logger(__name__)
@@ -54,7 +62,7 @@ def _clear_cancel_event(job_id: str) -> None:
 # ============================================================
 
 @router.get("/collections")
-def list_collections() -> dict:
+def list_collections(user_id: str = Depends(get_current_user_id)) -> dict:
     """列出 Milvus 中已有的集合及行数"""
     from src.indexing.milvus_ops import milvus
     try:
@@ -68,12 +76,28 @@ def list_collections() -> dict:
             cnt = milvus.count(name)
         except Exception:
             cnt = -1
-        result.append({"name": name, "count": cnt})
+        binding_payload = {
+            "associated_library_id": None,
+            "associated_library_name": None,
+            "binding_ready": False,
+        }
+        try:
+            with Session(get_engine()) as session:
+                _binding, lib = get_collection_binding(session, user_id, name)
+                if lib is not None:
+                    binding_payload = {
+                        "associated_library_id": lib.id,
+                        "associated_library_name": lib.name,
+                        "binding_ready": True,
+                    }
+        except Exception as be:
+            logger.warning("list_collections binding lookup failed user=%s name=%s err=%s", user_id, name, be)
+        result.append({"name": name, "count": cnt, **binding_payload})
     return {"collections": result}
 
 
 @router.post("/collections")
-def create_collection(body: dict) -> dict:
+def create_collection(body: dict, user_id: str = Depends(get_current_user_id)) -> dict:
     """创建新集合（v2 schema: chunk_id 主键，支持 upsert），并生成覆盖范围摘要（可后续刷新）"""
     name = (body.get("name") or "").strip()
     if not name:
@@ -96,11 +120,28 @@ def create_collection(body: dict) -> dict:
             set_scope(name, summary)
     except Exception as e:
         logger.debug("create_collection scope summary failed (non-fatal): %s", e)
-    return {"ok": True, "name": name}
+
+    associated_library_id = None
+    associated_library_name = None
+    try:
+        with Session(get_engine()) as session:
+            _binding, lib, _binding_created, _lib_created = ensure_collection_binding(session, user_id, name)
+            associated_library_id = lib.id
+            associated_library_name = lib.name
+            session.commit()
+    except Exception as e:
+        logger.warning("create_collection auto-binding failed user=%s name=%s err=%s", user_id, name, e)
+
+    return {
+        "ok": True,
+        "name": name,
+        "associated_library_id": associated_library_id,
+        "associated_library_name": associated_library_name,
+    }
 
 
 @router.delete("/collections/{name}")
-def delete_collection(name: str) -> dict:
+def delete_collection(name: str, user_id: str = Depends(get_current_user_id)) -> dict:
     """删除指定集合（不可恢复）"""
     from src.indexing.milvus_ops import milvus
     try:
@@ -118,7 +159,83 @@ def delete_collection(name: str) -> dict:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    return {"ok": True, "name": name}
+    binding_deleted = False
+    library_deleted = False
+    try:
+        binding_cleanup = delete_collection_binding(user_id, name, delete_library=True)
+        binding_deleted = bool(binding_cleanup.get("deleted_binding"))
+        library_deleted = bool(binding_cleanup.get("deleted_library"))
+    except Exception as be:
+        logger.warning("delete collection binding cleanup failed user=%s collection=%s err=%s", user_id, name, be)
+    return {
+        "ok": True,
+        "name": name,
+        "binding_deleted": binding_deleted,
+        "library_deleted": library_deleted,
+    }
+
+
+@router.post("/collections/{name}/binding/ensure")
+def ensure_collection_library_binding_endpoint(
+    name: str,
+    user_id: str = Depends(get_current_user_id),
+) -> dict:
+    """Ensure current collection has a bound permanent scholar library."""
+    collection_name = (name or "").strip()
+    if not collection_name:
+        raise HTTPException(status_code=400, detail="集合名称不能为空")
+    try:
+        with Session(get_engine()) as session:
+            binding, lib, binding_created, library_created = ensure_collection_binding(session, user_id, collection_name)
+            session.commit()
+            return {
+                "ok": True,
+                "collection": collection_name,
+                "binding_id": binding.id,
+                "associated_library_id": lib.id,
+                "associated_library_name": lib.name,
+                "binding_created": binding_created,
+                "library_created": library_created,
+            }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"绑定知识库与文献库失败: {e}")
+
+
+@router.post("/collections/{name}/library-repair")
+def repair_collection_library_binding(
+    name: str,
+    body: Optional[dict] = Body(None),
+    user_id: str = Depends(get_current_user_id),
+) -> dict:
+    """
+    Scan collection PDFs and scholar library records, then repair linkages via DOI/title.
+    """
+    collection_name = (name or "").strip()
+    if not collection_name:
+        raise HTTPException(status_code=400, detail="集合名称不能为空")
+    max_scan = 200
+    auto_create_binding = True
+    if body:
+        try:
+            max_scan = int(body.get("max_scan", 200))
+        except Exception:
+            max_scan = 200
+        auto_create_binding = bool(body.get("auto_create_binding", True))
+    try:
+        result = repair_collection_library_links(
+            user_id=user_id,
+            collection_name=collection_name,
+            auto_create_binding=auto_create_binding,
+            max_scan=max_scan,
+        )
+        if not result.get("ok"):
+            raise HTTPException(status_code=400, detail=result.get("reason") or "修复失败")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("library-repair failed collection=%s user=%s", collection_name, user_id)
+        raise HTTPException(status_code=500, detail=f"修复失败: {e}")
 
 
 @router.get("/collections/{name}/scope")

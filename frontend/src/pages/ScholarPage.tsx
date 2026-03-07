@@ -1,4 +1,4 @@
-import { useEffect, useCallback, useState } from 'react';
+import { useEffect, useCallback, useMemo, useRef, useState } from 'react';
 import {
   Search,
   Download,
@@ -19,15 +19,29 @@ import {
   FolderPlus,
   RefreshCw,
   FileSearch,
+  Upload,
+  Settings2,
+  PanelLeftOpen,
+  PanelLeftClose,
 } from 'lucide-react';
-import { listLLMProviders, type LLMProviderInfo } from '../api/ingest';
 import { useTranslation } from 'react-i18next';
 import { useScholarStore } from '../stores/useScholarStore';
 import { useConfigStore } from '../stores/useConfigStore';
 import { useToastStore } from '../stores/useToastStore';
 import { PdfViewerModal } from '../components/ui/PdfViewerModal';
-import { getPdfViewUrl, getLibraryPdfViewUrl, fetchPdfAsBlobUrl } from '../api/scholar';
-import type { ScholarSource, ScholarLibraryPaper } from '../api/scholar';
+import { ScholarAdvancedSettingsModal } from '../components/scholar/ScholarAdvancedSettingsModal';
+import {
+  getPdfViewUrl,
+  getLibraryPdfViewUrl,
+  fetchPdfAsBlobUrl,
+  uploadLibraryPaperPdf,
+  deleteLibraryPaperPdf,
+  getHeadedBrowserWindowState,
+  showHeadedBrowserWindow,
+  parkHeadedBrowserWindow,
+} from '../api/scholar';
+import type { ScholarSearchResult } from '../api/scholar';
+import type { ScholarSource, ScholarLibraryPaper, HeadedBrowserWindowState } from '../api/scholar';
 
 const SOURCE_OPTIONS: { value: ScholarSource; labelKey: string }[] = [
   { value: 'google_scholar', labelKey: 'scholar.sourceGoogleScholar' },
@@ -38,30 +52,60 @@ const SOURCE_OPTIONS: { value: ScholarSource; labelKey: string }[] = [
   { value: 'annas_archive', labelKey: 'scholar.sourceAnnasArchive' },
 ];
 
-function scholarLlmGroupLabel(id: string): string {
-  const base = id.split('-')[0].toLowerCase();
-  const labels: Record<string, string> = {
-    openai: 'OpenAI',
-    deepseek: 'DeepSeek',
-    claude: 'Claude',
-    gemini: 'Gemini',
-    kimi: 'Kimi',
-    qwen: 'Qwen',
-    perplexity: 'Perplexity',
-    sonar: 'Perplexity',
-  };
-  return labels[base] || id;
+/** Backend may store different source strings: SerpAPI uses serpapi_scholar/serpapi_google, Playwright uses scholar/google, normalize uses google_scholar/google. */
+const SOURCE_FILTER_EQUIVALENTS: Record<string, string[]> = {
+  google_scholar: ['google_scholar', 'serpapi_scholar', 'scholar'],
+  google: ['google', 'serpapi_google'],
+  semantic_relevance: ['semantic', 'semantic_relevance', 'semantic_snippet'],
+  semantic_bulk: ['semantic_bulk'],
+  ncbi: ['ncbi'],
+  annas_archive: ['annas_archive'],
+};
+
+function sourceMatchesFilter(paperSource: string, filterValue: string): boolean {
+  const equivalents = SOURCE_FILTER_EQUIVALENTS[filterValue];
+  if (equivalents) return equivalents.includes(paperSource);
+  return paperSource === filterValue;
 }
 
-function scholarLlmProviderOptionLabel(id: string): string {
-  const base = scholarLlmGroupLabel(id);
-  const suffix = id.split('-').slice(1).join('-');
-  return suffix ? `${base} · ${suffix}` : base;
+const LIBRARY_PANEL_WIDTH_KEY = 'scholar_library_panel_width_v1';
+const LIBRARY_PANEL_MIN_WIDTH = 260;
+const LIBRARY_PANEL_MAX_WIDTH = 640;
+const RESULTS_PANEL_MIN_WIDTH = 420;
+const SCHOLAR_QUERY_HISTORY_KEY = 'scholar_query_history_v1';
+const SCHOLAR_QUERY_HISTORY_MAX = 12;
+
+function loadScholarQueryHistory(): string[] {
+  try {
+    const raw = localStorage.getItem(SCHOLAR_QUERY_HISTORY_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .map((item) => String(item ?? '').trim())
+      .filter(Boolean)
+      .slice(0, SCHOLAR_QUERY_HISTORY_MAX);
+  } catch {
+    return [];
+  }
+}
+
+function saveScholarQueryHistory(history: string[]) {
+  try {
+    localStorage.setItem(
+      SCHOLAR_QUERY_HISTORY_KEY,
+      JSON.stringify(history.slice(0, SCHOLAR_QUERY_HISTORY_MAX)),
+    );
+  } catch {
+    // ignore quota errors
+  }
 }
 
 export function ScholarPage() {
   const { t } = useTranslation();
   const currentCollection = useConfigStore((s) => s.currentCollection);
+  const collectionInfos = useConfigStore((s) => s.collectionInfos);
+  const scholarDownloaderDefaults = useConfigStore((s) => s.scholarDownloaderDefaults);
   const addToast = useToastStore((s) => s.addToast);
 
   const {
@@ -98,7 +142,7 @@ export function ScholarPage() {
     downloadOne,
     downloadSelected,
     toggleSelect,
-    selectAll,
+    setSelectedIndices,
     clearSelection,
     checkHealth,
     removeTask,
@@ -119,36 +163,313 @@ export function ScholarPage() {
     pendingDownloadAndOpen,
     downloadAndOpenFailures,
     clearDownloadAndOpenFailure,
-    selectedScholarLlmProvider,
-    selectedScholarLlmModel,
-    setScholarLlm,
-    scholarBrowserMode,
-    setScholarBrowserMode,
-    includeAcademia,
-    setIncludeAcademia,
+    applyScholarDownloaderDefaults,
   } = useScholarStore();
 
   const [tasksPanelOpen, setTasksPanelOpen] = useState(true);
   const [libraryPanelOpen, setLibraryPanelOpen] = useState(true);
+  const [libraryPanelWidth, setLibraryPanelWidth] = useState(320);
+  const [isResizingLibraryPanel, setIsResizingLibraryPanel] = useState(false);
   const [pdfView, setPdfView] = useState<{ paperId: string; title: string; pdfUrl?: string } | null>(null);
   const [downloadingIndex, setDownloadingIndex] = useState<number | null>(null);
   const [downloadingBatch, setDownloadingBatch] = useState(false);
   const [extractDoiDedupLoading, setExtractDoiDedupLoading] = useState(false);
   const [pdfRenameDedupLoading, setPdfRenameDedupLoading] = useState(false);
   const [showNewLibraryModal, setShowNewLibraryModal] = useState(false);
+  const [showAdvancedSettings, setShowAdvancedSettings] = useState(false);
+  const [headedBrowserWindow, setHeadedBrowserWindow] = useState<HeadedBrowserWindowState | null>(null);
+  const [headedBrowserWindowBusy, setHeadedBrowserWindowBusy] = useState(false);
   const [newLibraryName, setNewLibraryName] = useState('');
   const [newLibraryDesc, setNewLibraryDesc] = useState('');
   const [addingToLibrary, setAddingToLibrary] = useState(false);
-  const [llmProviders, setLlmProviders] = useState<LLMProviderInfo[]>([]);
-  const [isRefreshingLlm, setIsRefreshingLlm] = useState(false);
+  const [uploadingPapers, setUploadingPapers] = useState<Record<number, boolean>>({});
+  const [uploadFailures, setUploadFailures] = useState<Record<number, string>>({});
+  const [deletingPdfId, setDeletingPdfId] = useState<number | null>(null);
+  const [redownloadingId, setRedownloadingId] = useState<number | null>(null);
+  const resultsLayoutRef = useRef<HTMLDivElement | null>(null);
+
+  // Filter/sort state (shared for search results and library list)
+  const [sortField, setSortField] = useState<'score' | 'year' | 'impact_factor'>('score');
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
+  const [filterJournal, setFilterJournal] = useState('');
+  const [filterYearMin, setFilterYearMin] = useState<number | null>(null);
+  const [filterYearMax, setFilterYearMax] = useState<number | null>(null);
+  const [filterStatus, setFilterStatus] = useState<'all' | 'downloaded' | 'not_downloaded'>('all');
+  const [filterIfMin, setFilterIfMin] = useState<number | null>(null);
+  const [filterSource, setFilterSource] = useState<ScholarSource | 'all'>('all');
+  const [filterDownloadableOnly, setFilterDownloadableOnly] = useState(false);
+  const [filterBarCollapsed, setFilterBarCollapsed] = useState(true);
+  const [catalogFilterBarCollapsed, setCatalogFilterBarCollapsed] = useState(true);
+  const [queryHistory, setQueryHistory] = useState<string[]>([]);
+  const currentCollectionInfo = useMemo(
+    () => collectionInfos.find((item) => item.name === currentCollection),
+    [collectionInfos, currentCollection],
+  );
+
+  useEffect(() => {
+    setQueryHistory(loadScholarQueryHistory());
+  }, []);
+
+  const FILTER_STORAGE_KEY = 'scholar_filter_prefs';
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(FILTER_STORAGE_KEY);
+      if (!raw) return;
+      const p = JSON.parse(raw) as Record<string, unknown>;
+      if (p.filterJournal != null) setFilterJournal(String(p.filterJournal));
+      if (typeof p.filterYearMin === 'number') setFilterYearMin(p.filterYearMin);
+      if (typeof p.filterYearMax === 'number') setFilterYearMax(p.filterYearMax);
+      if (p.filterStatus === 'downloaded' || p.filterStatus === 'not_downloaded') setFilterStatus(p.filterStatus);
+      if (typeof p.filterIfMin === 'number') setFilterIfMin(p.filterIfMin);
+      if (p.filterSource && p.filterSource !== 'all') setFilterSource(p.filterSource as ScholarSource);
+      if (p.filterDownloadableOnly === true) setFilterDownloadableOnly(true);
+      if (p.sortField === 'year' || p.sortField === 'impact_factor') setSortField(p.sortField);
+      if (p.sortDir === 'asc') setSortDir('asc');
+    } catch {
+      // ignore invalid stored prefs
+    }
+  }, []);
+  useEffect(() => {
+    const prefs = {
+      filterJournal,
+      filterYearMin,
+      filterYearMax,
+      filterStatus,
+      filterIfMin,
+      filterSource,
+      filterDownloadableOnly,
+      sortField,
+      sortDir,
+    };
+    try {
+      localStorage.setItem(FILTER_STORAGE_KEY, JSON.stringify(prefs));
+    } catch {
+      // ignore quota etc.
+    }
+  }, [
+    filterJournal,
+    filterYearMin,
+    filterYearMax,
+    filterStatus,
+    filterIfMin,
+    filterSource,
+    filterDownloadableOnly,
+    sortField,
+    sortDir,
+  ]);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(LIBRARY_PANEL_WIDTH_KEY);
+      if (!raw) return;
+      const parsed = Number(raw);
+      if (Number.isFinite(parsed)) {
+        setLibraryPanelWidth(Math.max(LIBRARY_PANEL_MIN_WIDTH, Math.min(LIBRARY_PANEL_MAX_WIDTH, parsed)));
+      }
+    } catch {
+      // ignore invalid stored width
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(LIBRARY_PANEL_WIDTH_KEY, String(libraryPanelWidth));
+    } catch {
+      // ignore quota etc.
+    }
+  }, [libraryPanelWidth]);
+
+  useEffect(() => {
+    if (!isResizingLibraryPanel) return undefined;
+
+    const updateWidth = (clientX: number) => {
+      const container = resultsLayoutRef.current;
+      if (!container) return;
+      const rect = container.getBoundingClientRect();
+      const maxWidth = Math.min(LIBRARY_PANEL_MAX_WIDTH, rect.width - RESULTS_PANEL_MIN_WIDTH);
+      const nextWidth = Math.min(Math.max(clientX - rect.left, LIBRARY_PANEL_MIN_WIDTH), maxWidth);
+      setLibraryPanelWidth(nextWidth);
+    };
+
+    const handlePointerMove = (event: PointerEvent) => {
+      updateWidth(event.clientX);
+    };
+
+    const stopResize = () => {
+      setIsResizingLibraryPanel(false);
+    };
+
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+    window.addEventListener('pointermove', handlePointerMove);
+    window.addEventListener('pointerup', stopResize);
+    window.addEventListener('pointercancel', stopResize);
+
+    return () => {
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', stopResize);
+      window.removeEventListener('pointercancel', stopResize);
+    };
+  }, [isResizingLibraryPanel]);
+
+  const filteredResults = useMemo((): { result: ScholarSearchResult; originalIndex: number }[] => {
+    let list = results.map((result, originalIndex) => ({ result, originalIndex }));
+    const meta = (r: ScholarSearchResult) => r.metadata;
+    if (filterJournal.trim()) {
+      const q = filterJournal.trim().toLowerCase();
+      list = list.filter(({ result }) => {
+        const v = (meta(result).venue ?? meta(result).normalized_journal_name ?? '').toLowerCase();
+        return v.includes(q);
+      });
+    }
+    if (filterYearMin != null) {
+      list = list.filter(({ result }) => (meta(result).year ?? 0) >= filterYearMin);
+    }
+    if (filterYearMax != null) {
+      list = list.filter(({ result }) => (meta(result).year ?? 9999) <= filterYearMax);
+    }
+    if (filterSource !== 'all') {
+      list = list.filter(({ result }) => sourceMatchesFilter(meta(result).source || '', filterSource));
+    }
+    if (filterIfMin != null) {
+      list = list.filter(({ result }) => (meta(result).impact_factor ?? 0) >= filterIfMin);
+    }
+    if (filterDownloadableOnly) {
+      list = list.filter(({ result }) => !!(meta(result).pdf_url ?? meta(result).downloadable));
+    }
+    const mult = sortDir === 'asc' ? 1 : -1;
+    list = [...list].sort((a, b) => {
+      const ma = meta(a.result);
+      const mb = meta(b.result);
+      if (sortField === 'year') {
+        const ya = ma.year ?? 0;
+        const yb = mb.year ?? 0;
+        return mult * (ya - yb);
+      }
+      if (sortField === 'impact_factor') {
+        const ia = ma.impact_factor ?? 0;
+        const ib = mb.impact_factor ?? 0;
+        return mult * (ia - ib);
+      }
+      return mult * (a.result.score - b.result.score);
+    });
+    return list;
+  }, [
+    results,
+    filterJournal,
+    filterYearMin,
+    filterYearMax,
+    filterSource,
+    filterIfMin,
+    filterDownloadableOnly,
+    sortField,
+    sortDir,
+  ]);
+
+  const filteredLibraryPapers = useMemo((): ScholarLibraryPaper[] => {
+    let list = [...libraryPapers];
+    if (filterJournal.trim()) {
+      const q = filterJournal.trim().toLowerCase();
+      list = list.filter(
+        (p) =>
+          (p.venue ?? p.normalized_journal_name ?? '').toLowerCase().includes(q)
+      );
+    }
+    if (filterYearMin != null) {
+      list = list.filter((p) => (p.year ?? 0) >= filterYearMin);
+    }
+    if (filterYearMax != null) {
+      list = list.filter((p) => (p.year ?? 9999) <= filterYearMax);
+    }
+    if (filterSource !== 'all') {
+      list = list.filter((p) => sourceMatchesFilter(p.source || '', filterSource));
+    }
+    if (filterStatus === 'downloaded') {
+      list = list.filter((p) => p.is_downloaded ?? !!p.downloaded_at);
+    } else if (filterStatus === 'not_downloaded') {
+      list = list.filter((p) => !(p.is_downloaded ?? p.downloaded_at));
+    }
+    if (filterIfMin != null) {
+      list = list.filter((p) => (p.impact_factor ?? 0) >= filterIfMin);
+    }
+    const mult = sortDir === 'asc' ? 1 : -1;
+    list.sort((a, b) => {
+      if (sortField === 'year') {
+        return mult * ((a.year ?? 0) - (b.year ?? 0));
+      }
+      if (sortField === 'impact_factor') {
+        return mult * ((a.impact_factor ?? 0) - (b.impact_factor ?? 0));
+      }
+      return mult * (a.score - b.score);
+    });
+    return list;
+  }, [
+    libraryPapers,
+    filterJournal,
+    filterYearMin,
+    filterYearMax,
+    filterSource,
+    filterStatus,
+    filterIfMin,
+    sortField,
+    sortDir,
+  ]);
+
+  const activeFilterCount = useMemo(() => {
+    let n = 0;
+    if (filterJournal.trim()) n++;
+    if (filterYearMin != null) n++;
+    if (filterYearMax != null) n++;
+    if (filterSource !== 'all') n++;
+    if (filterIfMin != null) n++;
+    if (filterDownloadableOnly) n++;
+    if (filterStatus !== 'all') n++;
+    return n;
+  }, [
+    filterJournal,
+    filterYearMin,
+    filterYearMax,
+    filterSource,
+    filterIfMin,
+    filterDownloadableOnly,
+    filterStatus,
+  ]);
 
   useEffect(() => {
     checkHealth();
   }, [checkHealth]);
 
+  const loadHeadedBrowserWindowState = useCallback(async () => {
+    try {
+      const state = await getHeadedBrowserWindowState();
+      setHeadedBrowserWindow(state);
+    } catch {
+      setHeadedBrowserWindow(null);
+    }
+  }, []);
+
   useEffect(() => {
     if (scholarHealth?.enabled) loadLibraries();
   }, [scholarHealth?.enabled, loadLibraries]);
+
+  useEffect(() => {
+    const boundLibId = currentCollectionInfo?.associated_library_id;
+    if (boundLibId == null) return;
+    if (!libraries.some((l) => l.id === boundLibId)) return;
+    if (activeLibraryId === boundLibId) return;
+    setActiveLibrary(boundLibId);
+  }, [activeLibraryId, currentCollectionInfo?.associated_library_id, libraries, setActiveLibrary]);
+
+  useEffect(() => {
+    if (!scholarHealth?.enabled) return;
+    loadHeadedBrowserWindowState();
+  }, [scholarHealth?.enabled, loadHeadedBrowserWindowState]);
+
+  useEffect(() => {
+    applyScholarDownloaderDefaults(scholarDownloaderDefaults);
+  }, [applyScholarDownloaderDefaults, scholarDownloaderDefaults]);
 
   useEffect(() => {
     if (!openPdfAfterDownload) return;
@@ -178,20 +499,6 @@ export function ScholarPage() {
     }
   }, [openPdfAfterDownload, clearOpenPdfAfterDownload]);
 
-  const loadLlmProviders = useCallback(async (force = false) => {
-    if (force) setIsRefreshingLlm(true);
-    try {
-      const data = await listLLMProviders();
-      if (data?.providers?.length) setLlmProviders(data.providers);
-    } finally {
-      if (force) setIsRefreshingLlm(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    if (scholarHealth?.enabled) loadLlmProviders();
-  }, [scholarHealth?.enabled, loadLlmProviders]);
-
   const isResultInLibrary = useCallback(
     (title: string, doi: string | null, libPapers: ScholarLibraryPaper[]) => {
       const t = title.trim().toLowerCase();
@@ -207,11 +514,51 @@ export function ScholarPage() {
 
   const taskIds = Object.keys(downloadTasks);
   const activeTaskCount = taskIds.length;
+  const headedBrowserStatusLabel =
+    headedBrowserWindow?.mode === 'visible'
+      ? t('scholar.headedBrowserStatusVisible')
+      : headedBrowserWindow?.mode === 'parked'
+        ? t('scholar.headedBrowserStatusParked')
+        : t('scholar.headedBrowserStatusUnavailable');
 
   const handleSearch = useCallback(() => {
+    const q = query.trim();
+    if (q) {
+      setQueryHistory((prev) => {
+        const next = [q, ...prev.filter((item) => item.toLowerCase() !== q.toLowerCase())].slice(
+          0,
+          SCHOLAR_QUERY_HISTORY_MAX,
+        );
+        saveScholarQueryHistory(next);
+        return next;
+      });
+    }
     setSearchError(null);
     search();
-  }, [search, setSearchError]);
+  }, [query, search, setSearchError]);
+
+  const handleUploadPdf = useCallback(
+    async (p: ScholarLibraryPaper, file?: File) => {
+      if (!file || activeLibraryId == null || activeLibraryId < 0) return;
+      setUploadingPapers((prev) => ({ ...prev, [p.id]: true }));
+      setUploadFailures((prev) => {
+        const next = { ...prev };
+        delete next[p.id];
+        return next;
+      });
+      try {
+        await uploadLibraryPaperPdf(activeLibraryId, p.id, file);
+        addToast(t('scholar.uploadPdfSuccess'), 'success');
+        await loadLibraryPapers(activeLibraryId);
+      } catch {
+        setUploadFailures((prev) => ({ ...prev, [p.id]: 'error' }));
+        addToast(t('scholar.uploadPdfError'), 'error');
+      } finally {
+        setUploadingPapers((prev) => ({ ...prev, [p.id]: false }));
+      }
+    },
+    [activeLibraryId, loadLibraryPapers, addToast, t]
+  );
 
   const handleDownloadOne = useCallback(
     async (index: number) => {
@@ -249,6 +596,32 @@ export function ScholarPage() {
     }
   }, [selectedIndices.length, downloadSelected, currentCollection, addToast, t]);
 
+  const handleShowHeadedBrowser = useCallback(async () => {
+    setHeadedBrowserWindowBusy(true);
+    try {
+      const state = await showHeadedBrowserWindow();
+      setHeadedBrowserWindow(state);
+      addToast(t('scholar.headedBrowserSummoned'), 'success');
+    } catch {
+      addToast(t('scholar.headedBrowserControlError'), 'error');
+    } finally {
+      setHeadedBrowserWindowBusy(false);
+    }
+  }, [addToast, t]);
+
+  const handleParkHeadedBrowser = useCallback(async () => {
+    setHeadedBrowserWindowBusy(true);
+    try {
+      const state = await parkHeadedBrowserWindow();
+      setHeadedBrowserWindow(state);
+      addToast(t('scholar.headedBrowserParked'), 'success');
+    } catch {
+      addToast(t('scholar.headedBrowserControlError'), 'error');
+    } finally {
+      setHeadedBrowserWindowBusy(false);
+    }
+  }, [addToast, t]);
+
   const handleAddSelectedToLibrary = useCallback(async () => {
     if (selectedIndices.length === 0 || activeLibraryId == null) return;
     setAddingToLibrary(true);
@@ -272,7 +645,9 @@ export function ScholarPage() {
     [activeLibraryId, addResultsToLibrary, addToast, t]
   );
 
-  const allSelected = results.length > 0 && selectedIndices.length === results.length;
+  const allSelected =
+    filteredResults.length > 0 &&
+    filteredResults.every(({ originalIndex }) => selectedIndices.includes(originalIndex));
 
   if (scholarHealth && !scholarHealth.enabled) {
     return (
@@ -295,141 +670,112 @@ export function ScholarPage() {
     <div className="flex flex-col h-full min-h-0">
       <div className="flex-shrink-0 p-4 space-y-4">
         {/* Search bar */}
-        <div className="flex flex-wrap items-end gap-3">
-          <div className="flex-1 min-w-[200px]">
-            <label className="block text-xs font-medium text-slate-400 mb-1">{t('scholar.queryLabel')}</label>
-            <div className="flex rounded-lg border border-slate-600/80 bg-slate-800/60 focus-within:border-sky-500/50">
-              <Search className="text-slate-500 shrink-0 self-center ml-3" size={18} />
-              <input
-                type="text"
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
-                placeholder={t('scholar.queryPlaceholder')}
-                className="flex-1 bg-transparent px-3 py-2.5 text-slate-200 placeholder:text-slate-500 focus:outline-none text-sm"
-              />
-            </div>
-          </div>
-          <div className="w-[180px]">
-            <label className="block text-xs font-medium text-slate-400 mb-1">{t('scholar.sourceLabel')}</label>
-            <select
-              value={source}
-              onChange={(e) => setSource(e.target.value as ScholarSource)}
-              className="w-full rounded-lg border border-slate-600/80 bg-slate-800/60 px-3 py-2.5 text-slate-200 text-sm focus:outline-none focus:ring-1 focus:ring-sky-500/50"
-            >
-              {SOURCE_OPTIONS.map((opt) => (
-                <option key={opt.value} value={opt.value}>
-                  {t(opt.labelKey)}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div className="flex gap-2">
-            <div className="w-24">
-              <label className="block text-xs font-medium text-slate-400 mb-1">{t('scholar.yearStart')}</label>
-              <input
-                type="number"
-                min={1900}
-                max={2100}
-                value={yearStart ?? ''}
-                onChange={(e) => setYearStart(e.target.value === '' ? null : parseInt(e.target.value, 10) || null)}
-                placeholder="—"
-                className="w-full rounded-lg border border-slate-600/80 bg-slate-800/60 px-3 py-2.5 text-slate-200 text-sm focus:outline-none"
-              />
-            </div>
-            <div className="w-24">
-              <label className="block text-xs font-medium text-slate-400 mb-1">{t('scholar.yearEnd')}</label>
-              <input
-                type="number"
-                min={1900}
-                max={2100}
-                value={yearEnd ?? ''}
-                onChange={(e) => setYearEnd(e.target.value === '' ? null : parseInt(e.target.value, 10) || null)}
-                placeholder="—"
-                className="w-full rounded-lg border border-slate-600/80 bg-slate-800/60 px-3 py-2.5 text-slate-200 text-sm focus:outline-none"
-              />
-            </div>
-          </div>
-          <div className="w-28">
-            <label className="block text-xs font-medium text-slate-400 mb-1">{t('scholar.limitLabel')}</label>
-            <div className="flex rounded-lg border border-slate-600/80 bg-slate-800/60 overflow-hidden">
-              <input
-                type="number"
-                min={1}
-                step={10}
-                value={limit}
-                onChange={(e) => setLimit(parseInt(e.target.value, 10) || 30)}
-                className="w-14 flex-1 min-w-0 bg-transparent px-2 py-2.5 text-slate-200 text-sm focus:outline-none"
-              />
-              <div className="flex flex-col border-l border-slate-600/80">
-                <button
-                  type="button"
-                  onClick={() => setLimit(limit + 10)}
-                  className="flex items-center justify-center p-0.5 text-slate-400 hover:bg-slate-600/60 hover:text-slate-200 transition-colors"
-                  title={t('scholar.limitIncrease')}
-                  aria-label={t('scholar.limitIncrease')}
-                >
-                  <ChevronUp size={16} />
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setLimit(Math.max(1, limit - 10))}
-                  className="flex items-center justify-center p-0.5 text-slate-400 hover:bg-slate-600/60 hover:text-slate-200 transition-colors"
-                  title={t('scholar.limitDecrease')}
-                  aria-label={t('scholar.limitDecrease')}
-                >
-                  <ChevronDown size={16} />
-                </button>
+        <div className="rounded-xl border border-slate-700/60 bg-slate-800/30 p-4 space-y-4">
+          <div className="flex flex-wrap items-end gap-3">
+            <div className="flex-[2.2] min-w-[320px]">
+              <label className="block text-xs font-medium text-slate-400 mb-1">{t('scholar.queryLabel')}</label>
+              <div className="flex rounded-lg border border-slate-600/80 bg-slate-800/60 focus-within:border-sky-500/50">
+                <Search className="text-slate-500 shrink-0 self-center ml-3" size={18} />
+                <input
+                  type="text"
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
+                  list="scholar-query-history"
+                  placeholder={t('scholar.queryPlaceholder')}
+                  className="flex-1 bg-transparent px-3 py-2.5 text-slate-200 placeholder:text-slate-500 focus:outline-none text-sm"
+                />
+                <datalist id="scholar-query-history">
+                  {queryHistory.map((item) => (
+                    <option key={item} value={item} />
+                  ))}
+                </datalist>
               </div>
             </div>
-          </div>
-          <label className="flex items-center gap-2 cursor-pointer select-none">
-            <input
-              type="checkbox"
-              checked={smartOptimize}
-              onChange={(e) => setSmartOptimize(e.target.checked)}
-              className="rounded border-slate-500 bg-slate-800 text-teal-500 focus:ring-teal-500/50"
-            />
-            <Sparkles size={16} className="text-teal-400 shrink-0" />
-            <span className="text-xs text-slate-400 whitespace-nowrap">{t('scholar.smartOptimize')}</span>
-          </label>
-          {(source === 'google_scholar' || source === 'google') && (
-            <>
-              <label className="flex items-center gap-2 cursor-pointer select-none" title={t('sidebar.useSerpapiHelp')}>
+            <div className="w-[180px]">
+              <label className="block text-xs font-medium text-slate-400 mb-1">{t('scholar.sourceLabel')}</label>
+              <select
+                value={source}
+                onChange={(e) => setSource(e.target.value as ScholarSource)}
+                className="w-full rounded-lg border border-slate-600/80 bg-slate-800/60 px-3 py-2.5 text-slate-200 text-sm focus:outline-none focus:ring-1 focus:ring-sky-500/50"
+              >
+                {SOURCE_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {t(opt.labelKey)}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="flex gap-2">
+              <div className="w-24">
+                <label className="block text-xs font-medium text-slate-400 mb-1">{t('scholar.yearStart')}</label>
                 <input
-                  type="checkbox"
-                  checked={useSerpapi}
-                  onChange={(e) => setUseSerpapi(e.target.checked)}
-                  className="rounded border-slate-500 bg-slate-800 text-teal-500 focus:ring-teal-500/50"
+                  type="number"
+                  min={1900}
+                  max={2100}
+                  value={yearStart ?? ''}
+                  onChange={(e) => setYearStart(e.target.value === '' ? null : parseInt(e.target.value, 10) || null)}
+                  placeholder="—"
+                  className="w-full rounded-lg border border-slate-600/80 bg-slate-800/60 px-3 py-2.5 text-slate-200 text-sm focus:outline-none"
                 />
-                <span className="text-xs text-slate-400 whitespace-nowrap">{t('sidebar.useSerpapi')}</span>
-              </label>
-              {useSerpapi && (
-                <div className="flex items-center gap-2">
-                  <span className="text-xs text-slate-400 whitespace-nowrap">{t('sidebar.serpapiRatio')}</span>
-                  <select
-                    value={serpapiRatio}
-                    onChange={(e) => setSerpapiRatio(Number(e.target.value))}
-                    className="rounded-lg border border-slate-600/80 bg-slate-800/60 px-2 py-1.5 text-slate-200 text-xs focus:outline-none focus:ring-1 focus:ring-sky-500/50"
+              </div>
+              <div className="w-24">
+                <label className="block text-xs font-medium text-slate-400 mb-1">{t('scholar.yearEnd')}</label>
+                <input
+                  type="number"
+                  min={1900}
+                  max={2100}
+                  value={yearEnd ?? ''}
+                  onChange={(e) => setYearEnd(e.target.value === '' ? null : parseInt(e.target.value, 10) || null)}
+                  placeholder="—"
+                  className="w-full rounded-lg border border-slate-600/80 bg-slate-800/60 px-3 py-2.5 text-slate-200 text-sm focus:outline-none"
+                />
+              </div>
+            </div>
+            <div className="w-28">
+              <label className="block text-xs font-medium text-slate-400 mb-1">{t('scholar.limitLabel')}</label>
+              <div className="flex rounded-lg border border-slate-600/80 bg-slate-800/60 overflow-hidden">
+                <input
+                  type="number"
+                  min={1}
+                  step={10}
+                  value={limit}
+                  onChange={(e) => setLimit(parseInt(e.target.value, 10) || 30)}
+                  className="w-14 flex-1 min-w-0 bg-transparent px-2 py-2.5 text-slate-200 text-sm focus:outline-none"
+                />
+                <div className="flex flex-col border-l border-slate-600/80">
+                  <button
+                    type="button"
+                    onClick={() => setLimit(limit + 10)}
+                    className="flex items-center justify-center p-0.5 text-slate-400 hover:bg-slate-600/60 hover:text-slate-200 transition-colors"
+                    title={t('scholar.limitIncrease')}
+                    aria-label={t('scholar.limitIncrease')}
                   >
-                    {[0, 25, 33, 50, 67, 75, 100].map((v) => (
-                      <option key={v} value={v}>{v}%</option>
-                    ))}
-                  </select>
+                    <ChevronUp size={16} />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setLimit(Math.max(1, limit - 10))}
+                    className="flex items-center justify-center p-0.5 text-slate-400 hover:bg-slate-600/60 hover:text-slate-200 transition-colors"
+                    title={t('scholar.limitDecrease')}
+                    aria-label={t('scholar.limitDecrease')}
+                  >
+                    <ChevronDown size={16} />
+                  </button>
                 </div>
-              )}
-            </>
-          )}
-          <button
-            onClick={handleSearch}
-            disabled={isSearching}
-            className="flex items-center gap-2 px-4 py-2.5 rounded-lg bg-sky-600 hover:bg-sky-500 disabled:opacity-60 disabled:cursor-not-allowed text-white font-medium text-sm transition-colors"
-          >
-            {isSearching ? <Loader2 size={18} className="animate-spin" /> : <Search size={18} />}
-            {t('common.search')}
-          </button>
+              </div>
+            </div>
+            <button
+              onClick={handleSearch}
+              disabled={isSearching}
+              className="flex items-center gap-2 px-4 py-2.5 rounded-lg bg-sky-600 hover:bg-sky-500 disabled:opacity-60 disabled:cursor-not-allowed text-white font-medium text-sm transition-colors"
+            >
+              {isSearching ? <Loader2 size={18} className="animate-spin" /> : <Search size={18} />}
+              {t('common.search')}
+            </button>
+          </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-end gap-3">
             <div className="w-[160px]">
               <label className="block text-xs font-medium text-slate-400 mb-1">{t('scholar.libraryLabel')}</label>
               <select
@@ -446,99 +792,80 @@ export function ScholarPage() {
                 ))}
               </select>
             </div>
-            {/* Download assist LLM (same list as RAG model selector) */}
-            <div>
-              <label className="block text-xs font-medium text-slate-400 mb-1 whitespace-nowrap">{t('scholar.llmForDownloadLabel')}</label>
-              <div className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-600/80 bg-slate-800/60">
-                <Sparkles size={13} className="text-rose-400 shrink-0" />
-                <select
-                  value={selectedScholarLlmProvider}
-                  onChange={(e) => {
-                    const p = e.target.value;
-                    const prov = llmProviders.find((x) => x.id === p);
-                    setScholarLlm(p, prov?.default_model ?? '');
-                  }}
-                  className="bg-transparent text-xs font-medium text-slate-200 focus:outline-none cursor-pointer appearance-none pr-2 min-w-[100px]"
-                  style={{
-                    backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 24 24' fill='none' stroke='%239ca3af' stroke-width='2'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E")`,
-                    backgroundRepeat: 'no-repeat',
-                    backgroundPosition: 'right 0 center',
-                  }}
-                >
-                  <option value="">{t('scholar.llmDefault')}</option>
-                  {Array.from(
-                    llmProviders.reduce((acc, p) => {
-                      const g = scholarLlmGroupLabel(p.id);
-                      if (!acc.has(g)) acc.set(g, []);
-                      acc.get(g)!.push(p);
-                      return acc;
-                    }, new Map<string, LLMProviderInfo[]>()),
-                  ).map(([group, providers]) => (
-                    <optgroup key={group} label={group} className="bg-slate-800">
-                      {providers.map((p) => (
-                        <option key={p.id} value={p.id} className="bg-slate-800 text-slate-200">
-                          {scholarLlmProviderOptionLabel(p.id)}
-                        </option>
-                      ))}
-                    </optgroup>
-                  ))}
-                </select>
-                <span className="text-slate-600 text-xs select-none">/</span>
-                <select
-                  value={selectedScholarLlmModel}
-                  onChange={(e) => setScholarLlm(selectedScholarLlmProvider, e.target.value)}
-                  disabled={!selectedScholarLlmProvider}
-                  className="bg-transparent text-xs font-medium text-slate-200 focus:outline-none cursor-pointer appearance-none pr-2 min-w-[110px] disabled:opacity-60"
-                  style={{
-                    backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 24 24' fill='none' stroke='%239ca3af' stroke-width='2'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E")`,
-                    backgroundRepeat: 'no-repeat',
-                    backgroundPosition: 'right 0 center',
-                  }}
-                >
-                  <option value="">{t('scholar.llmModelDefault')}</option>
-                  {(llmProviders.find((p) => p.id === selectedScholarLlmProvider)?.models ?? []).map((m) => (
-                    <option key={m} value={m} className="bg-slate-800 text-slate-200">
-                      {m}
-                    </option>
-                  ))}
-                </select>
-                <button
-                  type="button"
-                  onClick={() => loadLlmProviders(true)}
-                  disabled={isRefreshingLlm}
-                  className="text-slate-400 hover:text-sky-300 disabled:opacity-60 transition-colors"
-                  title={t('scholar.llmRefresh')}
-                >
-                  <RefreshCw size={12} className={isRefreshingLlm ? 'animate-spin' : ''} />
-                </button>
-              </div>
-            </div>
-            {/* 下载器浏览器：有头/无头 */}
-            <div>
-              <label className="block text-xs font-medium text-slate-400 mb-1">{t('scholar.browserModeLabel')}</label>
-              <select
-                value={scholarBrowserMode}
-                onChange={(e) => setScholarBrowserMode(e.target.value as 'default' | 'headed' | 'headless')}
-                className="w-full rounded-lg border border-slate-600/80 bg-slate-800/60 px-3 py-2.5 text-slate-200 text-sm focus:outline-none focus:ring-1 focus:ring-sky-500/50 min-w-[100px]"
+            <button
+              type="button"
+              onClick={() => setShowAdvancedSettings(true)}
+              className="inline-flex items-center gap-2 rounded-lg border border-slate-600/80 bg-slate-800/60 px-3 py-2.5 text-sm font-medium text-slate-200 hover:border-slate-500 hover:bg-slate-800 transition-colors"
+            >
+              <Settings2 size={16} className="text-sky-300" />
+              {t('scholar.advancedSettingsTitle')}
+            </button>
+            <div className="flex flex-wrap items-center gap-2 pt-6">
+              <span className="text-xs text-slate-400 whitespace-nowrap">
+                {t('scholar.headedBrowserToolsLabel')}: {headedBrowserStatusLabel}
+              </span>
+              <button
+                type="button"
+                onClick={handleShowHeadedBrowser}
+                disabled={headedBrowserWindowBusy || !headedBrowserWindow?.available}
+                className="inline-flex items-center gap-2 rounded-lg border border-slate-600/80 bg-slate-800/60 px-3 py-2 text-xs font-medium text-slate-200 hover:border-slate-500 hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                title={t('scholar.headedBrowserSummon')}
               >
-                <option value="default">{t('scholar.browserModeDefault')}</option>
-                <option value="headless">{t('scholar.browserModeHeadless')}</option>
-                <option value="headed">{t('scholar.browserModeHeaded')}</option>
-              </select>
+                {headedBrowserWindowBusy ? <Loader2 size={14} className="animate-spin" /> : <PanelLeftOpen size={14} className="text-teal-300" />}
+                {t('scholar.headedBrowserSummon')}
+              </button>
+              <button
+                type="button"
+                onClick={handleParkHeadedBrowser}
+                disabled={headedBrowserWindowBusy || !headedBrowserWindow?.available}
+                className="inline-flex items-center gap-2 rounded-lg border border-slate-600/80 bg-slate-800/60 px-3 py-2 text-xs font-medium text-slate-200 hover:border-slate-500 hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                title={t('scholar.headedBrowserPark')}
+              >
+                {headedBrowserWindowBusy ? <Loader2 size={14} className="animate-spin" /> : <PanelLeftClose size={14} className="text-slate-300" />}
+                {t('scholar.headedBrowserPark')}
+              </button>
             </div>
-            {/* Academia.edu 下载开关 */}
-            <div className="flex items-center gap-2">
+            <label className="flex items-center gap-2 cursor-pointer select-none pt-6">
               <input
-                id="include-academia-toggle"
                 type="checkbox"
-                checked={includeAcademia}
-                onChange={(e) => setIncludeAcademia(e.target.checked)}
-                className="w-3.5 h-3.5 rounded border-slate-500 bg-slate-700 text-sky-500 focus:ring-sky-500/40 focus:ring-1 cursor-pointer flex-shrink-0"
+                checked={smartOptimize}
+                onChange={(e) => setSmartOptimize(e.target.checked)}
+                className="rounded border-slate-500 bg-slate-800 text-teal-500 focus:ring-teal-500/50"
               />
-              <label htmlFor="include-academia-toggle" className="text-xs text-slate-400 cursor-pointer select-none leading-tight">
-                {t('scholar.includeAcademia')}
-              </label>
-            </div>
+      <ScholarAdvancedSettingsModal
+        open={showAdvancedSettings}
+        onClose={() => setShowAdvancedSettings(false)}
+      />
+              <Sparkles size={16} className="text-teal-400 shrink-0" />
+              <span className="text-xs text-slate-400 whitespace-nowrap">{t('scholar.smartOptimize')}</span>
+            </label>
+            {(source === 'google_scholar' || source === 'google') && (
+              <>
+                <label className="flex items-center gap-2 cursor-pointer select-none pt-6" title={t('sidebar.useSerpapiHelp')}>
+                  <input
+                    type="checkbox"
+                    checked={useSerpapi}
+                    onChange={(e) => setUseSerpapi(e.target.checked)}
+                    className="rounded border-slate-500 bg-slate-800 text-teal-500 focus:ring-teal-500/50"
+                  />
+                  <span className="text-xs text-slate-400 whitespace-nowrap">{t('sidebar.useSerpapi')}</span>
+                </label>
+                {useSerpapi && (
+                  <div className="pt-6">
+                    <select
+                      value={serpapiRatio}
+                      onChange={(e) => setSerpapiRatio(Number(e.target.value))}
+                      className="rounded-lg border border-slate-600/80 bg-slate-800/60 px-2.5 py-2 text-slate-200 text-xs focus:outline-none focus:ring-1 focus:ring-sky-500/50"
+                      title={t('sidebar.serpapiRatio')}
+                    >
+                      {[0, 25, 33, 50, 67, 75, 100].map((v) => (
+                        <option key={v} value={v}>{t('sidebar.serpapiRatio')} {v}%</option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+              </>
+            )}
             <div className="pt-6">
               <button
                 type="button"
@@ -633,85 +960,72 @@ export function ScholarPage() {
       )}
 
       {/* Results + Library panel + Tasks layout */}
-      <div className="flex-1 flex min-h-0 gap-4 px-4 pb-4">
+      <div ref={resultsLayoutRef} className="flex-1 flex min-h-0 gap-4 px-4 pb-4">
         {/* Library panel (left) */}
         {activeLibraryId != null && (
-          <div className="w-80 flex-shrink-0 flex flex-col rounded-xl border border-slate-700/60 bg-slate-800/30 overflow-hidden">
-            <button
-              onClick={() => setLibraryPanelOpen((o) => !o)}
-              className="flex items-center justify-between px-4 py-2 border-b border-slate-700/60 bg-slate-800/50 text-slate-200 text-sm font-medium"
+          <>
+            <div
+              className="flex-shrink-0 flex flex-col rounded-xl border border-slate-700/60 bg-slate-800/30 overflow-hidden"
+              style={{ width: libraryPanelWidth }}
             >
-              <span className="flex items-center gap-2 truncate">
-                <BookOpen size={16} />
-                {t('scholar.libraryPanelTitle')} ({libraryPapers.length})
-              </span>
-              {libraryPanelOpen ? <ChevronDown size={18} /> : <ChevronUp size={18} />}
-            </button>
-            {libraryPanelOpen && (
-              <>
-                <div className="flex items-center gap-2 p-2 border-b border-slate-700/60">
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      const taskId = await downloadLibraryBatch(currentCollection);
-                      if (taskId) {
-                        addToast(t('scholar.batchDownloadStarted', { count: libraryPapers.length }), 'success');
-                      } else {
-                        addToast(t('scholar.downloadFailed'), 'error');
-                      }
-                    }}
-                    disabled={libraryPapers.length === 0 || libraryLoading}
-                    className="flex-1 flex items-center justify-center gap-2 px-3 py-2 rounded-lg bg-sky-600 hover:bg-sky-500 disabled:opacity-60 text-white text-sm font-medium"
-                  >
-                    <Download size={16} />
-                    {t('scholar.libraryDownloadAll')}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      setExtractDoiDedupLoading(true);
-                      try {
-                        const stats = await extractDoiAndDedup();
-                        if (stats != null) {
-                          addToast(
-                            t('scholar.libraryExtractDoiDedupSuccess', {
-                              extracted: stats.extracted_count,
-                              removed: stats.removed_count,
-                            }),
-                            'success',
-                          );
-                        } else {
-                          addToast(t('scholar.downloadFailed'), 'error');
-                        }
-                      } finally {
-                        setExtractDoiDedupLoading(false);
-                      }
-                    }}
-                    disabled={libraryPapers.length === 0 || libraryLoading || extractDoiDedupLoading}
-                    className="flex items-center justify-center gap-2 px-3 py-2 rounded-lg border border-slate-500/60 bg-slate-700/50 hover:bg-slate-600/50 disabled:opacity-60 text-slate-200 text-sm font-medium"
-                    title={t('scholar.libraryExtractDoiDedup')}
-                  >
-                    {extractDoiDedupLoading ? (
-                      <Loader2 size={16} className="animate-spin" />
-                    ) : (
-                      <FileSearch size={16} />
-                    )}
-                    <span className="hidden sm:inline">{t('scholar.libraryExtractDoiDedup')}</span>
-                  </button>
-                  {activeLibraryId != null && activeLibraryId >= 0 && (
+              <button
+                onClick={() => setLibraryPanelOpen((o) => !o)}
+                className="flex items-center justify-between px-4 py-2 border-b border-slate-700/60 bg-slate-800/50 text-slate-200 text-sm font-medium"
+              >
+                <span className="flex items-center gap-2 truncate">
+                  <BookOpen size={16} />
+                  {t('scholar.libraryPanelTitle')}{' '}
+                  {activeFilterCount > 0 && libraryPapers.length > 0 ? (
+                    <span className="text-slate-400">
+                      ({filteredLibraryPapers.length} / {libraryPapers.length})
+                    </span>
+                  ) : (
+                    <span className="text-slate-400">({libraryPapers.length})</span>
+                  )}
+                </span>
+                {libraryPanelOpen ? <ChevronDown size={18} /> : <ChevronUp size={18} />}
+              </button>
+              {libraryPanelOpen && (
+                <>
+                  {activeFilterCount > 0 && (
+                    <p className="px-4 py-1 text-xs text-slate-500 border-b border-slate-700/40" title={t('scholar.filtersApplyToCatalog')}>
+                      {t('scholar.filtersApplyToCatalog')}
+                    </p>
+                  )}
+                  <div className="flex items-center gap-2 p-2 border-b border-slate-700/60">
                     <button
                       type="button"
                       onClick={async () => {
-                        setPdfRenameDedupLoading(true);
+                        const result = await downloadLibraryBatch(currentCollection);
+                        if (result == null) {
+                          addToast(t('scholar.downloadFailed'), 'error');
+                          return;
+                        }
+                        if (result.taskId) {
+                          addToast(t('scholar.batchDownloadStarted', { count: result.submittedCount }), 'success');
+                          return;
+                        }
+                        if (result.skippedReason === 'all_downloaded') {
+                          addToast(t('scholar.allAlreadyDownloaded'), 'info');
+                        }
+                      }}
+                      disabled={libraryPapers.length === 0 || libraryLoading}
+                      className="flex-1 flex items-center justify-center gap-2 px-3 py-2 rounded-lg bg-sky-600 hover:bg-sky-500 disabled:opacity-60 text-white text-sm font-medium"
+                    >
+                      <Download size={16} />
+                      {t('scholar.libraryDownloadAll')}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        setExtractDoiDedupLoading(true);
                         try {
-                          const stats = await pdfRenameDedup();
+                          const stats = await extractDoiAndDedup();
                           if (stats != null) {
                             addToast(
-                              t('scholar.pdfRenameDedupSuccess', {
-                                renamed: stats.renamed,
-                                removed: stats.removed,
-                                no_doi: stats.no_doi,
-                                synced_downloaded: stats.synced_downloaded ?? 0,
+                              t('scholar.libraryExtractDoiDedupSuccess', {
+                                extracted: stats.extracted_count,
+                                removed: stats.removed_count,
                               }),
                               'success',
                             );
@@ -719,182 +1033,422 @@ export function ScholarPage() {
                             addToast(t('scholar.downloadFailed'), 'error');
                           }
                         } finally {
-                          setPdfRenameDedupLoading(false);
+                          setExtractDoiDedupLoading(false);
                         }
                       }}
-                      disabled={libraryLoading || pdfRenameDedupLoading}
+                      disabled={libraryPapers.length === 0 || libraryLoading || extractDoiDedupLoading}
                       className="flex items-center justify-center gap-2 px-3 py-2 rounded-lg border border-slate-500/60 bg-slate-700/50 hover:bg-slate-600/50 disabled:opacity-60 text-slate-200 text-sm font-medium"
-                      title={t('scholar.pdfRenameDedup')}
+                      title={t('scholar.libraryExtractDoiDedup')}
                     >
-                      {pdfRenameDedupLoading ? (
+                      {extractDoiDedupLoading ? (
                         <Loader2 size={16} className="animate-spin" />
                       ) : (
-                        <RefreshCw size={16} />
+                        <FileSearch size={16} />
                       )}
-                      <span className="hidden sm:inline">{t('scholar.pdfRenameDedup')}</span>
+                      <span className="hidden sm:inline">{t('scholar.libraryExtractDoiDedup')}</span>
                     </button>
-                  )}
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const activeLib = libraries.find((l) => l.id === activeLibraryId);
-                      const isTemp = activeLib?.is_temporary ?? false;
-                      const confirmKey = isTemp ? 'scholar.libraryClearConfirm' : 'scholar.libraryDeleteConfirm';
-                      if (window.confirm(t(confirmKey))) {
-                        if (isTemp) {
-                          clearTemporaryLibrary(activeLibraryId);
-                        } else {
-                          deleteLibrary(activeLibraryId);
+                    {activeLibraryId != null && activeLibraryId >= 0 && (
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          setPdfRenameDedupLoading(true);
+                          try {
+                            const stats = await pdfRenameDedup();
+                            if (stats != null) {
+                              addToast(
+                                t('scholar.pdfRenameDedupSuccess', {
+                                  renamed: stats.renamed,
+                                  removed: stats.removed,
+                                  no_doi: stats.no_doi,
+                                  synced_downloaded: stats.synced_downloaded ?? 0,
+                                }),
+                                'success',
+                              );
+                            } else {
+                              addToast(t('scholar.downloadFailed'), 'error');
+                            }
+                          } finally {
+                            setPdfRenameDedupLoading(false);
+                          }
+                        }}
+                        disabled={libraryLoading || pdfRenameDedupLoading}
+                        className="flex items-center justify-center gap-2 px-3 py-2 rounded-lg border border-slate-500/60 bg-slate-700/50 hover:bg-slate-600/50 disabled:opacity-60 text-slate-200 text-sm font-medium"
+                        title={t('scholar.pdfRenameDedup')}
+                      >
+                        {pdfRenameDedupLoading ? (
+                          <Loader2 size={16} className="animate-spin" />
+                        ) : (
+                          <RefreshCw size={16} />
+                        )}
+                        <span className="hidden sm:inline">{t('scholar.pdfRenameDedup')}</span>
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const activeLib = libraries.find((l) => l.id === activeLibraryId);
+                        const isTemp = activeLib?.is_temporary ?? false;
+                        const confirmKey = isTemp ? 'scholar.libraryClearConfirm' : 'scholar.libraryDeleteConfirm';
+                        if (window.confirm(t(confirmKey))) {
+                          if (isTemp) {
+                            clearTemporaryLibrary(activeLibraryId);
+                          } else {
+                            deleteLibrary(activeLibraryId);
+                          }
                         }
+                      }}
+                      className="p-2 rounded-lg text-slate-400 hover:bg-red-500/20 hover:text-red-400"
+                      title={
+                        libraries.find((l) => l.id === activeLibraryId)?.is_temporary
+                          ? t('scholar.libraryClear')
+                          : t('scholar.libraryDelete')
                       }
-                    }}
-                    className="p-2 rounded-lg text-slate-400 hover:bg-red-500/20 hover:text-red-400"
-                    title={
-                      libraries.find((l) => l.id === activeLibraryId)?.is_temporary
-                        ? t('scholar.libraryClear')
-                        : t('scholar.libraryDelete')
-                    }
-                  >
-                    <Trash2 size={16} />
-                  </button>
-                </div>
-                <div className="flex-1 overflow-y-auto p-2 min-h-0">
-                  {libraryLoading ? (
-                    <div className="flex items-center justify-center py-8">
-                      <Loader2 size={24} className="animate-spin text-sky-400" />
-                    </div>
-                  ) : libraryPapers.length === 0 ? (
-                    <p className="text-slate-500 text-sm py-6 text-center">{t('scholar.libraryEmpty')}</p>
-                  ) : (
-                    <ul className="space-y-2">
-                      {libraryPapers.map((p) => (
-                        <li
-                          key={p.id}
-                          className="flex items-start gap-2 rounded-lg border border-slate-600/60 bg-slate-800/50 p-2 text-sm group"
-                        >
-                          <div className="flex-1 min-w-0">
-                            {p.url ? (
-                              <a
-                                href={p.url}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className="text-slate-200 line-clamp-2 hover:text-sky-300 hover:underline block"
-                                title={p.title}
-                              >
-                                {p.title}
-                              </a>
-                            ) : (
-                              <p className="text-slate-200 line-clamp-2" title={p.title}>
-                                {p.title}
-                              </p>
-                            )}
-                            <p className="text-xs text-slate-500 mt-0.5">
-                              {p.authors?.join(', ')} {p.year != null ? ` · ${p.year}` : ''}
-                            </p>
-                            <div className="flex flex-wrap items-center gap-1.5 mt-1">
-                              {p.source && (
-                                <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-600/60 text-slate-300">
-                                  {p.source.replace(/_/g, ' ')}
-                                </span>
-                              )}
-                              {p.pdf_url && (
-                                <a
-                                  href={p.pdf_url}
-                                  target="_blank"
-                                  rel="noopener noreferrer"
-                                  className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-600/50 text-sky-400 hover:bg-slate-600/70 hover:text-sky-300"
-                                  title={t('scholar.openPdfLink')}
-                                  onClick={(e) => e.stopPropagation()}
-                                >
-                                  <FileText size={10} />
-                                  PDF
-                                </a>
-                              )}
-                              {p.downloaded_at && p.paper_id ? (
-                                <button
-                                  type="button"
-                                  onClick={async () => {
-                                    const url =
-                                      activeLibraryId != null && activeLibraryId >= 0
-                                        ? getLibraryPdfViewUrl(activeLibraryId, p.paper_id!)
-                                        : getPdfViewUrl(p.paper_id!);
-                                    const pdfUrl = url.includes('/scholar/libraries/')
-                                      ? await fetchPdfAsBlobUrl(url).catch(() => url)
-                                      : url;
-                                    setPdfView({ paperId: p.paper_id!, title: p.title, pdfUrl });
-                                  }}
-                                  className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-600/40 text-green-500 hover:bg-slate-600/60 cursor-pointer"
-                                  title={t('scholar.openPdf')}
-                                >
-                                  {t('scholar.libraryPaperDownloaded')}
-                                </button>
-                              ) : !p.downloaded_at && p.paper_id ? (
-                                (() => {
-                                  const isPending = pendingDownloadAndOpen?.paperId === p.paper_id;
-                                  const isFailed = !isPending && !!downloadAndOpenFailures[p.paper_id!];
-                                  return (
-                                    <button
-                                      type="button"
-                                      onClick={() => {
-                                        if (isFailed) clearDownloadAndOpenFailure(p.paper_id!);
-                                        downloadLibraryPaperAndOpen(p);
-                                      }}
-                                      disabled={isPending}
-                                      className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium disabled:opacity-70 ${
-                                        isFailed
-                                          ? 'bg-red-500/20 text-red-400 hover:bg-red-500/30 hover:text-red-300'
-                                          : 'bg-slate-600/50 text-sky-400 hover:bg-slate-600/70 hover:text-sky-300'
-                                      }`}
-                                      title={isFailed ? t('scholar.downloadAndOpenFailed') : t('scholar.downloadAndOpen')}
-                                    >
-                                      {isPending ? (
-                                        <Loader2 size={10} className="animate-spin" />
-                                      ) : isFailed ? (
-                                        <AlertCircle size={10} />
-                                      ) : (
-                                        <Download size={10} />
-                                      )}
-                                      {isFailed ? t('scholar.downloadAndOpenFailed') : t('scholar.downloadAndOpen')}
-                                    </button>
-                                  );
-                                })()
-                              ) : (
-                                <span
-                                  className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-600/40 ${p.downloaded_at ? 'text-green-500' : 'text-slate-400'}`}
-                                >
-                                  {p.downloaded_at ? t('scholar.libraryPaperDownloaded') : t('scholar.libraryPaperNotDownloaded')}
-                                </span>
-                              )}
-                            </div>
-                            {p.doi && (
-                              <a
-                                href={`https://doi.org/${p.doi}`}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className="text-xs text-sky-500/80 hover:text-sky-400 hover:underline truncate block mt-0.5"
-                                title={`DOI: ${p.doi}`}
-                                onClick={(e) => e.stopPropagation()}
-                              >
-                                {p.doi}
-                              </a>
-                            )}
-                          </div>
+                    >
+                      <Trash2 size={16} />
+                    </button>
+                  </div>
+                  {/* 文献目录内排序与筛选栏 */}
+                  {libraryPapers.length > 0 && (
+                    <div className="flex-shrink-0 border-b border-slate-700/60 bg-slate-800/40">
+                      <button
+                        type="button"
+                        onClick={() => setCatalogFilterBarCollapsed((c) => !c)}
+                        className="w-full flex items-center justify-between px-3 py-2 text-left text-xs text-slate-400 hover:text-slate-200"
+                      >
+                        <span>
+                          {t('scholar.sortBy')}: {t(sortField === 'score' ? 'scholar.sortRelevance' : sortField === 'year' ? 'scholar.sortYear' : 'scholar.sortImpactFactor')}{' '}
+                          · {sortDir === 'asc' ? t('scholar.sortAsc') : t('scholar.sortDesc')}
+                          {activeFilterCount > 0 && ` · ${activeFilterCount} ${t('scholar.filtersActive')}`}
+                        </span>
+                        {catalogFilterBarCollapsed ? <ChevronDown size={14} /> : <ChevronUp size={14} />}
+                      </button>
+                      {!catalogFilterBarCollapsed && (
+                        <div className="px-3 pb-3 pt-0 flex flex-wrap items-end gap-2">
+                          <input
+                            type="text"
+                            value={filterJournal}
+                            onChange={(e) => setFilterJournal(e.target.value)}
+                            placeholder={t('scholar.filterJournal')}
+                            className="w-24 rounded border border-slate-600/80 bg-slate-800/60 px-2 py-1 text-slate-200 text-xs"
+                          />
+                          <input
+                            type="number"
+                            value={filterYearMin ?? ''}
+                            onChange={(e) => setFilterYearMin(e.target.value ? parseInt(e.target.value, 10) : null)}
+                            placeholder={t('scholar.filterYearMin')}
+                            className="w-14 rounded border border-slate-600/80 bg-slate-800/60 px-2 py-1 text-slate-200 text-xs"
+                          />
+                          <input
+                            type="number"
+                            value={filterYearMax ?? ''}
+                            onChange={(e) => setFilterYearMax(e.target.value ? parseInt(e.target.value, 10) : null)}
+                            placeholder={t('scholar.filterYearMax')}
+                            className="w-14 rounded border border-slate-600/80 bg-slate-800/60 px-2 py-1 text-slate-200 text-xs"
+                          />
+                          <input
+                            type="number"
+                            step={0.1}
+                            value={filterIfMin ?? ''}
+                            onChange={(e) => setFilterIfMin(e.target.value ? parseFloat(e.target.value) : null)}
+                            placeholder={t('scholar.filterImpactFactor')}
+                            className="w-14 rounded border border-slate-600/80 bg-slate-800/60 px-2 py-1 text-slate-200 text-xs"
+                          />
+                          <select
+                            value={filterSource}
+                            onChange={(e) => setFilterSource(e.target.value as ScholarSource | 'all')}
+                            className="rounded border border-slate-600/80 bg-slate-800/60 px-2 py-1 text-slate-200 text-xs min-w-0"
+                          >
+                            <option value="all">{t('scholar.statusAll')}</option>
+                            {SOURCE_OPTIONS.map((opt) => (
+                              <option key={opt.value} value={opt.value}>
+                                {t(opt.labelKey)}
+                              </option>
+                            ))}
+                          </select>
+                          <select
+                            value={filterStatus}
+                            onChange={(e) => setFilterStatus(e.target.value as 'all' | 'downloaded' | 'not_downloaded')}
+                            className="rounded border border-slate-600/80 bg-slate-800/60 px-2 py-1 text-slate-200 text-xs"
+                          >
+                            <option value="all">{t('scholar.statusAll')}</option>
+                            <option value="downloaded">{t('scholar.statusDownloaded')}</option>
+                            <option value="not_downloaded">{t('scholar.statusNotDownloaded')}</option>
+                          </select>
+                          <select
+                            value={sortField}
+                            onChange={(e) => setSortField(e.target.value as 'score' | 'year' | 'impact_factor')}
+                            className="rounded border border-slate-600/80 bg-slate-800/60 px-2 py-1 text-slate-200 text-xs"
+                          >
+                            <option value="score">{t('scholar.sortRelevance')}</option>
+                            <option value="year">{t('scholar.sortYear')}</option>
+                            <option value="impact_factor">{t('scholar.sortImpactFactor')}</option>
+                          </select>
                           <button
                             type="button"
-                            onClick={() => removeFromLibrary(activeLibraryId, p.id)}
-                            className="flex-shrink-0 p-1.5 rounded text-slate-400 hover:bg-red-500/20 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity"
-                            title={t('scholar.libraryRemoveFromCatalog')}
+                            onClick={() => setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'))}
+                            className="px-2 py-1 rounded border border-slate-600/80 bg-slate-800/60 text-slate-400 hover:text-slate-200 text-xs"
+                            title={sortDir === 'asc' ? t('scholar.sortDesc') : t('scholar.sortAsc')}
                           >
-                            <Trash2 size={14} />
+                            {sortDir === 'asc' ? '↑' : '↓'}
                           </button>
-                        </li>
-                      ))}
-                    </ul>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setFilterJournal('');
+                              setFilterYearMin(null);
+                              setFilterYearMax(null);
+                              setFilterIfMin(null);
+                              setFilterSource('all');
+                              setFilterStatus('all');
+                            }}
+                            className="px-2 py-1 rounded border border-slate-600/80 bg-slate-700/50 text-slate-400 hover:text-slate-200 text-xs"
+                          >
+                            {t('scholar.resetFilters')}
+                          </button>
+                        </div>
+                      )}
+                    </div>
                   )}
-                </div>
-              </>
-            )}
-          </div>
+                  <div className="flex-1 overflow-y-auto p-2 min-h-0">
+                    {libraryLoading ? (
+                      <div className="flex items-center justify-center py-8">
+                        <Loader2 size={24} className="animate-spin text-sky-400" />
+                      </div>
+                    ) : libraryPapers.length === 0 ? (
+                      <p className="text-slate-500 text-sm py-6 text-center">{t('scholar.libraryEmpty')}</p>
+                    ) : filteredLibraryPapers.length === 0 ? (
+                      <p className="text-slate-500 text-sm py-6 text-center">{t('scholar.noMatchFilters')}</p>
+                    ) : (
+                      <ul className="space-y-2">
+                        {filteredLibraryPapers.map((p) => (
+                          <li
+                            key={p.id}
+                            className="flex items-start gap-2 rounded-lg border border-slate-600/60 bg-slate-800/50 p-2 text-sm group"
+                          >
+                            <div className="flex-1 min-w-0">
+                              {p.url ? (
+                                <a
+                                  href={p.url}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="text-slate-200 line-clamp-2 hover:text-sky-300 hover:underline block"
+                                  title={p.title}
+                                >
+                                  {p.title}
+                                </a>
+                              ) : (
+                                <p className="text-slate-200 line-clamp-2" title={p.title}>
+                                  {p.title}
+                                </p>
+                              )}
+                              <p className="text-xs text-slate-500 mt-0.5">
+                                {p.authors?.join(', ')} {p.year != null ? ` · ${p.year}` : ''}
+                              </p>
+                              {(p.venue || p.impact_factor != null) && (
+                                <p className="text-xs text-slate-400 mt-0.5">
+                                  {p.venue ?? ''}
+                                  {p.impact_factor != null && ` · IF ${p.impact_factor}${p.jif_quartile ? ` ${p.jif_quartile}` : ''}`}
+                                </p>
+                              )}
+                              <div className="flex flex-wrap items-center gap-1.5 mt-1">
+                                {p.source && (
+                                  <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-600/60 text-slate-300">
+                                    {p.source.replace(/_/g, ' ')}
+                                  </span>
+                                )}
+                                {p.pdf_url && (
+                                  <a
+                                    href={p.pdf_url}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-600/50 text-sky-400 hover:bg-slate-600/70 hover:text-sky-300"
+                                    title={t('scholar.openPdfLink')}
+                                    onClick={(e) => e.stopPropagation()}
+                                  >
+                                    <FileText size={10} />
+                                    PDF
+                                  </a>
+                                )}
+                                {p.downloaded_at && p.paper_id ? (
+                                  <>
+                                    <button
+                                      type="button"
+                                      onClick={async () => {
+                                        const url =
+                                          activeLibraryId != null && activeLibraryId >= 0
+                                            ? getLibraryPdfViewUrl(activeLibraryId, p.paper_id!)
+                                            : getPdfViewUrl(p.paper_id!);
+                                        const pdfUrl = url.includes('/scholar/libraries/')
+                                          ? await fetchPdfAsBlobUrl(url).catch(() => url)
+                                          : url;
+                                        setPdfView({ paperId: p.paper_id!, title: p.title, pdfUrl });
+                                      }}
+                                      className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-600/40 text-green-500 hover:bg-slate-600/60 cursor-pointer"
+                                      title={t('scholar.openPdf')}
+                                    >
+                                      {t('scholar.libraryPaperDownloaded')}
+                                    </button>
+                                    {activeLibraryId != null && activeLibraryId >= 0 && (
+                                      <>
+                                        <button
+                                          type="button"
+                                          disabled={deletingPdfId === p.id}
+                                          onClick={async (e) => {
+                                            e.stopPropagation();
+                                            if (activeLibraryId == null) return;
+                                            setDeletingPdfId(p.id);
+                                            try {
+                                              await deleteLibraryPaperPdf(activeLibraryId, p.id);
+                                              await loadLibraryPapers(activeLibraryId);
+                                              addToast(t('scholar.pdfDeleted'), 'success');
+                                            } catch (err) {
+                                              addToast((err as Error)?.message || t('scholar.downloadFailed'), 'error');
+                                            } finally {
+                                              setDeletingPdfId(null);
+                                            }
+                                          }}
+                                          className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-600/50 text-slate-300 hover:bg-red-500/20 hover:text-red-400 disabled:opacity-70"
+                                          title={t('scholar.deletePdf')}
+                                        >
+                                          {deletingPdfId === p.id ? <Loader2 size={10} className="animate-spin" /> : <Trash2 size={10} />}
+                                          {t('scholar.deletePdf')}
+                                        </button>
+                                        <button
+                                          type="button"
+                                          disabled={redownloadingId === p.id}
+                                          onClick={async (e) => {
+                                            e.stopPropagation();
+                                            if (activeLibraryId == null) return;
+                                            setRedownloadingId(p.id);
+                                            try {
+                                              await deleteLibraryPaperPdf(activeLibraryId, p.id);
+                                              await loadLibraryPapers(activeLibraryId);
+                                              await downloadLibraryPaperAndOpen(p);
+                                            } catch (err) {
+                                              addToast((err as Error)?.message || t('scholar.downloadFailed'), 'error');
+                                            } finally {
+                                              setRedownloadingId(null);
+                                            }
+                                          }}
+                                          className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-600/50 text-sky-400 hover:bg-slate-600/70 disabled:opacity-70"
+                                          title={t('scholar.redownload')}
+                                        >
+                                          {redownloadingId === p.id ? <Loader2 size={10} className="animate-spin" /> : <RefreshCw size={10} />}
+                                          {t('scholar.redownload')}
+                                        </button>
+                                      </>
+                                    )}
+                                  </>
+                                ) : !p.downloaded_at && p.paper_id ? (
+                                  (() => {
+                                    const isPending = pendingDownloadAndOpen?.paperId === p.paper_id;
+                                    const isFailed = !isPending && !!downloadAndOpenFailures[p.paper_id!];
+                                    return (
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          if (isFailed) clearDownloadAndOpenFailure(p.paper_id!);
+                                          downloadLibraryPaperAndOpen(p);
+                                        }}
+                                        disabled={isPending}
+                                        className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium disabled:opacity-70 ${
+                                          isFailed
+                                            ? 'bg-red-500/20 text-red-400 hover:bg-red-500/30 hover:text-red-300'
+                                            : 'bg-slate-600/50 text-sky-400 hover:bg-slate-600/70 hover:text-sky-300'
+                                        }`}
+                                        title={isFailed ? t('scholar.downloadAndOpenFailed') : t('scholar.downloadAndOpen')}
+                                      >
+                                        {isPending ? (
+                                          <Loader2 size={10} className="animate-spin" />
+                                        ) : isFailed ? (
+                                          <AlertCircle size={10} />
+                                        ) : (
+                                          <Download size={10} />
+                                        )}
+                                        {isFailed ? t('scholar.downloadAndOpenFailed') : t('scholar.downloadAndOpen')}
+                                      </button>
+                                    );
+                                  })()
+                                ) : (
+                                  <span
+                                    className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-600/40 ${p.downloaded_at ? 'text-green-500' : 'text-slate-400'}`}
+                                  >
+                                    {p.downloaded_at ? t('scholar.libraryPaperDownloaded') : t('scholar.libraryPaperNotDownloaded')}
+                                  </span>
+                                )}
+                                {activeLibraryId != null && activeLibraryId >= 0 && !p.downloaded_at && (
+                                  <>
+                                    <input
+                                      type="file"
+                                      accept=".pdf"
+                                      className="hidden"
+                                      id={`upload-pdf-${p.id}`}
+                                      onChange={(e) => {
+                                        const f = e.target.files?.[0];
+                                        if (f) handleUploadPdf(p, f);
+                                        e.target.value = '';
+                                      }}
+                                    />
+                                    <button
+                                      type="button"
+                                      onClick={() => document.getElementById(`upload-pdf-${p.id}`)?.click()}
+                                      disabled={!!uploadingPapers[p.id]}
+                                      className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-600/50 text-amber-400 hover:bg-slate-600/70 disabled:opacity-70"
+                                      title={t('scholar.uploadPdf')}
+                                    >
+                                      {uploadingPapers[p.id] ? (
+                                        <Loader2 size={10} className="animate-spin" />
+                                      ) : (
+                                        <Upload size={10} />
+                                      )}
+                                      {t('scholar.uploadPdf')}
+                                    </button>
+                                  </>
+                                )}
+                              </div>
+                              {p.doi && (
+                                <a
+                                  href={`https://doi.org/${p.doi}`}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="text-xs text-sky-500/80 hover:text-sky-400 hover:underline truncate block mt-0.5"
+                                  title={`DOI: ${p.doi}`}
+                                  onClick={(e) => e.stopPropagation()}
+                                >
+                                  {p.doi}
+                                </a>
+                              )}
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => removeFromLibrary(activeLibraryId, p.id)}
+                              className="flex-shrink-0 p-1.5 rounded text-slate-400 hover:bg-red-500/20 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity"
+                              title={t('scholar.libraryRemoveFromCatalog')}
+                            >
+                              <Trash2 size={14} />
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
+            <div
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="Resize library panel"
+              onPointerDown={(e) => {
+                e.preventDefault();
+                setIsResizingLibraryPanel(true);
+              }}
+              className={`hidden md:flex w-3 -mx-1 flex-shrink-0 flex-col items-center justify-center gap-2 cursor-col-resize select-none touch-none ${isResizingLibraryPanel ? 'opacity-100' : 'opacity-70 hover:opacity-100'}`}
+            >
+              <div className="h-full w-px bg-slate-700/80" />
+              <div className="h-14 w-1.5 rounded-full bg-slate-500/60" />
+            </div>
+          </>
         )}
 
         <div className="flex-1 min-w-0 flex flex-col">
@@ -916,10 +1470,147 @@ export function ScholarPage() {
 
             {results.length > 0 && !isSearching && (
               <>
+                {/* Filter/sort bar (collapsible) */}
+                <div className="flex-shrink-0 border-b border-slate-700/60 bg-slate-800/40">
+                  <button
+                    type="button"
+                    onClick={() => setFilterBarCollapsed((c) => !c)}
+                    className="w-full flex items-center justify-between px-4 py-2 text-left text-sm text-slate-400 hover:text-slate-200"
+                  >
+                    <span>
+                      {t('scholar.sortBy')}: {t(sortField === 'score' ? 'scholar.sortRelevance' : sortField === 'year' ? 'scholar.sortYear' : 'scholar.sortImpactFactor')}{' '}
+                      · {sortDir === 'asc' ? t('scholar.sortAsc') : t('scholar.sortDesc')}
+                      {activeFilterCount > 0 && ` · ${activeFilterCount} ${t('scholar.filtersActive')}`}
+                    </span>
+                    {filterBarCollapsed ? <ChevronDown size={16} /> : <ChevronUp size={16} />}
+                  </button>
+                  {!filterBarCollapsed && (
+                    <div className="px-4 pb-3 pt-0 flex flex-wrap items-end gap-3">
+                      <div className="w-32">
+                        <label className="block text-xs text-slate-500 mb-0.5">{t('scholar.filterJournal')}</label>
+                        <input
+                          type="text"
+                          value={filterJournal}
+                          onChange={(e) => setFilterJournal(e.target.value)}
+                          placeholder=""
+                          className="w-full rounded border border-slate-600/80 bg-slate-800/60 px-2 py-1.5 text-slate-200 text-sm"
+                        />
+                      </div>
+                      <div className="w-20">
+                        <label className="block text-xs text-slate-500 mb-0.5">{t('scholar.filterYearMin')}</label>
+                        <input
+                          type="number"
+                          value={filterYearMin ?? ''}
+                          onChange={(e) => setFilterYearMin(e.target.value ? parseInt(e.target.value, 10) : null)}
+                          placeholder="—"
+                          className="w-full rounded border border-slate-600/80 bg-slate-800/60 px-2 py-1.5 text-slate-200 text-sm"
+                        />
+                      </div>
+                      <div className="w-20">
+                        <label className="block text-xs text-slate-500 mb-0.5">{t('scholar.filterYearMax')}</label>
+                        <input
+                          type="number"
+                          value={filterYearMax ?? ''}
+                          onChange={(e) => setFilterYearMax(e.target.value ? parseInt(e.target.value, 10) : null)}
+                          placeholder="—"
+                          className="w-full rounded border border-slate-600/80 bg-slate-800/60 px-2 py-1.5 text-slate-200 text-sm"
+                        />
+                      </div>
+                      <div className="w-24">
+                        <label className="block text-xs text-slate-500 mb-0.5">{t('scholar.filterImpactFactor')}</label>
+                        <input
+                          type="number"
+                          step={0.1}
+                          value={filterIfMin ?? ''}
+                          onChange={(e) => setFilterIfMin(e.target.value ? parseFloat(e.target.value) : null)}
+                          placeholder="—"
+                          className="w-full rounded border border-slate-600/80 bg-slate-800/60 px-2 py-1.5 text-slate-200 text-sm"
+                        />
+                      </div>
+                      <div className="w-28">
+                        <label className="block text-xs text-slate-500 mb-0.5">{t('scholar.filterSource')}</label>
+                        <select
+                          value={filterSource}
+                          onChange={(e) => setFilterSource(e.target.value as ScholarSource | 'all')}
+                          className="w-full rounded border border-slate-600/80 bg-slate-800/60 px-2 py-1.5 text-slate-200 text-sm"
+                        >
+                          <option value="all">{t('scholar.statusAll')}</option>
+                          {SOURCE_OPTIONS.map((opt) => (
+                            <option key={opt.value} value={opt.value}>
+                              {t(opt.labelKey)}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                      {activeLibraryId != null && (
+                        <div className="w-28">
+                          <label className="block text-xs text-slate-500 mb-0.5">{t('scholar.filterStatus')}</label>
+                          <select
+                            value={filterStatus}
+                            onChange={(e) => setFilterStatus(e.target.value as 'all' | 'downloaded' | 'not_downloaded')}
+                            className="w-full rounded border border-slate-600/80 bg-slate-800/60 px-2 py-1.5 text-slate-200 text-sm"
+                          >
+                            <option value="all">{t('scholar.statusAll')}</option>
+                            <option value="downloaded">{t('scholar.statusDownloaded')}</option>
+                            <option value="not_downloaded">{t('scholar.statusNotDownloaded')}</option>
+                          </select>
+                        </div>
+                      )}
+                      <label className="flex items-center gap-2 text-sm text-slate-400">
+                        <input
+                          type="checkbox"
+                          checked={filterDownloadableOnly}
+                          onChange={(e) => setFilterDownloadableOnly(e.target.checked)}
+                          className="rounded border-slate-500"
+                        />
+                        {t('scholar.filterDownloadableOnly')}
+                      </label>
+                      <div className="flex items-center gap-2">
+                        <label className="text-xs text-slate-500">{t('scholar.sortBy')}</label>
+                        <select
+                          value={sortField}
+                          onChange={(e) => setSortField(e.target.value as 'score' | 'year' | 'impact_factor')}
+                          className="rounded border border-slate-600/80 bg-slate-800/60 px-2 py-1.5 text-slate-200 text-sm"
+                        >
+                          <option value="score">{t('scholar.sortRelevance')}</option>
+                          <option value="year">{t('scholar.sortYear')}</option>
+                          <option value="impact_factor">{t('scholar.sortImpactFactor')}</option>
+                        </select>
+                        <button
+                          type="button"
+                          onClick={() => setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'))}
+                          className="px-2 py-1.5 rounded border border-slate-600/80 bg-slate-800/60 text-slate-400 hover:text-slate-200 text-sm"
+                          title={sortDir === 'asc' ? t('scholar.sortDesc') : t('scholar.sortAsc')}
+                        >
+                          {sortDir === 'asc' ? '↑' : '↓'}
+                        </button>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setFilterJournal('');
+                          setFilterYearMin(null);
+                          setFilterYearMax(null);
+                          setFilterIfMin(null);
+                          setFilterSource('all');
+                          setFilterStatus('all');
+                          setFilterDownloadableOnly(false);
+                        }}
+                        className="px-3 py-1.5 rounded border border-slate-600/80 bg-slate-700/50 text-slate-400 hover:text-slate-200 text-sm"
+                      >
+                        {t('scholar.resetFilters')}
+                      </button>
+                    </div>
+                  )}
+                </div>
                 {/* Table header with select all */}
                 <div className="flex-shrink-0 flex items-center gap-2 px-4 py-2 border-b border-slate-700/60 bg-slate-800/50">
                   <button
-                    onClick={() => (allSelected ? clearSelection() : selectAll())}
+                    onClick={() =>
+                      allSelected
+                        ? clearSelection()
+                        : setSelectedIndices(filteredResults.map(({ originalIndex }) => originalIndex))
+                    }
                     className="p-1 rounded text-slate-400 hover:text-sky-400 transition-colors"
                     title={allSelected ? t('scholar.clearSelection') : t('scholar.selectAll')}
                   >
@@ -927,25 +1618,55 @@ export function ScholarPage() {
                   </button>
                   <span className="font-medium text-slate-200">{t('scholar.searchResultsTitle')}</span>
                   <span className="text-slate-500 text-sm">
-                    {results.length} {t('scholar.resultsCount')}
+                    {filteredResults.length}
+                    {filteredResults.length !== results.length && ` / ${results.length}`}{' '}
+                    {t('scholar.resultsCount')}
                   </span>
+                  {activeFilterCount > 0 && (
+                    <span className="text-xs text-sky-400" title={t('scholar.filtersActive')}>
+                      ({activeFilterCount})
+                    </span>
+                  )}
                 </div>
 
                 <div className="flex-1 overflow-y-auto">
+                  {filteredResults.length === 0 && (
+                    <div className="h-full flex flex-col items-center justify-center py-16 px-4 text-center">
+                      <AlertCircle className="text-slate-500 mb-3" size={28} />
+                      <p className="text-slate-300 text-sm">{t('scholar.noMatchFilters')}</p>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setFilterJournal('');
+                          setFilterYearMin(null);
+                          setFilterYearMax(null);
+                          setFilterIfMin(null);
+                          setFilterSource('all');
+                          setFilterStatus('all');
+                          setFilterDownloadableOnly(false);
+                        }}
+                        className="mt-3 px-3 py-1.5 rounded border border-slate-600/80 bg-slate-700/50 text-slate-300 hover:text-slate-100 text-xs"
+                      >
+                        {t('scholar.resetFilters')}
+                      </button>
+                    </div>
+                  )}
                   {/* Desktop table */}
-                  <table className="w-full hidden md:table text-left text-sm">
+                  <table className={`w-full text-left text-sm ${filteredResults.length === 0 ? 'hidden' : 'hidden md:table'}`}>
                     <thead className="sticky top-0 bg-slate-800/90 border-b border-slate-700/60 z-10">
                       <tr className="text-slate-400">
                         <th className="w-10 py-2 px-2"></th>
                         <th className="py-2 px-3 font-medium">{t('scholar.colTitle')}</th>
                         <th className="py-2 px-3 font-medium w-32">{t('scholar.colAuthors')}</th>
                         <th className="py-2 px-3 font-medium w-16">{t('scholar.colYear')}</th>
+                        <th className="py-2 px-3 font-medium w-28">{t('scholar.colJournal')}</th>
+                        <th className="py-2 px-3 font-medium w-20">{t('scholar.colImpactFactor')}</th>
                         <th className="py-2 px-3 font-medium w-24">{t('scholar.colSource')}</th>
                         <th className="py-2 px-3 font-medium w-28">{t('scholar.colActions')}</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {results.map((item, index) => {
+                      {filteredResults.map(({ result: item, originalIndex: index }) => {
                         const m = item.metadata;
                         const selected = selectedIndices.includes(index);
                         const isDownloading = downloadingIndex === index;
@@ -981,6 +1702,30 @@ export function ScholarPage() {
                             </td>
                             <td className="py-2 px-3 text-slate-400 text-xs line-clamp-2">{m.authors?.join(', ') || '—'}</td>
                             <td className="py-2 px-3 text-slate-400">{m.year ?? '—'}</td>
+                            <td className="py-2 px-3 text-slate-400 text-xs max-w-[140px] truncate" title={m.venue ?? ''}>
+                              {m.venue ?? '—'}
+                            </td>
+                            <td className="py-2 px-3">
+                              {m.impact_factor != null ? (
+                                <span
+                                  className={`inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium ${
+                                    m.jif_quartile === 'Q1'
+                                      ? 'bg-emerald-500/20 text-emerald-400'
+                                      : m.jif_quartile === 'Q2'
+                                        ? 'bg-sky-500/20 text-sky-400'
+                                        : m.jif_quartile === 'Q3'
+                                          ? 'bg-amber-500/20 text-amber-400'
+                                          : 'bg-slate-500/20 text-slate-400'
+                                  }`}
+                                  title={m.jif_quartile ?? ''}
+                                >
+                                  {m.impact_factor}
+                                  {m.jif_quartile ? ` ${m.jif_quartile}` : ''}
+                                </span>
+                              ) : (
+                                '—'
+                              )}
+                            </td>
                             <td className="py-2 px-3 text-slate-500 text-xs">{m.source}</td>
                             <td className="py-2 px-3">
                               <div className="flex items-center gap-1">
@@ -1030,8 +1775,8 @@ export function ScholarPage() {
                   </table>
 
                   {/* Mobile cards */}
-                  <div className="md:hidden divide-y divide-slate-700/40">
-                    {results.map((item, index) => {
+                  <div className={`divide-y divide-slate-700/40 ${filteredResults.length === 0 ? 'hidden' : 'md:hidden'}`}>
+                    {filteredResults.map(({ result: item, originalIndex: index }) => {
                       const m = item.metadata;
                       const selected = selectedIndices.includes(index);
                       const isDownloading = downloadingIndex === index;
@@ -1047,6 +1792,12 @@ export function ScholarPage() {
                             <div className="flex-1 min-w-0">
                               <p className="text-slate-200 font-medium line-clamp-2">{m.title}</p>
                               <p className="text-xs text-slate-500 mt-1">{m.authors?.join(', ') || '—'}</p>
+                              {(m.venue || m.impact_factor != null) && (
+                                <p className="text-xs text-slate-400 mt-0.5">
+                                  {m.venue ?? ''}
+                                  {m.impact_factor != null && ` · IF ${m.impact_factor}${m.jif_quartile ? ` ${m.jif_quartile}` : ''}`}
+                                </p>
+                              )}
                               {m.doi && (
                                 <a
                                   href={`https://doi.org/${m.doi}`}

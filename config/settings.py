@@ -148,6 +148,40 @@ class WebSearchConfig:
 
 
 @dataclass
+class SharedBrowserConfig:
+    """Resident CDP browsers: headless (search/fetch) and headed (download). Both started at app startup.
+    Context pools are sized here; feature-level max_concurrent_* consume this budget."""
+    start_headless: bool = True
+    """Start shared headless browser at startup (port headless_port)."""
+    start_headed: bool = True
+    """Start shared headed browser at startup (port headed_port)."""
+    headless_port: int = 9222
+    """CDP port for the headless shared browser."""
+    headed_port: int = 9223
+    """CDP port for the headed shared browser (minimized/hidden by default)."""
+    headless_context_pool_size: int = 2
+    """Number of resident headless contexts (shared by search + web_content_fetcher)."""
+    headed_context_pool_size: int = 2
+    """Number of resident headed contexts (used by scholar_downloader)."""
+    context_acquire_timeout_seconds: float = 30.0
+    """Max wait when acquiring a context lease."""
+    context_idle_ttl_seconds: float = 300.0
+    """Idle TTL for pool slot metadata; unused for eviction (contexts stay resident)."""
+    context_cooldown_min_seconds: float = 1.0
+    """Min cooldown after releasing a context (random in [min, max])."""
+    context_cooldown_max_seconds: float = 2.0
+    """Max cooldown after releasing a context."""
+    headed_window_width: int = 1280
+    """Initial width of the shared headed browser window."""
+    headed_window_height: int = 900
+    """Initial height of the shared headed browser window."""
+    headed_window_visible_strip_px: int = 100
+    """Keep this many pixels visible when parking the headed browser off-screen."""
+    headed_window_y: int = 80
+    """Initial Y position of the parked headed browser window."""
+
+
+@dataclass
 class GoogleSearchConfig:
     """Google Scholar / Google 搜索配置（CapSolver 扩展路径使用全局 capsolver_extension_path）"""
     enabled: bool = True
@@ -159,9 +193,9 @@ class GoogleSearchConfig:
     max_results: int = 5
     user_data_dir: Optional[str] = None
     headed_browser_port: int = 9223
-    """CDP port for the optional headed (minimized) shared browser."""
+    """CDP port for the optional headed (minimized) shared browser. Prefer shared_browser.headed_port when set."""
     start_headed_browser: bool = False
-    """Whether to start the headed browser at app startup; if False, it is started on demand."""
+    """Whether to start the headed browser at app startup; prefer shared_browser.start_headed when set."""
 
 
 @dataclass
@@ -275,6 +309,14 @@ class ScholarDownloaderSettings:
     use_scihub: bool = True
     scihub_mirrors: List[str] = field(default_factory=lambda: ["https://sci-hub.st/", "https://sci-hub.ru/"])
     llm_provider: str = "qwen-thinking"  # LLM for downloader assist (button detection); UI can override per request
+    default_strategy_order: List[str] = field(default_factory=lambda: [
+        "direct_download",
+        "playwright_download",
+        "browser_lookup",
+        "sci_hub",
+        "brightdata",
+        "anna",
+    ])
 
 
 @dataclass
@@ -504,6 +546,11 @@ def _get_capsolver_extension_path() -> str:
     return (str(_RAW_CONFIG.get("capsolver_extension_path") or "extra_tools/CapSolverExtension")).strip()
 
 
+def _shared_browser_from_config() -> Dict[str, Any]:
+    """Shared CDP browser: headless + headed resident services (search + download)."""
+    return (_RAW_CONFIG.get("shared_browser") or {})
+
+
 def _google_search_from_config() -> Dict[str, Any]:
     return (_RAW_CONFIG.get("google_search") or {})
 
@@ -714,6 +761,23 @@ class Settings:
             max_queries=min(int(w.get("max_queries", 4)), 8),
         )
         self.capsolver_extension_path = _get_capsolver_extension_path()
+        sb = _shared_browser_from_config()
+        self.shared_browser = SharedBrowserConfig(
+            start_headless=bool(sb.get("start_headless", True)),
+            start_headed=bool(sb.get("start_headed", True)),
+            headless_port=int(sb.get("headless_port", 9222)),
+            headed_port=int(sb.get("headed_port", 9223)),
+            headless_context_pool_size=max(1, int(sb.get("headless_context_pool_size", 2))),
+            headed_context_pool_size=max(1, int(sb.get("headed_context_pool_size", 2))),
+            context_acquire_timeout_seconds=float(sb.get("context_acquire_timeout_seconds", 30)),
+            context_idle_ttl_seconds=float(sb.get("context_idle_ttl_seconds", 300)),
+            context_cooldown_min_seconds=float(sb.get("context_cooldown_min_seconds", 1)),
+            context_cooldown_max_seconds=float(sb.get("context_cooldown_max_seconds", 2)),
+            headed_window_width=max(400, int(sb.get("headed_window_width", 1280))),
+            headed_window_height=max(300, int(sb.get("headed_window_height", 900))),
+            headed_window_visible_strip_px=max(16, int(sb.get("headed_window_visible_strip_px", 100))),
+            headed_window_y=max(0, int(sb.get("headed_window_y", 80))),
+        )
         g = _google_search_from_config()
         self.google_search = GoogleSearchConfig(
             enabled=g.get("enabled", True),
@@ -721,7 +785,7 @@ class Settings:
             google_enabled=g.get("google_enabled", False),
             headless=g.get("headless"),
             proxy=g.get("proxy"),
-            timeout=int(g.get("timeout", 60000)),
+            timeout=int(g.get("timeout", 200000)),
             max_results=min(int(g.get("max_results", 5)), 20),
             user_data_dir=g.get("user_data_dir"),
             headed_browser_port=int(g.get("headed_browser_port", 9223)),
@@ -893,6 +957,14 @@ class Settings:
             use_scihub=bool(sd.get("use_scihub", True)),
             scihub_mirrors=list(sd.get("scihub_mirrors") or ["https://sci-hub.st/", "https://sci-hub.ru/"]),
             llm_provider=str(sd.get("llm_provider", "qwen-thinking")),
+            default_strategy_order=list(sd.get("default_strategy_order") or [
+                "direct_download",
+                "playwright_download",
+                "browser_lookup",
+                "sci_hub",
+                "brightdata",
+                "anna",
+            ]),
         )
 
     @property

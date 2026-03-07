@@ -91,20 +91,30 @@ async def lifespan(app: FastAPI):
     # 3. 初始化全局 DebugLogger
     from src.debug import init_debug_logger
     dl = init_debug_logger(enabled=settings.debug)
-    logger.info("[startup] debug mode: %s (log_dir=%s)", "ON" if dl.enabled else "OFF", dl.log_dir)
+    if dl.enabled:
+        logger.info("[startup] debug mode: ON (log_dir=%s)", dl.log_dir)
 
-    # 4. 启动共享浏览器：无头实例（默认）+ 可选有头实例（最小化）
-    try:
-        await SharedBrowserService.start()
-    except Exception as e:
-        logger.warning("[startup] shared headless browser start failed, fallback to local launch: %s", e)
-    gs_cfg = getattr(settings, "google_search", None)
-    if getattr(gs_cfg, "start_headed_browser", False):
+    # 4. 启动共享浏览器：无头 + 有头两个常驻服务（双端口），失败则回退到本地 launch
+    sb = getattr(settings, "shared_browser", None)
+    if sb is None:
+        sb = type("Fake", (), {"start_headless": True, "start_headed": False, "headless_port": 9222, "headed_port": 9223})()
+    if getattr(sb, "start_headless", True):
         try:
-            headed_port = getattr(gs_cfg, "headed_browser_port", 9223)
-            await SharedBrowserService.start_headed(port=headed_port)
+            await SharedBrowserService.start(port=getattr(sb, "headless_port", 9222))
         except Exception as e:
-            logger.warning("[startup] shared headed browser start failed: %s", e)
+            logger.warning("[startup] shared headless browser start failed, fallback to local launch: %s", e)
+    if getattr(sb, "start_headed", True):
+        try:
+            await SharedBrowserService.start_headed(port=getattr(sb, "headed_port", 9223))
+        except Exception as e:
+            logger.warning("[startup] shared headed browser start failed, fallback to local launch: %s", e)
+
+    # 4b. 初始化 resident context 池（headless + headed）
+    try:
+        from src.retrieval.context_pool import SharedContextPool
+        await SharedContextPool.get_instance().initialize()
+    except Exception as e:
+        logger.warning("[startup] context pool init failed: %s", e)
 
     # 5. 启动后台任务轮询 Worker
     worker_task = asyncio.create_task(run_background_worker())
@@ -122,6 +132,11 @@ async def lifespan(app: FastAPI):
         shutdown_adapter()
     except Exception as e:
         logger.warning("shutdown_adapter failed: %s", e)
+    try:
+        from src.retrieval.context_pool import SharedContextPool
+        await SharedContextPool.get_instance().shutdown()
+    except Exception as e:
+        logger.warning("context pool shutdown failed: %s", e)
     try:
         await SharedBrowserService.stop()
     except Exception as e:

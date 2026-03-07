@@ -1,7 +1,9 @@
 """
 日志管理模块：分级日志、按运行实例命名、自动清理。
+支持环境变量 RAG_LOG_LEVEL（DEBUG/INFO/WARNING/ERROR）覆盖配置文件，便于 start.sh --debug 等场景。
 """
 import logging
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -31,7 +33,7 @@ class LogManager:
         self.max_age_days = int(config.get("max_age_days", DEFAULT_MAX_AGE_DAYS))
         self.min_keep_mb = int(config.get("min_keep_mb", DEFAULT_MIN_KEEP_MB))
         self.console_output = config.get("console_output", DEFAULT_CONSOLE_OUTPUT)
-        level_name = (config.get("level") or DEFAULT_LEVEL).upper()
+        level_name = (os.environ.get("RAG_LOG_LEVEL") or config.get("level") or DEFAULT_LEVEL).upper()
         self.level = getattr(logging, level_name, logging.INFO)
 
         self._run_log_path: Path | None = None

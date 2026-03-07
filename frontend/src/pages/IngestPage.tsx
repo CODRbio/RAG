@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Database,
   HardDrive,
@@ -14,6 +14,7 @@ import {
   ChevronLeft,
   ChevronRight,
   List,
+  Link2,
 } from 'lucide-react';
 import { useConfigStore, useUIStore, useToastStore } from '../stores';
 import { Modal } from '../components/ui/Modal';
@@ -24,6 +25,8 @@ import {
   getCollectionScope,
   updateCollectionScope,
   refreshCollectionScope,
+  ensureCollectionLibraryBinding,
+  repairCollectionLibraryBinding,
   listPapers,
   deletePaper,
   uploadFiles,
@@ -39,6 +42,14 @@ import {
   type UploadedFile,
   type EnrichmentOptions,
 } from '../api/ingest';
+import {
+  listLibraries as listScholarLibraries,
+  getLibraryPapers as getScholarLibraryPapers,
+  ingestScholarLibrary,
+  importLibraryPdfs,
+  type LibraryImportPdfSummary,
+  type ScholarLibrary,
+} from '../api/scholar';
 
 // ---- Types ----
 
@@ -53,6 +64,10 @@ interface FileItem {
   chunks?: number;
   /** 上传后后端返回的路径 */
   serverPath?: string;
+}
+
+interface IngestScholarLibraryOption extends ScholarLibrary {
+  downloaded_count: number;
 }
 
 const STATUS_LABELS: Record<FileStatus, string> = {
@@ -91,7 +106,7 @@ const COLLECTION_TEMPLATES = [
 // ---- Component ----
 
 export function IngestPage() {
-  const { dbAddress, setDbStatus, currentCollection, setCurrentCollection, setCollections, addCollection } =
+  const { dbAddress, setDbStatus, currentCollection, setCurrentCollection, setCollections, setCollectionInfos, addCollection } =
     useConfigStore();
   const { showCreateCollectionModal, setShowCreateCollectionModal } = useUIStore();
   const addToast = useToastStore((s) => s.addToast);
@@ -147,9 +162,36 @@ export function IngestPage() {
   const [scopeUpdatedAt, setScopeUpdatedAt] = useState<string | null>(null);
   const [scopeModalLoading, setScopeModalLoading] = useState(false);
   const [scopeModalSaving, setScopeModalSaving] = useState(false);
+  const [bindingEnsuringCollection, setBindingEnsuringCollection] = useState<string | null>(null);
+  const [bindingRepairingCollection, setBindingRepairingCollection] = useState<string | null>(null);
+  const [scholarLibraries, setScholarLibraries] = useState<IngestScholarLibraryOption[]>([]);
+  const [scholarLibrariesLoading, setScholarLibrariesLoading] = useState(false);
+  const [selectedScholarLibraryId, setSelectedScholarLibraryId] = useState<number | null>(null);
+  const [autoDownloadMissingScholarPdfs, setAutoDownloadMissingScholarPdfs] = useState(false);
+  const [boundLibraryImportFiles, setBoundLibraryImportFiles] = useState<File[]>([]);
+  const [boundLibraryImporting, setBoundLibraryImporting] = useState(false);
+  const [boundLibraryImportSummary, setBoundLibraryImportSummary] = useState<LibraryImportPdfSummary | null>(null);
+  const selectedScholarLibrary = useMemo(
+    () => scholarLibraries.find((lib) => lib.id === selectedScholarLibraryId) ?? null,
+    [scholarLibraries, selectedScholarLibraryId],
+  );
+  const currentCollectionInfo = useMemo(
+    () => backendCollections.find((c) => c.name === currentCollection),
+    [backendCollections, currentCollection],
+  );
+  const boundScholarLibraryId = currentCollectionInfo?.associated_library_id ?? null;
+  const boundScholarLibraryName = currentCollectionInfo?.associated_library_name || null;
+  const boundScholarLibrary = useMemo(
+    () =>
+      (boundScholarLibraryId != null
+        ? scholarLibraries.find((lib) => lib.id === boundScholarLibraryId) ?? null
+        : null),
+    [boundScholarLibraryId, scholarLibraries],
+  );
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
+  const boundLibraryFolderInputRef = useRef<HTMLInputElement>(null);
   const abortRef = useRef<AbortController | null>(null);
 
   // ---- Auto-connect & load collections on mount ----
@@ -163,6 +205,7 @@ export function IngestPage() {
       // Sync to config store
       const names = cols.map((c) => c.name);
       setCollections(names);
+      setCollectionInfos(cols);
       // If current collection not in list, select first
       if (names.length > 0 && !names.includes(currentCollection)) {
         setCurrentCollection(names[0]);
@@ -173,7 +216,7 @@ export function IngestPage() {
     } finally {
       setCollectionsLoading(false);
     }
-  }, [currentCollection, setCollections, setCurrentCollection, setDbStatus, addToast]);
+  }, [currentCollection, setCollectionInfos, setCollections, setCurrentCollection, setDbStatus, addToast]);
 
   const loadLlmProviderOptions = useCallback(async () => {
     try {
@@ -200,9 +243,39 @@ export function IngestPage() {
     }
   }, []);
 
+  const loadScholarLibrariesForIngest = useCallback(async () => {
+    setScholarLibrariesLoading(true);
+    try {
+      const libs = (await listScholarLibraries()).filter((lib) => lib.id >= 0);
+      const enriched = await Promise.all(
+        libs.map(async (lib) => {
+          try {
+            const papers = await getScholarLibraryPapers(lib.id);
+            const downloaded_count = papers.filter((p) => Boolean(p.is_downloaded || p.downloaded_at)).length;
+            return { ...lib, downloaded_count } as IngestScholarLibraryOption;
+          } catch {
+            return { ...lib, downloaded_count: 0 } as IngestScholarLibraryOption;
+          }
+        }),
+      );
+      setScholarLibraries(enriched);
+      setSelectedScholarLibraryId((prev) => {
+        if (prev != null && enriched.some((lib) => lib.id === prev)) return prev;
+        return enriched[0]?.id ?? null;
+      });
+    } catch (err) {
+      console.warn('Failed to load scholar libraries for ingest', err);
+      setScholarLibraries([]);
+      setSelectedScholarLibraryId(null);
+    } finally {
+      setScholarLibrariesLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     loadCollections();
     loadLlmProviderOptions();
+    loadScholarLibrariesForIngest();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -363,6 +436,56 @@ export function IngestPage() {
     e.preventDefault();
     setIsDragOver(false);
     if (e.dataTransfer.files) addFilesToList(e.dataTransfer.files);
+  };
+
+  const handlePickBoundLibraryFolder = () => boundLibraryFolderInputRef.current?.click();
+
+  const handleBoundLibraryFolderChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const picked = Array.from(e.target.files ?? []).filter((f) => f.name.toLowerCase().endsWith('.pdf'));
+    setBoundLibraryImportFiles(picked);
+    setBoundLibraryImportSummary(null);
+    if (picked.length === 0) {
+      addToast('未找到可导入的 PDF 文件', 'info');
+    } else {
+      addToast(`已选择 ${picked.length} 个 PDF，点击“导入到绑定文献库”开始`, 'info');
+    }
+    e.target.value = '';
+  };
+
+  const handleImportBoundLibraryPdfs = async () => {
+    if (!currentCollection) {
+      addToast('请先选择集合', 'info');
+      return;
+    }
+    if (boundScholarLibraryId == null || boundScholarLibraryId < 0) {
+      addToast('当前集合尚未绑定永久文献库，请先点击“确保绑定”', 'info');
+      return;
+    }
+    if (boundLibraryImportFiles.length === 0) {
+      addToast('请先选择包含 PDF 的文件夹', 'info');
+      return;
+    }
+    if (boundLibraryImporting) return;
+    setBoundLibraryImporting(true);
+    try {
+      const summary = await importLibraryPdfs(boundScholarLibraryId, boundLibraryImportFiles);
+      setBoundLibraryImportSummary(summary);
+      setBoundLibraryImportFiles([]);
+      await loadScholarLibrariesForIngest();
+      await loadCollections();
+      addToast(
+        `导入完成：新增 ${summary.imported}，关联已有 ${summary.linked_existing}，跳过重复 ${summary.skipped_duplicates}`,
+        'success',
+      );
+      if (summary.errors.length > 0) {
+        addToast(`部分文件处理失败（${summary.errors.length}）`, 'error');
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      addToast(`导入失败: ${msg}`, 'error');
+    } finally {
+      setBoundLibraryImporting(false);
+    }
   };
 
   // ---- Upload & Process ----
@@ -653,6 +776,82 @@ export function IngestPage() {
     }
   };
 
+  const handleStartScholarLibraryIngest = async () => {
+    if (!selectedScholarLibraryId) {
+      addToast('请先选择一个文献库', 'info');
+      return;
+    }
+    if (!currentCollection) {
+      addToast('请先选择一个目标集合', 'info');
+      return;
+    }
+    if (isProcessing) {
+      addToast('当前有任务正在运行，请稍后重试', 'info');
+      return;
+    }
+    if (!selectedScholarLibrary) {
+      addToast('所选文献库不存在，请刷新后重试', 'error');
+      return;
+    }
+    if (!autoDownloadMissingScholarPdfs && selectedScholarLibrary.downloaded_count <= 0) {
+      addToast('该文献库暂无已下载 PDF，请先下载或开启“自动下载缺失 PDF”', 'info');
+      return;
+    }
+    const missingCount = Math.max(0, selectedScholarLibrary.paper_count - selectedScholarLibrary.downloaded_count);
+    const confirmed = window.confirm(
+      `将从文献库「${selectedScholarLibrary.name}」向集合「${currentCollection}」发起增量建库。\n` +
+      `总文献 ${selectedScholarLibrary.paper_count}，已下载 ${selectedScholarLibrary.downloaded_count}，缺失 ${missingCount}。\n` +
+      `${autoDownloadMissingScholarPdfs ? '已开启自动下载缺失 PDF，任务耗时可能较长。' : '未开启自动下载缺失 PDF。'}\n继续执行吗？`,
+    );
+    if (!confirmed) return;
+
+    setIsProcessing(true);
+    setGlobalProgress('正在提交文献库增量建库任务...');
+    const abortCtrl = new AbortController();
+    abortRef.current = abortCtrl;
+    try {
+      const res = await ingestScholarLibrary(selectedScholarLibraryId, {
+        collection: currentCollection,
+        skip_duplicate_doi: true,
+        skip_unchanged: true,
+        auto_download_missing: autoDownloadMissingScholarPdfs,
+      });
+      if (!res?.job_id) {
+        throw new Error('未返回 job_id');
+      }
+      setActiveJobId(res.job_id);
+      localStorage.setItem('ingest_active_job_id', res.job_id);
+      setGlobalProgress(
+        `任务已提交：准备入库 ${res.pdf_ready_count} 篇（缺失 PDF ${res.missing_pdf_count} 篇）`,
+      );
+      if (res.attempted_downloads > 0) {
+        addToast(
+          `任务已启动：可入库 ${res.pdf_ready_count} 篇；自动下载 ${res.downloaded_now}/${res.attempted_downloads} 成功`,
+          'success',
+        );
+      } else {
+        addToast(
+          `文献库增量建库任务已启动（可入库 ${res.pdf_ready_count} 篇）`,
+          'success',
+        );
+      }
+
+      for await (const evt of streamIngestJobEvents(res.job_id, abortCtrl.signal, 0)) {
+        applyIngestEvent(evt);
+      }
+    } catch (err) {
+      if ((err as Error).name !== 'AbortError') {
+        const msg = err instanceof Error ? err.message : String(err);
+        addToast(`文献库增量建库失败: ${msg}`, 'error');
+        setGlobalProgress(`失败: ${msg}`);
+      }
+    } finally {
+      setIsProcessing(false);
+      setIsCancelling(false);
+      abortRef.current = null;
+    }
+  };
+
 
   const handleAbort = async () => {
     if (isCancelling) return;
@@ -794,6 +993,44 @@ export function IngestPage() {
     }
   };
 
+  const handleEnsureBinding = async (name: string) => {
+    setBindingEnsuringCollection(name);
+    try {
+      const result = await ensureCollectionLibraryBinding(name);
+      addToast(
+        result.library_created
+          ? `已为「${name}」创建并绑定文献库「${result.associated_library_name}」`
+          : `已确认「${name}」绑定文献库「${result.associated_library_name}」`,
+        'success',
+      );
+      await loadCollections();
+      await loadScholarLibrariesForIngest();
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      addToast(`绑定失败: ${msg}`, 'error');
+    } finally {
+      setBindingEnsuringCollection(null);
+    }
+  };
+
+  const handleRepairBinding = async (name: string) => {
+    setBindingRepairingCollection(name);
+    try {
+      const result = await repairCollectionLibraryBinding(name, { auto_create_binding: true, max_scan: 300 });
+      addToast(
+        `修复完成：扫描${result.scanned}，DOI匹配${result.matched_by_doi}，标题匹配${result.matched_by_title}，新增记录${result.created_library_records}，复制PDF${result.copied_pdfs}`,
+        'success',
+      );
+      await loadCollections();
+      await loadScholarLibrariesForIngest();
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      addToast(`修复失败: ${msg}`, 'error');
+    } finally {
+      setBindingRepairingCollection(null);
+    }
+  };
+
   // ---- Delete collection ----
   const handleDeleteCollection = async (name: string) => {
     if (!window.confirm(`确定要删除集合「${name}」？此操作不可恢复，集合内所有数据将被永久删除。`)) {
@@ -819,7 +1056,6 @@ export function IngestPage() {
   const doneCount = files.filter((f) => f.status === 'done').length;
   const skippedCount = files.filter((f) => f.status === 'skipped').length;
   const errorCount = files.filter((f) => f.status === 'error').length;
-  const currentCollectionInfo = backendCollections.find((c) => c.name === currentCollection);
   const hasCollections = backendCollections.length > 0;
   const isConnected = !connectError && !collectionsLoading;
   const canUpload = hasCollections && isConnected;
@@ -879,6 +1115,18 @@ export function IngestPage() {
         className="hidden"
         onChange={handleFileInputChange}
       />
+      <input
+        ref={boundLibraryFolderInputRef}
+        id="bound-library-folder-input"
+        name="bound-library-folder-input"
+        type="file"
+        accept=".pdf"
+        multiple
+        // @ts-expect-error: webkitdirectory is non-standard but widely supported
+        webkitdirectory=""
+        className="hidden"
+        onChange={handleBoundLibraryFolderChange}
+      />
 
       {/* 状态卡片 */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
@@ -917,6 +1165,14 @@ export function IngestPage() {
                     <span>文档数:</span>
                     <span className="text-white">
                       {currentCollectionInfo.count >= 0 ? currentCollectionInfo.count : '?'}
+                    </span>
+                  </div>
+                )}
+                {currentCollectionInfo && (
+                  <div className="flex justify-between gap-2">
+                    <span>关联文献库:</span>
+                    <span className="text-white truncate text-right">
+                      {currentCollectionInfo.associated_library_name || '未绑定'}
                     </span>
                   </div>
                 )}
@@ -968,9 +1224,34 @@ export function IngestPage() {
                       <div className="text-xs text-gray-400">
                         {c.count >= 0 ? `${c.count} 条记录` : '加载中...'}
                       </div>
+                      <div className="text-[11px] text-gray-500 truncate">
+                        文献库: {c.associated_library_name || '未绑定'}
+                      </div>
                     </div>
                   </div>
                   <div className="flex items-center gap-1">
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleEnsureBinding(c.name);
+                      }}
+                      disabled={bindingEnsuringCollection === c.name}
+                      className="p-1.5 text-gray-300 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition-colors disabled:opacity-50"
+                      title="确保知识库与文献库绑定"
+                    >
+                      {bindingEnsuringCollection === c.name ? <Loader2 size={14} className="animate-spin" /> : <Link2 size={14} />}
+                    </button>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleRepairBinding(c.name);
+                      }}
+                      disabled={bindingRepairingCollection === c.name}
+                      className="p-1.5 text-gray-300 hover:text-violet-600 hover:bg-violet-50 rounded-lg transition-colors disabled:opacity-50"
+                      title="扫描 DOI/标题 修复文献库关联"
+                    >
+                      {bindingRepairingCollection === c.name ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
+                    </button>
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
@@ -1021,6 +1302,190 @@ export function IngestPage() {
             </div>
           )}
         </div>
+      </div>
+
+      {/* 绑定文献库管理：本地文件夹导入 PDF */}
+      <div className="bg-white border rounded-2xl p-6 shadow-sm">
+        <div className="flex items-center justify-between mb-4">
+          <div>
+            <h3 className="text-lg font-bold text-gray-900">绑定文献库管理</h3>
+            <p className="text-xs text-gray-500">
+              将本地文件夹中的 PDF 批量导入当前集合绑定的文献库，并按 DOI/标题规则自动关联命名
+            </p>
+          </div>
+          <button
+            onClick={loadScholarLibrariesForIngest}
+            disabled={scholarLibrariesLoading || boundLibraryImporting}
+            className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"
+            title="刷新文献库状态"
+          >
+            <RefreshCw size={16} className={scholarLibrariesLoading ? 'animate-spin' : ''} />
+          </button>
+        </div>
+
+        {!currentCollection ? (
+          <div className="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+            请先选择集合，再管理其绑定文献库。
+          </div>
+        ) : !boundScholarLibraryName ? (
+          <div className="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+            当前集合尚未绑定文献库，请先在集合列表中点击“确保绑定”。
+          </div>
+        ) : (
+          <div className="space-y-4">
+            <div className="text-sm text-gray-700 bg-gray-50 border border-gray-200 rounded-lg px-3 py-2">
+              当前集合：<span className="font-semibold text-gray-900">{currentCollection}</span> · 绑定文献库：
+              <span className="font-semibold text-gray-900 ml-1">{boundScholarLibraryName}</span>
+              {boundScholarLibrary ? (
+                <span className="text-xs text-gray-500 ml-2">
+                  （总文献 {boundScholarLibrary.paper_count}，已下载 {boundScholarLibrary.downloaded_count}）
+                </span>
+              ) : null}
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={handlePickBoundLibraryFolder}
+                disabled={boundLibraryImporting || isProcessing}
+                className="px-4 py-2 rounded-lg border border-gray-300 text-gray-700 text-sm font-medium hover:bg-gray-50 disabled:opacity-50"
+              >
+                选择本地 PDF 文件夹
+              </button>
+              <button
+                type="button"
+                onClick={handleImportBoundLibraryPdfs}
+                disabled={boundLibraryImportFiles.length === 0 || boundLibraryImporting || isProcessing}
+                className="px-4 py-2 rounded-lg bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 disabled:opacity-50 inline-flex items-center gap-2"
+              >
+                {boundLibraryImporting ? <Loader2 size={14} className="animate-spin" /> : null}
+                导入到绑定文献库
+              </button>
+              {boundLibraryImportFiles.length > 0 && (
+                <span className="text-xs text-gray-500">已选择 {boundLibraryImportFiles.length} 个 PDF</span>
+              )}
+            </div>
+
+            {boundLibraryImportFiles.length > 0 && (
+              <div className="text-xs text-gray-600 bg-gray-50 border border-gray-200 rounded-lg px-3 py-2 max-h-28 overflow-auto space-y-0.5">
+                {boundLibraryImportFiles.slice(0, 8).map((f, idx) => {
+                  const relPath = (f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name;
+                  return <div key={`${relPath}-${idx}`}>{relPath}</div>;
+                })}
+                {boundLibraryImportFiles.length > 8 ? (
+                  <div className="text-gray-400">... 还有 {boundLibraryImportFiles.length - 8} 个文件</div>
+                ) : null}
+              </div>
+            )}
+
+            {boundLibraryImportSummary && (
+              <div className="text-xs text-gray-700 bg-blue-50 border border-blue-100 rounded-lg px-3 py-2 space-y-1">
+                <div>
+                  导入统计：总计 {boundLibraryImportSummary.total_files}，新增 {boundLibraryImportSummary.imported}，关联已有{' '}
+                  {boundLibraryImportSummary.linked_existing}，重命名 {boundLibraryImportSummary.renamed}，跳过重复{' '}
+                  {boundLibraryImportSummary.skipped_duplicates}，无 DOI {boundLibraryImportSummary.no_doi}，无效 PDF{' '}
+                  {boundLibraryImportSummary.invalid_pdf}
+                </div>
+                {boundLibraryImportSummary.errors.length > 0 && (
+                  <div className="text-red-600">
+                    错误示例：{boundLibraryImportSummary.errors.slice(0, 2).join('；')}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* 文献库 -> 增量建库 */}
+      <div className="bg-white border rounded-2xl p-6 shadow-sm">
+        <div className="flex items-center justify-between mb-4">
+          <div>
+            <h3 className="text-lg font-bold text-gray-900">从文献库增量建库</h3>
+            <p className="text-xs text-gray-500">将 Scholar 文献库中已下载的 PDF 增量入库到当前集合</p>
+          </div>
+          <button
+            onClick={loadScholarLibrariesForIngest}
+            disabled={scholarLibrariesLoading}
+            className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"
+            title="刷新文献库列表"
+          >
+            <RefreshCw size={16} className={scholarLibrariesLoading ? 'animate-spin' : ''} />
+          </button>
+        </div>
+
+        {scholarLibrariesLoading ? (
+          <div className="text-sm text-gray-500 flex items-center gap-2">
+            <Loader2 size={14} className="animate-spin" />
+            正在加载文献库...
+          </div>
+        ) : scholarLibraries.length === 0 ? (
+          <div className="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+            暂无可用文献库。请先在“文献检索”页面创建并导入文献。
+          </div>
+        ) : (
+          <div className="space-y-4">
+            <div className="space-y-2 max-h-56 overflow-auto border rounded-xl bg-gray-50 p-2">
+              {scholarLibraries.map((lib) => (
+                <label
+                  key={lib.id}
+                  className={`flex items-center justify-between px-3 py-2 rounded-lg cursor-pointer border ${
+                    selectedScholarLibraryId === lib.id ? 'border-blue-400 bg-blue-50' : 'border-transparent hover:border-gray-300'
+                  }`}
+                >
+                  <span className="flex items-center gap-2 min-w-0">
+                    <input
+                      type="radio"
+                      name="scholar-library-ingest"
+                      checked={selectedScholarLibraryId === lib.id}
+                      onChange={() => setSelectedScholarLibraryId(lib.id)}
+                      className="accent-blue-600"
+                    />
+                    <span className="min-w-0">
+                      <span className="block text-sm font-medium text-gray-800 truncate">{lib.name}</span>
+                      <span className="block text-xs text-gray-500 truncate">
+                        总文献 {lib.paper_count} · 已下载 {lib.downloaded_count}
+                      </span>
+                    </span>
+                  </span>
+                </label>
+              ))}
+            </div>
+
+            {selectedScholarLibrary && (
+              <div className="text-xs text-gray-600 bg-gray-50 border border-gray-200 rounded-lg px-3 py-2">
+                已选：<span className="font-semibold text-gray-800">{selectedScholarLibrary.name}</span> ·
+                总文献 {selectedScholarLibrary.paper_count} ·
+                已下载 {selectedScholarLibrary.downloaded_count} ·
+                缺失 PDF {Math.max(0, selectedScholarLibrary.paper_count - selectedScholarLibrary.downloaded_count)}
+              </div>
+            )}
+
+            <label className="flex items-center gap-2 text-sm text-gray-700">
+              <input
+                type="checkbox"
+                checked={autoDownloadMissingScholarPdfs}
+                onChange={(e) => setAutoDownloadMissingScholarPdfs(e.target.checked)}
+                className="accent-blue-600"
+              />
+              建库前自动尝试下载缺失 PDF（耗时较长）
+            </label>
+
+            <div className="text-xs text-gray-500 bg-blue-50 border border-blue-100 rounded-lg px-3 py-2">
+              增量策略：默认启用 DOI 去重与未变化文件跳过（skip_unchanged），重复执行不会重复入库。
+            </div>
+
+            <div className="flex justify-end">
+              <button
+                onClick={handleStartScholarLibraryIngest}
+                disabled={!selectedScholarLibraryId || !currentCollection || isProcessing}
+                className="px-4 py-2 rounded-lg bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 disabled:opacity-50"
+              >
+                一键增量建库到当前集合
+              </button>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* 已入库文件列表 */}

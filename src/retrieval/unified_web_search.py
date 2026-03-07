@@ -461,7 +461,22 @@ class UnifiedWebSearcher:
 
         # 合并去重
         merged = _merge_and_dedup(all_hits)
-        logger.info(f"统一搜索完成: 合并前 {len(all_hits)} 条, 去重后 {len(merged)} 条")
+        before_count = len(all_hits)
+        after_count = len(merged)
+        dedup_removed = max(0, before_count - after_count)
+        if dedup_removed > 0:
+            logger.info(
+                "统一搜索完成: 合并前 %d 条, 去重后 %d 条, 移除重复 %d 条",
+                before_count,
+                after_count,
+                dedup_removed,
+            )
+        else:
+            logger.info(
+                "统一搜索完成: 合并前 %d 条, 去重后 %d 条（未发现重复）",
+                before_count,
+                after_count,
+            )
 
         # 全文抓取增强（UI 优先：请求显式传参时以 UI 为准，未传时由 config 决定，便于命令行）
         #   'force' / True  → 硬强制，全量抓取，不做 LLM 预判
@@ -1108,8 +1123,12 @@ class UnifiedWebSearcher:
         max_parallel = getattr(perf, "max_parallel_providers", 3) or 3
         timeout_s = getattr(perf, "per_provider_timeout_seconds", 30) or 30
         browser_max = getattr(perf, "browser_providers_max_parallel", 1) or 1
+        sb = getattr(settings, "shared_browser", None)
+        if sb is not None:
+            pool_size = getattr(sb, "headless_context_pool_size", 2)
+            browser_max = min(browser_max, pool_size)
         max_browser_q = max(len(scholar_browser_queries), len(google_browser_queries), 1)
-        browser_timeout = max(timeout_s * max_browser_q, 120)
+        browser_timeout = max(timeout_s * max_browser_q, 200)
 
         sem = asyncio.Semaphore(max_parallel)
         sem_browser = asyncio.Semaphore(browser_max)

@@ -13,8 +13,8 @@ export default defineConfig({
         target: 'http://127.0.0.1:9999',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api/, ''),
-        timeout: 120000,
-        proxyTimeout: 120000,
+        timeout: 300000,
+        proxyTimeout: 300000,
         configure: (proxy) => {
           // When the backend worker dies mid-request, http-proxy emits an 'error' event
           // (e.g. "socket hang up", ECONNRESET, ECONNREFUSED). Vite's default handler

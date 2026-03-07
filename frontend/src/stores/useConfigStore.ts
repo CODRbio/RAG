@@ -1,6 +1,30 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import type { RagConfig, WebSearchConfig, WebSource, DeepResearchDefaults } from '../types';
+import type {
+  RagConfig,
+  WebSearchConfig,
+  WebSource,
+  DeepResearchDefaults,
+  ScholarDownloaderDefaults,
+} from '../types';
+import type { CollectionInfo } from '../api/ingest';
+
+export const DEFAULT_SCHOLAR_DOWNLOADER_DEFAULTS: ScholarDownloaderDefaults = {
+  includeAcademia: false,
+  assistLlmEnabled: false,
+  llmProvider: '',
+  llmModel: '',
+  browserMode: 'headed',
+  strategyOrder: ['direct_download', 'playwright_download', 'browser_lookup', 'sci_hub', 'brightdata', 'anna'],
+};
+
+const LEGACY_SCHOLAR_DOWNLOADER_DEFAULT_ORDER: ScholarDownloaderDefaults['strategyOrder'] = [
+  'anna',
+  'playwright_download',
+  'sci_hub',
+  'brightdata',
+  'direct_download',
+];
 
 interface ConfigState {
   // 服务连接
@@ -8,6 +32,7 @@ interface ConfigState {
   dbStatus: 'disconnected' | 'connecting' | 'connected';
   currentCollection: string;
   collections: string[];
+  collectionInfos: CollectionInfo[];
 
   // RAG 配置
   ragConfig: RagConfig;
@@ -22,11 +47,15 @@ interface ConfigState {
   // Deep Research 默认设置（通过 ⚙ 弹窗配置，跨会话持久化）
   deepResearchDefaults: DeepResearchDefaults;
 
+  // Scholar 下载高级设置默认值（浏览器本地持久化）
+  scholarDownloaderDefaults: ScholarDownloaderDefaults;
+
   // Actions
   setDbAddress: (addr: string) => void;
   setDbStatus: (status: 'disconnected' | 'connecting' | 'connected') => void;
   setCurrentCollection: (name: string) => void;
   setCollections: (list: string[]) => void;
+  setCollectionInfos: (list: CollectionInfo[]) => void;
   addCollection: (name: string) => void;
 
   updateRagConfig: (update: Partial<RagConfig>) => void;
@@ -36,6 +65,8 @@ interface ConfigState {
 
   updateDeepResearchDefaults: (update: Partial<DeepResearchDefaults>) => void;
   setDeepResearchStepModel: (step: string, value: string) => void;
+  updateScholarDownloaderDefaults: (update: Partial<ScholarDownloaderDefaults>) => void;
+  resetScholarDownloaderDefaults: (defaults?: Partial<ScholarDownloaderDefaults>) => void;
 
   setWebSearchEnabled: (enabled: boolean) => void;
   toggleWebSource: (sourceId: string) => void;
@@ -73,6 +104,10 @@ export const useConfigStore = create<ConfigState>()(
       dbStatus: 'disconnected',
       currentCollection: 'deepsea_research_v1',
       collections: ['deepsea_research_v1', 'general_ocean_v2'],
+      collectionInfos: [
+        { name: 'deepsea_research_v1', count: -1, associated_library_id: null, associated_library_name: null, binding_ready: false },
+        { name: 'general_ocean_v2', count: -1, associated_library_id: null, associated_library_name: null, binding_ready: false },
+      ],
 
       ragConfig: {
         enabled: true,  // 默认启用本地 RAG
@@ -125,13 +160,19 @@ export const useConfigStore = create<ConfigState>()(
         },
       },
 
+      scholarDownloaderDefaults: DEFAULT_SCHOLAR_DOWNLOADER_DEFAULTS,
+
       setDbAddress: (addr) => set({ dbAddress: addr }),
       setDbStatus: (status) => set({ dbStatus: status }),
       setCurrentCollection: (name) => set({ currentCollection: name }),
       setCollections: (list) => set({ collections: list }),
+      setCollectionInfos: (list) => set({ collectionInfos: list }),
       addCollection: (name) =>
         set((state) => ({
           collections: [...state.collections, name],
+          collectionInfos: state.collectionInfos.some((c) => c.name === name)
+            ? state.collectionInfos
+            : [...state.collectionInfos, { name, count: -1, associated_library_id: null, associated_library_name: null, binding_ready: false }],
           currentCollection: name,
         })),
 
@@ -154,6 +195,23 @@ export const useConfigStore = create<ConfigState>()(
             stepModels: { ...state.deepResearchDefaults.stepModels, [step]: value },
           },
         })),
+      updateScholarDownloaderDefaults: (update) =>
+        set((state) => ({
+          scholarDownloaderDefaults: {
+            ...state.scholarDownloaderDefaults,
+            ...update,
+          },
+        })),
+      resetScholarDownloaderDefaults: (defaults) =>
+        set({
+          scholarDownloaderDefaults: {
+            ...DEFAULT_SCHOLAR_DOWNLOADER_DEFAULTS,
+            ...defaults,
+            strategyOrder: defaults?.strategyOrder
+              ? [...defaults.strategyOrder]
+              : [...DEFAULT_SCHOLAR_DOWNLOADER_DEFAULTS.strategyOrder],
+          },
+        }),
 
       setWebSearchEnabled: (enabled) =>
         set((state) => ({
@@ -214,11 +272,13 @@ export const useConfigStore = create<ConfigState>()(
         dbAddress: state.dbAddress,
         currentCollection: state.currentCollection,
         collections: state.collections,
+        collectionInfos: state.collectionInfos,
         ragConfig: state.ragConfig,
         webSearchConfig: state.webSearchConfig,
         selectedProvider: state.selectedProvider,
         selectedModel: state.selectedModel,
         deepResearchDefaults: state.deepResearchDefaults,
+        scholarDownloaderDefaults: state.scholarDownloaderDefaults,
       }),
       // 合并存储数据与默认值，确保新增字段有默认值
       merge: (persistedState, currentState) => {
@@ -274,6 +334,7 @@ export const useConfigStore = create<ConfigState>()(
               return [...saved, ...missing];
             })(),
           },
+          collectionInfos: persisted.collectionInfos || currentState.collectionInfos,
           deepResearchDefaults: {
             ...currentState.deepResearchDefaults,
             ...(persisted.deepResearchDefaults || {}),
@@ -288,6 +349,25 @@ export const useConfigStore = create<ConfigState>()(
               ...(persisted.deepResearchDefaults?.stepModels || {}),
             },
             ultra_lite_provider: (persisted.deepResearchDefaults as any)?.ultra_lite_provider ?? currentState.deepResearchDefaults.ultra_lite_provider,
+          },
+          scholarDownloaderDefaults: {
+            ...currentState.scholarDownloaderDefaults,
+            ...(persisted.scholarDownloaderDefaults || {}),
+            includeAcademia: persisted.scholarDownloaderDefaults?.includeAcademia ?? currentState.scholarDownloaderDefaults.includeAcademia,
+            assistLlmEnabled: persisted.scholarDownloaderDefaults?.assistLlmEnabled ?? currentState.scholarDownloaderDefaults.assistLlmEnabled,
+            llmProvider: persisted.scholarDownloaderDefaults?.llmProvider ?? currentState.scholarDownloaderDefaults.llmProvider,
+            llmModel: persisted.scholarDownloaderDefaults?.llmModel ?? currentState.scholarDownloaderDefaults.llmModel,
+            browserMode: persisted.scholarDownloaderDefaults?.browserMode === 'headless' ? 'headless' : 'headed',
+            strategyOrder: (() => {
+              const saved = persisted.scholarDownloaderDefaults?.strategyOrder || [];
+              const allowed = new Set(DEFAULT_SCHOLAR_DOWNLOADER_DEFAULTS.strategyOrder);
+              const filtered = saved.filter((id) => allowed.has(id));
+              const missing = DEFAULT_SCHOLAR_DOWNLOADER_DEFAULTS.strategyOrder.filter((id) => !filtered.includes(id));
+              const normalized = filtered.length > 0 ? [...filtered, ...missing] : currentState.scholarDownloaderDefaults.strategyOrder;
+              const matchesLegacyDefault = normalized.length === LEGACY_SCHOLAR_DOWNLOADER_DEFAULT_ORDER.length
+                && normalized.every((id, index) => id === LEGACY_SCHOLAR_DOWNLOADER_DEFAULT_ORDER[index]);
+              return matchesLegacyDefault ? [...DEFAULT_SCHOLAR_DOWNLOADER_DEFAULTS.strategyOrder] : normalized;
+            })(),
           },
         };
       },
@@ -321,6 +401,7 @@ useConfigStore.persist.onFinishHydration?.(() => {
           const { currentCollection } = useConfigStore.getState();
           useConfigStore.setState({
             collections: names,
+          collectionInfos: cols,
             dbStatus: 'connected',
             ...(names.includes(currentCollection) ? {} : { currentCollection: names[0] }),
           });

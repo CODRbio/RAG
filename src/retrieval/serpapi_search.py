@@ -13,6 +13,7 @@ import aiohttp
 
 from config.settings import settings
 from src.log import get_logger
+from src.retrieval.venue_utils import extract_clean_venue
 from src.utils.cache import TTLCache, _make_key, get_cache
 
 logger = get_logger(__name__)
@@ -126,17 +127,72 @@ class SerpAPISearcher:
         timeout_s = int(self._config.get("timeout_seconds", 30))
         self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_s))
 
-    async def _fetch_results(self, params: Dict[str, Any]) -> List[Dict[str, Any]]:
+    async def _fetch_raw_page(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Fetch one page; returns full JSON payload (organic_results + serpapi_pagination)."""
         if not self.enabled:
-            return []
+            return {}
         await self._ensure_session()
         assert self._session is not None
         async with self._session.get(self.BASE_URL, params=params) as resp:
             if resp.status != 200:
                 text = await resp.text()
                 raise RuntimeError(f"SerpAPI error: {resp.status} - {text[:200]}")
-            payload = await resp.json()
-        return payload.get("organic_results") or []
+            return await resp.json()
+
+    async def _fetch_paginated(
+        self,
+        base_params: Dict[str, Any],
+        limit: int,
+        page_size: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch results with pagination (start=0, page_size, 2*page_size, ...).
+
+        Stop conditions (in order):
+        1. Empty organic_results — no more results at all.
+        2. Got fewer than page_size results — this was the last (partial) page.
+        3. start >= 980 — Google Scholar hard cap.
+        4. Collected >= limit — have enough.
+
+        serpapi_pagination.next is checked as an *optional early-exit hint* only
+        when the page was partial (already covered by rule 2). We do NOT stop on
+        absence of 'next' when we received a full page, because SerpAPI sometimes
+        omits the field even when more pages exist (e.g. with year filters).
+        """
+        SCHOLAR_MAX_START = 980
+        all_rows: List[Dict[str, Any]] = []
+        params = dict(base_params)
+        # Scholar max 20 per page; Google organic allows up to 100
+        max_num = 100 if base_params.get("engine") == "google" else 20
+        effective_page_size = min(max(page_size, 1), max_num)
+        params["num"] = effective_page_size
+
+        start = 0
+        while start <= SCHOLAR_MAX_START and len(all_rows) < limit:
+            params["start"] = start
+            try:
+                payload = await self._fetch_raw_page(params)
+            except Exception as e:
+                logger.warning("[retrieval] serpapi paginate error start=%d: %s", start, e)
+                break
+            rows = payload.get("organic_results") or []
+            if not rows:
+                logger.info("[retrieval] serpapi paginate stop: empty results at start=%d", start)
+                break
+            all_rows.extend(rows)
+            logger.info(
+                "[retrieval] serpapi paginate page start=%d got=%d total=%d/%d",
+                start, len(rows), len(all_rows), limit,
+            )
+            # Partial page → last page regardless of pagination hint
+            if len(rows) < effective_page_size:
+                break
+            if len(all_rows) >= limit:
+                break
+            start += effective_page_size
+            await asyncio.sleep(0.5)
+
+        return all_rows[:limit]
 
     async def search_scholar(
         self,
@@ -160,21 +216,20 @@ class SerpAPISearcher:
                 return cached
 
         logger.info("[retrieval] serpapi scholar start query=%r limit=%s year=%s~%s", q[:80], k, year_start, year_end)
-        params: Dict[str, Any] = {
+        base_params: Dict[str, Any] = {
             "engine": "google_scholar",
             "q": q,
             "api_key": self._config.get("api_key"),
-            "num": min(max(k, 1), 20),
         }
         if year_start:
-            params["as_ylo"] = int(year_start)
+            base_params["as_ylo"] = int(year_start)
         if year_end:
-            params["as_yhi"] = int(year_end)
+            base_params["as_yhi"] = int(year_end)
 
         try:
-            rows = await self._fetch_results(params)
+            rows = await self._fetch_paginated(base_params, limit=k, page_size=20)
             results: List[Dict[str, Any]] = []
-            for idx, item in enumerate(rows[:k], start=1):
+            for idx, item in enumerate(rows, start=1):
                 title = (item.get("title") or "").strip()
                 url = (item.get("link") or "").strip()
                 snippet = (item.get("snippet") or "").strip()
@@ -199,7 +254,8 @@ class SerpAPISearcher:
                 if authors:
                     metadata["authors"] = authors
                 if summary:
-                    metadata["venue"] = summary
+                    metadata["venue_raw"] = summary
+                    metadata["venue"] = extract_clean_venue(summary) or summary
                 year = _extract_year_from_summary(summary)
                 if year is not None:
                     metadata["year"] = year
@@ -250,17 +306,16 @@ class SerpAPISearcher:
                 return cached
 
         logger.info("[retrieval] serpapi google start query=%r limit=%s", q[:80], k)
-        params: Dict[str, Any] = {
+        base_params: Dict[str, Any] = {
             "engine": "google",
             "q": q,
             "api_key": self._config.get("api_key"),
-            "num": min(max(k, 1), 20),
         }
 
         try:
-            rows = await self._fetch_results(params)
+            rows = await self._fetch_paginated(base_params, limit=k, page_size=100)
             results: List[Dict[str, Any]] = []
-            for idx, item in enumerate(rows[:k], start=1):
+            for idx, item in enumerate(rows, start=1):
                 title = (item.get("title") or "").strip()
                 url = (item.get("link") or "").strip()
                 snippet = (item.get("snippet") or "").strip()

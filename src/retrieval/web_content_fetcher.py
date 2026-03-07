@@ -397,12 +397,12 @@ class WebContentFetcher:
         使用 Playwright headless 浏览器抓取。
 
         支持 JS 渲染页面，含 stealth 反检测。
-        优先复用共享 CDP 浏览器；不可用时回退到临时浏览器。
+        优先从 resident context 池借出；不可用时回退到临时浏览器。
         """
+        html: Optional[str] = None
         try:
             from playwright.async_api import async_playwright
 
-            # 可选 stealth 插件
             stealth_fn = None
             try:
                 from playwright_stealth import stealth_async
@@ -410,42 +410,71 @@ class WebContentFetcher:
             except ImportError:
                 pass
 
-            async with async_playwright() as p:
-                cdp_url = SharedBrowserService.get_cdp_url_headless()
-                own_browser = False
-                if cdp_url:
-                    browser = await p.chromium.connect_over_cdp(cdp_url)
-                else:
-                    browser = await p.chromium.launch(headless=True)
-                    own_browser = True
-                try:
-                    context = await browser.new_context(
-                        user_agent=(
-                            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                            "AppleWebKit/537.36 (KHTML, like Gecko) "
-                            "Chrome/120.0.0.0 Safari/537.36"
-                        ),
-                        viewport={"width": 1280, "height": 800},
-                    )
-                    page = await context.new_page()
+            # Prefer headless context pool
+            try:
+                from config.settings import settings
+                from src.retrieval.context_pool import (
+                    SharedContextPool,
+                    acquire_headless_context,
+                    release_context as release_context_lease,
+                )
+                pool = SharedContextPool.get_instance()
+                if pool.is_initialized():
+                    cfg = getattr(settings, "shared_browser", None)
+                    acquire_timeout = getattr(cfg, "context_acquire_timeout_seconds", 30.0) if cfg else 30.0
+                    lease = await acquire_headless_context(timeout=acquire_timeout, purpose="content_fetcher")
+                    if lease is not None:
+                        try:
+                            context = lease.context
+                            page = await context.new_page()
+                            if stealth_fn:
+                                await stealth_fn(page)
+                            await page.goto(
+                                url,
+                                wait_until="domcontentloaded",
+                                timeout=self.effective_timeout_seconds * 1000,
+                            )
+                            await page.wait_for_timeout(2000)
+                            html = await page.content()
+                            await page.close()
+                        finally:
+                            await release_context_lease(lease, had_error=False)
+            except Exception as e:
+                logger.debug("[web_content_fetcher] pool acquire failed, fallback: %s", e)
 
-                    if stealth_fn:
-                        await stealth_fn(page)
-
-                    await page.goto(
-                        url,
-                        wait_until="domcontentloaded",
-                        timeout=self.effective_timeout_seconds * 1000,
-                    )
-
-                    # 等待正文加载
-                    await page.wait_for_timeout(2000)
-
-                    html = await page.content()
-                    await context.close()
-                finally:
-                    if own_browser:
-                        await browser.close()
+            # Fallback: ephemeral browser/context (only if pool did not produce html)
+            if not (html and len(html) >= 200):
+                async with async_playwright() as p:
+                    cdp_url = SharedBrowserService.get_cdp_url_headless()
+                    own_browser = False
+                    if cdp_url:
+                        browser = await p.chromium.connect_over_cdp(cdp_url)
+                    else:
+                        browser = await p.chromium.launch(headless=True)
+                        own_browser = True
+                    try:
+                        context = await browser.new_context(
+                            user_agent=(
+                                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                "Chrome/120.0.0.0 Safari/537.36"
+                            ),
+                            viewport={"width": 1280, "height": 800},
+                        )
+                        page = await context.new_page()
+                        if stealth_fn:
+                            await stealth_fn(page)
+                        await page.goto(
+                            url,
+                            wait_until="domcontentloaded",
+                            timeout=self.effective_timeout_seconds * 1000,
+                        )
+                        await page.wait_for_timeout(2000)
+                        html = await page.content()
+                        await context.close()
+                    finally:
+                        if own_browser:
+                            await browser.close()
 
             if not html or len(html) < 200:
                 return None

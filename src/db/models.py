@@ -619,7 +619,30 @@ class RevokedToken(SQLModel, table=True):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 10. Scholar sub-libraries  (named candidate lists for download)
+# 10. Knowledge-base to scholar-library binding
+# ──────────────────────────────────────────────────────────────────────────────
+
+class CollectionLibraryBinding(SQLModel, table=True):
+    """Persistent 1:1 binding between a KB collection and a scholar library."""
+
+    __tablename__ = "collection_library_bindings"
+    __table_args__ = (
+        UniqueConstraint("user_id", "collection_name", name="uq_collection_library_user_collection"),
+        UniqueConstraint("user_id", "library_id", name="uq_collection_library_user_library"),
+        Index("idx_collection_library_user_collection", "user_id", "collection_name"),
+        Index("idx_collection_library_user_library", "user_id", "library_id"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: str = Field(default="default", sa_column=Column(Text, nullable=False, server_default="default"))
+    collection_name: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    library_id: int = Field(foreign_key="scholar_libraries.id")
+    created_at: str = Field(default_factory=_now_iso, sa_column=Column(Text, nullable=False))
+    updated_at: str = Field(default_factory=_now_iso, sa_column=Column(Text, nullable=False))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 11. Scholar sub-libraries  (named candidate lists for download)
 # ──────────────────────────────────────────────────────────────────────────────
 
 class ScholarLibrary(SQLModel, table=True):
@@ -661,6 +684,8 @@ class ScholarLibraryPaper(SQLModel, table=True):
     annas_md5: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
     added_at: str = Field(default_factory=_now_iso, sa_column=Column(Text, nullable=False))
     downloaded_at: Optional[str] = Field(default=None, sa_column=Column(Text, nullable=True))
+    venue: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    normalized_journal_name: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
 
     library: Optional[ScholarLibrary] = Relationship(back_populates="papers")
 
@@ -669,3 +694,50 @@ class ScholarLibraryPaper(SQLModel, table=True):
             return json.loads(self.authors or "[]")
         except Exception:
             return []
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 12. Impact Factor index  (from docs/impact_factor.xlsx, rebuilt on file change)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class ImpactFactorJournal(SQLModel, table=True):
+    """One row per journal from JCR-style Excel; used for IF lookup by normalized name/abbr/ISSN."""
+
+    __tablename__ = "impact_factor_journals"
+    __table_args__ = (
+        Index("idx_ifj_normalized_name", "normalized_journal_name"),
+        Index("idx_ifj_normalized_abbr", "normalized_jcr_abbreviation"),
+        Index("idx_ifj_issn", "issn"),
+        Index("idx_ifj_eissn", "eissn"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    source_file: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    source_version: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    journal_name: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    normalized_journal_name: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    jcr_abbreviation: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    normalized_jcr_abbreviation: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    issn: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    eissn: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    category: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    edition: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    impact_factor: Optional[float] = Field(default=None, sa_column=Column(Float, nullable=True))
+    jif_quartile: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    jif_rank: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    jif_5year: Optional[float] = Field(default=None, sa_column=Column(Float, nullable=True))
+    publisher: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+
+
+class ImpactFactorIndexMeta(SQLModel, table=True):
+    """One row per source workbook; fingerprint used to decide when to rebuild the journal index."""
+
+    __tablename__ = "impact_factor_index_meta"
+
+    source_file: str = Field(primary_key=True)
+    last_mtime: float = Field(default=0.0, sa_column=Column(Float, nullable=False, server_default="0"))
+    last_size: int = Field(default=0, sa_column=Column(Integer, nullable=False, server_default="0"))
+    last_hash: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    indexed_at: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    row_count: int = Field(default=0, sa_column=Column(Integer, nullable=False, server_default="0"))
+    version: int = Field(default=1, sa_column=Column(Integer, nullable=False, server_default="1"))

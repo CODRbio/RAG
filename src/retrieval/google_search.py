@@ -51,6 +51,12 @@ from bs4 import BeautifulSoup
 from config.settings import settings
 from src.log import get_logger
 from src.retrieval.browser_service import SharedBrowserService
+from src.retrieval.venue_utils import extract_clean_venue
+from src.retrieval.context_pool import (
+    acquire_headless_context,
+    acquire_headed_context,
+    release_context as release_context_lease,
+)
 from src.retrieval.capsolver_api import CapSolverAPI
 from src.retrieval.two_captcha_api import TwoCaptchaAPI
 from src.utils.cache import TTLCache, _make_key, get_cache
@@ -208,21 +214,45 @@ async def _get_or_create_shared_browser_manager(
 
 async def acquire_shared_browser(
     job_id: str = "",
-    timeout: int = 120000,
+    timeout: int = 200000,
     user_data_dir: str = "",
     headless: Optional[bool] = None,
     proxy: Optional[str] = None,
     extension_path: Optional[str] = None,
-) -> Tuple["_BrowserManager", Any, bool]:
+) -> Tuple[Any, Any, bool]:
     """
-    获取共享浏览器，引用计数 +1（仅当 is_shared=True 时）。
-    - browser_reuse 且已有共享实例：复用，ref_count++，返回 (manager, context, True)。
-    - browser_reuse 且无共享实例：创建并设为共享，ref_count=1，返回 (manager, context, True)。
-    - 非 browser_reuse：创建独立实例，返回 (manager, context, False)，调用方在 finally 中关闭 manager。
+    获取共享浏览器。优先从 resident context 池借出；否则引用计数单例或独立实例。
+    返回 (manager_or_wrapper, context, is_shared)。释放时必须传 manager= 第一个返回值以便池 lease 正确归还。
     """
     perf = getattr(settings, "perf_google_search", None)
     reuse = bool(perf and getattr(perf, "browser_reuse", True))
     jid = (job_id or "").strip() or f"_anon_{id(object())}"
+    effective_headless = headless if headless is not None else True
+
+    if reuse:
+        try:
+            from src.retrieval.context_pool import SharedContextPool
+            pool = SharedContextPool.get_instance()
+            if pool.is_initialized():
+                cfg = getattr(settings, "shared_browser", None)
+                acquire_timeout = getattr(cfg, "context_acquire_timeout_seconds", 30.0) if cfg else 30.0
+                if effective_headless:
+                    lease = await acquire_headless_context(
+                        timeout=acquire_timeout,
+                        job_id=jid,
+                        purpose="search",
+                    )
+                else:
+                    lease = await acquire_headed_context(
+                        timeout=acquire_timeout,
+                        job_id=jid,
+                        purpose="search_headed",
+                    )
+                if lease is not None:
+                    wrapper = _PooledBrowserWrapper(lease, lease.context)
+                    return wrapper, lease.context, True
+        except Exception as e:
+            logger.debug("[google_search] context pool acquire failed, fallback: %s", e)
 
     if not reuse:
         manager = _BrowserManager(timeout=timeout)
@@ -293,12 +323,20 @@ async def acquire_shared_browser(
 async def release_shared_browser(
     job_id: str = "",
     is_shared: bool = True,
-    manager: Optional["_BrowserManager"] = None,
+    manager: Optional[Any] = None,
 ) -> None:
     """
-    释放浏览器引用。is_shared=False 且 manager 非空时直接关闭 manager；
+    释放浏览器引用。若 manager 为池 wrapper（含 _lease）则归还 lease；
+    is_shared=False 且 manager 非空时直接关闭 manager；
     否则 ref_count--，若归零则调度延迟关闭（max_idle_seconds 后再真正关闭）。
     """
+    if manager is not None and getattr(manager, "_lease", None) is not None:
+        try:
+            await release_context_lease(manager._lease, had_error=False)
+        except Exception as e:
+            logger.warning("release context pool lease: %s", e)
+        return
+
     if not is_shared and manager is not None:
         try:
             async with _profile_lock_guard:
@@ -351,7 +389,7 @@ def _get_google_search_config() -> Dict[str, Any]:
                 "extension_path": getattr(settings, "capsolver_extension_path", "extra_tools/CapSolverExtension"),
                 "headless": getattr(gs, "headless", None),
                 "proxy": getattr(gs, "proxy", None),
-                "timeout": getattr(gs, "timeout", 60000),
+                "timeout": getattr(gs, "timeout", 200000),
                 "max_results": getattr(gs, "max_results", 5),
                 "user_data_dir": getattr(gs, "user_data_dir", None),
                 "headed_browser_port": getattr(gs, "headed_browser_port", 9223),
@@ -373,7 +411,7 @@ def _get_google_search_config() -> Dict[str, Any]:
         "extension_path": raw.get("capsolver_extension_path", gs.get("extension_path", "extra_tools/CapSolverExtension")),
         "headless": gs.get("headless"),
         "proxy": gs.get("proxy"),
-        "timeout": gs.get("timeout", 60000),
+        "timeout": gs.get("timeout", 200000),
         "max_results": min(int(gs.get("max_results", 5)), 20),
         "user_data_dir": gs.get("user_data_dir"),
         "headed_browser_port": int(gs.get("headed_browser_port", 9223)),
@@ -574,7 +612,7 @@ async def _simulate_human_scroll_to_bottom(page):
 class _BrowserManager:
     """浏览器管理器，负责创建和管理浏览器实例（含 CDP 连接）"""
     
-    def __init__(self, timeout: int = 120000):
+    def __init__(self, timeout: int = 200000):
         self.playwright = None
         self.browsers = []
         self.browser_pids = []  # 记录 chromium 进程 PID
@@ -727,8 +765,11 @@ class _BrowserManager:
             if not cdp_url:
                 try:
                     from config.settings import settings
-                    gs = getattr(settings, "google_search", None)
-                    port = getattr(gs, "headed_browser_port", 9223)
+                    sb = getattr(settings, "shared_browser", None)
+                    port = getattr(sb, "headed_port", None) if sb else None
+                    if port is None:
+                        gs = getattr(settings, "google_search", None)
+                        port = getattr(gs, "headed_browser_port", 9223)
                     await SharedBrowserService.start_headed(port=port)
                     cdp_url = SharedBrowserService.get_cdp_url_headed()
                 except Exception as e:
@@ -848,6 +889,35 @@ class _BrowserManager:
             Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
             Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
         """)
+
+
+async def _apply_stealth_to_page(page) -> None:
+    """Standalone stealth for pool path (no _BrowserManager)."""
+    if _STEALTH_AVAILABLE == "v2" and _Stealth is not None:
+        try:
+            s = _Stealth()
+            await s.apply_stealth_async(page)
+            return
+        except Exception:
+            pass
+    await page.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+    """)
+
+
+class _PooledBrowserWrapper:
+    """Thin wrapper for pool lease so callers get (manager, context, is_shared) and can call manager._apply_stealth_mode; release via release_shared_browser(manager=this)."""
+    def __init__(self, lease: Any, context: Any) -> None:
+        self._lease = lease
+        self.browsers = [context]
+
+    def is_cdp_connected(self) -> bool:
+        return True
+
+    async def _apply_stealth_mode(self, page) -> None:
+        await _apply_stealth_to_page(page)
 
 
 # ============================================================
@@ -1171,7 +1241,7 @@ class GoogleSearcher:
             if cached is not None:
                 return cached
 
-        timeout = self._config.get("timeout", 60000)
+        timeout = self._config.get("timeout", 200000)
         headless = self._config.get("headless")
         proxy = self._config.get("proxy")
         user_data_dir = self._get_user_data_dir()
@@ -1289,7 +1359,7 @@ class GoogleSearcher:
                     await release_shared_browser(
                         job_id=job_id,
                         is_shared=is_shared,
-                        manager=None if is_shared else browser_manager,
+                        manager=browser_manager,
                     )
 
         if do_headed_retry is not None:
@@ -1357,7 +1427,7 @@ class GoogleSearcher:
         logger.info("[retrieval] playwright scholar_batch start queries=%d cached=%d", len(queries_to_search), len(queries) - len(queries_to_search))
         logger.info(f"Scholar 批量搜索：{len(queries_to_search)} 个查询待执行，{len(queries) - len(queries_to_search)} 个命中缓存")
 
-        timeout = self._config.get("timeout", 60000)
+        timeout = self._config.get("timeout", 200000)
         headless = self._config.get("headless")
         proxy = self._config.get("proxy")
         user_data_dir = self._get_user_data_dir()
@@ -1479,7 +1549,7 @@ class GoogleSearcher:
                     await release_shared_browser(
                         job_id=job_id,
                         is_shared=is_shared,
-                        manager=None if is_shared else browser_manager,
+                        manager=browser_manager,
                     )
 
         for _q, _lim, _ys, _ye, _to, _sc in headed_retries:
@@ -1529,7 +1599,7 @@ class GoogleSearcher:
             if cached is not None:
                 return cached
 
-        timeout = self._config.get("timeout", 60000)
+        timeout = self._config.get("timeout", 200000)
         headless = self._config.get("headless")
         proxy = self._config.get("proxy")
         user_data_dir = self._get_user_data_dir()
@@ -1612,7 +1682,7 @@ class GoogleSearcher:
                 await release_shared_browser(
                     job_id=job_id,
                     is_shared=is_shared,
-                    manager=None if is_shared else browser_manager,
+                    manager=browser_manager,
                 )
 
         if do_headed_retry:
@@ -1673,7 +1743,7 @@ class GoogleSearcher:
         logger.info("[retrieval] playwright google_batch start queries=%d cached=%d", len(queries_to_search), len(queries) - len(queries_to_search))
         logger.info(f"Google 批量搜索：{len(queries_to_search)} 个查询待执行，{len(queries) - len(queries_to_search)} 个命中缓存")
 
-        timeout = self._config.get("timeout", 60000)
+        timeout = self._config.get("timeout", 200000)
         headless = self._config.get("headless")
         proxy = self._config.get("proxy")
         user_data_dir = self._get_user_data_dir()
@@ -1773,7 +1843,7 @@ class GoogleSearcher:
                 await release_shared_browser(
                     job_id=job_id,
                     is_shared=is_shared,
-                    manager=None if is_shared else browser_manager,
+                    manager=browser_manager,
                 )
 
         for _q, _lim, _to, _sc in headed_retries_google:
@@ -1827,7 +1897,7 @@ class GoogleSearcher:
         query: str,
         year_start: Optional[int] = None,
         year_end: Optional[int] = None,
-        timeout: int = 60000,
+        timeout: int = 200000,
     ) -> None:
         """
         通过搜索框输入方式执行 Scholar 搜索，避免 URL 携带搜索词触发反爬封控。
@@ -1947,7 +2017,9 @@ class GoogleSearcher:
         if result.get('year'):
             metadata["year"] = result['year']
         if result.get('publication_info'):
-            metadata["venue"] = result['publication_info']
+            raw_venue = result['publication_info']
+            metadata["venue_raw"] = raw_venue
+            metadata["venue"] = extract_clean_venue(raw_venue) or raw_venue
         if result.get('cited_count'):
             metadata["cited_by"] = result['cited_count']
         if result.get('pdf_link'):
@@ -2137,7 +2209,7 @@ class GoogleSearcher:
         year_start: Optional[int] = None,
         year_end: Optional[int] = None,
         result_selector: str = ".gs_r",
-        timeout: int = 60000,
+        timeout: int = 200000,
         scope: str = "",
     ) -> List[Dict[str, Any]]:
         """

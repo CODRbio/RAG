@@ -14,7 +14,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlmodel import Session, select
@@ -23,11 +23,15 @@ from config.settings import settings
 from src.api.routes_auth import get_current_user_id
 from src.db.engine import get_engine
 from src.db.models import ScholarLibrary, ScholarLibraryPaper
-from src.utils.path_manager import PathManager
 from src.log import get_logger
+from src.services.collection_library_binding_service import (
+    ensure_collection_binding,
+    resolve_bound_library_for_collection,
+)
 from src.tasks.dispatcher import process_download_and_ingest
 from src.tasks.redis_queue import get_task_queue
 from src.tasks.task_state import TaskKind, TaskStatus, TaskState
+from src.utils.path_manager import PathManager
 
 logger = get_logger(__name__)
 router = APIRouter(prefix="/scholar", tags=["scholar"])
@@ -48,16 +52,20 @@ class DownloadRequest(BaseModel):
     title: str = Field(..., min_length=1, max_length=500)
     doi: Optional[str] = Field(None, pattern=r"^10\.\d{4,}/\S+")
     pdf_url: Optional[str] = None
+    url: Optional[str] = None
     annas_md5: Optional[str] = Field(None, pattern=r"^[0-9a-f]{32}$")
     authors: Optional[List[str]] = None
     year: Optional[int] = None
     collection: Optional[str] = None
     auto_ingest: Optional[bool] = None
     library_paper_id: Optional[int] = Field(None, description="ScholarLibraryPaper.id; when set, downloaded_at is written on success")
+    library_id: Optional[int] = Field(None, description="When set with library_paper_id, download to library pdfs folder")
     llm_provider: Optional[str] = Field(None, description="LLM provider for downloader assist (e.g. qwen-thinking); uses config default if not set")
     model_override: Optional[str] = Field(None, description="Model override for downloader LLM; uses provider default if not set")
+    assist_llm_enabled: Optional[bool] = Field(None, description="显式启停下载辅助 LLM；False 时彻底关闭，不回退到服务端默认")
     show_browser: Optional[bool] = Field(None, description="有头(True)/无头(False)；不传则用配置默认")
     include_academia: bool = Field(False, description="是否允许尝试 Academia.edu 下载（默认跳过，避免卡住）")
+    strategy_order: Optional[List[str]] = Field(None, description="Scholar 下载策略顺序（UI 策略项）")
 
 
 class BatchDownloadRequest(BaseModel):
@@ -68,8 +76,18 @@ class BatchDownloadRequest(BaseModel):
     auto_ingest: bool = False  # when False (default), only download; when True, download then ingest per paper
     llm_provider: Optional[str] = Field(None, description="LLM provider for downloader assist; applies to all papers in batch")
     model_override: Optional[str] = Field(None, description="Model override for downloader LLM; applies to all papers in batch")
+    assist_llm_enabled: Optional[bool] = Field(None, description="显式启停下载辅助 LLM；False 时彻底关闭")
     show_browser: Optional[bool] = Field(None, description="有头(True)/无头(False)；不传则用配置默认")
     include_academia: bool = Field(False, description="是否允许尝试 Academia.edu 下载（默认跳过，避免卡住）")
+    strategy_order: Optional[List[str]] = Field(None, description="Scholar 下载策略顺序（UI 策略项）")
+
+
+class HeadedBrowserWindowState(BaseModel):
+    available: bool
+    running: bool
+    mode: str
+    cdp_url: Optional[str] = None
+    bounds: Optional[Dict[str, int]] = None
 
 
 # ─── Scholar sub-libraries ───────────────────────────────────────────────────
@@ -129,6 +147,32 @@ class EnrichDoiRequest(BaseModel):
     results: List[Dict[str, Any]] = Field(default_factory=list)
 
 
+class LibraryIngestRequest(BaseModel):
+    """Request body for POST /scholar/libraries/{lib_id}/ingest."""
+    collection: Optional[str] = None
+    skip_duplicate_doi: bool = True
+    skip_unchanged: bool = True
+    auto_download_missing: bool = False
+    max_auto_download: int = Field(30, ge=1, le=200)
+    llm_provider: Optional[str] = None
+    model_override: Optional[str] = None
+    assist_llm_enabled: Optional[bool] = None
+    show_browser: Optional[bool] = None
+    include_academia: bool = False
+    strategy_order: Optional[List[str]] = None
+
+
+class LibraryImportPdfSummary(BaseModel):
+    total_files: int
+    imported: int
+    linked_existing: int
+    renamed: int
+    skipped_duplicates: int
+    invalid_pdf: int
+    no_doi: int
+    errors: List[str] = Field(default_factory=list)
+
+
 def _normalize_web_hit_for_scholar(hit: Dict[str, Any], canonical_source: str) -> Dict[str, Any]:
     """Map unified_web_search hit to Scholar API response shape (content, score, metadata)."""
     meta = (hit.get("metadata") or {}).copy()
@@ -149,6 +193,54 @@ def _enrich_scholar_results_with_crossref(results: List[Dict[str, Any]]) -> None
         _enrich_web_hits_missing_doi(results, set())
     except Exception as e:
         logger.debug("Crossref enrich for scholar results failed (non-fatal): %s", e)
+
+
+def _normalize_and_enrich_venue(results: List[Dict[str, Any]]) -> None:
+    """In-place: clean venue, add normalized_journal_name, batch lookup IF, add impact_factor/jif_quartile/jif_5year/journal_name_matched."""
+    if not results:
+        return
+    try:
+        from src.retrieval.venue_utils import extract_clean_venue, normalize_journal_name
+        from src.services.impact_factor_service import lookup_many
+
+        venues_to_lookup: List[str] = []
+        for r in results:
+            meta = r.get("metadata") or {}
+            venue = (meta.get("venue") or "").strip()
+            if not venue and meta.get("venue_raw"):
+                venue = extract_clean_venue(meta.get("venue_raw") or "")
+            if venue:
+                meta["venue"] = venue
+                norm = normalize_journal_name(venue)
+                meta["normalized_journal_name"] = norm
+                venues_to_lookup.append(venue)
+            else:
+                meta["normalized_journal_name"] = ""
+
+        if not venues_to_lookup:
+            return
+        if_map = lookup_many(venues_to_lookup, ensure_current=True)
+        for r in results:
+            meta = r.get("metadata") or {}
+            norm = meta.get("normalized_journal_name") or ""
+            venue = meta.get("venue") or ""
+            data = None
+            if norm and norm in if_map:
+                data = if_map[norm]
+            elif venue and venue in if_map:
+                data = if_map[venue]
+            if data:
+                meta["impact_factor"] = data.get("impact_factor")
+                meta["jif_quartile"] = data.get("jif_quartile") or ""
+                meta["jif_5year"] = data.get("jif_5year")
+                meta["journal_name_matched"] = data.get("journal_name") or ""
+            else:
+                meta["impact_factor"] = None
+                meta["jif_quartile"] = None
+                meta["jif_5year"] = None
+                meta["journal_name_matched"] = None
+    except Exception as e:
+        logger.debug("Impact factor enrich for scholar results failed (non-fatal): %s", e)
 
 
 @router.post("/search")
@@ -189,6 +281,7 @@ async def scholar_search(req: ScholarSearchRequest):
         )
         results = [_normalize_web_hit_for_scholar(h, "google_scholar") for h in raw_hits]
         _enrich_scholar_results_with_crossref(results)
+        _normalize_and_enrich_venue(results)
         return {"results": results, "count": len(results)}
     if req.source == "google":
         from src.retrieval.unified_web_search import unified_web_searcher
@@ -212,6 +305,7 @@ async def scholar_search(req: ScholarSearchRequest):
         )
         results = [_normalize_web_hit_for_scholar(h, "google") for h in raw_hits]
         _enrich_scholar_results_with_crossref(results)
+        _normalize_and_enrich_venue(results)
         return {"results": results, "count": len(results)}
 
     # Semantic Scholar relevance only: /paper/search, no snippet, no fallback
@@ -229,6 +323,7 @@ async def scholar_search(req: ScholarSearchRequest):
             logger.warning("semantic relevance search failed: %s", relevance_res)
         results = [_normalize_web_hit_for_scholar(h, "semantic") for h in raw_hits]
         _enrich_scholar_results_with_crossref(results)
+        _normalize_and_enrich_venue(results)
         return {"results": results, "count": len(results)}
 
     # NCBI PubMed (年份过滤) via unified_web_searcher
@@ -247,6 +342,7 @@ async def scholar_search(req: ScholarSearchRequest):
         )
         results = [_normalize_web_hit_for_scholar(h, "ncbi") for h in raw_hits]
         _enrich_scholar_results_with_crossref(results)
+        _normalize_and_enrich_venue(results)
         return {"results": results, "count": len(results)}
 
     # Semantic Scholar bulk (布尔/关键词，年份过滤) — bulk API 无 snippet，直接走 adapter
@@ -262,11 +358,16 @@ async def scholar_search(req: ScholarSearchRequest):
         raise HTTPException(status_code=400, detail=f"未知搜索源: {req.source}")
 
     _enrich_scholar_results_with_crossref(results)
+    _normalize_and_enrich_venue(results)
     return {"results": results, "count": len(results)}
 
 
 @router.post("/download")
-async def scholar_download(req: DownloadRequest, background_tasks: BackgroundTasks):
+async def scholar_download(
+    req: DownloadRequest,
+    background_tasks: BackgroundTasks,
+    user_id: str = Depends(get_current_user_id),
+):
     """
     Download one paper PDF (download only; no vectorization/ingest by default).
     If auto_ingest=True, runs download then ingest in background and returns task_id.
@@ -279,6 +380,14 @@ async def scholar_download(req: DownloadRequest, background_tasks: BackgroundTas
     should_ingest = (
         req.auto_ingest if req.auto_ingest is not None else cfg.auto_ingest_after_download
     )
+
+    effective_library_id = getattr(req, "library_id", None)
+    if effective_library_id is None and (req.collection or "").strip():
+        bound = resolve_bound_library_for_collection(user_id, req.collection, auto_create=True)
+        if bound is not None and bound.id is not None:
+            effective_library_id = int(bound.id)
+
+    download_dir = _resolve_library_download_dir(effective_library_id)
 
     if should_ingest:
         task_id = f"dl_ingest_{uuid.uuid4().hex[:8]}"
@@ -301,11 +410,16 @@ async def scholar_download(req: DownloadRequest, background_tasks: BackgroundTas
             task_id=task_id,
             paper_info=req.model_dump(),
             collection=req.collection,
+            download_dir=download_dir,
+            user_id=user_id,
+            library_id=effective_library_id,
             library_paper_id=getattr(req, "library_paper_id", None),
             llm_provider=getattr(req, "llm_provider", None),
             model_override=getattr(req, "model_override", None),
+            assist_llm_enabled=getattr(req, "assist_llm_enabled", None),
             show_browser=getattr(req, "show_browser", None),
             include_academia=getattr(req, "include_academia", False),
+            strategy_order=getattr(req, "strategy_order", None),
         )
         return {
             "status": "submitted",
@@ -320,13 +434,23 @@ async def scholar_download(req: DownloadRequest, background_tasks: BackgroundTas
         doi=req.doi,
         pdf_url=req.pdf_url,
         annas_md5=req.annas_md5,
+        url=req.url,
         authors=req.authors,
         year=req.year,
+        download_dir=download_dir,
         llm_provider=getattr(req, "llm_provider", None),
         model_override=getattr(req, "model_override", None),
+        assist_llm_enabled=getattr(req, "assist_llm_enabled", None),
         show_browser=getattr(req, "show_browser", None),
         include_academia=getattr(req, "include_academia", False),
+        strategy_order=getattr(req, "strategy_order", None),
     )
+    if result.get("success") and req.library_paper_id is not None:
+        from src.tasks.dispatcher import _mark_library_paper_downloaded
+
+        _mark_library_paper_downloaded(req.library_paper_id)
+    if effective_library_id is not None:
+        result["library_id"] = effective_library_id
     return result
 
 
@@ -432,7 +556,6 @@ def _sync_library_paper_downloaded_at(lib_id: int, pdfs_dir: str) -> int:
 @router.post("/download/batch")
 async def scholar_batch_download(
     req: BatchDownloadRequest,
-    background_tasks: BackgroundTasks,
     user_id: str = Depends(get_current_user_id),
 ):
     """Batch download; when auto_ingest=True also runs ingest per paper. Default: download only."""
@@ -440,7 +563,12 @@ async def scholar_batch_download(
     if not cfg or not cfg.enabled:
         raise HTTPException(status_code=503, detail="Scholar downloader is disabled")
 
-    batch_download_dir = _resolve_library_download_dir(req.library_id)
+    effective_library_id = req.library_id
+    if effective_library_id is None and (req.collection or "").strip():
+        bound = resolve_bound_library_for_collection(user_id, req.collection, auto_create=True)
+        if bound is not None and bound.id is not None:
+            effective_library_id = int(bound.id)
+    batch_download_dir = _resolve_library_download_dir(effective_library_id)
 
     task_id = f"batch_dl_{uuid.uuid4().hex[:8]}"
     total = len(req.papers)
@@ -449,6 +577,7 @@ async def scholar_batch_download(
         task_id=task_id,
         kind=TaskKind.scholar,
         status=TaskStatus.running,
+        started_at=time.time(),
         payload={
             "total": total,
             "completed": 0,
@@ -499,48 +628,74 @@ async def scholar_batch_download(
 
         async def _one(paper: DownloadRequest):
             nonlocal completed, failed
-            include_academia = getattr(req, "include_academia", False)
-            if req.auto_ingest:
-                sub_id = f"{task_id}_{uuid.uuid4().hex[:4]}"
-                result = await process_download_and_ingest(
-                    task_id=sub_id,
-                    paper_info=paper.model_dump(),
-                    collection=req.collection,
-                    download_dir=batch_download_dir,
-                    library_paper_id=getattr(paper, "library_paper_id", None),
-                    llm_provider=getattr(req, "llm_provider", None) or getattr(paper, "llm_provider", None),
-                    model_override=getattr(req, "model_override", None) or getattr(paper, "model_override", None),
-                    show_browser=getattr(req, "show_browser", None),
-                    include_academia=include_academia,
-                )
-            else:
-                result = await adapter.download_paper(
-                    title=paper.title,
-                    doi=paper.doi,
-                    pdf_url=paper.pdf_url,
-                    annas_md5=paper.annas_md5,
-                    authors=paper.authors,
-                    year=paper.year,
-                    download_dir=batch_download_dir,
-                    llm_provider=getattr(req, "llm_provider", None) or getattr(paper, "llm_provider", None),
-                    model_override=getattr(req, "model_override", None) or getattr(paper, "model_override", None),
-                    show_browser=getattr(req, "show_browser", None),
-                    include_academia=include_academia,
-                )
-                result = {**result, "ingest_triggered": False}
-                # Update downloaded_at for the library paper row when download succeeds
-                if result.get("success") and paper.library_paper_id is not None:
-                    from src.tasks.dispatcher import _mark_library_paper_downloaded
-                    _mark_library_paper_downloaded(paper.library_paper_id)
+            try:
+                include_academia = getattr(req, "include_academia", False)
+                if req.auto_ingest:
+                    sub_id = f"{task_id}_{uuid.uuid4().hex[:4]}"
+                    result = await process_download_and_ingest(
+                        task_id=sub_id,
+                        paper_info=paper.model_dump(),
+                        collection=req.collection,
+                        download_dir=batch_download_dir,
+                        user_id=user_id,
+                        library_id=effective_library_id,
+                        library_paper_id=getattr(paper, "library_paper_id", None),
+                        llm_provider=getattr(req, "llm_provider", None) or getattr(paper, "llm_provider", None),
+                        model_override=getattr(req, "model_override", None) or getattr(paper, "model_override", None),
+                        assist_llm_enabled=(
+                            getattr(req, "assist_llm_enabled", None)
+                            if getattr(req, "assist_llm_enabled", None) is not None
+                            else getattr(paper, "assist_llm_enabled", None)
+                        ),
+                        show_browser=getattr(req, "show_browser", None),
+                        include_academia=include_academia,
+                        strategy_order=getattr(req, "strategy_order", None) or getattr(paper, "strategy_order", None),
+                    )
+                else:
+                    result = await adapter.download_paper(
+                        title=paper.title,
+                        doi=paper.doi,
+                        pdf_url=paper.pdf_url,
+                        url=paper.url,
+                        annas_md5=paper.annas_md5,
+                        authors=paper.authors,
+                        year=paper.year,
+                        download_dir=batch_download_dir,
+                        llm_provider=getattr(req, "llm_provider", None) or getattr(paper, "llm_provider", None),
+                        model_override=getattr(req, "model_override", None) or getattr(paper, "model_override", None),
+                        assist_llm_enabled=(
+                            getattr(req, "assist_llm_enabled", None)
+                            if getattr(req, "assist_llm_enabled", None) is not None
+                            else getattr(paper, "assist_llm_enabled", None)
+                        ),
+                        show_browser=getattr(req, "show_browser", None),
+                        include_academia=include_academia,
+                        strategy_order=getattr(req, "strategy_order", None) or getattr(paper, "strategy_order", None),
+                    )
+                    result = {**result, "ingest_triggered": False}
+                    # Update downloaded_at for the library paper row when download succeeds
+                    if result.get("success") and paper.library_paper_id is not None:
+                        from src.tasks.dispatcher import _mark_library_paper_downloaded
+                        _mark_library_paper_downloaded(paper.library_paper_id)
+            except Exception as e:
+                logger.exception("[scholar-batch] paper failed task_id=%s title=%s: %s", task_id, paper.title, e)
+                result = {
+                    "success": False,
+                    "ingest_triggered": False,
+                    "message": str(e) or e.__class__.__name__,
+                }
             async with progress_lock:
                 if result.get("ingest_triggered") or result.get("success"):
                     completed += 1
                 else:
                     failed += 1
+                    route_diag = result.get("route_diag") if isinstance(result, dict) else None
                     logger.warning(
-                        "文献下载失败: %s - %s",
+                        "文献下载失败: %s - %s | route_attempted=%s route_skipped=%s",
                         paper.title,
                         result.get("message", "未知错误"),
+                        (route_diag or {}).get("attempted", []),
+                        list(((route_diag or {}).get("skipped", {}) or {}).keys()),
                     )
                 state = q.get_state(task_id)
                 if state:
@@ -556,6 +711,50 @@ async def scholar_batch_download(
 
         try:
             await asyncio.gather(*[sem_wrap(sem, _one, p) for p in req.papers])
+            if effective_library_id is not None and not _is_temp_library(effective_library_id) and batch_download_dir:
+                try:
+                    _sync_library_paper_downloaded_at(effective_library_id, batch_download_dir)
+                except Exception as e:
+                    logger.warning("batch post-sync downloaded_at failed: %s", e)
+
+            state = q.get_state(task_id)
+            if state:
+                state.finished_at = time.time()
+                state.payload["completed"] = completed
+                state.payload["failed"] = failed
+                if failed == total:
+                    state.status = TaskStatus.error
+                    state.error_message = "所有论文下载均失败"
+                else:
+                    state.status = TaskStatus.completed
+                    state.error_message = None
+                q.set_state(state)
+                q.push_event(
+                    task_id,
+                    "done",
+                    {"completed": completed, "failed": failed, "total": total},
+                )
+        except Exception as e:
+            logger.exception("[scholar-batch] task_id=%s failed: %s", task_id, e)
+            state = q.get_state(task_id)
+            if state:
+                state.status = TaskStatus.error
+                state.finished_at = time.time()
+                state.error_message = str(e) or e.__class__.__name__
+                state.payload["completed"] = completed
+                state.payload["failed"] = failed
+                state.payload["total"] = total
+                q.set_state(state)
+                q.push_event(
+                    task_id,
+                    "error",
+                    {
+                        "message": state.error_message,
+                        "completed": completed,
+                        "failed": failed,
+                        "total": total,
+                    },
+                )
         finally:
             heartbeat_stop.set()
             heartbeat_task.cancel()
@@ -564,34 +763,24 @@ async def scholar_batch_download(
             except asyncio.CancelledError:
                 pass
 
-        if req.library_id is not None and not _is_temp_library(req.library_id) and batch_download_dir:
-            try:
-                _sync_library_paper_downloaded_at(req.library_id, batch_download_dir)
-            except Exception as e:
-                logger.warning("batch post-sync downloaded_at failed: %s", e)
-
-        state = q.get_state(task_id)
-        if state:
-            state.finished_at = time.time()
-            state.payload["completed"] = completed
-            state.payload["failed"] = failed
-            if failed == total:
-                state.status = TaskStatus.error
-                state.error_message = "所有论文下载均失败"
-            else:
-                state.status = TaskStatus.completed
-            q.set_state(state)
-            q.push_event(
-                task_id,
-                "done",
-                {"completed": completed, "failed": failed, "total": total},
-            )
-
     async def sem_wrap(sem, coro_fn, paper):
         async with sem:
             return await coro_fn(paper)
 
-    background_tasks.add_task(lambda: asyncio.run(_batch_job()))
+    # Schedule on the app's event loop (same as context pool). BackgroundTasks would run in
+    # thread pool and expects a callable, not a coroutine.
+    batch_task = asyncio.create_task(_batch_job(), name=f"scholar-batch:{task_id}")
+
+    def _log_batch_task_result(task: asyncio.Task) -> None:
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            logger.warning("[scholar-batch] task_id=%s was cancelled", task_id)
+            return
+        if exc is not None:
+            logger.exception("[scholar-batch] task_id=%s escaped task wrapper: %s", task_id, exc)
+
+    batch_task.add_done_callback(_log_batch_task_result)
     return {
         "status": "submitted",
         "task_id": task_id,
@@ -722,6 +911,40 @@ def list_scholar_libraries(user_id: str = Depends(get_current_user_id)):
     for lib_id, entry in list(_temp_store.items()):
         result.append(_temp_library_response(entry))
     return result
+
+
+@router.get("/libraries/by-collection/{collection_name:path}")
+def get_scholar_library_by_collection(
+    collection_name: str,
+    auto_create: bool = False,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Resolve scholar library bound to collection."""
+    collection = (collection_name or "").strip()
+    if not collection:
+        raise HTTPException(status_code=400, detail="集合名称不能为空")
+
+    lib = resolve_bound_library_for_collection(user_id, collection, auto_create=bool(auto_create))
+    if lib is None and auto_create:
+        with Session(get_engine()) as session:
+            _binding, lib, _binding_created, _library_created = ensure_collection_binding(session, user_id, collection)
+            session.commit()
+    if lib is None:
+        return {"collection": collection, "bound": False, "library": None}
+    return {
+        "collection": collection,
+        "bound": True,
+        "library": {
+            "id": lib.id,
+            "name": lib.name,
+            "description": lib.description or "",
+            "paper_count": 0,
+            "created_at": lib.created_at,
+            "updated_at": lib.updated_at,
+            "is_temporary": False,
+            "folder_path": getattr(lib, "folder_path", None) or None,
+        },
+    }
 
 
 @router.post("/libraries")
@@ -947,6 +1170,8 @@ def _paper_from_search_item(item: Dict[str, Any]) -> ScholarLibraryPaper:
         source=(meta.get("source") or "") or "",
         score=float(item.get("score") or 0),
         annas_md5=(meta.get("annas_md5") or "") or "",
+        venue=(meta.get("venue") or "") or "",
+        normalized_journal_name=(meta.get("normalized_journal_name") or "") or "",
     )
 
 
@@ -959,7 +1184,7 @@ def _temp_paper_from_search_item(item: Dict[str, Any], lib_id: int) -> Dict[str,
     if not isinstance(authors, list):
         authors = []
     now_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
-    return {
+    out: Dict[str, Any] = {
         "id": _temp_paper_id_counter,
         "library_id": lib_id,
         "title": (meta.get("title") or "").strip() or "(无标题)",
@@ -973,13 +1198,108 @@ def _temp_paper_from_search_item(item: Dict[str, Any], lib_id: int) -> Dict[str,
         "annas_md5": (meta.get("annas_md5") or "") or "",
         "added_at": now_iso,
         "downloaded_at": None,
+        "venue": (meta.get("venue") or "") or "",
+        "normalized_journal_name": (meta.get("normalized_journal_name") or "") or "",
     }
+    if meta.get("impact_factor") is not None:
+        out["impact_factor"] = meta["impact_factor"]
+    if meta.get("jif_quartile"):
+        out["jif_quartile"] = meta["jif_quartile"]
+    if meta.get("jif_5year") is not None:
+        out["jif_5year"] = meta["jif_5year"]
+    return out
 
 
 def _doi_to_paper_id_for_api(doi: str) -> str:
     """DOI to paper_id stem for API (delegate to adapter)."""
     from src.retrieval.downloader.adapter import _doi_to_paper_id
     return _doi_to_paper_id(doi)
+
+
+def _attach_impact_factor_metadata(papers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """In-place: add impact_factor, jif_quartile, jif_5year to each paper that has venue/normalized_journal_name."""
+    if not papers:
+        return papers
+    try:
+        from src.services.impact_factor_service import lookup_many
+
+        venues = []
+        for p in papers:
+            v = (p.get("venue") or "").strip() or (p.get("normalized_journal_name") or "").strip()
+            if v:
+                venues.append(v)
+        if not venues:
+            return papers
+        if_map = lookup_many(venues, ensure_current=True)
+        for p in papers:
+            v = (p.get("venue") or "").strip()
+            norm = (p.get("normalized_journal_name") or "").strip() or v
+            data = if_map.get(norm) or (if_map.get(v) if v else None)
+            if data:
+                p["impact_factor"] = data.get("impact_factor")
+                p["jif_quartile"] = data.get("jif_quartile") or ""
+                p["jif_5year"] = data.get("jif_5year")
+            else:
+                p.setdefault("impact_factor", None)
+                p.setdefault("jif_quartile", None)
+                p.setdefault("jif_5year", None)
+    except Exception as e:
+        logger.debug("Attach impact factor to library papers failed (non-fatal): %s", e)
+    return papers
+
+
+def _build_library_ingest_cfg(
+    *,
+    file_paths: List[str],
+    collection_name: str,
+    user_id: str,
+    skip_duplicate_doi: bool,
+    skip_unchanged: bool,
+) -> Dict[str, Any]:
+    """Build ingest config payload for library -> ingest bridge."""
+    return {
+        "file_paths": file_paths,
+        "collection_name": collection_name,
+        "content_hashes": {},
+        "enrich_tables": False,
+        "enrich_figures": False,
+        "actual_skip": True,
+        "skip_duplicate_doi": bool(skip_duplicate_doi),
+        "skip_unchanged": bool(skip_unchanged),
+        "llm_text_provider": None,
+        "llm_text_model": None,
+        "llm_text_concurrency": None,
+        "llm_vision_provider": None,
+        "llm_vision_model": None,
+        "llm_vision_concurrency": None,
+        "user_id": user_id,
+    }
+
+
+def _library_paper_id(doi: Optional[str], title: str, authors: List[str], year: Optional[int]) -> Optional[str]:
+    """Return paper_id for a library paper: from DOI if present, else from title/authors/year so download button is enabled when only pdf_url exists."""
+    if doi and (doi or "").strip():
+        return _doi_to_paper_id_for_api(doi)
+    if not (title or (authors and authors[0])):
+        return None
+    from src.retrieval.downloader.adapter import _normalize_to_paper_id
+    return _normalize_to_paper_id(title or "", list(authors) if authors else [], year)
+
+
+def _build_library_row_index(rows: List[ScholarLibraryPaper]) -> Tuple[Dict[str, ScholarLibraryPaper], Dict[str, ScholarLibraryPaper]]:
+    """Build in-memory DOI/title lookup for fast dedup/linking."""
+    from src.retrieval.dedup import normalize_doi, normalize_title
+
+    by_doi: Dict[str, ScholarLibraryPaper] = {}
+    by_title: Dict[str, ScholarLibraryPaper] = {}
+    for row in rows:
+        ndoi = normalize_doi((row.doi or "").strip())
+        if ndoi and ndoi not in by_doi:
+            by_doi[ndoi] = row
+        ntitle = normalize_title((row.title or "").strip())
+        if ntitle and ntitle not in by_title:
+            by_title[ntitle] = row
+    return by_doi, by_title
 
 
 @router.get("/libraries/{lib_id:int}/papers")
@@ -992,16 +1312,23 @@ def list_scholar_library_papers(lib_id: int, user_id: str = Depends(get_current_
         out = []
         for p in papers:
             d = dict(p)
-            doi = (d.get("doi") or "").strip()
-            d["paper_id"] = _doi_to_paper_id_for_api(doi) if doi else None
+            d["paper_id"] = _library_paper_id(
+                (d.get("doi") or "").strip() or None,
+                d.get("title") or "",
+                d.get("authors") or [],
+                d.get("year"),
+            )
+            d["venue"] = d.get("venue") or None
+            d["normalized_journal_name"] = d.get("normalized_journal_name") or None
+            d["is_downloaded"] = bool(d.get("downloaded_at"))
             out.append(d)
-        return out
+        return _attach_impact_factor_metadata(out)
     with Session(get_engine()) as session:
         lib = session.get(ScholarLibrary, lib_id)
         if not lib or getattr(lib, "user_id", None) != user_id:
             raise HTTPException(status_code=404, detail="库不存在")
         papers = session.exec(select(ScholarLibraryPaper).where(ScholarLibraryPaper.library_id == lib_id)).all()
-        return [
+        out = [
             {
                 "id": p.id,
                 "library_id": p.library_id,
@@ -1016,10 +1343,132 @@ def list_scholar_library_papers(lib_id: int, user_id: str = Depends(get_current_
                 "annas_md5": p.annas_md5 or None,
                 "added_at": p.added_at,
                 "downloaded_at": getattr(p, "downloaded_at", None),
-                "paper_id": _doi_to_paper_id_for_api(p.doi) if (p.doi and (p.doi or "").strip()) else None,
+                "venue": getattr(p, "venue", None) or None,
+                "normalized_journal_name": getattr(p, "normalized_journal_name", None) or None,
+                "paper_id": _library_paper_id(
+                    (p.doi or "").strip() or None,
+                    p.title or "",
+                    p.get_authors(),
+                    p.year,
+                ),
+                "is_downloaded": bool(getattr(p, "downloaded_at", None)),
             }
             for p in papers
         ]
+        return _attach_impact_factor_metadata(out)
+
+
+@router.post("/libraries/{lib_id:int}/ingest")
+async def ingest_scholar_library(
+    lib_id: int,
+    body: LibraryIngestRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Create one ingest job from a scholar library's PDFs (incremental by DOI/content hash)."""
+    if _is_temp_library(lib_id):
+        raise HTTPException(status_code=400, detail="临时库不支持直接增量建库")
+
+    with Session(get_engine()) as session:
+        lib = session.get(ScholarLibrary, lib_id)
+        if not lib or getattr(lib, "user_id", None) != user_id:
+            raise HTTPException(status_code=404, detail="库不存在")
+        rows = list(session.exec(select(ScholarLibraryPaper).where(ScholarLibraryPaper.library_id == lib_id)).all())
+
+    download_dir = _resolve_library_download_dir(lib_id)
+    if not download_dir:
+        raise HTTPException(status_code=400, detail="该库未配置可用目录")
+    pdfs_dir = Path(download_dir)
+    pdfs_dir.mkdir(parents=True, exist_ok=True)
+
+    from src.retrieval.downloader.utils import is_valid_pdf
+
+    file_paths: List[str] = []
+    missing_rows: List[ScholarLibraryPaper] = []
+    for row in rows:
+        stem = _library_paper_id(
+            (row.doi or "").strip() or None,
+            row.title or "",
+            row.get_authors(),
+            row.year,
+        )
+        if not stem:
+            continue
+        candidate = pdfs_dir / f"{stem}.pdf"
+        if candidate.is_file() and is_valid_pdf(str(candidate)):
+            file_paths.append(str(candidate))
+        else:
+            missing_rows.append(row)
+
+    downloaded_now = 0
+    failed_downloads = 0
+    attempted_downloads = 0
+
+    if body.auto_download_missing and missing_rows:
+        from src.retrieval.downloader.adapter import get_adapter
+
+        adapter = get_adapter()
+        for row in missing_rows[: body.max_auto_download]:
+            attempted_downloads += 1
+            result = await adapter.download_paper(
+                title=row.title,
+                doi=(row.doi or "").strip() or None,
+                pdf_url=(row.pdf_url or "").strip() or None,
+                annas_md5=(row.annas_md5 or "").strip() or None,
+                authors=row.get_authors(),
+                year=row.year,
+                download_dir=download_dir,
+                llm_provider=body.llm_provider,
+                model_override=body.model_override,
+                assist_llm_enabled=body.assist_llm_enabled,
+                show_browser=body.show_browser,
+                include_academia=body.include_academia,
+                strategy_order=body.strategy_order,
+            )
+            if result.get("success") and result.get("filepath"):
+                fp = str(result["filepath"])
+                if fp not in file_paths:
+                    file_paths.append(fp)
+                downloaded_now += 1
+                try:
+                    from src.tasks.dispatcher import _mark_library_paper_downloaded
+
+                    _mark_library_paper_downloaded(row.id)
+                except Exception as e:
+                    logger.warning("mark downloaded_at failed for library paper %s: %s", row.id, e)
+            else:
+                failed_downloads += 1
+
+    unique_paths = list(dict.fromkeys(file_paths))
+    if not unique_paths:
+        raise HTTPException(status_code=400, detail="该文献库没有可入库的 PDF，请先下载文献")
+
+    from src.indexing.ingest_job_store import create_job
+
+    collection_name = (body.collection or "").strip() or settings.collection.global_
+    ingest_cfg = _build_library_ingest_cfg(
+        file_paths=unique_paths,
+        collection_name=collection_name,
+        user_id=user_id,
+        skip_duplicate_doi=body.skip_duplicate_doi,
+        skip_unchanged=body.skip_unchanged,
+    )
+    job = create_job(collection_name, ingest_cfg, total_files=len(unique_paths))
+    job_id = job.get("job_id")
+    if not job_id:
+        raise HTTPException(status_code=500, detail="创建入库任务失败")
+
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "collection": collection_name,
+        "library_id": lib_id,
+        "total_library_papers": len(rows),
+        "pdf_ready_count": len(unique_paths),
+        "missing_pdf_count": max(0, len(missing_rows) - downloaded_now),
+        "attempted_downloads": attempted_downloads,
+        "downloaded_now": downloaded_now,
+        "failed_downloads": failed_downloads,
+    }
 
 
 @router.get("/libraries/{lib_id:int}/pdf/{paper_id:path}")
@@ -1045,6 +1494,226 @@ def get_library_pdf(lib_id: int, paper_id: str, user_id: str = Depends(get_curre
         media_type="application/pdf",
         filename=f"{paper_id}.pdf",
     )
+
+
+@router.post("/libraries/{lib_id:int}/papers/{record_id:int}/upload-pdf")
+async def upload_library_paper_pdf(
+    lib_id: int,
+    record_id: int,
+    file: UploadFile = File(...),
+    user_id: str = Depends(get_current_user_id),
+):
+    """Upload a PDF for a library paper; store as {paper_id}.pdf, set downloaded_at."""
+    if _is_temp_library(lib_id):
+        raise HTTPException(status_code=400, detail="临时库不支持上传 PDF")
+    pdfs_dir = _resolve_library_download_dir(lib_id)
+    if not pdfs_dir:
+        raise HTTPException(status_code=400, detail="该库无 PDF 目录")
+    with Session(get_engine()) as session:
+        lib = session.get(ScholarLibrary, lib_id)
+        if not lib or getattr(lib, "user_id", None) != user_id:
+            raise HTTPException(status_code=404, detail="库不存在")
+        row = session.get(ScholarLibraryPaper, record_id)
+        if not row or row.library_id != lib_id:
+            raise HTTPException(status_code=404, detail="文献不存在")
+        paper_id = _library_paper_id(
+            (row.doi or "").strip() or None,
+            row.title or "",
+            row.get_authors(),
+            row.year,
+        )
+        if not paper_id:
+            raise HTTPException(status_code=400, detail="无法生成 paper_id（需 DOI 或标题）")
+    content = await file.read()
+    if not content or content[:4] != b"%PDF":
+        raise HTTPException(status_code=400, detail="无效的 PDF 文件")
+    pdfs_path = Path(pdfs_dir)
+    pdfs_path.mkdir(parents=True, exist_ok=True)
+    target = pdfs_path / f"{paper_id}.pdf"
+    target.write_bytes(content)
+    now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+    with Session(get_engine()) as session:
+        row = session.get(ScholarLibraryPaper, record_id)
+        if row:
+            row.downloaded_at = now
+            session.add(row)
+            session.commit()
+    return {"success": True, "paper_id": paper_id, "filename": f"{paper_id}.pdf"}
+
+
+@router.post("/libraries/{lib_id:int}/import-pdfs", response_model=LibraryImportPdfSummary)
+async def import_library_pdfs(
+    lib_id: int,
+    files: List[UploadFile] = File(...),
+    user_id: str = Depends(get_current_user_id),
+):
+    """Bulk import local PDF files into one permanent library and auto-link records."""
+    if _is_temp_library(lib_id):
+        raise HTTPException(status_code=400, detail="临时库不支持该操作")
+    if not files:
+        raise HTTPException(status_code=400, detail="未提供 PDF 文件")
+
+    pdfs_dir = _resolve_library_download_dir(lib_id)
+    if not pdfs_dir:
+        raise HTTPException(status_code=400, detail="该库无 PDF 目录")
+    pdfs_path = Path(pdfs_dir)
+    pdfs_path.mkdir(parents=True, exist_ok=True)
+
+    from src.indexing.paper_metadata_store import paper_meta_store
+    from src.parser.pdf_parser import extract_native_metadata
+    from src.retrieval.dedup import extract_doi_from_pdf_tiered, normalize_doi, normalize_title
+    from src.retrieval.downloader.adapter import _normalize_to_paper_id
+
+    summary: Dict[str, Any] = {
+        "total_files": len(files),
+        "imported": 0,
+        "linked_existing": 0,
+        "renamed": 0,
+        "skipped_duplicates": 0,
+        "invalid_pdf": 0,
+        "no_doi": 0,
+        "errors": [],
+    }
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+
+    with Session(get_engine()) as session:
+        lib = session.get(ScholarLibrary, lib_id)
+        if not lib or getattr(lib, "user_id", None) != user_id:
+            raise HTTPException(status_code=404, detail="库不存在")
+
+        existing_rows = list(
+            session.exec(select(ScholarLibraryPaper).where(ScholarLibraryPaper.library_id == lib_id)).all()
+        )
+        existing_by_doi, existing_by_title = _build_library_row_index(existing_rows)
+
+        for idx, upload in enumerate(files):
+            raw_name = (upload.filename or f"import_{idx}.pdf").strip()
+            original_stem = Path(raw_name).stem
+            temp_path = pdfs_path / f".__import_{uuid.uuid4().hex}.pdf"
+            target_path: Optional[Path] = None
+            try:
+                payload = await upload.read()
+                if not payload or payload[:4] != b"%PDF":
+                    summary["invalid_pdf"] += 1
+                    summary["errors"].append(f"{raw_name}: invalid PDF")
+                    continue
+
+                temp_path.write_bytes(payload)
+
+                extracted_doi, extracted_title = extract_doi_from_pdf_tiered(temp_path)
+                native_meta = extract_native_metadata(temp_path)
+                title = (
+                    (extracted_title or native_meta.get("title") or original_stem or "").strip()
+                    or "(无标题)"
+                )
+                ntitle = normalize_title(title)
+                ndoi = normalize_doi(extracted_doi)
+                if not ndoi:
+                    summary["no_doi"] += 1
+
+                if ndoi:
+                    paper_id = _doi_to_paper_id_for_api(ndoi)
+                    existing = existing_by_doi.get(ndoi)
+                else:
+                    paper_id = _normalize_to_paper_id(title or "", [], None)
+                    existing = existing_by_title.get(ntitle) if ntitle else None
+                target_path = pdfs_path / f"{paper_id}.pdf"
+
+                if existing is not None:
+                    summary["linked_existing"] += 1
+                    if not target_path.exists():
+                        temp_path.rename(target_path)
+                        summary["imported"] += 1
+                        if target_path.stem != original_stem:
+                            summary["renamed"] += 1
+                    else:
+                        summary["skipped_duplicates"] += 1
+
+                    changed = False
+                    if ndoi and not (existing.doi or "").strip():
+                        existing.doi = ndoi
+                        changed = True
+                    if title and ((existing.title or "").strip() in ("", "(无标题)")):
+                        existing.title = title
+                        changed = True
+                    if not (existing.downloaded_at or "").strip():
+                        existing.downloaded_at = now_iso
+                        changed = True
+                    if not (existing.source or "").strip():
+                        existing.source = "folder_import"
+                        changed = True
+                    if changed:
+                        session.add(existing)
+
+                    if ndoi:
+                        existing_by_doi[ndoi] = existing
+                    if ntitle and ntitle not in existing_by_title:
+                        existing_by_title[ntitle] = existing
+
+                    try:
+                        paper_meta_store.upsert(
+                            target_path.stem,
+                            doi=ndoi or None,
+                            title=title,
+                            source="library_folder_import",
+                        )
+                    except Exception:
+                        pass
+                    continue
+
+                if target_path.exists():
+                    summary["skipped_duplicates"] += 1
+                    continue
+
+                temp_path.rename(target_path)
+                summary["imported"] += 1
+                if target_path.stem != original_stem:
+                    summary["renamed"] += 1
+
+                new_row = ScholarLibraryPaper(
+                    library_id=lib_id,
+                    title=title,
+                    authors="[]",
+                    year=None,
+                    doi=ndoi or "",
+                    pdf_url="",
+                    url="",
+                    source="folder_import",
+                    score=0.0,
+                    annas_md5="",
+                    added_at=now_iso,
+                    downloaded_at=now_iso,
+                )
+                session.add(new_row)
+                session.flush()
+
+                if ndoi:
+                    existing_by_doi[ndoi] = new_row
+                if ntitle and ntitle not in existing_by_title:
+                    existing_by_title[ntitle] = new_row
+
+                try:
+                    paper_meta_store.upsert(
+                        target_path.stem,
+                        doi=ndoi or None,
+                        title=title,
+                        source="library_folder_import",
+                    )
+                except Exception:
+                    pass
+            except Exception as e:
+                summary["errors"].append(f"{raw_name}: {e}")
+            finally:
+                if temp_path.exists():
+                    temp_path.unlink(missing_ok=True)
+
+        session.commit()
+
+    # Keep payload bounded for UI toast/readability.
+    if len(summary["errors"]) > 20:
+        extra = len(summary["errors"]) - 20
+        summary["errors"] = summary["errors"][:20] + [f"... and {extra} more errors"]
+    return summary
 
 
 @router.post("/libraries/{lib_id:int}/papers")
@@ -1103,6 +1772,8 @@ def add_papers_to_scholar_library(lib_id: int, body: AddPapersToLibraryRequest, 
                     existing_row.source = paper.source
                     existing_row.score = paper.score
                     existing_row.annas_md5 = paper.annas_md5 or ""
+                    existing_row.venue = paper.venue or ""
+                    existing_row.normalized_journal_name = paper.normalized_journal_name or ""
                     session.add(existing_row)
                     added += 1
                 continue
@@ -1117,6 +1788,42 @@ def add_papers_to_scholar_library(lib_id: int, body: AddPapersToLibraryRequest, 
             added += 1
         session.commit()
         return {"added": added, "total_requested": len(body.papers)}
+
+
+@router.delete("/libraries/{lib_id:int}/papers/{record_id:int}/pdf")
+def delete_library_paper_pdf(lib_id: int, record_id: int, user_id: str = Depends(get_current_user_id)):
+    """Delete the downloaded PDF file for a library paper and clear downloaded_at. Paper stays in the library so user can re-download."""
+    if _is_temp_library(lib_id):
+        raise HTTPException(status_code=400, detail="临时库无本地 PDF")
+    pdfs_dir = _resolve_library_download_dir(lib_id)
+    if not pdfs_dir or not Path(pdfs_dir).is_dir():
+        raise HTTPException(status_code=400, detail="该库无 PDF 目录")
+    with Session(get_engine()) as session:
+        lib = session.get(ScholarLibrary, lib_id)
+        if not lib or getattr(lib, "user_id", None) != user_id:
+            raise HTTPException(status_code=404, detail="库不存在")
+        paper = session.get(ScholarLibraryPaper, record_id)
+        if not paper or paper.library_id != lib_id:
+            raise HTTPException(status_code=404, detail="文献不存在")
+        stem = _library_paper_id(
+            (paper.doi or "").strip() or None,
+            paper.title or "",
+            paper.get_authors(),
+            paper.year,
+        )
+        if not stem:
+            raise HTTPException(status_code=400, detail="无法解析 paper_id（需 DOI 或标题）")
+        pdf_path = Path(pdfs_dir) / f"{stem}.pdf"
+        if pdf_path.is_file():
+            try:
+                pdf_path.unlink(missing_ok=True)
+            except OSError as e:
+                logger.warning("delete_library_paper_pdf unlink failed: %s", e)
+                raise HTTPException(status_code=500, detail="删除文件失败")
+        paper.downloaded_at = None
+        session.add(paper)
+        session.commit()
+    return {"ok": True, "paper_id": stem}
 
 
 @router.delete("/libraries/{lib_id:int}/papers/{paper_id:int}")
@@ -1232,8 +1939,57 @@ async def scholar_health():
     from src.retrieval.downloader.adapter import is_adapter_ready
 
     cfg = getattr(settings, "scholar_downloader", None)
+    allowed = [
+        "direct_download",
+        "playwright_download",
+        "browser_lookup",
+        "sci_hub",
+        "brightdata",
+        "anna",
+    ]
+    configured = list(getattr(cfg, "default_strategy_order", [])) if cfg else []
+    normalized = [item for item in configured if item in allowed]
+    for item in allowed:
+        if item not in normalized:
+            normalized.append(item)
     return {
         "enabled": bool(cfg and cfg.enabled),
         "adapter_ready": is_adapter_ready(),
         "download_dir": getattr(cfg, "download_dir", "") if cfg else "",
+        "default_strategy_order": normalized,
     }
+
+
+@router.get("/browser/headed", response_model=HeadedBrowserWindowState)
+async def scholar_headed_browser_state():
+    from src.retrieval.browser_service import SharedBrowserService
+
+    state = SharedBrowserService.get_headed_window_state()
+    state["bounds"] = (
+        SharedBrowserService._get_headed_window_bounds(state["mode"])
+        if state.get("mode") in {"parked", "visible"}
+        else None
+    )
+    return state
+
+
+@router.post("/browser/headed/show", response_model=HeadedBrowserWindowState)
+async def scholar_show_headed_browser():
+    from src.retrieval.browser_service import SharedBrowserService
+
+    try:
+        return await SharedBrowserService.show_headed()
+    except Exception as e:
+        logger.warning("[scholar] show headed browser failed: %s", e)
+        raise HTTPException(status_code=503, detail=f"无法召回有头浏览器: {e}")
+
+
+@router.post("/browser/headed/park", response_model=HeadedBrowserWindowState)
+async def scholar_park_headed_browser():
+    from src.retrieval.browser_service import SharedBrowserService
+
+    try:
+        return await SharedBrowserService.park_headed()
+    except Exception as e:
+        logger.warning("[scholar] park headed browser failed: %s", e)
+        raise HTTPException(status_code=503, detail=f"无法停靠有头浏览器: {e}")

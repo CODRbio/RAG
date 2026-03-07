@@ -250,6 +250,7 @@ class BrowserManager:
                            proxy: Optional[str] = None,
                            stealth_mode: bool = False,
                            always_download_pdf: bool = False,
+                           reuse_shared_cdp: bool = True,
                            **kwargs) -> Browser:
         """
         启动浏览器实例
@@ -270,22 +271,36 @@ class BrowserManager:
         """
         await self._ensure_playwright()
 
-        # 按 headless 选择对应 CDP 端点
-        if headless is not False:
-            cdp_url = SharedBrowserService.get_cdp_url_headless()
-        else:
-            cdp_url = SharedBrowserService.get_cdp_url_headed()
-        if cdp_url and browser_type in ("chromium", "chrome"):
-            logger.info(f"连接共享浏览器 CDP: {cdp_url}")
-            browser = await self.playwright.chromium.connect_over_cdp(cdp_url)
-            self._cdp_browser_handle = browser
-            return browser
+        logger.info(
+            "[headed-diag] launch_browser: browser_type=%r, headless=%s, proxy=%s, "
+            "stealth_mode=%s, reuse_shared_cdp=%s, always_download_pdf=%s, kwargs_keys=%s",
+            browser_type,
+            headless,
+            proxy,
+            stealth_mode,
+            reuse_shared_cdp,
+            always_download_pdf,
+            list(kwargs.keys()) if kwargs else [],
+        )
 
-        # 自动检测显示模式
+        # 先做自动检测，再判断 CDP，避免 headless=None 被误判为“非 False”走错分支
         if headless is None:
             use_headed, display_mode = ensure_display()
             headless = not use_headed
             logger.info(f"自动检测显示模式: {display_mode}, headless={headless}")
+
+        # 按需复用共享 CDP 浏览器。显式禁用时始终本地启动，适合需要真实可见窗口
+        # 或依赖 user_data_dir / persistent context 语义的场景。
+        if reuse_shared_cdp:
+            if headless:
+                cdp_url = SharedBrowserService.get_cdp_url_headless()
+            else:
+                cdp_url = SharedBrowserService.get_cdp_url_headed()
+            if cdp_url and browser_type in ("chromium", "chrome"):
+                logger.info(f"连接共享浏览器 CDP: {cdp_url}")
+                browser = await self.playwright.chromium.connect_over_cdp(cdp_url)
+                self._cdp_browser_handle = browser
+                return browser
 
         context_options = {}
         
@@ -357,6 +372,13 @@ class BrowserManager:
                 })
                 logger.info("已应用Firefox的代理配置")
         
+        logger.info(
+            "[headed-diag] launch_browser: launch_options passed to Playwright: headless=%s, args=%s, keys=%s",
+            launch_options.get("headless"),
+            launch_options.get("args", []),
+            list(launch_options.keys()),
+        )
+        
         # 根据浏览器类型选择启动方法
         # 注意：Chrome 137+ 已移除扩展加载支持，建议使用 Playwright 内置 Chromium
         if browser_type == "chrome":
@@ -371,6 +393,13 @@ class BrowserManager:
         else:
             # 默认使用 Playwright 内置 Chromium
             browser = await self.playwright.chromium.launch(**launch_options)
+        
+        logger.info(
+            "[headed-diag] Playwright launch returned: type=%s, launch_options.headless=%s, launch_options.args=%s",
+            browser_type,
+            launch_options.get("headless"),
+            launch_options.get("args", []),
+        )
             
         self.browsers.append(browser)
         return browser
@@ -439,6 +468,7 @@ class BrowserManager:
                                       timeout: int = 120000,
                                       always_download_pdf: bool = True,
                                       downloads_path: Optional[str] = None,
+                                      reuse_shared_cdp: bool = True,
                                       **kwargs) -> BrowserContext:
         """
         启动持久化浏览器实例
@@ -465,38 +495,56 @@ class BrowserManager:
         """
         await self._ensure_playwright()
 
-        # 按 headless 选择对应 CDP 端点
-        if headless is not False:
-            cdp_url = SharedBrowserService.get_cdp_url_headless()
-        else:
-            cdp_url = SharedBrowserService.get_cdp_url_headed()
-        if cdp_url and browser_type in ("chromium", "chrome"):
-            logger.info(f"通过 CDP 复用共享浏览器: {cdp_url}")
-            if user_data_dir:
-                logger.info("CDP 模式不使用 user_data_dir 持久化配置，改为独立 context 隔离")
+        logger.info(
+            "[headed-diag] launch_persistent_browser: user_data_dir=%r, browser_type=%r, "
+            "headless=%s, reuse_shared_cdp=%s, stealth_mode=%s, extension_path=%s, "
+            "downloads_path=%s, timeout=%s, kwargs_keys=%s",
+            user_data_dir,
+            browser_type,
+            headless,
+            reuse_shared_cdp,
+            stealth_mode,
+            extension_path,
+            downloads_path,
+            timeout,
+            list(kwargs.keys()) if kwargs else [],
+        )
 
-            browser = await self.playwright.chromium.connect_over_cdp(cdp_url)
-            self._cdp_browser_handle = browser
-            context = await browser.new_context(
-                accept_downloads=True,
-                user_agent=user_agent or DEFAULT_USER_AGENT,
-                viewport=viewport or DEFAULT_VIEWPORT,
-                locale=DEFAULT_LOCALE,
-                timezone_id=DEFAULT_TIMEZONE,
-                geolocation=DEFAULT_GEOLOCATION,
-                color_scheme="light",
-                reduced_motion="no-preference",
-                has_touch=False,
-            )
-            if downloads_path:
-                os.makedirs(downloads_path, exist_ok=True)
-            return context
-
-        # 自动检测显示模式
+        # 先做自动检测，再判断 CDP，避免 headless=None 被误判为“非 False”走错分支
         if headless is None:
             use_headed, display_mode = ensure_display()
             headless = not use_headed
             logger.info(f"自动检测显示模式: {display_mode}, headless={headless}")
+
+        # 对 persistent context，显式允许时优先复用共享 CDP（有头/无头双端口）；无 CDP 时回退到本地 launch。
+        if reuse_shared_cdp:
+            if headless:
+                cdp_url = SharedBrowserService.get_cdp_url_headless()
+            else:
+                cdp_url = SharedBrowserService.get_cdp_url_headed()
+            if cdp_url and browser_type in ("chromium", "chrome"):
+                logger.info(f"通过 CDP 复用共享浏览器: {cdp_url}")
+                if user_data_dir:
+                    logger.info("CDP 模式不使用 user_data_dir 持久化配置，改为独立 context 隔离")
+
+                browser = await self.playwright.chromium.connect_over_cdp(cdp_url)
+                self._cdp_browser_handle = browser
+                context_options_cdp = dict(
+                    accept_downloads=True,
+                    user_agent=user_agent or DEFAULT_USER_AGENT,
+                    viewport=viewport or DEFAULT_VIEWPORT,
+                    locale=DEFAULT_LOCALE,
+                    timezone_id=DEFAULT_TIMEZONE,
+                    geolocation=DEFAULT_GEOLOCATION,
+                    color_scheme="light",
+                    reduced_motion="no-preference",
+                    has_touch=False,
+                )
+                if downloads_path:
+                    os.makedirs(downloads_path, exist_ok=True)
+                    logger.info(f"CDP context 将通过 download.save_as 使用下载目录: {downloads_path}")
+                context = await browser.new_context(**context_options_cdp)
+                return context
         
         # 确保用户数据目录存在
         os.makedirs(user_data_dir, exist_ok=True)
@@ -511,8 +559,7 @@ class BrowserManager:
         # 如果指定了下载路径，设置到 context_options
         if downloads_path:
             os.makedirs(downloads_path, exist_ok=True)
-            context_options["downloads_path"] = os.path.abspath(downloads_path)
-            logger.info(f"设置 context 下载路径: {downloads_path}")
+            logger.info(f"已准备下载目录: {downloads_path}")
         
         # 如果需要总是下载PDF或设置下载路径
         if (always_download_pdf or downloads_path) and "chrom" in browser_type:
@@ -651,6 +698,13 @@ class BrowserManager:
             ])
             context_options["args"] = args
         
+        logger.info(
+            "[headed-diag] launch_persistent_browser: context_options passed to Playwright: headless=%s, args=%s, keys=%s",
+            context_options.get("headless"),
+            context_options.get("args", []),
+            list(context_options.keys()),
+        )
+        
         # 根据浏览器类型选择启动方法
         try:
             # 重要：Chrome 137+ 已移除 --load-extension 支持
@@ -708,6 +762,15 @@ class BrowserManager:
                     user_data_dir,
                     **context_options
                 )
+            
+            logger.info(
+                "[headed-diag] Playwright launch_persistent_context returned: type=%s, pages=%d, "
+                "context_options.headless=%s, context_options.args=%s",
+                browser_type,
+                len(browser.pages),
+                context_options.get("headless"),
+                context_options.get("args", []),
+            )
                 
             # 如果启用了隐身模式，进一步修改浏览器属性以隐藏自动化信息
             if stealth_mode and browser.pages:

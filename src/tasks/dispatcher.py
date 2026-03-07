@@ -11,6 +11,7 @@ import json
 import threading
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from config.settings import settings
@@ -194,7 +195,14 @@ async def run_unified_chat_worker_once() -> bool:
 
 _SCHOLAR_DOWNLOAD_HEARTBEAT_INTERVAL = 5  # seconds
 
-_STRATEGY_PROGRESS = {"annas_md5": 10, "pdf_url": 20, "sci_hub": 30, "annas_doi": 40}
+_STRATEGY_PROGRESS = {
+    "anna": 10,
+    "browser_lookup": 15,
+    "playwright_download": 20,
+    "direct_download": 25,
+    "sci_hub": 30,
+    "brightdata": 40,
+}
 
 
 def _mark_library_paper_downloaded(library_paper_id: int) -> None:
@@ -220,11 +228,15 @@ async def process_download_and_ingest(
     paper_info: Dict[str, Any],
     collection: Optional[str] = None,
     download_dir: Optional[str] = None,
+    user_id: Optional[str] = None,
+    library_id: Optional[int] = None,
     library_paper_id: Optional[int] = None,
     llm_provider: Optional[str] = None,
     model_override: Optional[str] = None,
+    assist_llm_enabled: Optional[bool] = None,
     show_browser: Optional[bool] = None,
     include_academia: Optional[bool] = None,
+    strategy_order: Optional[list[str]] = None,
 ) -> Dict[str, Any]:
     """
     Download one paper PDF then trigger ingest into the given collection.
@@ -291,6 +303,17 @@ async def process_download_and_ingest(
         elif stage == "validating":
             q.push_event(task_id, "progress", {"progress": 45, "stage": "DOWNLOADING", "message": "validating"})
 
+    if not download_dir and user_id and collection:
+        try:
+            from src.services.collection_library_binding_service import resolve_bound_library_for_collection
+
+            bound_lib = resolve_bound_library_for_collection(user_id, collection, auto_create=True)
+            if bound_lib and getattr(bound_lib, "folder_path", None):
+                download_dir = str(Path(bound_lib.folder_path) / "pdfs")
+                library_id = int(bound_lib.id) if bound_lib.id is not None else library_id
+        except Exception as e:
+            logger.warning("process_download_and_ingest resolve bound library failed: %s", e)
+
     adapter = get_adapter()
     try:
         heartbeat_task = asyncio.create_task(_heartbeat_loop())
@@ -298,15 +321,18 @@ async def process_download_and_ingest(
             title=paper_info.get("title", ""),
             doi=paper_info.get("doi"),
             pdf_url=paper_info.get("pdf_url"),
+            url=paper_info.get("url"),
             annas_md5=paper_info.get("annas_md5"),
             authors=paper_info.get("authors"),
             year=paper_info.get("year"),
             download_dir=download_dir,
             llm_provider=llm_provider,
             model_override=model_override,
+            assist_llm_enabled=assist_llm_enabled,
             progress_callback=_progress_callback,
             show_browser=show_browser,
             include_academia=bool(include_academia),
+            strategy_order=strategy_order,
         )
     except Exception as e:
         heartbeat_stop.set()
@@ -381,6 +407,8 @@ async def process_download_and_ingest(
     state.payload["paper_id"] = paper_id
     state.payload["filepath"] = filepath
     state.payload["collection"] = collection_name
+    if library_id is not None:
+        state.payload["library_id"] = library_id
     q.set_state(state)
     q.push_event(
         task_id,
@@ -395,6 +423,7 @@ async def process_download_and_ingest(
     return {
         **dl_result,
         "collection": collection_name,
+        "library_id": library_id,
         "ingest_job_id": ingest_job_id,
         "ingest_triggered": True,
     }

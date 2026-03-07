@@ -16,6 +16,7 @@ from typing import Generator
 
 from sqlalchemy import event
 from sqlalchemy.engine import Engine
+from sqlalchemy.pool import SingletonThreadPool
 from sqlmodel import Session, SQLModel, create_engine
 
 _engine: Engine | None = None
@@ -91,12 +92,15 @@ def get_engine() -> Engine:
 
     is_sqlite = db_url.startswith("sqlite")
     connect_args = {"check_same_thread": False, "timeout": 30} if is_sqlite else {}
+    # One connection per thread for SQLite to reduce "database is locked" under concurrent requests.
+    pool_class = SingletonThreadPool if is_sqlite else None
 
     _engine = create_engine(
         db_url,
         echo=False,
         connect_args=connect_args,
         pool_pre_ping=True,
+        poolclass=pool_class,
     )
 
     if is_sqlite:
@@ -138,6 +142,8 @@ def _ensure_schema_updates() -> None:
         ("deep_research_jobs", "started_at", "REAL"),
         ("canvases", "preliminary_knowledge", "TEXT NOT NULL DEFAULT ''"),
         ("scholar_libraries", "folder_path", "TEXT"),
+        ("scholar_library_papers", "venue", "TEXT NOT NULL DEFAULT ''"),
+        ("scholar_library_papers", "normalized_journal_name", "TEXT NOT NULL DEFAULT ''"),
     ]
     with engine.connect() as conn:
         for table, col, col_type in _add_column_if_missing:

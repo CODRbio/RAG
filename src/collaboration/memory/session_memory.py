@@ -4,12 +4,13 @@
 """
 
 import json
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional, TypeVar
 
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlmodel import Session, select
 
 from src.db.engine import get_engine
@@ -20,6 +21,27 @@ from src.utils.context_limits import SESSION_MEMORY_TURN_MAX_CHARS
 
 _pm = PromptManager()
 logger = get_logger(__name__)
+
+T = TypeVar("T")
+
+
+def _retry_on_locked(fn: Callable[[], T], max_retries: int = 3) -> T:
+    """Run fn(); on SQLite 'database is locked' / 'database is busy' retry with backoff."""
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except OperationalError as e:
+            last_exc = e
+            msg = str(e).lower()
+            if "locked" not in msg and "busy" not in msg:
+                raise
+            if attempt == max_retries - 1:
+                raise
+            sleep_ms = 50 * (attempt + 1)
+            logger.debug("[session_memory] database locked, retry %s/%s in %sms", attempt + 1, max_retries, sleep_ms)
+            time.sleep(sleep_ms / 1000.0)
+    raise last_exc  # type: ignore[misc]
 
 
 @dataclass
@@ -50,20 +72,24 @@ class SessionStore:
     ) -> str:
         session_id = str(uuid.uuid4())
         now = datetime.now().isoformat()
-        with Session(get_engine()) as session:
-            row = ChatSession(
-                session_id=session_id,
-                canvas_id=canvas_id,
-                stage=stage,
-                rolling_summary="",
-                summary_at_turn=0,
-                title="",
-                session_type=session_type if session_type in ("chat", "research") else "chat",
-                created_at=now,
-                updated_at=now,
-            )
-            session.add(row)
-            session.commit()
+
+        def _do() -> None:
+            with Session(get_engine()) as session:
+                row = ChatSession(
+                    session_id=session_id,
+                    canvas_id=canvas_id,
+                    stage=stage,
+                    rolling_summary="",
+                    summary_at_turn=0,
+                    title="",
+                    session_type=session_type if session_type in ("chat", "research") else "chat",
+                    created_at=now,
+                    updated_at=now,
+                )
+                session.add(row)
+                session.commit()
+
+        _retry_on_locked(_do)
         return session_id
 
     def get_session_meta(self, session_id: str) -> Optional[Dict[str, Any]]:
@@ -99,51 +125,62 @@ class SessionStore:
         return meta.get("stage") or "explore"
 
     def update_session_stage(self, session_id: str, stage: str) -> None:
-        with Session(get_engine()) as session:
-            row = session.get(ChatSession, session_id)
-            if row:
-                row.stage = stage
-                row.updated_at = datetime.now().isoformat()
-                session.add(row)
-                session.commit()
+        def _do() -> None:
+            with Session(get_engine()) as session:
+                row = session.get(ChatSession, session_id)
+                if row:
+                    row.stage = stage
+                    row.updated_at = datetime.now().isoformat()
+                    session.add(row)
+                    session.commit()
+
+        _retry_on_locked(_do)
 
     def update_session_meta(self, session_id: str, meta: Dict[str, Any]) -> None:
         """更新会话元数据，如 canvas_id、title、session_type"""
-        with Session(get_engine()) as session:
-            row = session.get(ChatSession, session_id)
-            if not row:
-                return
-            if isinstance(meta.get("canvas_id"), str):
-                row.canvas_id = meta["canvas_id"]
-            if isinstance(meta.get("rolling_summary"), str):
-                row.rolling_summary = meta["rolling_summary"]
-            if isinstance(meta.get("summary_at_turn"), int):
-                row.summary_at_turn = meta["summary_at_turn"]
-            if "title" in meta and isinstance(meta.get("title"), str):
-                row.title = meta["title"]
-            if meta.get("session_type") in ("chat", "research"):
-                row.session_type = meta["session_type"]
-            if "preferences" in meta and isinstance(meta["preferences"], dict):
-                existing = {}
-                if getattr(row, "preferences", None):
-                    try:
-                        existing = json.loads(row.preferences)
-                    except (TypeError, ValueError):
-                        pass
-                existing.update(meta["preferences"])
-                row.preferences = json.dumps(existing, ensure_ascii=False)
-            row.updated_at = datetime.now().isoformat()
-            session.add(row)
-            session.commit()
 
-    def touch_session(self, session_id: str) -> None:
-        """仅更新 updated_at，用于「重新激活」后使会话排到历史列表最前。"""
-        with Session(get_engine()) as session:
-            row = session.get(ChatSession, session_id)
-            if row:
+        def _do() -> None:
+            with Session(get_engine()) as session:
+                row = session.get(ChatSession, session_id)
+                if not row:
+                    return
+                if isinstance(meta.get("canvas_id"), str):
+                    row.canvas_id = meta["canvas_id"]
+                if isinstance(meta.get("rolling_summary"), str):
+                    row.rolling_summary = meta["rolling_summary"]
+                if isinstance(meta.get("summary_at_turn"), int):
+                    row.summary_at_turn = meta["summary_at_turn"]
+                if "title" in meta and isinstance(meta.get("title"), str):
+                    row.title = meta["title"]
+                if meta.get("session_type") in ("chat", "research"):
+                    row.session_type = meta["session_type"]
+                if "preferences" in meta and isinstance(meta["preferences"], dict):
+                    existing = {}
+                    if getattr(row, "preferences", None):
+                        try:
+                            existing = json.loads(row.preferences)
+                        except (TypeError, ValueError):
+                            pass
+                    existing.update(meta["preferences"])
+                    row.preferences = json.dumps(existing, ensure_ascii=False)
                 row.updated_at = datetime.now().isoformat()
                 session.add(row)
                 session.commit()
+
+        _retry_on_locked(_do)
+
+    def touch_session(self, session_id: str) -> None:
+        """仅更新 updated_at，用于「重新激活」后使会话排到历史列表最前。"""
+
+        def _do() -> None:
+            with Session(get_engine()) as session:
+                row = session.get(ChatSession, session_id)
+                if row:
+                    row.updated_at = datetime.now().isoformat()
+                    session.add(row)
+                    session.commit()
+
+        _retry_on_locked(_do)
 
     def get_turns(
         self,
@@ -240,20 +277,25 @@ class SessionStore:
                 try:
                     session.commit()
                     return
-                except IntegrityError:
+                except (IntegrityError, OperationalError) as e:
                     session.rollback()
                     if attempt == max_retries - 1:
                         raise
-                    logger.debug("[session_memory] append_turn conflict, retry %s/%s", attempt + 1, max_retries)
+                    if isinstance(e, OperationalError) and ("locked" in str(e).lower() or "busy" in str(e).lower()):
+                        time.sleep(0.05 * (attempt + 1))
+                    logger.debug("[session_memory] append_turn conflict/locked, retry %s/%s", attempt + 1, max_retries)
 
     def delete_session(self, session_id: str) -> bool:
-        with Session(get_engine()) as session:
-            row = session.get(ChatSession, session_id)
-            if not row:
-                return False
-            session.delete(row)  # cascade deletes turns
-            session.commit()
-        return True
+        def _do() -> bool:
+            with Session(get_engine()) as session:
+                row = session.get(ChatSession, session_id)
+                if not row:
+                    return False
+                session.delete(row)  # cascade deletes turns
+                session.commit()
+            return True
+
+        return _retry_on_locked(lambda: _do())
 
     def delete_sessions_by_canvas_id(self, canvas_id: str) -> int:
         """删除该画布下的所有会话（及其轮次），返回删除的会话数。"""

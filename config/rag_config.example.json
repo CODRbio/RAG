@@ -128,6 +128,22 @@
     "query_expansion_llm": "deepseek",
     "max_queries": 4
   },
+  "shared_browser": {
+    "start_headless": true,
+    "start_headed": true,
+    "headless_port": 9222,
+    "headed_port": 9223,
+    "headless_context_pool_size": 2,
+    "headed_context_pool_size": 2,
+    "context_acquire_timeout_seconds": 30,
+    "context_idle_ttl_seconds": 300,
+    "context_cooldown_min_seconds": 1,
+    "context_cooldown_max_seconds": 2,
+    "headed_window_width": 1280,
+    "headed_window_height": 900,
+    "headed_window_visible_strip_px": 100,
+    "headed_window_y": 80
+  },
   "google_search": {
     "enabled": true,
     "scholar_enabled": true,
@@ -203,6 +219,7 @@
     "stealth_mode": true,
     "experience_store_path": null,
     "annas_keyword_max_pages": 5,
+    "default_strategy_order": ["direct_download", "playwright_download", "browser_lookup", "sci_hub", "brightdata", "anna"],
     "use_scihub": true,
     "scihub_mirrors": ["https://sci-hub.st/", "https://sci-hub.ru/"],
     "timeouts": {

@@ -3,7 +3,7 @@ src/retrieval/downloader/adapter.py
 
 Adapter between RAG and PaperDownloader.
 Search: delegate to RAG modules (google_search / semantic_scholar / ncbi_search).
-Download: run PaperDownloader in ThreadPoolExecutor (separate event loop).
+Download: run PaperDownloader on the caller's async event loop.
 """
 
 import hashlib
@@ -13,7 +13,7 @@ import asyncio
 import random
 import unicodedata
 import threading
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from config.settings import settings
 from src.log import get_logger
@@ -25,10 +25,50 @@ logger = get_logger(__name__)
 
 # Academia.edu PDFs often require paid access; prefer DOI/Sci-Hub/Anna's first, use Academia as fallback.
 ACADEMIA_DOMAIN = "academia.edu"
+_UI_STRATEGY_IDS = (
+    "direct_download",
+    "playwright_download",
+    "browser_lookup",
+    "sci_hub",
+    "brightdata",
+    "anna",
+)
+_FALLBACK_DEFAULT_STRATEGY_ORDER = [
+    "direct_download",
+    "playwright_download",
+    "browser_lookup",
+    "sci_hub",
+    "brightdata",
+    "anna",
+]
+DEFAULT_STRATEGY_ORDER = [
+    item for item in getattr(settings.scholar_downloader, "default_strategy_order", _FALLBACK_DEFAULT_STRATEGY_ORDER)
+    if item in _UI_STRATEGY_IDS
+]
+for _item in _FALLBACK_DEFAULT_STRATEGY_ORDER:
+    if _item not in DEFAULT_STRATEGY_ORDER:
+        DEFAULT_STRATEGY_ORDER.append(_item)
 
 
 def _is_academia_pdf_url(url: Optional[str]) -> bool:
     """True if the URL is an Academia.edu PDF/page (deprioritize: try other sources first)."""
+    return bool(url and ACADEMIA_DOMAIN in (url or "").lower())
+
+
+def _normalize_strategy_order(strategy_order: Optional[Sequence[str]]) -> List[str]:
+    allowed = set(_UI_STRATEGY_IDS)
+    ordered: List[str] = []
+    for item in strategy_order or []:
+        if item in allowed and item not in ordered:
+            ordered.append(item)
+    for item in DEFAULT_STRATEGY_ORDER:
+        if item not in ordered:
+            ordered.append(item)
+    return ordered
+
+
+def _is_academia_url(url: Optional[str]) -> bool:
+    """True if URL points to academia.edu."""
     return bool(url and ACADEMIA_DOMAIN in (url or "").lower())
 
 
@@ -132,23 +172,6 @@ class ScholarDownloaderAdapter:
             initial_config=initial_config,
         )
 
-        self._bg_loop = asyncio.new_event_loop()
-        self._bg_thread = threading.Thread(
-            target=self._run_bg_loop,
-            daemon=True,
-            name="scholar_dl_bg",
-        )
-        self._bg_thread.start()
-
-        self._warmup_future = asyncio.run_coroutine_threadsafe(
-            self._dl.initialize(),
-            self._bg_loop,
-        )
-
-    def _run_bg_loop(self) -> None:
-        asyncio.set_event_loop(self._bg_loop)
-        self._bg_loop.run_forever()
-
     async def search_google_scholar(
         self,
         query: str,
@@ -229,12 +252,8 @@ class ScholarDownloaderAdapter:
         query: str,
         limit: int = 10,
     ) -> List[Dict[str, Any]]:
-        """Anna's Archive keyword search running on shared downloader loop."""
-        fut = asyncio.run_coroutine_threadsafe(
-            self._impl_search_annas(query=query, limit=limit),
-            self._bg_loop,
-        )
-        return await asyncio.wrap_future(fut)
+        """Anna's Archive keyword search via shared downloader instance."""
+        return await self._impl_search_annas(query=query, limit=limit)
 
     async def _impl_search_annas(
         self, query: str, limit: int
@@ -264,51 +283,53 @@ class ScholarDownloaderAdapter:
         title: str,
         doi: Optional[str] = None,
         pdf_url: Optional[str] = None,
+        url: Optional[str] = None,
         annas_md5: Optional[str] = None,
         authors: Optional[List[str]] = None,
         year: Optional[int] = None,
         download_dir: Optional[str] = None,
         llm_provider: Optional[str] = None,
         model_override: Optional[str] = None,
+        assist_llm_enabled: Optional[bool] = None,
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         show_browser: Optional[bool] = None,
         include_academia: bool = False,
+        strategy_order: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Download one paper PDF to download_dir (or override). Returns success, paper_id, filepath, message.
         If progress_callback is set, it is called with e.g. {"stage": "strategy_start", "strategy": "annas_md5"}.
         show_browser: optional override for headed(True)/headless(False); affects browser launch.
         include_academia: when False (default), Academia.edu pdf_url is skipped entirely to avoid hangs."""
-        fut = asyncio.run_coroutine_threadsafe(
-            self._impl_download_inner(
-                title, doi, pdf_url, annas_md5, authors, year,
-                download_dir=download_dir,
-                llm_provider=llm_provider,
-                model_override=model_override,
-                progress_callback=progress_callback,
-                show_browser=show_browser,
-                include_academia=include_academia,
-            ),
-            self._bg_loop,
+        return await self._impl_download_inner(
+            title, doi, pdf_url, url, annas_md5, authors, year,
+            download_dir=download_dir,
+            llm_provider=llm_provider,
+            model_override=model_override,
+            assist_llm_enabled=assist_llm_enabled,
+            progress_callback=progress_callback,
+            show_browser=show_browser,
+            include_academia=include_academia,
+            strategy_order=strategy_order,
         )
-        return await asyncio.wrap_future(fut)
 
     async def _impl_download_inner(
         self,
         title: str,
         doi: Optional[str],
         pdf_url: Optional[str],
+        url: Optional[str],
         annas_md5: Optional[str],
         authors: Optional[List[str]],
         year: Optional[int],
         download_dir: Optional[str] = None,
         llm_provider: Optional[str] = None,
         model_override: Optional[str] = None,
+        assist_llm_enabled: Optional[bool] = None,
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         show_browser: Optional[bool] = None,
         include_academia: bool = False,
+        strategy_order: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        if show_browser is not None:
-            self._dl.set_show_browser_override(show_browser)
         target_dir = (download_dir or self.download_dir).rstrip("/")
         cb = progress_callback
 
@@ -357,58 +378,172 @@ class ScholarDownloaderAdapter:
                 except Exception as e:
                     logger.debug("DOI-based skip check failed (non-fatal): %s", e)
 
+            # Persist the caller's browser mode onto the shared downloader instance.
+            # The session pool/context lifecycle must follow this instance-level override
+            # instead of the per-request ContextVar used inside individual page flows.
+            logger.info(
+                "[headed-diag] adapter: show_browser=%r (from API), "
+                "current _show_browser_override=%r, self._dl.headless=%s",
+                show_browser,
+                getattr(self._dl, "_show_browser_override", None),
+                self._dl.headless,
+            )
+            self._dl.set_show_browser_override(show_browser)
+
             # Make sure shared browser context is healthy; no-op when already ready.
             await self._dl.initialize()
 
             success = False
             message = ""
+            effective_strategy_order = _normalize_strategy_order(strategy_order)
+            pdf_url_is_academia = _is_academia_pdf_url(pdf_url)
+            article_url_is_academia = _is_academia_url(url)
+            llm_disabled = assist_llm_enabled is False
+            effective_llm_provider = None if llm_disabled else llm_provider
+            effective_model_override = None if llm_disabled else model_override
+            doi_str = (doi or "").strip()
+            doi_landing_url = (
+                doi_str
+                if (doi_str and doi_str.lower().startswith("http"))
+                else (f"https://doi.org/{doi_str}" if doi_str else "")
+            )
+            browser_lookup_targets: List[tuple[str, str]] = []
+            if not pdf_url:
+                if doi_landing_url:
+                    browser_lookup_targets.append(("doi", doi_landing_url))
+                if url:
+                    browser_lookup_targets.append(("url", url))
+            if not include_academia:
+                browser_lookup_targets = [
+                    (kind, target)
+                    for kind, target in browser_lookup_targets
+                    if not _is_academia_url(target)
+                ]
 
-            if annas_md5 and self.annas_api_key:
+            route_diag = {
+                "has_pdf_url": bool(pdf_url),
+                "has_doi": bool(doi_str),
+                "has_url": bool(url),
+                "has_annas_md5": bool(annas_md5),
+                "include_academia": bool(include_academia),
+                "requested_strategy_order": list(strategy_order or []),
+                "effective_strategy_order": list(effective_strategy_order),
+                "browser_lookup_targets": [kind for kind, _ in browser_lookup_targets],
+                "skipped": {},
+                "attempted": [],
+            }
+
+            logger.info(
+                "[download-route] paper=%s has_pdf_url=%s has_doi=%s has_url=%s has_annas_md5=%s strategy_order=%s browser_lookup_targets=%s",
+                title[:80],
+                bool(pdf_url),
+                bool(doi_str),
+                bool(url),
+                bool(annas_md5),
+                effective_strategy_order,
+                [kind for kind, _ in browser_lookup_targets],
+            )
+
+            async def _run_direct_download() -> bool:
+                nonlocal message
+                if not pdf_url or (pdf_url_is_academia and not include_academia):
+                    return False
                 if cb:
-                    cb({"stage": "strategy_start", "strategy": "annas_md5"})
+                    cb({"stage": "strategy_start", "strategy": "direct_download"})
                 try:
-                    ok, _reason, _ = await self._dl.download_with_annas_archive(
-                        annas_md5, filepath, title=title, authors=authors, year=year
+                    ok = await self._dl.download_direct(
+                        pdf_url,
+                        filepath,
+                        title=title,
+                        authors=authors,
+                        year=year,
                     )
                     if cb:
-                        cb({"stage": "strategy_done", "strategy": "annas_md5", "success": ok})
+                        cb({"stage": "strategy_done", "strategy": "direct_download", "success": ok})
                     if ok:
-                        success = True
-                        message = "Anna's Archive (MD5)"
+                        message = "Direct PDF URL"
+                    return ok
                 except Exception as e:
                     if cb:
-                        cb({"stage": "strategy_done", "strategy": "annas_md5", "success": False})
-                    logger.warning("Anna's MD5 download failed: %s", e)
+                        cb({"stage": "strategy_done", "strategy": "direct_download", "success": False})
+                    logger.warning("Direct PDF download failed: %s", e)
+                    return False
 
-            # When pdf_url is Academia.edu: skip entirely if include_academia=False (default).
-            # When allowed, still defer to last (after DOI/Sci-Hub/Anna's).
-            pdf_url_is_academia = _is_academia_pdf_url(pdf_url)
-            if pdf_url_is_academia and not include_academia:
-                logger.info("Academia.edu pdf_url skipped (include_academia=False): %s", (pdf_url or "")[:80])
-            if not success and pdf_url and not pdf_url_is_academia:
+            async def _run_playwright_download() -> bool:
+                nonlocal message
+                if not pdf_url or (pdf_url_is_academia and not include_academia):
+                    return False
                 if cb:
-                    cb({"stage": "strategy_start", "strategy": "pdf_url"})
+                    cb({"stage": "strategy_start", "strategy": "playwright_download"})
                 try:
                     await asyncio.sleep(random.uniform(1.0, 3.0))
-                    success = await self._dl.find_and_download_pdf_with_browser(
-                        pdf_url, filepath, title=title, authors=authors, year=year,
-                        llm_provider=llm_provider, model_override=model_override,
+                    ok = await self._dl.find_and_download_pdf_with_browser(
+                        pdf_url,
+                        filepath,
+                        title=title,
+                        authors=authors,
+                        year=year,
+                        llm_provider=effective_llm_provider,
+                        model_override=effective_model_override,
+                        progress_callback=cb,
+                        show_browser=show_browser,
+                        disable_assist_llm=llm_disabled,
                     )
                     if cb:
-                        cb({"stage": "strategy_done", "strategy": "pdf_url", "success": success})
-                    if success:
-                        message = "PDF URL 直接下载"
+                        cb({"stage": "strategy_done", "strategy": "playwright_download", "success": ok})
+                    if ok:
+                        message = "Playwright browser flow"
+                    return ok
                 except Exception as e:
                     if cb:
-                        cb({"stage": "strategy_done", "strategy": "pdf_url", "success": False})
-                    logger.warning("PDF URL download failed: %s", e)
+                        cb({"stage": "strategy_done", "strategy": "playwright_download", "success": False})
+                    logger.warning("Playwright PDF download failed: %s", e)
+                    return False
 
-            if not success and doi:
+            async def _run_browser_lookup() -> bool:
+                nonlocal message
+                if not browser_lookup_targets:
+                    return False
+                if cb:
+                    cb({"stage": "strategy_start", "strategy": "browser_lookup"})
+                try:
+                    await asyncio.sleep(random.uniform(1.0, 3.0))
+                    for target_kind, target_url in browser_lookup_targets:
+                        ok = await self._dl.find_and_download_pdf_with_browser(
+                            target_url,
+                            filepath,
+                            title=title,
+                            authors=authors,
+                            year=year,
+                            llm_provider=effective_llm_provider,
+                            model_override=effective_model_override,
+                            progress_callback=cb,
+                            show_browser=show_browser,
+                            disable_assist_llm=llm_disabled,
+                        )
+                        if ok:
+                            if cb:
+                                cb({"stage": "strategy_done", "strategy": "browser_lookup", "success": True})
+                            message = f"Browser lookup via {target_kind}"
+                            return True
+                    if cb:
+                        cb({"stage": "strategy_done", "strategy": "browser_lookup", "success": False})
+                    return False
+                except Exception as e:
+                    if cb:
+                        cb({"stage": "strategy_done", "strategy": "browser_lookup", "success": False})
+                    logger.warning("Browser lookup failed: %s", e)
+                    return False
+
+            async def _run_sci_hub() -> bool:
+                nonlocal message
+                if not doi:
+                    return False
                 if cb:
                     cb({"stage": "strategy_start", "strategy": "sci_hub"})
                 try:
                     await asyncio.sleep(random.uniform(1.5, 3.5))
-                    success = await self._dl.download_with_sci_hub(
+                    ok = await self._dl.download_with_sci_hub(
                         f"https://doi.org/{doi}",
                         filepath,
                         title=title,
@@ -416,51 +551,121 @@ class ScholarDownloaderAdapter:
                         year=year,
                     )
                     if cb:
-                        cb({"stage": "strategy_done", "strategy": "sci_hub", "success": success})
-                    if success:
+                        cb({"stage": "strategy_done", "strategy": "sci_hub", "success": ok})
+                    if ok:
                         message = "Sci-Hub"
+                    return ok
                 except Exception as e:
                     if cb:
                         cb({"stage": "strategy_done", "strategy": "sci_hub", "success": False})
                     logger.warning("Sci-Hub download failed: %s", e)
+                    return False
 
-            if not success and doi and self.annas_api_key:
+            async def _run_brightdata() -> bool:
+                nonlocal message
+                if not pdf_url or not getattr(self._dl, "brightdata_api_key", None):
+                    return False
+                if pdf_url_is_academia and not include_academia:
+                    return False
                 if cb:
-                    cb({"stage": "strategy_start", "strategy": "annas_doi"})
+                    cb({"stage": "strategy_start", "strategy": "brightdata"})
                 try:
-                    md5 = await self._dl._annas_search_md5(doi)
-                    if md5:
-                        ok, _, _ = await self._dl.download_with_annas_archive(
-                            md5, filepath, title=title, authors=authors, year=year
-                        )
-                        if cb:
-                            cb({"stage": "strategy_done", "strategy": "annas_doi", "success": bool(ok)})
-                        if ok:
-                            success = True
-                            message = "Anna's Archive (DOI)"
-                except Exception as e:
-                    if cb:
-                        cb({"stage": "strategy_done", "strategy": "annas_doi", "success": False})
-                    logger.warning("Anna's DOI search failed: %s", e)
-
-            # Academia fallback: only when explicitly enabled and all other strategies failed.
-            if not success and pdf_url and pdf_url_is_academia and include_academia:
-                if cb:
-                    cb({"stage": "strategy_start", "strategy": "pdf_url"})
-                try:
-                    await asyncio.sleep(random.uniform(1.0, 3.0))
-                    success = await self._dl.find_and_download_pdf_with_browser(
-                        pdf_url, filepath, title=title, authors=authors, year=year,
-                        llm_provider=llm_provider, model_override=model_override,
+                    ok = await self._dl.download_with_solver(
+                        pdf_url,
+                        filepath,
+                        title=title,
+                        authors=authors,
+                        year=year,
                     )
                     if cb:
-                        cb({"stage": "strategy_done", "strategy": "pdf_url", "success": success})
-                    if success:
-                        message = "PDF URL 直接下载 (Academia 兜底)"
+                        cb({"stage": "strategy_done", "strategy": "brightdata", "success": ok})
+                    if ok:
+                        message = "BrightData"
+                    return ok
                 except Exception as e:
                     if cb:
-                        cb({"stage": "strategy_done", "strategy": "pdf_url", "success": False})
-                    logger.warning("PDF URL (Academia) download failed: %s", e)
+                        cb({"stage": "strategy_done", "strategy": "brightdata", "success": False})
+                    logger.warning("BrightData download failed: %s", e)
+                    return False
+
+            async def _run_anna() -> bool:
+                nonlocal message
+                if not self.annas_api_key:
+                    return False
+                if not annas_md5 and not doi:
+                    return False
+                if cb:
+                    cb({"stage": "strategy_start", "strategy": "anna"})
+                try:
+                    if annas_md5:
+                        ok, _reason, _ = await self._dl.download_with_annas_archive(
+                            annas_md5,
+                            filepath,
+                            title=title,
+                            authors=authors,
+                            year=year,
+                        )
+                        if ok:
+                            if cb:
+                                cb({"stage": "strategy_done", "strategy": "anna", "success": True})
+                            message = "Anna's Archive (MD5)"
+                            return True
+                    if doi:
+                        md5 = await self._dl._annas_search_md5(doi)
+                        if md5:
+                            ok, _, _ = await self._dl.download_with_annas_archive(
+                                md5,
+                                filepath,
+                                title=title,
+                                authors=authors,
+                                year=year,
+                            )
+                            if ok:
+                                if cb:
+                                    cb({"stage": "strategy_done", "strategy": "anna", "success": True})
+                                message = "Anna's Archive (DOI)"
+                                return True
+                    if cb:
+                        cb({"stage": "strategy_done", "strategy": "anna", "success": False})
+                    return False
+                except Exception as e:
+                    if cb:
+                        cb({"stage": "strategy_done", "strategy": "anna", "success": False})
+                    logger.warning("Anna download failed: %s", e)
+                    return False
+            if pdf_url_is_academia and not include_academia:
+                logger.info("Academia.edu pdf_url skipped (include_academia=False): %s", (pdf_url or "")[:80])
+            if article_url_is_academia and not include_academia:
+                logger.info("Academia.edu article url skipped (include_academia=False): %s", (url or "")[:80])
+
+            runners = {
+                "direct_download": _run_direct_download,
+                "playwright_download": _run_playwright_download,
+                "browser_lookup": _run_browser_lookup,
+                "sci_hub": _run_sci_hub,
+                "brightdata": _run_brightdata,
+                "anna": _run_anna,
+            }
+            strategy_can_run = {
+                "direct_download": bool(pdf_url) and (include_academia or not pdf_url_is_academia),
+                "playwright_download": bool(pdf_url) and (include_academia or not pdf_url_is_academia),
+                "browser_lookup": bool(browser_lookup_targets),
+                "sci_hub": bool(doi_str),
+                "brightdata": bool(pdf_url) and bool(getattr(self._dl, "brightdata_api_key", None))
+                and (include_academia or not pdf_url_is_academia),
+                "anna": bool(self.annas_api_key) and bool(annas_md5 or doi_str),
+            }
+            for strategy_id in effective_strategy_order:
+                if success:
+                    break
+                runner = runners.get(strategy_id)
+                if not runner:
+                    continue
+                if not strategy_can_run.get(strategy_id, True):
+                    route_diag["skipped"][strategy_id] = "precondition_not_met"
+                    continue
+                route_diag["attempted"].append(strategy_id)
+                success = await runner()
 
             if not success:
                 return {
@@ -468,6 +673,7 @@ class ScholarDownloaderAdapter:
                     "paper_id": None,
                     "filepath": None,
                     "message": "所有下载策略均失败",
+                    "route_diag": route_diag,
                 }
 
             if not os.path.exists(filepath):
@@ -506,6 +712,7 @@ class ScholarDownloaderAdapter:
                 "paper_id": paper_id,
                 "filepath": filepath,
                 "message": message,
+                "route_diag": route_diag,
             }
 
         try:
@@ -541,6 +748,7 @@ class ScholarDownloaderAdapter:
                     title=p.get("title", ""),
                     doi=p.get("doi"),
                     pdf_url=p.get("pdf_url"),
+                    url=p.get("url"),
                     annas_md5=p.get("annas_md5"),
                     authors=p.get("authors"),
                     year=p.get("year"),
@@ -557,18 +765,19 @@ class ScholarDownloaderAdapter:
         return results
 
     def shutdown(self) -> None:
-        if self._bg_loop and self._bg_loop.is_running():
-            cleanup_future = asyncio.run_coroutine_threadsafe(
-                self._dl.cleanup_resources(force_close=True),
-                self._bg_loop,
-            )
-            try:
-                cleanup_future.result(timeout=15)
-            except Exception as e:
-                logger.warning("Downloader cleanup during shutdown failed: %s", e)
-            self._bg_loop.call_soon_threadsafe(self._bg_loop.stop)
-        if self._bg_thread and self._bg_thread.is_alive():
-            self._bg_thread.join(timeout=10)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop is not None and loop.is_running():
+            loop.create_task(self._dl.cleanup_resources(force_close=True))
+            return
+
+        try:
+            asyncio.run(self._dl.cleanup_resources(force_close=True))
+        except Exception as e:
+            logger.warning("Downloader cleanup during shutdown failed: %s", e)
 
 
 _adapter_instance: Optional[ScholarDownloaderAdapter] = None
