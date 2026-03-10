@@ -13,6 +13,7 @@ from config.settings import settings
 from src.api.routes_auth import get_optional_user_id
 from src.log import get_logger
 from src.services.collection_library_binding_service import resolve_bound_library_for_collection
+from src.utils.path_manager import PathManager
 
 logger = get_logger(__name__)
 
@@ -65,19 +66,55 @@ def _query_chunk_in_collection(collection_name: str, chunk_id: str) -> Optional[
     }
 
 
-def _find_enriched_json_by_paper_id(paper_id: str) -> Optional[Path]:
-    parsed_dir = settings.path.data / "parsed"
-    direct = parsed_dir / paper_id / "enriched.json"
-    if direct.exists():
-        return direct
-    candidates = list(parsed_dir.glob(f"*{paper_id}*/enriched.json"))
-    if candidates:
-        return candidates[0]
+def _find_enriched_json_by_paper_id(
+    paper_id: str,
+    user_id: Optional[str] = None,
+    collection: Optional[str] = None,
+) -> Optional[Path]:
+    parsed_roots: List[Path] = []
+    if user_id:
+        if (collection or "").strip():
+            try:
+                bound_lib = resolve_bound_library_for_collection(user_id, collection, auto_create=False)
+                if bound_lib and getattr(bound_lib, "name", None):
+                    parsed_roots.append(PathManager.get_user_library_parsed_path(user_id, str(bound_lib.name)))
+            except Exception as e:
+                logger.debug(
+                    "resolve bound library parsed root failed user=%s collection=%s err=%s",
+                    user_id,
+                    collection,
+                    e,
+                )
+        parsed_roots.extend(PathManager.get_user_all_library_parsed_paths(user_id))
+        parsed_roots.append(PathManager.get_user_parsed_path(user_id))
+    parsed_roots.append(settings.path.data / "parsed")
+    seen: set[str] = set()
+    deduped: List[Path] = []
+    for p in parsed_roots:
+        key = str(p.resolve()) if p.exists() else str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(p)
+    parsed_roots = deduped
+
+    for parsed_dir in parsed_roots:
+        direct = parsed_dir / paper_id / "enriched.json"
+        if direct.exists():
+            return direct
+        candidates = list(parsed_dir.glob(f"*{paper_id}*/enriched.json"))
+        if candidates:
+            return candidates[0]
     return None
 
 
-def _query_chunk_from_parsed(paper_id: str, chunk_id: str) -> Optional[Dict[str, Any]]:
-    json_path = _find_enriched_json_by_paper_id(paper_id)
+def _query_chunk_from_parsed(
+    paper_id: str,
+    chunk_id: str,
+    user_id: Optional[str] = None,
+    collection: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    json_path = _find_enriched_json_by_paper_id(paper_id, user_id=user_id, collection=collection)
     if not json_path:
         return None
     try:
@@ -254,6 +291,7 @@ def graph_chunk_detail(
     chunk_id: str,
     collection: Optional[str] = Query(None, description="优先查询的集合名"),
     paper_id: Optional[str] = Query(None, description="可选，前端透传用于展示"),
+    user_id: Optional[str] = Depends(get_optional_user_id),
 ) -> Dict[str, Any]:
     """获取 chunk 详情文本与元数据（用于图谱节点点击弹窗）。"""
     from src.indexing.milvus_ops import milvus
@@ -290,7 +328,7 @@ def graph_chunk_detail(
 
     # 回退：Milvus 不存在时，尝试从 parsed/enriched.json 重建并匹配 chunk_id
     if paper_id:
-        fallback = _query_chunk_from_parsed(paper_id, chunk_id)
+        fallback = _query_chunk_from_parsed(paper_id, chunk_id, user_id=user_id, collection=collection)
         if fallback:
             related_entities: List[str] = []
             hippo = _get_hippo()

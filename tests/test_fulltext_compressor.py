@@ -9,6 +9,8 @@ from src.retrieval.fulltext_compressor import (
     _word_count,
     compress_fulltext_hits_sync,
     WORD_THRESHOLD_DEFAULT,
+    CHAR_THRESHOLD_DEFAULT,
+    MAX_OUTPUT_WORDS_DEFAULT,
     FALLBACK_TRUNCATE_CHARS,
 )
 
@@ -62,6 +64,45 @@ class TestCompressLongCallsLlm:
         # Compressor uses stripped content for original_full_text_chars
         assert hits[0]["metadata"]["original_full_text_chars"] == len(long_text.strip())
         client.chat.assert_called_once()
+
+    def test_char_threshold_triggers_for_cjk_like_text(self):
+        # No whitespace => word_count is 1, but char length should still trigger.
+        long_cjk = "这是一段很长的文本" * 800
+        hits = [{"content": long_cjk, "metadata": {"content_type": "full_text", "title": "T", "url": ""}}]
+        client = MagicMock()
+        client.chat.return_value = {"final_text": "摘要内容。"}
+        out = compress_fulltext_hits_sync(
+            hits,
+            "query",
+            client,
+            word_threshold=WORD_THRESHOLD_DEFAULT,
+            char_threshold=CHAR_THRESHOLD_DEFAULT,
+            max_output_words=MAX_OUTPUT_WORDS_DEFAULT,
+            max_concurrent=1,
+        )
+        assert out is hits
+        assert hits[0]["content"] == "摘要内容。"
+        client.chat.assert_called_once()
+
+    def test_overlong_summary_rejected_and_truncated(self):
+        long_text = "word " * 1200
+        too_long_summary = "s " * (MAX_OUTPUT_WORDS_DEFAULT + 20)
+        hits = [{"content": long_text, "metadata": {"content_type": "full_text", "title": "T", "url": ""}}]
+        client = MagicMock()
+        client.chat.return_value = {"final_text": too_long_summary}
+        out = compress_fulltext_hits_sync(
+            hits,
+            "query",
+            client,
+            word_threshold=WORD_THRESHOLD_DEFAULT,
+            char_threshold=CHAR_THRESHOLD_DEFAULT,
+            max_output_words=MAX_OUTPUT_WORDS_DEFAULT,
+            max_concurrent=1,
+        )
+        assert out is hits
+        # Falls back to truncation when summary exceeds configured word budget.
+        assert len(hits[0]["content"]) <= FALLBACK_TRUNCATE_CHARS + 3
+        assert hits[0]["content"].endswith("...")
 
 
 class TestCompressLlmFailureTruncates:

@@ -56,6 +56,9 @@ from src.retrieval.context_pool import (
     acquire_headless_context,
     acquire_headed_context,
     release_context as release_context_lease,
+    run_with_headless_context,
+    run_with_headed_context,
+    SharedContextPool,
 )
 from src.retrieval.capsolver_api import CapSolverAPI
 from src.retrieval.two_captcha_api import TwoCaptchaAPI
@@ -761,7 +764,8 @@ class _BrowserManager:
                 self.attach_cdp_browser(browser, context)
                 return context
         else:
-            cdp_url = SharedBrowserService.get_cdp_url_headed()
+            headed_slot_id = kwargs.get("headed_slot_id")
+            cdp_url = SharedBrowserService.get_cdp_url_headed(slot_id=headed_slot_id)
             if not cdp_url:
                 try:
                     from config.settings import settings
@@ -770,8 +774,13 @@ class _BrowserManager:
                     if port is None:
                         gs = getattr(settings, "google_search", None)
                         port = getattr(gs, "headed_browser_port", 9223)
-                    await SharedBrowserService.start_headed(port=port)
-                    cdp_url = SharedBrowserService.get_cdp_url_headed()
+                    ext_path = getattr(settings, "capsolver_extension_path", None)
+                    await SharedBrowserService.start_headed(
+                        port=port,
+                        extension_path=ext_path,
+                        slot_id=headed_slot_id,
+                    )
+                    cdp_url = SharedBrowserService.get_cdp_url_headed(slot_id=headed_slot_id)
                 except Exception as e:
                     logger.warning("懒启动有头 CDP 失败: %s", e)
             if cdp_url:
@@ -905,6 +914,14 @@ async def _apply_stealth_to_page(page) -> None:
         Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
         Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
     """)
+
+
+class _CdpStub:
+    """Minimal shim for captcha handler when using pooled CDP context (is_cdp_connected is True)."""
+
+    @staticmethod
+    def is_cdp_connected() -> bool:
+        return True
 
 
 class _PooledBrowserWrapper:
@@ -1257,110 +1274,201 @@ class GoogleSearcher:
         logger.debug(f"[scholar-lock] waiting  query={query!r}")
         async with _playwright_scholar_lock:
             logger.debug(f"[scholar-lock] acquired query={query!r}")
-            try:
-                browser_manager, context, is_shared = await acquire_shared_browser(
-                    job_id=job_id,
-                    timeout=timeout,
-                    user_data_dir=user_data_dir,
-                    headless=headless,
-                    proxy=proxy,
-                    extension_path=self._get_extension_path(),
-                )
+            pooled_result = None
+            pool = SharedContextPool.get_instance()
+            if pool.is_initialized():
+                cfg = getattr(settings, "shared_browser", None)
+                acquire_timeout = getattr(cfg, "context_acquire_timeout_seconds", 30.0) if cfg else 30.0
+                effective_headless = headless is not False
 
-                page = await context.new_page()
-                page.set_default_timeout(timeout)
-                await browser_manager._apply_stealth_mode(page)
+                async def _pooled_scholar_worker(context):
+                    page = await context.new_page()
+                    try:
+                        page.set_default_timeout(timeout)
+                        await _apply_stealth_to_page(page)
+                        await self._navigate_scholar_via_searchbox(
+                            page, query, year_start, year_end, timeout
+                        )
+                        worker_retry = None
+                        worker_results = []
+                        if await self._wait_and_check_captcha(page):
+                            logger.warning("检测到验证码")
+                            captcha_result = await self._handle_captcha_with_tiers(
+                                page=page,
+                                browser_manager=_CdpStub(),
+                                headless=headless,
+                                result_selector=".gs_r",
+                                scope="scholar",
+                            )
+                            if captcha_result == "needs_headed":
+                                worker_retry = ("scholar", query, limit, year_start, year_end, timeout, "scholar")
+                            elif captcha_result == "failed":
+                                return (worker_results, None)
+                        if worker_retry is not None:
+                            return (worker_results, worker_retry)
+                        html_content = await page.content()
+                        total = _ScholarParser.extract_total_results(html_content)
+                        if total:
+                            logger.info(f"总共约 {total} 条结果")
+                        current_page = 1
+                        needed_pages = (limit + 9) // 10
+                        while current_page <= needed_pages and len(worker_results) < limit:
+                            logger.info(f"处理第 {current_page} 页 (已收集 {len(worker_results)}/{limit})")
+                            try:
+                                await page.wait_for_selector('div.gs_r.gs_or.gs_scl', timeout=timeout/4)
+                            except Exception:
+                                pass
+                            html = await page.content()
+                            page_results = _ScholarParser.extract_results(html)
+                            if not page_results:
+                                logger.warning(f"第 {current_page} 页无结果")
+                                break
+                            for r in page_results[:limit - len(worker_results)]:
+                                worker_results.append(self._to_scholar_rag_format(r, query))
+                            logger.info(f"第 {current_page} 页提取 {len(page_results)} 条")
+                            if len(worker_results) >= limit or current_page >= needed_pages:
+                                break
+                            await self._random_delay(1.0, 3.0)
+                            await _simulate_human_scroll_to_bottom(page)
+                            if not await self._click_next_page(page, timeout):
+                                break
+                            current_page += 1
+                            await self._random_delay()
+                            await _simulate_human_behavior(page)
+                        logger.info(f"Scholar 搜索完成，共 {len(worker_results)} 条结果")
+                        return (worker_results, None)
+                    finally:
+                        await page.close()
 
-                # 通过搜索框输入方式搜索（避免 URL 携带搜索词触发封控）
-                await self._navigate_scholar_via_searchbox(
-                    page, query, year_start, year_end, timeout
-                )
-
-                # 检查验证码（等待 JS 异步重定向稳定）
-                if await self._wait_and_check_captcha(page):
-                    logger.warning("检测到验证码")
-                    captcha_result = await self._handle_captcha_with_tiers(
-                        page=page,
-                        browser_manager=browser_manager,
-                        headless=headless,
-                        result_selector=".gs_r",
-                        scope="scholar",
-                    )
-                    if captcha_result == "needs_headed":
-                        do_headed_retry = ("scholar", query, limit, year_start, year_end, timeout, "scholar")
-                    elif captcha_result == "failed":
+                try:
+                    if effective_headless:
+                        pooled_result = await run_with_headless_context(
+                            _pooled_scholar_worker,
+                            timeout=acquire_timeout,
+                            job_id=job_id,
+                            purpose="search",
+                            reserved_group="search",
+                        )
+                    else:
+                        pooled_result = await run_with_headed_context(
+                            _pooled_scholar_worker,
+                            timeout=acquire_timeout,
+                            job_id=job_id,
+                            purpose="search_headed",
+                        )
+                except Exception as e:
+                    logger.debug("[google_search] pooled scholar failed, fallback: %s", e)
+                if pooled_result is not None:
+                    results, do_headed_retry = pooled_result
+                    if self._cache and results:
+                        self._cache.set(cache_key, results)
+                    if do_headed_retry is None:
                         return results
+
+            if pooled_result is None:
+                try:
+                    browser_manager, context, is_shared = await acquire_shared_browser(
+                        job_id=job_id,
+                        timeout=timeout,
+                        user_data_dir=user_data_dir,
+                        headless=headless,
+                        proxy=proxy,
+                        extension_path=self._get_extension_path(),
+                    )
+
+                    page = await context.new_page()
+                    page.set_default_timeout(timeout)
+                    await browser_manager._apply_stealth_mode(page)
+
+                    # 通过搜索框输入方式搜索（避免 URL 携带搜索词触发封控）
+                    await self._navigate_scholar_via_searchbox(
+                        page, query, year_start, year_end, timeout
+                    )
+
+                    # 检查验证码（等待 JS 异步重定向稳定）
+                    if await self._wait_and_check_captcha(page):
+                        logger.warning("检测到验证码")
+                        captcha_result = await self._handle_captcha_with_tiers(
+                            page=page,
+                            browser_manager=browser_manager,
+                            headless=headless,
+                            result_selector=".gs_r",
+                            scope="scholar",
+                        )
+                        if captcha_result == "needs_headed":
+                            do_headed_retry = ("scholar", query, limit, year_start, year_end, timeout, "scholar")
+                        elif captcha_result == "failed":
+                            return results
                     # else "solved" -> fall through
 
-                if do_headed_retry is not None:
-                    # Skip extraction; will retry with headed browser after releasing lock
-                    pass
-                else:
-                    # 获取总结果数
-                    html_content = await page.content()
-                    total = _ScholarParser.extract_total_results(html_content)
-                    if total:
-                        logger.info(f"总共约 {total} 条结果")
+                    if do_headed_retry is not None:
+                        pass
+                    else:
+                        # 获取总结果数
+                        html_content = await page.content()
+                        total = _ScholarParser.extract_total_results(html_content)
+                        if total:
+                            logger.info(f"总共约 {total} 条结果")
 
-                    # 多页抓取
-                    current_page = 1
-                    needed_pages = (limit + 9) // 10
+                        # 多页抓取
+                        current_page = 1
+                        needed_pages = (limit + 9) // 10
 
-                    while current_page <= needed_pages and len(results) < limit:
-                        logger.info(f"处理第 {current_page} 页 (已收集 {len(results)}/{limit})")
+                        while current_page <= needed_pages and len(results) < limit:
+                            logger.info(f"处理第 {current_page} 页 (已收集 {len(results)}/{limit})")
 
+                            try:
+                                await page.wait_for_selector('div.gs_r.gs_or.gs_scl', timeout=timeout/4)
+                            except Exception:
+                                pass
+
+                            html = await page.content()
+                            page_results = _ScholarParser.extract_results(html)
+
+                            if not page_results:
+                                logger.warning(f"第 {current_page} 页无结果")
+                                break
+
+                            for r in page_results[:limit - len(results)]:
+                                rag_item = self._to_scholar_rag_format(r, query)
+                                results.append(rag_item)
+
+                            logger.info(f"第 {current_page} 页提取 {len(page_results)} 条")
+
+                            if len(results) >= limit or current_page >= needed_pages:
+                                break
+
+                            # 翻页
+                            await self._random_delay(1.0, 3.0)
+                            await _simulate_human_scroll_to_bottom(page)
+
+                            if not await self._click_next_page(page, timeout):
+                                break
+
+                            current_page += 1
+                            await self._random_delay()
+                            await _simulate_human_behavior(page)
+
+                        logger.info(f"Scholar 搜索完成，共 {len(results)} 条结果")
+                        if self._cache:
+                            self._cache.set(cache_key, results)
+                        return results
+
+                except Exception as e:
+                    logger.error(f"Scholar 搜索出错: {e}")
+                    return results
+                finally:
+                    if page:
                         try:
-                            await page.wait_for_selector('div.gs_r.gs_or.gs_scl', timeout=timeout/4)
+                            await page.close()
                         except Exception:
                             pass
-
-                        html = await page.content()
-                        page_results = _ScholarParser.extract_results(html)
-
-                        if not page_results:
-                            logger.warning(f"第 {current_page} 页无结果")
-                            break
-
-                        for r in page_results[:limit - len(results)]:
-                            rag_item = self._to_scholar_rag_format(r, query)
-                            results.append(rag_item)
-
-                        logger.info(f"第 {current_page} 页提取 {len(page_results)} 条")
-
-                        if len(results) >= limit or current_page >= needed_pages:
-                            break
-
-                        # 翻页
-                        await self._random_delay(1.0, 3.0)
-                        await _simulate_human_scroll_to_bottom(page)
-
-                        if not await self._click_next_page(page, timeout):
-                            break
-
-                        current_page += 1
-                        await self._random_delay()
-                        await _simulate_human_behavior(page)
-
-                    logger.info(f"Scholar 搜索完成，共 {len(results)} 条结果")
-                    if self._cache:
-                        self._cache.set(cache_key, results)
-                    return results
-
-            except Exception as e:
-                logger.error(f"Scholar 搜索出错: {e}")
-                return results
-            finally:
-                if page:
-                    try:
-                        await page.close()
-                    except Exception:
-                        pass
-                if browser_manager is not None:
-                    await release_shared_browser(
-                        job_id=job_id,
-                        is_shared=is_shared,
-                        manager=browser_manager,
-                    )
+                    if browser_manager is not None:
+                        await release_shared_browser(
+                            job_id=job_id,
+                            is_shared=is_shared,
+                            manager=browser_manager,
+                        )
 
         if do_headed_retry is not None:
             _fn, _q, _lim, _ys, _ye, _to, _sc = do_headed_retry
@@ -1442,115 +1550,213 @@ class GoogleSearcher:
         logger.debug(f"[scholar-lock] waiting  batch queries={len(queries_to_search)}")
         async with _playwright_scholar_lock:
             logger.debug(f"[scholar-lock] acquired batch queries={len(queries_to_search)}")
-            try:
-                browser_manager, context, is_shared = await acquire_shared_browser(
-                    job_id=job_id,
-                    timeout=timeout,
-                    user_data_dir=user_data_dir,
-                    headless=headless,
-                    proxy=proxy,
-                    extension_path=self._get_extension_path(),
-                )
+            pooled_result = None
+            pool = SharedContextPool.get_instance()
+            if pool.is_initialized():
+                cfg = getattr(settings, "shared_browser", None)
+                acquire_timeout = getattr(cfg, "context_acquire_timeout_seconds", 30.0) if cfg else 30.0
+                effective_headless = headless is not False
 
-                page = await context.new_page()
-                page.set_default_timeout(timeout)
-                await browser_manager._apply_stealth_mode(page)
-
-                # 串行执行每个查询
-                for idx, query in enumerate(queries_to_search):
-                    logger.info(f"Scholar 批量搜索 [{idx+1}/{len(queries_to_search)}]: {query!r}")
-
-                    query_results = []
+                async def _pooled_scholar_batch_worker(context):
+                    page = await context.new_page()
                     try:
-                        # 通过搜索框输入方式搜索（避免 URL 携带搜索词触发封控）
-                        await self._navigate_scholar_via_searchbox(
-                            page, query, year_start, year_end, timeout
-                        )
-
-                        # 检查验证码（等待 JS 异步重定向稳定）
-                        if await self._wait_and_check_captcha(page):
-                            logger.warning(f"检测到验证码 (query={query!r})")
-                            captcha_result = await self._handle_captcha_with_tiers(
-                                page=page,
-                                browser_manager=browser_manager,
-                                headless=headless,
-                                result_selector=".gs_r",
-                                scope=f"scholar_batch:{query}",
-                            )
-                            if captcha_result == "needs_headed":
-                                headed_retries.append((query, limit_per_query, year_start, year_end, timeout, f"scholar_batch:{query}"))
-                                continue
-                            if captcha_result == "failed":
-                                continue
-
-                        # 提取结果（支持多页抓取，每页 10 条）
-                        needed_pages = max(1, (limit_per_query + 9) // 10)
-                        current_page = 1
-
-                        while current_page <= needed_pages and len(query_results) < limit_per_query:
+                        page.set_default_timeout(timeout)
+                        await _apply_stealth_to_page(page)
+                        worker_all = []
+                        worker_retries: List[Tuple[str, int, Optional[int], Optional[int], int, str]] = []
+                        for idx, query in enumerate(queries_to_search):
+                            logger.info(f"Scholar 批量搜索 [{idx+1}/{len(queries_to_search)}]: {query!r}")
+                            query_results = []
                             try:
-                                await page.wait_for_selector('div.gs_r.gs_or.gs_scl', timeout=timeout/4)
-                            except Exception:
-                                pass
-
-                            html = await page.content()
-                            page_results = _ScholarParser.extract_results(html)
-
-                            if not page_results:
-                                logger.warning(f"  Scholar batch: 第 {current_page} 页无结果 (query={query!r})")
-                                break
-
-                            for r in page_results[:limit_per_query - len(query_results)]:
-                                rag_item = self._to_scholar_rag_format(r, query)
-                                query_results.append(rag_item)
-
-                            logger.info(f"  Scholar batch: 第 {current_page} 页提取 {len(page_results)} 条 (累计 {len(query_results)}/{limit_per_query})")
-
-                            if len(query_results) >= limit_per_query or current_page >= needed_pages:
-                                break
-
-                            # 翻页
-                            await self._random_delay(1.0, 3.0)
-                            await _simulate_human_scroll_to_bottom(page)
-                            if not await self._click_next_page(page, timeout):
-                                break
-                            current_page += 1
-                            await self._random_delay()
-
-                        logger.info(f"  -> 获取 {len(query_results)} 条结果 (query={query!r})")
-
-                        # 缓存单个查询的结果
-                        if self._cache and query_results:
-                            cache_key = _make_key("google_scholar", query, limit_per_query, year_start, year_end)
-                            self._cache.set(cache_key, query_results)
-
-                        all_results.extend(query_results)
-
-                        # 查询间延迟（避免被封）
-                        if idx < len(queries_to_search) - 1:
-                            await self._random_delay(2.0, 4.0)
-
-                    except Exception as e:
-                        logger.error(f"Scholar 批量搜索单个查询出错 (query={query!r}): {e}")
-                        continue
-
-                logger.info("[retrieval] playwright scholar_batch done total_hits=%d", len(all_results))
-                logger.info(f"Scholar 批量搜索完成，共 {len(all_results)} 条结果")
-
-            except Exception as e:
-                logger.error(f"Scholar 批量搜索出错: {e}")
-            finally:
-                if page:
-                    try:
+                                await self._navigate_scholar_via_searchbox(
+                                    page, query, year_start, year_end, timeout
+                                )
+                                if await self._wait_and_check_captcha(page):
+                                    logger.warning(f"检测到验证码 (query={query!r})")
+                                    captcha_result = await self._handle_captcha_with_tiers(
+                                        page=page,
+                                        browser_manager=_CdpStub(),
+                                        headless=headless,
+                                        result_selector=".gs_r",
+                                        scope=f"scholar_batch:{query}",
+                                    )
+                                    if captcha_result == "needs_headed":
+                                        worker_retries.append((query, limit_per_query, year_start, year_end, timeout, f"scholar_batch:{query}"))
+                                        continue
+                                    if captcha_result == "failed":
+                                        continue
+                                needed_pages = max(1, (limit_per_query + 9) // 10)
+                                current_page = 1
+                                while current_page <= needed_pages and len(query_results) < limit_per_query:
+                                    try:
+                                        await page.wait_for_selector('div.gs_r.gs_or.gs_scl', timeout=timeout/4)
+                                    except Exception:
+                                        pass
+                                    html = await page.content()
+                                    page_results = _ScholarParser.extract_results(html)
+                                    if not page_results:
+                                        logger.warning(f"  Scholar batch: 第 {current_page} 页无结果 (query={query!r})")
+                                        break
+                                    for r in page_results[:limit_per_query - len(query_results)]:
+                                        query_results.append(self._to_scholar_rag_format(r, query))
+                                    logger.info(f"  Scholar batch: 第 {current_page} 页提取 {len(page_results)} 条 (累计 {len(query_results)}/{limit_per_query})")
+                                    if len(query_results) >= limit_per_query or current_page >= needed_pages:
+                                        break
+                                    await self._random_delay(1.0, 3.0)
+                                    await _simulate_human_scroll_to_bottom(page)
+                                    if not await self._click_next_page(page, timeout):
+                                        break
+                                    current_page += 1
+                                    await self._random_delay()
+                                logger.info(f"  -> 获取 {len(query_results)} 条结果 (query={query!r})")
+                                if self._cache and query_results:
+                                    ck = _make_key("google_scholar", query, limit_per_query, year_start, year_end)
+                                    self._cache.set(ck, query_results)
+                                worker_all.extend(query_results)
+                                if idx < len(queries_to_search) - 1:
+                                    await self._random_delay(2.0, 4.0)
+                            except Exception as e:
+                                logger.error(f"Scholar 批量搜索单个查询出错 (query={query!r}): {e}")
+                        return (worker_all, worker_retries)
+                    finally:
                         await page.close()
-                    except Exception:
-                        pass
-                if browser_manager is not None:
-                    await release_shared_browser(
+
+                try:
+                    if effective_headless:
+                        pooled_result = await run_with_headless_context(
+                            _pooled_scholar_batch_worker,
+                            timeout=acquire_timeout,
+                            job_id=job_id,
+                            purpose="search",
+                            reserved_group="search",
+                        )
+                    else:
+                        pooled_result = await run_with_headed_context(
+                            _pooled_scholar_batch_worker,
+                            timeout=acquire_timeout,
+                            job_id=job_id,
+                            purpose="search_headed",
+                        )
+                except Exception as e:
+                    logger.debug("[google_search] pooled scholar_batch failed, fallback: %s", e)
+                if pooled_result is not None:
+                    all_results, headed_retries = pooled_result
+                    if not headed_retries:
+                        logger.info("[retrieval] playwright scholar_batch done total_hits=%d", len(all_results))
+                        return all_results
+
+            if pooled_result is None:
+                try:
+                    browser_manager, context, is_shared = await acquire_shared_browser(
                         job_id=job_id,
-                        is_shared=is_shared,
-                        manager=browser_manager,
+                        timeout=timeout,
+                        user_data_dir=user_data_dir,
+                        headless=headless,
+                        proxy=proxy,
+                        extension_path=self._get_extension_path(),
                     )
+
+                    page = await context.new_page()
+                    page.set_default_timeout(timeout)
+                    await browser_manager._apply_stealth_mode(page)
+
+                    # 串行执行每个查询
+                    for idx, query in enumerate(queries_to_search):
+                        logger.info(f"Scholar 批量搜索 [{idx+1}/{len(queries_to_search)}]: {query!r}")
+
+                        query_results = []
+                        try:
+                            # 通过搜索框输入方式搜索（避免 URL 携带搜索词触发封控）
+                            await self._navigate_scholar_via_searchbox(
+                                page, query, year_start, year_end, timeout
+                            )
+
+                            # 检查验证码（等待 JS 异步重定向稳定）
+                            if await self._wait_and_check_captcha(page):
+                                logger.warning(f"检测到验证码 (query={query!r})")
+                                captcha_result = await self._handle_captcha_with_tiers(
+                                    page=page,
+                                    browser_manager=browser_manager,
+                                    headless=headless,
+                                    result_selector=".gs_r",
+                                    scope=f"scholar_batch:{query}",
+                                )
+                                if captcha_result == "needs_headed":
+                                    headed_retries.append((query, limit_per_query, year_start, year_end, timeout, f"scholar_batch:{query}"))
+                                    continue
+                                if captcha_result == "failed":
+                                    continue
+
+                            # 提取结果（支持多页抓取，每页 10 条）
+                            needed_pages = max(1, (limit_per_query + 9) // 10)
+                            current_page = 1
+
+                            while current_page <= needed_pages and len(query_results) < limit_per_query:
+                                try:
+                                    await page.wait_for_selector('div.gs_r.gs_or.gs_scl', timeout=timeout/4)
+                                except Exception:
+                                    pass
+
+                                html = await page.content()
+                                page_results = _ScholarParser.extract_results(html)
+
+                                if not page_results:
+                                    logger.warning(f"  Scholar batch: 第 {current_page} 页无结果 (query={query!r})")
+                                    break
+
+                                for r in page_results[:limit_per_query - len(query_results)]:
+                                    rag_item = self._to_scholar_rag_format(r, query)
+                                    query_results.append(rag_item)
+
+                                logger.info(f"  Scholar batch: 第 {current_page} 页提取 {len(page_results)} 条 (累计 {len(query_results)}/{limit_per_query})")
+
+                                if len(query_results) >= limit_per_query or current_page >= needed_pages:
+                                    break
+
+                                # 翻页
+                                await self._random_delay(1.0, 3.0)
+                                await _simulate_human_scroll_to_bottom(page)
+                                if not await self._click_next_page(page, timeout):
+                                    break
+                                current_page += 1
+                                await self._random_delay()
+
+                            logger.info(f"  -> 获取 {len(query_results)} 条结果 (query={query!r})")
+
+                            # 缓存单个查询的结果
+                            if self._cache and query_results:
+                                cache_key = _make_key("google_scholar", query, limit_per_query, year_start, year_end)
+                                self._cache.set(cache_key, query_results)
+
+                            all_results.extend(query_results)
+
+                            # 查询间延迟（避免被封）
+                            if idx < len(queries_to_search) - 1:
+                                await self._random_delay(2.0, 4.0)
+
+                        except Exception as e:
+                            logger.error(f"Scholar 批量搜索单个查询出错 (query={query!r}): {e}")
+                            continue
+
+                    logger.info("[retrieval] playwright scholar_batch done total_hits=%d", len(all_results))
+                    logger.info(f"Scholar 批量搜索完成，共 {len(all_results)} 条结果")
+
+                except Exception as e:
+                    logger.error(f"Scholar 批量搜索出错: {e}")
+                finally:
+                    if page:
+                        try:
+                            await page.close()
+                        except Exception:
+                            pass
+                    if browser_manager is not None:
+                        await release_shared_browser(
+                            job_id=job_id,
+                            is_shared=is_shared,
+                            manager=browser_manager,
+                        )
+            elif pooled_result is not None:
+                all_results, headed_retries = pooled_result
 
         for _q, _lim, _ys, _ye, _to, _sc in headed_retries:
             retry_results = await self._retry_with_headed_browser(
@@ -1611,79 +1817,154 @@ class GoogleSearcher:
         is_shared = True
         do_headed_retry = False
 
-        try:
-            browser_manager, context, is_shared = await acquire_shared_browser(
-                job_id=job_id,
-                timeout=timeout,
-                user_data_dir=user_data_dir,
-                headless=headless,
-                proxy=proxy,
-                extension_path=self._get_extension_path(),
-            )
+        pooled_result = None
+        pool = SharedContextPool.get_instance()
+        if pool.is_initialized():
+            cfg = getattr(settings, "shared_browser", None)
+            acquire_timeout = getattr(cfg, "context_acquire_timeout_seconds", 30.0) if cfg else 30.0
+            effective_headless = headless is not False
 
-            page = await context.new_page()
-            page.set_default_timeout(timeout)
-            await browser_manager._apply_stealth_mode(page)
-
-            # 构建搜索 URL
-            encoded = quote_plus(query)
-            search_url = f"https://www.google.com/search?q={encoded}&hl=en"
-            logger.info(f"Google 搜索 URL: {search_url}")
-            
-            await page.goto(search_url, wait_until="domcontentloaded")
-            await self._random_delay()
-            await _simulate_human_behavior(page)
-            
-            try:
-                await page.wait_for_load_state("networkidle", timeout=timeout/2)
-            except Exception:
-                logger.warning("等待页面加载超时，继续处理...")
-            
-            # 检查验证码
-            if await self._wait_and_check_captcha(page):
-                logger.warning("检测到验证码")
-                captcha_result = await self._handle_captcha_with_tiers(
-                    page=page,
-                    browser_manager=browser_manager,
-                    headless=headless,
-                    result_selector="div.g",
-                    scope="google",
-                )
-                if captcha_result == "needs_headed":
-                    do_headed_retry = True
-                elif captcha_result == "failed":
-                    return results
-                # else "solved" -> fall through
-            
-            if not do_headed_retry:
-                # 提取结果
-                html = await page.content()
-                page_results = _GoogleParser.extract_results(html)
-                
-                for r in page_results[:limit]:
-                    rag_item = self._to_google_rag_format(r, query)
-                    results.append(rag_item)
-                
-                logger.info(f"Google 搜索完成，共 {len(results)} 条结果")
-                if self._cache:
-                    self._cache.set(cache_key, results)
-                return results
-
-        except Exception as e:
-            logger.error(f"Google 搜索出错: {e}")
-            return results
-        finally:
-            if page:
+            async def _pooled_google_worker(context):
+                page = await context.new_page()
                 try:
+                    page.set_default_timeout(timeout)
+                    await _apply_stealth_to_page(page)
+                    encoded = quote_plus(query)
+                    search_url = f"https://www.google.com/search?q={encoded}&hl=en"
+                    logger.info(f"Google 搜索 URL: {search_url}")
+                    await page.goto(search_url, wait_until="domcontentloaded")
+                    await self._random_delay()
+                    await _simulate_human_behavior(page)
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=timeout/2)
+                    except Exception:
+                        logger.warning("等待页面加载超时，继续处理...")
+                    worker_retry = False
+                    worker_results = []
+                    if await self._wait_and_check_captcha(page):
+                        logger.warning("检测到验证码")
+                        captcha_result = await self._handle_captcha_with_tiers(
+                            page=page,
+                            browser_manager=_CdpStub(),
+                            headless=headless,
+                            result_selector="div.g",
+                            scope="google",
+                        )
+                        if captcha_result == "needs_headed":
+                            worker_retry = True
+                        elif captcha_result == "failed":
+                            return (worker_results, False)
+                    if not worker_retry:
+                        html = await page.content()
+                        page_results = _GoogleParser.extract_results(html)
+                        for r in page_results[:limit]:
+                            worker_results.append(self._to_google_rag_format(r, query))
+                        logger.info(f"Google 搜索完成，共 {len(worker_results)} 条结果")
+                    return (worker_results, worker_retry)
+                finally:
                     await page.close()
-                except Exception:
-                    pass
-            if browser_manager is not None:
-                await release_shared_browser(
+
+            try:
+                if effective_headless:
+                    pooled_result = await run_with_headless_context(
+                        _pooled_google_worker,
+                        timeout=acquire_timeout,
+                        job_id=job_id,
+                        purpose="search",
+                        reserved_group="search",
+                    )
+                else:
+                    pooled_result = await run_with_headed_context(
+                        _pooled_google_worker,
+                        timeout=acquire_timeout,
+                        job_id=job_id,
+                        purpose="search_headed",
+                    )
+            except Exception as e:
+                logger.debug("[google_search] pooled google failed, fallback: %s", e)
+            if pooled_result is not None:
+                results, do_headed_retry = pooled_result
+                if not do_headed_retry and results:
+                    if self._cache:
+                        self._cache.set(cache_key, results)
+                    return results
+
+        if pooled_result is None:
+            try:
+                browser_manager, context, is_shared = await acquire_shared_browser(
                     job_id=job_id,
-                    is_shared=is_shared,
-                    manager=browser_manager,
+                    timeout=timeout,
+                    user_data_dir=user_data_dir,
+                    headless=headless,
+                    proxy=proxy,
+                    extension_path=self._get_extension_path(),
                 )
+
+                page = await context.new_page()
+                page.set_default_timeout(timeout)
+                await browser_manager._apply_stealth_mode(page)
+
+                # 构建搜索 URL
+                encoded = quote_plus(query)
+                search_url = f"https://www.google.com/search?q={encoded}&hl=en"
+                logger.info(f"Google 搜索 URL: {search_url}")
+                
+                await page.goto(search_url, wait_until="domcontentloaded")
+                await self._random_delay()
+                await _simulate_human_behavior(page)
+                
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=timeout/2)
+                except Exception:
+                    logger.warning("等待页面加载超时，继续处理...")
+                
+                # 检查验证码
+                if await self._wait_and_check_captcha(page):
+                    logger.warning("检测到验证码")
+                    captcha_result = await self._handle_captcha_with_tiers(
+                        page=page,
+                        browser_manager=browser_manager,
+                        headless=headless,
+                        result_selector="div.g",
+                        scope="google",
+                    )
+                    if captcha_result == "needs_headed":
+                        do_headed_retry = True
+                    elif captcha_result == "failed":
+                        return results
+                    # else "solved" -> fall through
+                
+                if not do_headed_retry:
+                    # 提取结果
+                    html = await page.content()
+                    page_results = _GoogleParser.extract_results(html)
+                    
+                    for r in page_results[:limit]:
+                        rag_item = self._to_google_rag_format(r, query)
+                        results.append(rag_item)
+                    
+                    logger.info(f"Google 搜索完成，共 {len(results)} 条结果")
+                    if self._cache:
+                        self._cache.set(cache_key, results)
+                    return results
+
+            except Exception as e:
+                logger.error(f"Google 搜索出错: {e}")
+                return results
+            finally:
+                if page:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+                if browser_manager is not None:
+                    await release_shared_browser(
+                        job_id=job_id,
+                        is_shared=is_shared,
+                        manager=browser_manager,
+                    )
+        elif pooled_result is not None:
+            results, do_headed_retry = pooled_result
 
         if do_headed_retry:
             return await self._retry_with_headed_browser(
@@ -1754,97 +2035,181 @@ class GoogleSearcher:
         is_shared = True
         headed_retries_google: List[Tuple[str, int, int, str]] = []
 
-        try:
-            browser_manager, context, is_shared = await acquire_shared_browser(
-                job_id=job_id,
-                timeout=timeout,
-                user_data_dir=user_data_dir,
-                headless=headless,
-                proxy=proxy,
-                extension_path=self._get_extension_path(),
-            )
+        pooled_result = None
+        pool = SharedContextPool.get_instance()
+        if pool.is_initialized():
+            cfg = getattr(settings, "shared_browser", None)
+            acquire_timeout = getattr(cfg, "context_acquire_timeout_seconds", 30.0) if cfg else 30.0
+            effective_headless = headless is not False
 
-            page = await context.new_page()
-            page.set_default_timeout(timeout)
-            await browser_manager._apply_stealth_mode(page)
-
-            # 串行执行每个查询
-            for idx, query in enumerate(queries_to_search):
-                logger.info(f"Google 批量搜索 [{idx+1}/{len(queries_to_search)}]: {query!r}")
-                
-                query_results = []
+            async def _pooled_google_batch_worker(context):
+                page = await context.new_page()
                 try:
-                    # 构建搜索 URL
-                    encoded = quote_plus(query)
-                    search_url = f"https://www.google.com/search?q={encoded}&hl=en"
+                    page.set_default_timeout(timeout)
+                    await _apply_stealth_to_page(page)
+                    worker_all: List[Dict[str, Any]] = []
+                    worker_retries: List[Tuple[str, int, int, str]] = []
+                    for idx, query in enumerate(queries_to_search):
+                        logger.info(f"Google 批量搜索 [{idx+1}/{len(queries_to_search)}]: {query!r}")
+                        query_results = []
+                        try:
+                            encoded = quote_plus(query)
+                            search_url = f"https://www.google.com/search?q={encoded}&hl=en"
+                            await page.goto(search_url, wait_until="domcontentloaded")
+                            await self._random_delay()
+                            await _simulate_human_behavior(page)
+                            try:
+                                await page.wait_for_load_state("networkidle", timeout=timeout/2)
+                            except Exception:
+                                pass
+                            if await self._wait_and_check_captcha(page):
+                                logger.warning(f"检测到验证码 (query={query!r})")
+                                captcha_result = await self._handle_captcha_with_tiers(
+                                    page=page,
+                                    browser_manager=_CdpStub(),
+                                    headless=headless,
+                                    result_selector="div.g",
+                                    scope=f"google_batch:{query}",
+                                )
+                                if captcha_result == "needs_headed":
+                                    worker_retries.append((query, limit_per_query, timeout, f"google_batch:{query}"))
+                                    continue
+                                if captcha_result == "failed":
+                                    continue
+                            html = await page.content()
+                            page_results = _GoogleParser.extract_results(html)
+                            for r in page_results[:limit_per_query]:
+                                query_results.append(self._to_google_rag_format(r, query))
+                            logger.info(f"  -> 获取 {len(query_results)} 条结果")
+                            if self._cache and query_results:
+                                self._cache.set(_make_key("google_web", query, limit_per_query), query_results)
+                            worker_all.extend(query_results)
+                            if idx < len(queries_to_search) - 1:
+                                await self._random_delay(2.0, 4.0)
+                        except Exception as e:
+                            logger.error(f"Google 批量搜索单个查询出错 (query={query!r}): {e}")
+                    return (worker_all, worker_retries)
+                finally:
+                    await page.close()
+
+            try:
+                if effective_headless:
+                    pooled_result = await run_with_headless_context(
+                        _pooled_google_batch_worker,
+                        timeout=acquire_timeout,
+                        job_id=job_id,
+                        purpose="search",
+                        reserved_group="search",
+                    )
+                else:
+                    pooled_result = await run_with_headed_context(
+                        _pooled_google_batch_worker,
+                        timeout=acquire_timeout,
+                        job_id=job_id,
+                        purpose="search_headed",
+                    )
+            except Exception as e:
+                logger.debug("[google_search] pooled google_batch failed, fallback: %s", e)
+            if pooled_result is not None:
+                all_results, headed_retries_google = pooled_result
+                if not headed_retries_google:
+                    logger.info("[retrieval] playwright google_batch done total_hits=%d", len(all_results))
+                    return all_results
+
+        if pooled_result is None:
+            try:
+                browser_manager, context, is_shared = await acquire_shared_browser(
+                    job_id=job_id,
+                    timeout=timeout,
+                    user_data_dir=user_data_dir,
+                    headless=headless,
+                    proxy=proxy,
+                    extension_path=self._get_extension_path(),
+                )
+
+                page = await context.new_page()
+                page.set_default_timeout(timeout)
+                await browser_manager._apply_stealth_mode(page)
+
+                # 串行执行每个查询
+                for idx, query in enumerate(queries_to_search):
+                    logger.info(f"Google 批量搜索 [{idx+1}/{len(queries_to_search)}]: {query!r}")
                     
-                    await page.goto(search_url, wait_until="domcontentloaded")
-                    await self._random_delay()
-                    await _simulate_human_behavior(page)
-                    
+                    query_results = []
                     try:
-                        await page.wait_for_load_state("networkidle", timeout=timeout/2)
+                        # 构建搜索 URL
+                        encoded = quote_plus(query)
+                        search_url = f"https://www.google.com/search?q={encoded}&hl=en"
+                        
+                        await page.goto(search_url, wait_until="domcontentloaded")
+                        await self._random_delay()
+                        await _simulate_human_behavior(page)
+                        
+                        try:
+                            await page.wait_for_load_state("networkidle", timeout=timeout/2)
+                        except Exception:
+                            pass
+                        
+                        # 检查验证码
+                        if await self._wait_and_check_captcha(page):
+                            logger.warning(f"检测到验证码 (query={query!r})")
+                            captcha_result = await self._handle_captcha_with_tiers(
+                                page=page,
+                                browser_manager=browser_manager,
+                                headless=headless,
+                                result_selector="div.g",
+                                scope=f"google_batch:{query}",
+                            )
+                            if captcha_result == "needs_headed":
+                                headed_retries_google.append((query, limit_per_query, timeout, f"google_batch:{query}"))
+                                continue
+                            if captcha_result == "failed":
+                                continue
+                        
+                        # 提取结果
+                        html = await page.content()
+                        page_results = _GoogleParser.extract_results(html)
+                        
+                        for r in page_results[:limit_per_query]:
+                            rag_item = self._to_google_rag_format(r, query)
+                            query_results.append(rag_item)
+                        
+                        logger.info(f"  -> 获取 {len(query_results)} 条结果")
+                        
+                        # 缓存单个查询的结果
+                        if self._cache and query_results:
+                            cache_key = _make_key("google_web", query, limit_per_query)
+                            self._cache.set(cache_key, query_results)
+                        
+                        all_results.extend(query_results)
+                        
+                        # 查询间延迟（避免被封）
+                        if idx < len(queries_to_search) - 1:
+                            await self._random_delay(2.0, 4.0)
+                    
+                    except Exception as e:
+                        logger.error(f"Google 批量搜索单个查询出错 (query={query!r}): {e}")
+                        continue
+                
+                logger.info("[retrieval] playwright google_batch done total_hits=%d", len(all_results))
+                logger.info(f"Google 批量搜索完成，共 {len(all_results)} 条结果")
+            
+            except Exception as e:
+                logger.error(f"Google 批量搜索出错: {e}")
+            finally:
+                if page:
+                    try:
+                        await page.close()
                     except Exception:
                         pass
-                    
-                    # 检查验证码
-                    if await self._wait_and_check_captcha(page):
-                        logger.warning(f"检测到验证码 (query={query!r})")
-                        captcha_result = await self._handle_captcha_with_tiers(
-                            page=page,
-                            browser_manager=browser_manager,
-                            headless=headless,
-                            result_selector="div.g",
-                            scope=f"google_batch:{query}",
-                        )
-                        if captcha_result == "needs_headed":
-                            headed_retries_google.append((query, limit_per_query, timeout, f"google_batch:{query}"))
-                            continue
-                        if captcha_result == "failed":
-                            continue
-                    
-                    # 提取结果
-                    html = await page.content()
-                    page_results = _GoogleParser.extract_results(html)
-                    
-                    for r in page_results[:limit_per_query]:
-                        rag_item = self._to_google_rag_format(r, query)
-                        query_results.append(rag_item)
-                    
-                    logger.info(f"  -> 获取 {len(query_results)} 条结果")
-                    
-                    # 缓存单个查询的结果
-                    if self._cache and query_results:
-                        cache_key = _make_key("google_web", query, limit_per_query)
-                        self._cache.set(cache_key, query_results)
-                    
-                    all_results.extend(query_results)
-                    
-                    # 查询间延迟（避免被封）
-                    if idx < len(queries_to_search) - 1:
-                        await self._random_delay(2.0, 4.0)
-                
-                except Exception as e:
-                    logger.error(f"Google 批量搜索单个查询出错 (query={query!r}): {e}")
-                    continue
-            
-            logger.info("[retrieval] playwright google_batch done total_hits=%d", len(all_results))
-            logger.info(f"Google 批量搜索完成，共 {len(all_results)} 条结果")
-        
-        except Exception as e:
-            logger.error(f"Google 批量搜索出错: {e}")
-        finally:
-            if page:
-                try:
-                    await page.close()
-                except Exception:
-                    pass
-            if browser_manager is not None:
-                await release_shared_browser(
-                    job_id=job_id,
-                    is_shared=is_shared,
-                    manager=browser_manager,
-                )
+                if browser_manager is not None:
+                    await release_shared_browser(
+                        job_id=job_id,
+                        is_shared=is_shared,
+                        manager=browser_manager,
+                    )
+        elif pooled_result is not None:
+            all_results, headed_retries_google = pooled_result
 
         for _q, _lim, _to, _sc in headed_retries_google:
             retry_results = await self._retry_with_headed_browser(

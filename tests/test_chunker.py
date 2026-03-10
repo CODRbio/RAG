@@ -123,6 +123,29 @@ class TestChunkBlocks:
         assert "text" in content_types
         assert "table" in content_types
 
+    def test_soft_target_does_not_force_flush(self):
+        blocks = [
+            {"block_type": "text", "heading_path": ["Intro"], "text": "A" * 35, "page_index": 0, "block_id": "b1"},
+            {"block_type": "text", "heading_path": ["Intro"], "text": "B" * 35, "page_index": 0, "block_id": "b2"},
+            {"block_type": "text", "heading_path": ["Intro"], "text": "C" * 35, "page_index": 0, "block_id": "b3"},
+        ]
+        cfg = ChunkConfig(target_chars=50, min_chars=20, max_chars=400)
+        chunks = chunk_blocks(blocks, "doc", config=cfg)
+        # target_chars is soft; same-section coherent text should not be fragmented early.
+        assert len([c for c in chunks if c.content_type == "text"]) == 1
+
+    def test_short_adjacent_blocks_are_absorbed(self):
+        blocks = [
+            {"block_type": "text", "heading_path": ["Results"], "text": "Short note.", "page_index": 0, "block_id": "s1"},
+            {"block_type": "text", "heading_path": ["Results"], "text": "Another short note.", "page_index": 0, "block_id": "s2"},
+            {"block_type": "text", "heading_path": ["Results"], "text": "A longer supporting paragraph that should stay with nearby short notes.", "page_index": 0, "block_id": "s3"},
+        ]
+        cfg = ChunkConfig(target_chars=40, min_chars=80, max_chars=500)
+        chunks = chunk_blocks(blocks, "doc", config=cfg)
+        text_chunks = [c for c in chunks if c.content_type == "text"]
+        assert len(text_chunks) == 1
+        assert "Short note." in text_chunks[0].text
+
 
 # ── 表格切块 ──
 

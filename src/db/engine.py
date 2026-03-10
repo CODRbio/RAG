@@ -81,6 +81,24 @@ def _make_absolute_sqlite_url(url: str) -> str:
     return f"sqlite:///{abs_path}"
 
 
+def _normalize_db_url(url: str) -> str:
+    """
+    Normalize common DB URL variants.
+
+    - Keep explicit SQLAlchemy driver URLs unchanged.
+    - Expand relative SQLite paths to absolute later via _make_absolute_sqlite_url().
+    - Default PostgreSQL URLs to psycopg so the app works once psycopg is installed.
+    """
+    normalized = (url or "").strip()
+    if not normalized:
+        return normalized
+    if normalized.startswith("postgres://"):
+        normalized = "postgresql://" + normalized[len("postgres://"):]
+    if normalized.startswith("postgresql://"):
+        return "postgresql+psycopg://" + normalized[len("postgresql://"):]
+    return normalized
+
+
 def get_engine() -> Engine:
     """Return the singleton SQLAlchemy engine, creating it on first call."""
     global _engine
@@ -88,7 +106,7 @@ def get_engine() -> Engine:
         return _engine
 
     raw_url = _resolve_db_url()
-    db_url = _make_absolute_sqlite_url(raw_url)
+    db_url = _make_absolute_sqlite_url(_normalize_db_url(raw_url))
 
     is_sqlite = db_url.startswith("sqlite")
     connect_args = {"check_same_thread": False, "timeout": 30} if is_sqlite else {}

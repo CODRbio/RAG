@@ -8,13 +8,14 @@ Google Scholar / Google search use RAG unified_web_search (SerpAPI + Playwright 
 import asyncio
 import json
 import os
+import shutil
 import time
 import uuid
 from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlmodel import Session, select
@@ -48,6 +49,25 @@ class ScholarSearchRequest(BaseModel):
     serpapi_ratio: Optional[float] = Field(None, ge=0.0, le=1.0)  # 0–1, share of queries to SerpAPI; default 0.5 when use_serpapi=True
 
 
+# Sources included in batch search (all except plain Google)
+BATCH_SEARCH_DEFAULT_SOURCES: List[str] = [
+    "google_scholar",
+    "semantic_relevance",
+    "semantic_bulk",
+    "ncbi",
+    "annas_archive",
+]
+
+
+class ScholarBatchSearchRequest(BaseModel):
+    query: str
+    sources: Optional[List[str]] = None  # defaults to BATCH_SEARCH_DEFAULT_SOURCES when None
+    limit_per_source: int = 20
+    year_start: Optional[int] = None
+    year_end: Optional[int] = None
+    optimize: bool = True  # each source gets its own LLM-optimized query
+
+
 class DownloadRequest(BaseModel):
     title: str = Field(..., min_length=1, max_length=500)
     doi: Optional[str] = Field(None, pattern=r"^10\.\d{4,}/\S+")
@@ -62,6 +82,10 @@ class DownloadRequest(BaseModel):
     library_id: Optional[int] = Field(None, description="When set with library_paper_id, download to library pdfs folder")
     llm_provider: Optional[str] = Field(None, description="LLM provider for downloader assist (e.g. qwen-thinking); uses config default if not set")
     model_override: Optional[str] = Field(None, description="Model override for downloader LLM; uses provider default if not set")
+    assist_llm_mode: Optional[str] = Field(
+        None,
+        description="下载辅助 LLM 模式: ultra-lite | lite | auto-upgrade",
+    )
     assist_llm_enabled: Optional[bool] = Field(None, description="显式启停下载辅助 LLM；False 时彻底关闭，不回退到服务端默认")
     show_browser: Optional[bool] = Field(None, description="有头(True)/无头(False)；不传则用配置默认")
     include_academia: bool = Field(False, description="是否允许尝试 Academia.edu 下载（默认跳过，避免卡住）")
@@ -76,6 +100,10 @@ class BatchDownloadRequest(BaseModel):
     auto_ingest: bool = False  # when False (default), only download; when True, download then ingest per paper
     llm_provider: Optional[str] = Field(None, description="LLM provider for downloader assist; applies to all papers in batch")
     model_override: Optional[str] = Field(None, description="Model override for downloader LLM; applies to all papers in batch")
+    assist_llm_mode: Optional[str] = Field(
+        None,
+        description="下载辅助 LLM 模式: ultra-lite | lite | auto-upgrade; applies to all papers in batch",
+    )
     assist_llm_enabled: Optional[bool] = Field(None, description="显式启停下载辅助 LLM；False 时彻底关闭")
     show_browser: Optional[bool] = Field(None, description="有头(True)/无头(False)；不传则用配置默认")
     include_academia: bool = Field(False, description="是否允许尝试 Academia.edu 下载（默认跳过，避免卡住）")
@@ -154,8 +182,17 @@ class LibraryIngestRequest(BaseModel):
     skip_unchanged: bool = True
     auto_download_missing: bool = False
     max_auto_download: int = Field(30, ge=1, le=200)
+    enrich_tables: bool = False
+    enrich_figures: bool = False
+    llm_text_provider: Optional[str] = None
+    llm_text_model: Optional[str] = None
+    llm_text_concurrency: Optional[int] = None
+    llm_vision_provider: Optional[str] = None
+    llm_vision_model: Optional[str] = None
+    llm_vision_concurrency: Optional[int] = None
     llm_provider: Optional[str] = None
     model_override: Optional[str] = None
+    assist_llm_mode: Optional[str] = None
     assist_llm_enabled: Optional[bool] = None
     show_browser: Optional[bool] = None
     include_academia: bool = False
@@ -171,6 +208,49 @@ class LibraryImportPdfSummary(BaseModel):
     invalid_pdf: int
     no_doi: int
     errors: List[str] = Field(default_factory=list)
+
+
+class LibraryRefreshMetadataSummary(BaseModel):
+    updated: int
+    skipped_no_doi: int
+    failed: int
+
+
+class LibraryRecommendRequest(BaseModel):
+    question: str
+    collection: Optional[str] = None
+    candidate_library_paper_ids: Optional[List[int]] = None
+    top_k: int = Field(default=10, ge=1, le=50)
+
+
+class LibraryRecommendItem(BaseModel):
+    library_paper_id: int
+    collection_paper_id: str
+    title: str
+    doi: Optional[str] = None
+    year: Optional[int] = None
+    venue: Optional[str] = None
+    impact_factor: Optional[float] = None
+    score: float
+    matched_chunks: int
+    best_chunk_score: float
+    snippets: List[str]
+
+
+class LibraryRecommendResponse(BaseModel):
+    question: str
+    library_id: int
+    collection: str
+    total_candidates: int
+    eligible_candidates: int
+    excluded_not_ingested: int
+    recommendations: List[LibraryRecommendItem]
+
+
+class RecommendStartResponse(BaseModel):
+    task_id: str
+    status: str = "submitted"
+    message: Optional[str] = None
 
 
 def _normalize_web_hit_for_scholar(hit: Dict[str, Any], canonical_source: str) -> Dict[str, Any]:
@@ -362,6 +442,100 @@ async def scholar_search(req: ScholarSearchRequest):
     return {"results": results, "count": len(results)}
 
 
+@router.post("/search/batch")
+async def scholar_search_batch(req: ScholarBatchSearchRequest):
+    """
+    Search multiple sources simultaneously; each source gets its own LLM-optimized query
+    when optimize=True. Results are merged and deduplicated by DOI.
+    Excluded: plain Google (use single-source /search for that).
+    """
+    if not getattr(settings, "scholar_downloader", None) or not settings.scholar_downloader.enabled:
+        raise HTTPException(status_code=503, detail="Scholar downloader is disabled")
+
+    from src.retrieval.downloader.adapter import get_adapter
+    from src.retrieval.scholar_query_optimizer import optimize_scholar_query
+    from src.retrieval.unified_web_search import unified_web_searcher
+    from src.retrieval.semantic_scholar import semantic_scholar_searcher
+
+    valid_sources = {"google_scholar", "semantic_relevance", "semantic", "semantic_bulk", "ncbi", "annas_archive"}
+    requested = req.sources if req.sources else BATCH_SEARCH_DEFAULT_SOURCES
+    sources = [s for s in requested if s in valid_sources]
+    if not sources:
+        return {"results": [], "count": 0, "source_counts": {}}
+
+    adapter = get_adapter()
+
+    async def _search_one(source: str) -> List[Dict[str, Any]]:
+        query = req.query
+        if req.optimize:
+            try:
+                query = optimize_scholar_query(query, source)
+                logger.info("batch search: optimized for source=%s -> %r", source, query[:80])
+            except Exception as e:
+                logger.warning("batch search: optimize failed for source=%s: %s", source, e)
+        try:
+            if source == "google_scholar":
+                raw_hits = await unified_web_searcher.search(
+                    query,
+                    providers=["scholar"],
+                    source_configs={"scholar": {"topK": req.limit_per_source, "useSerpapi": False}},
+                    max_results_per_provider=req.limit_per_source,
+                    year_start=req.year_start,
+                    year_end=req.year_end,
+                    serpapi_ratio=None,
+                    use_content_fetcher="off",
+                )
+                return [_normalize_web_hit_for_scholar(h, "google_scholar") for h in raw_hits]
+            elif source in ("semantic", "semantic_relevance"):
+                relevance_res = await semantic_scholar_searcher.search(
+                    query, limit=req.limit_per_source,
+                    year_start=req.year_start, year_end=req.year_end,
+                )
+                raw_hits = relevance_res if isinstance(relevance_res, list) else []
+                return [_normalize_web_hit_for_scholar(h, "semantic") for h in raw_hits]
+            elif source == "ncbi":
+                raw_hits = await unified_web_searcher.search(
+                    query,
+                    providers=["ncbi"],
+                    source_configs={"ncbi": {"topK": req.limit_per_source}},
+                    max_results_per_provider=req.limit_per_source,
+                    year_start=req.year_start,
+                    year_end=req.year_end,
+                    use_content_fetcher="off",
+                )
+                return [_normalize_web_hit_for_scholar(h, "ncbi") for h in raw_hits]
+            elif source == "semantic_bulk":
+                return await adapter.search_semantic_scholar_bulk(
+                    query=query, limit=req.limit_per_source,
+                    year_start=req.year_start, year_end=req.year_end,
+                )
+            elif source == "annas_archive":
+                return await adapter.search_annas_archive(query=query, limit=req.limit_per_source)
+            else:
+                return []
+        except Exception as e:
+            logger.warning("batch search source=%s failed: %s", source, e)
+            return []
+
+    all_results_lists = await asyncio.gather(*[_search_one(src) for src in sources])
+
+    source_counts: Dict[str, int] = {}
+    all_merged: List[Dict[str, Any]] = []
+    for src, results_list in zip(sources, all_results_lists):
+        source_counts[src] = len(results_list)
+        all_merged.extend(results_list)
+
+    deduped = _dedupe_papers_by_doi_keep_best_source(all_merged)
+    _enrich_scholar_results_with_crossref(deduped)
+    _normalize_and_enrich_venue(deduped)
+
+    logger.info(
+        "batch search done: sources=%s source_counts=%s total_after_dedup=%d",
+        sources, source_counts, len(deduped),
+    )
+    return {"results": deduped, "count": len(deduped), "source_counts": source_counts}
+
+
 @router.post("/download")
 async def scholar_download(
     req: DownloadRequest,
@@ -416,6 +590,7 @@ async def scholar_download(
             library_paper_id=getattr(req, "library_paper_id", None),
             llm_provider=getattr(req, "llm_provider", None),
             model_override=getattr(req, "model_override", None),
+            assist_llm_mode=getattr(req, "assist_llm_mode", None),
             assist_llm_enabled=getattr(req, "assist_llm_enabled", None),
             show_browser=getattr(req, "show_browser", None),
             include_academia=getattr(req, "include_academia", False),
@@ -429,7 +604,7 @@ async def scholar_download(
 
     from src.retrieval.downloader.adapter import get_adapter
 
-    result = await get_adapter().download_paper(
+    result = await get_adapter(show_browser=getattr(req, "show_browser", None)).download_paper(
         title=req.title,
         doi=req.doi,
         pdf_url=req.pdf_url,
@@ -440,12 +615,13 @@ async def scholar_download(
         download_dir=download_dir,
         llm_provider=getattr(req, "llm_provider", None),
         model_override=getattr(req, "model_override", None),
+        assist_llm_mode=getattr(req, "assist_llm_mode", None),
         assist_llm_enabled=getattr(req, "assist_llm_enabled", None),
         show_browser=getattr(req, "show_browser", None),
         include_academia=getattr(req, "include_academia", False),
         strategy_order=getattr(req, "strategy_order", None),
     )
-    if result.get("success") and req.library_paper_id is not None:
+    if result.get("success") and result.get("should_mark_downloaded", True) and req.library_paper_id is not None:
         from src.tasks.dispatcher import _mark_library_paper_downloaded
 
         _mark_library_paper_downloaded(req.library_paper_id)
@@ -485,15 +661,12 @@ def _pdf_rename_dedup_library_folder(pdfs_dir: str) -> dict:
         if not is_valid_pdf(str(pdf)):
             continue
         doi, _title = extract_doi_from_pdf_tiered(pdf)
-        if not doi:
-            no_doi += 1
-            continue
-        new_stem = _doi_to_paper_id(doi)
-        new_path = pdfs_path / f"{new_stem}.pdf"
-        ndoi = normalize_doi(doi)
+        ndoi = normalize_doi(doi) if doi else ""
         if not ndoi:
             no_doi += 1
             continue
+        new_stem = _doi_to_paper_id(ndoi)
+        new_path = pdfs_path / f"{new_stem}.pdf"
         if ndoi in seen_dois:
             # Only remove if this is a different file from the one we kept (same path = already kept, do not delete)
             kept = seen_dois[ndoi]
@@ -527,8 +700,8 @@ def _pdf_rename_dedup_library_folder(pdfs_dir: str) -> dict:
 
 
 def _sync_library_paper_downloaded_at(lib_id: int, pdfs_dir: str) -> int:
-    """Set downloaded_at for ScholarLibraryPaper rows where the PDF exists on disk (by DOI → paper_id). Returns count updated."""
-    from src.retrieval.downloader.adapter import _doi_to_paper_id
+    """Set downloaded_at for ScholarLibraryPaper rows where the PDF exists on disk.
+    Uses _library_paper_id(doi, title, authors, year) so both DOI-based and fallback (title/authors/year) papers are recognized."""
     from src.retrieval.downloader.utils import is_valid_pdf
 
     pdfs_path = Path(pdfs_dir)
@@ -539,10 +712,16 @@ def _sync_library_paper_downloaded_at(lib_id: int, pdfs_dir: str) -> int:
     with Session(get_engine()) as session:
         rows = list(session.exec(select(ScholarLibraryPaper).where(ScholarLibraryPaper.library_id == lib_id)).all())
         for row in rows:
-            doi = (row.doi or "").strip()
-            if not doi or getattr(row, "downloaded_at", None):
+            if getattr(row, "downloaded_at", None):
                 continue
-            paper_id = _doi_to_paper_id(doi)
+            paper_id = _library_paper_id(
+                (row.doi or "").strip() or None,
+                (row.title or "").strip(),
+                row.get_authors() if hasattr(row, "get_authors") else [],
+                row.year,
+            )
+            if not paper_id:
+                continue
             candidate = pdfs_path / f"{paper_id}.pdf"
             if candidate.is_file() and is_valid_pdf(str(candidate)):
                 row.downloaded_at = now
@@ -591,6 +770,7 @@ async def scholar_batch_download(
     async def _batch_job():
         from src.retrieval.downloader.adapter import get_adapter
 
+        batch_show_browser = getattr(req, "show_browser", None)
         batch_start = time.time()
         heartbeat_stop = asyncio.Event()
         _BATCH_HEARTBEAT_INTERVAL = 5
@@ -624,7 +804,7 @@ async def scholar_batch_download(
         completed = 0
         failed = 0
         progress_lock = asyncio.Lock()
-        adapter = get_adapter()
+        adapter = get_adapter(show_browser=batch_show_browser)
 
         async def _one(paper: DownloadRequest):
             nonlocal completed, failed
@@ -642,6 +822,7 @@ async def scholar_batch_download(
                         library_paper_id=getattr(paper, "library_paper_id", None),
                         llm_provider=getattr(req, "llm_provider", None) or getattr(paper, "llm_provider", None),
                         model_override=getattr(req, "model_override", None) or getattr(paper, "model_override", None),
+                        assist_llm_mode=getattr(req, "assist_llm_mode", None) or getattr(paper, "assist_llm_mode", None),
                         assist_llm_enabled=(
                             getattr(req, "assist_llm_enabled", None)
                             if getattr(req, "assist_llm_enabled", None) is not None
@@ -663,6 +844,7 @@ async def scholar_batch_download(
                         download_dir=batch_download_dir,
                         llm_provider=getattr(req, "llm_provider", None) or getattr(paper, "llm_provider", None),
                         model_override=getattr(req, "model_override", None) or getattr(paper, "model_override", None),
+                        assist_llm_mode=getattr(req, "assist_llm_mode", None) or getattr(paper, "assist_llm_mode", None),
                         assist_llm_enabled=(
                             getattr(req, "assist_llm_enabled", None)
                             if getattr(req, "assist_llm_enabled", None) is not None
@@ -674,7 +856,7 @@ async def scholar_batch_download(
                     )
                     result = {**result, "ingest_triggered": False}
                     # Update downloaded_at for the library paper row when download succeeds
-                    if result.get("success") and paper.library_paper_id is not None:
+                    if result.get("success") and result.get("should_mark_downloaded", True) and paper.library_paper_id is not None:
                         from src.tasks.dispatcher import _mark_library_paper_downloaded
                         _mark_library_paper_downloaded(paper.library_paper_id)
             except Exception as e:
@@ -1056,7 +1238,8 @@ def _is_academia_pdf_url(url: Optional[str]) -> bool:
 
 
 def _dedupe_papers_by_doi_keep_best_source(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """For each DOI keep one paper: best source priority; when equal, prefer non-Academia pdf_url (Academia often paywalled). No-DOI items kept as-is."""
+    """For each normalized DOI keep one paper: best source priority; when equal, prefer non-Academia pdf_url. No-DOI items kept as-is."""
+    from src.retrieval.dedup import normalize_doi
     if not items:
         return items
     no_doi: List[Dict[str, Any]] = []
@@ -1064,19 +1247,19 @@ def _dedupe_papers_by_doi_keep_best_source(items: List[Dict[str, Any]]) -> List[
     for item in items:
         meta = item.get("metadata") or {}
         doi = (meta.get("doi") or "").strip()
+        ndoi = normalize_doi(doi)
         pri = _scholar_source_priority(meta.get("source") or "")
-        if not doi:
+        if not ndoi:
             no_doi.append(item)
             continue
-        existing = by_doi.get(doi)
+        existing = by_doi.get(ndoi)
         if existing is None:
-            by_doi[doi] = item
+            by_doi[ndoi] = item
             continue
         existing_meta = existing.get("metadata") or {}
         existing_pri = _scholar_source_priority(existing_meta.get("source") or "")
         item_pdf = (meta.get("pdf_url") or "").strip()
         existing_pdf = (existing_meta.get("pdf_url") or "").strip()
-        # Prefer higher source priority; when equal, prefer non-Academia pdf_url
         take_item = (
             pri < existing_pri
             or (
@@ -1086,7 +1269,7 @@ def _dedupe_papers_by_doi_keep_best_source(items: List[Dict[str, Any]]) -> List[
             )
         )
         if take_item:
-            by_doi[doi] = item
+            by_doi[ndoi] = item
     return list(by_doi.values()) + no_doi
 
 
@@ -1114,7 +1297,9 @@ def _extract_doi_and_dedup_library_papers(
             continue
         url = (p.get("url") or "").strip()
         title = (p.get("title") or "").strip()
-        ndoi = _extract_doi_from_text(url or title)
+        ndoi = _extract_doi_from_text(url) if url else None
+        if not ndoi and title:
+            ndoi = _extract_doi_from_text(title)
         if ndoi:
             p["doi"] = ndoi
             extracted_count += 1
@@ -1253,12 +1438,15 @@ def _build_library_ingest_cfg(
     file_paths: List[str],
     collection_name: str,
     user_id: str,
+    library_name: str,
     skip_duplicate_doi: bool,
     skip_unchanged: bool,
+    file_metadata_map: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Build ingest config payload for library -> ingest bridge."""
     return {
         "file_paths": file_paths,
+        "file_metadata_map": file_metadata_map or {},
         "collection_name": collection_name,
         "content_hashes": {},
         "enrich_tables": False,
@@ -1273,7 +1461,56 @@ def _build_library_ingest_cfg(
         "llm_vision_model": None,
         "llm_vision_concurrency": None,
         "user_id": user_id,
+        "library_name": library_name,
     }
+
+
+def _sync_remove_library_deleted_papers(
+    *,
+    collection_name: str,
+    lib_id: int,
+    user_id: str,
+    library_name: str,
+    current_library_paper_ids: set[int],
+) -> int:
+    """Delete papers from vector/Paper/parsed_raw when they are no longer in the library."""
+    removed_papers = 0
+    parsed_root = PathManager.get_user_library_parsed_path(user_id, library_name)
+    try:
+        from src.indexing.paper_store import list_papers_linked_to_library, delete_paper
+        from src.indexing.milvus_ops import milvus
+
+        linked = list_papers_linked_to_library(collection_name, lib_id, user_id=user_id)
+        for p in linked:
+            lp_id = p.get("library_paper_id")
+            if lp_id is None:
+                continue
+            try:
+                lp_id_int = int(lp_id)
+            except Exception:
+                continue
+            if lp_id_int in current_library_paper_ids:
+                continue
+
+            paper_id = (p.get("paper_id") or "").strip()
+            if not paper_id:
+                continue
+            try:
+                if milvus.client.has_collection(collection_name):
+                    milvus.client.delete(
+                        collection_name=collection_name,
+                        filter=f'paper_id == "{paper_id}"',
+                    )
+                delete_paper(collection_name, paper_id)
+                parsed_paper_dir = parsed_root / paper_id
+                if parsed_paper_dir.exists():
+                    shutil.rmtree(parsed_paper_dir)
+                removed_papers += 1
+            except Exception as e:
+                logger.warning("sync-remove paper from collection failed paper_id=%s: %s", paper_id, e)
+    except Exception as e:
+        logger.warning("library ingest sync-removal (remove deleted papers from vector) failed: %s", e)
+    return removed_papers
 
 
 def _library_paper_id(doi: Optional[str], title: str, authors: List[str], year: Optional[int]) -> Optional[str]:
@@ -1303,8 +1540,12 @@ def _build_library_row_index(rows: List[ScholarLibraryPaper]) -> Tuple[Dict[str,
 
 
 @router.get("/libraries/{lib_id:int}/papers")
-def list_scholar_library_papers(lib_id: int, user_id: str = Depends(get_current_user_id)):
-    """List all papers in a scholar library (temp or permanent)."""
+def list_scholar_library_papers(
+    lib_id: int,
+    collection: Optional[str] = Query(None, description="If set, each paper includes in_collection and collection_paper_id for this collection"),
+    user_id: str = Depends(get_current_user_id),
+):
+    """List all papers in a scholar library (temp or permanent). Optional collection param for in_collection/collection_paper_id."""
     if _is_temp_library(lib_id):
         if lib_id not in _temp_store:
             raise HTTPException(status_code=404, detail="库不存在")
@@ -1321,6 +1562,8 @@ def list_scholar_library_papers(lib_id: int, user_id: str = Depends(get_current_
             d["venue"] = d.get("venue") or None
             d["normalized_journal_name"] = d.get("normalized_journal_name") or None
             d["is_downloaded"] = bool(d.get("downloaded_at"))
+            d["in_collection"] = False
+            d["collection_paper_id"] = None
             out.append(d)
         return _attach_impact_factor_metadata(out)
     with Session(get_engine()) as session:
@@ -1328,8 +1571,12 @@ def list_scholar_library_papers(lib_id: int, user_id: str = Depends(get_current_
         if not lib or getattr(lib, "user_id", None) != user_id:
             raise HTTPException(status_code=404, detail="库不存在")
         papers = session.exec(select(ScholarLibraryPaper).where(ScholarLibraryPaper.library_id == lib_id)).all()
-        out = [
-            {
+        out = []
+        for p in papers:
+            coll_name = getattr(p, "collection_name", None) or ""
+            coll_paper_id = getattr(p, "collection_paper_id", None) or ""
+            in_coll = bool(collection and coll_name == collection)
+            d = {
                 "id": p.id,
                 "library_id": p.library_id,
                 "title": p.title,
@@ -1352,10 +1599,491 @@ def list_scholar_library_papers(lib_id: int, user_id: str = Depends(get_current_
                     p.year,
                 ),
                 "is_downloaded": bool(getattr(p, "downloaded_at", None)),
+                "in_collection": in_coll,
+                "collection_paper_id": coll_paper_id if in_coll else None,
             }
-            for p in papers
-        ]
+            out.append(d)
         return _attach_impact_factor_metadata(out)
+
+
+def _aggregate_chunks_to_library_papers(
+    chunks: List[Any],
+    eligible_lookup: Dict[str, Any],
+    top_k: int,
+    max_snippets: int = 3,
+) -> List[Dict[str, Any]]:
+    """
+    Group EvidenceChunk objects by doc_id and join them to library papers via eligible_lookup.
+
+    eligible_lookup: dict mapping collection_paper_id -> ScholarLibraryPaper (or dict with same keys).
+    Returns list of aggregated dicts sorted by (best_chunk_score desc, matched_chunks desc), capped at top_k.
+    """
+    from collections import defaultdict
+
+    doc_chunks: Dict[str, List[Any]] = defaultdict(list)
+    for chunk in chunks:
+        doc_id = getattr(chunk, "doc_id", None) or getattr(chunk, "chunk_id", None) or ""
+        if doc_id and doc_id in eligible_lookup:
+            doc_chunks[doc_id].append(chunk)
+
+    results: List[Dict[str, Any]] = []
+    for coll_paper_id, chunk_list in doc_chunks.items():
+        paper = eligible_lookup[coll_paper_id]
+        scores = [getattr(c, "score", 0.0) for c in chunk_list]
+        best_score = max(scores) if scores else 0.0
+        # Sort chunks by score desc for snippet selection
+        sorted_chunks = sorted(chunk_list, key=lambda c: getattr(c, "score", 0.0), reverse=True)
+        snippets = [
+            (getattr(c, "text", "") or "").strip()
+            for c in sorted_chunks[:max_snippets]
+            if (getattr(c, "text", "") or "").strip()
+        ]
+
+        p_id = getattr(paper, "id", None) if hasattr(paper, "id") else paper.get("id")
+        p_title = getattr(paper, "title", None) if hasattr(paper, "title") else paper.get("title", "")
+        p_doi = getattr(paper, "doi", None) if hasattr(paper, "doi") else paper.get("doi")
+        p_year = getattr(paper, "year", None) if hasattr(paper, "year") else paper.get("year")
+        p_venue = getattr(paper, "venue", None) if hasattr(paper, "venue") else paper.get("venue")
+        p_if = getattr(paper, "impact_factor", None) if hasattr(paper, "impact_factor") else paper.get("impact_factor")
+
+        results.append({
+            "library_paper_id": p_id,
+            "collection_paper_id": coll_paper_id,
+            "title": p_title or "",
+            "doi": (p_doi or "").strip() or None,
+            "year": p_year,
+            "venue": (p_venue or "").strip() or None,
+            "impact_factor": p_if,
+            "score": best_score,
+            "matched_chunks": len(chunk_list),
+            "best_chunk_score": best_score,
+            "snippets": snippets,
+        })
+
+    results.sort(key=lambda r: (r["best_chunk_score"], r["matched_chunks"]), reverse=True)
+    return results[:top_k]
+
+
+_RECOMMEND_JOB_TIMEOUT_S = 120  # hard timeout for recommend retrieval + aggregate
+
+
+def _recommend_sync_step(
+    collection: str,
+    question: str,
+    retrieval_top_k: int,
+    eligible_lookup: Dict[str, Dict[str, Any]],
+    top_k: int,
+    lib_id: int,
+    total_candidates: int,
+    eligible_count: int,
+    excluded_count: int,
+) -> Dict[str, Any]:
+    """Run retrieval and aggregate in a thread; returns LibraryRecommendResponse as dict."""
+    from src.retrieval.service import get_retrieval_service
+
+    svc = get_retrieval_service(collection=collection)
+    pack = svc.search(question, mode="local", top_k=retrieval_top_k)
+    chunks = pack.chunks
+    aggregated = _aggregate_chunks_to_library_papers(
+        chunks=chunks,
+        eligible_lookup=eligible_lookup,
+        top_k=top_k,
+        max_snippets=3,
+    )
+    raw_rows = [
+        {
+            "id": r["library_paper_id"],
+            "library_paper_id": r["library_paper_id"],
+            "collection_paper_id": r["collection_paper_id"],
+            "title": r["title"],
+            "doi": r["doi"],
+            "year": r["year"],
+            "venue": r["venue"],
+            "impact_factor": r["impact_factor"],
+            "score": r["score"],
+            "matched_chunks": r["matched_chunks"],
+            "best_chunk_score": r["best_chunk_score"],
+            "snippets": r["snippets"],
+        }
+        for r in aggregated
+    ]
+    enriched = _attach_impact_factor_metadata(raw_rows)
+    recommendations = [
+        {
+            "library_paper_id": row["library_paper_id"],
+            "collection_paper_id": row["collection_paper_id"],
+            "title": row["title"],
+            "doi": row.get("doi"),
+            "year": row.get("year"),
+            "venue": row.get("venue"),
+            "impact_factor": row.get("impact_factor"),
+            "score": row["score"],
+            "matched_chunks": row["matched_chunks"],
+            "best_chunk_score": row["best_chunk_score"],
+            "snippets": row["snippets"],
+        }
+        for row in enriched
+    ]
+    return {
+        "question": question,
+        "library_id": lib_id,
+        "collection": collection,
+        "total_candidates": total_candidates,
+        "eligible_candidates": eligible_count,
+        "excluded_not_ingested": excluded_count,
+        "recommendations": recommendations,
+    }
+
+
+async def _run_recommend_job(
+    task_id: str,
+    lib_id: int,
+    body: LibraryRecommendRequest,
+    collection: str,
+    eligible_lookup: Dict[str, Dict[str, Any]],
+    total_candidates: int,
+    eligible_count: int,
+    excluded_count: int,
+) -> None:
+    q = get_task_queue()
+    heartbeat_stop = asyncio.Event()
+    job_start = time.time()
+    _HEARTBEAT_INTERVAL = 5
+
+    async def _heartbeat() -> None:
+        while not heartbeat_stop.is_set():
+            try:
+                await asyncio.wait_for(heartbeat_stop.wait(), timeout=_HEARTBEAT_INTERVAL)
+            except asyncio.TimeoutError:
+                pass
+            if heartbeat_stop.is_set():
+                break
+            s = q.get_state(task_id)
+            if s and s.status in (TaskStatus.completed, TaskStatus.error, TaskStatus.timeout):
+                break
+            elapsed = time.time() - job_start
+            q.push_event(task_id, "heartbeat", {"stage": "recommend", "elapsed_s": round(elapsed, 1)})
+
+    heartbeat_task = asyncio.create_task(_heartbeat())
+    try:
+        if eligible_count == 0:
+            q.push_event(
+                task_id,
+                "progress",
+                {"stage": "no_eligible", "message": "无已入库候选，跳过检索"},
+            )
+            response_dict = {
+                "question": body.question,
+                "library_id": lib_id,
+                "collection": collection,
+                "total_candidates": total_candidates,
+                "eligible_candidates": 0,
+                "excluded_not_ingested": excluded_count,
+                "recommendations": [],
+            }
+            q.push_event(task_id, "done", response_dict)
+            state = q.get_state(task_id)
+            if state:
+                state.status = TaskStatus.completed
+                state.finished_at = time.time()
+                state.payload["recommend_result"] = response_dict
+                q.set_state(state)
+            return
+
+        q.push_event(
+            task_id,
+            "progress",
+            {"stage": "retrieval_started", "message": "正在检索..."},
+        )
+        retrieval_top_k = min(body.top_k * 5, 100)
+        loop = asyncio.get_event_loop()
+        try:
+            future = loop.run_in_executor(
+                None,
+                lambda: _recommend_sync_step(
+                    collection=collection,
+                    question=body.question,
+                    retrieval_top_k=retrieval_top_k,
+                    eligible_lookup=eligible_lookup,
+                    top_k=body.top_k,
+                    lib_id=lib_id,
+                    total_candidates=total_candidates,
+                    eligible_count=eligible_count,
+                    excluded_count=excluded_count,
+                ),
+            )
+            response_dict = await asyncio.wait_for(future, timeout=_RECOMMEND_JOB_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            q.push_event(
+                task_id,
+                "error",
+                {"message": f"推荐检索超时（{_RECOMMEND_JOB_TIMEOUT_S}s）"},
+            )
+            state = q.get_state(task_id)
+            if state:
+                state.status = TaskStatus.timeout
+                state.finished_at = time.time()
+                state.error_message = "推荐检索超时"
+                q.set_state(state)
+            return
+        except Exception as exc:
+            logger.exception("[recommend] job failed task_id=%s: %s", task_id, exc)
+            q.push_event(task_id, "error", {"message": str(exc) or exc.__class__.__name__})
+            state = q.get_state(task_id)
+            if state:
+                state.status = TaskStatus.error
+                state.finished_at = time.time()
+                state.error_message = str(exc) or exc.__class__.__name__
+                q.set_state(state)
+            return
+
+        q.push_event(
+            task_id,
+            "progress",
+            {"stage": "aggregating", "message": "正在汇总..."},
+        )
+        q.push_event(task_id, "done", response_dict)
+        state = q.get_state(task_id)
+        if state:
+            state.status = TaskStatus.completed
+            state.finished_at = time.time()
+            state.payload["recommend_result"] = response_dict
+            q.set_state(state)
+    finally:
+        heartbeat_stop.set()
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
+
+
+@router.post("/libraries/{lib_id:int}/recommend/start", response_model=RecommendStartResponse)
+async def recommend_library_papers_start(
+    lib_id: int,
+    body: LibraryRecommendRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Start an async recommend task; client subscribes to GET /scholar/task/{task_id}/stream for progress and result."""
+    if _is_temp_library(lib_id):
+        raise HTTPException(status_code=400, detail="临时库不支持推荐")
+
+    with Session(get_engine()) as session:
+        lib = session.get(ScholarLibrary, lib_id)
+        if not lib or getattr(lib, "user_id", None) != user_id:
+            raise HTTPException(status_code=404, detail="库不存在")
+
+        all_papers = session.exec(
+            select(ScholarLibraryPaper).where(ScholarLibraryPaper.library_id == lib_id)
+        ).all()
+
+    collection = (body.collection or "").strip()
+    if not collection:
+        from config.settings import settings as _settings
+        collection = (_settings.collection.global_ or "").strip()
+    if not collection:
+        raise HTTPException(status_code=400, detail="未指定知识库集合（collection），请先绑定子库或传入 collection 参数")
+
+    candidate_set: Optional[set] = None
+    if body.candidate_library_paper_ids is not None:
+        candidate_set = set(body.candidate_library_paper_ids)
+
+    total_candidates = len(all_papers) if candidate_set is None else len(candidate_set)
+    eligible_lookup: Dict[str, Any] = {}
+    excluded_count = 0
+    for p in all_papers:
+        if candidate_set is not None and p.id not in candidate_set:
+            continue
+        coll_name = (getattr(p, "collection_name", None) or "").strip()
+        coll_paper_id = (getattr(p, "collection_paper_id", None) or "").strip()
+        if coll_name == collection and coll_paper_id:
+            eligible_lookup[coll_paper_id] = {
+                "id": p.id,
+                "title": p.title or "",
+                "doi": p.doi,
+                "year": p.year,
+                "venue": (getattr(p, "venue", None) or "").strip() or None,
+                "impact_factor": getattr(p, "impact_factor", None),
+            }
+        else:
+            excluded_count += 1
+
+    eligible_count = len(eligible_lookup)
+    task_id = f"recommend_{uuid.uuid4().hex[:12]}"
+    q = get_task_queue()
+    parent = TaskState(
+        task_id=task_id,
+        kind=TaskKind.scholar,
+        status=TaskStatus.running,
+        started_at=time.time(),
+        payload={
+            "type": "recommend",
+            "library_id": lib_id,
+            "question": body.question,
+            "collection": collection,
+            "total_candidates": total_candidates,
+            "eligible_candidates": eligible_count,
+            "excluded_not_ingested": excluded_count,
+        },
+    )
+    q.set_state(parent)
+    recommend_task = asyncio.create_task(
+        _run_recommend_job(
+            task_id=task_id,
+            lib_id=lib_id,
+            body=body,
+            collection=collection,
+            eligible_lookup=eligible_lookup,
+            total_candidates=total_candidates,
+            eligible_count=eligible_count,
+            excluded_count=excluded_count,
+        ),
+        name=f"recommend:{task_id}",
+    )
+
+    def _log_recommend_task(t: asyncio.Task) -> None:
+        try:
+            exc = t.exception()
+        except asyncio.CancelledError:
+            logger.warning("[recommend] task_id=%s was cancelled", task_id)
+            return
+        if exc is not None:
+            logger.exception("[recommend] task_id=%s escaped: %s", task_id, exc)
+
+    recommend_task.add_done_callback(_log_recommend_task)
+    return RecommendStartResponse(
+        task_id=task_id,
+        status="submitted",
+        message="推荐任务已提交",
+    )
+
+
+@router.post("/libraries/{lib_id:int}/recommend", response_model=LibraryRecommendResponse)
+async def recommend_library_papers(
+    lib_id: int,
+    body: LibraryRecommendRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Recommend the most relevant papers in a library for a given question using local RAG retrieval."""
+    if _is_temp_library(lib_id):
+        raise HTTPException(status_code=400, detail="临时库不支持推荐")
+
+    from src.retrieval.service import get_retrieval_service
+
+    with Session(get_engine()) as session:
+        lib = session.get(ScholarLibrary, lib_id)
+        if not lib or getattr(lib, "user_id", None) != user_id:
+            raise HTTPException(status_code=404, detail="库不存在")
+
+        all_papers = session.exec(
+            select(ScholarLibraryPaper).where(ScholarLibraryPaper.library_id == lib_id)
+        ).all()
+
+    # Determine effective collection
+    collection = (body.collection or "").strip()
+    if not collection:
+        from config.settings import settings as _settings
+        collection = (_settings.collection.global_ or "").strip()
+    if not collection:
+        raise HTTPException(status_code=400, detail="未指定知识库集合（collection），请先绑定子库或传入 collection 参数")
+
+    # Optionally restrict to candidate IDs from frontend filter
+    candidate_set: Optional[set] = None
+    if body.candidate_library_paper_ids is not None:
+        candidate_set = set(body.candidate_library_paper_ids)
+
+    total_candidates = len(all_papers) if candidate_set is None else len(candidate_set)
+
+    # Partition: eligible = ingested into this collection
+    eligible_lookup: Dict[str, Any] = {}
+    excluded_count = 0
+    for p in all_papers:
+        if candidate_set is not None and p.id not in candidate_set:
+            continue
+        coll_name = (getattr(p, "collection_name", None) or "").strip()
+        coll_paper_id = (getattr(p, "collection_paper_id", None) or "").strip()
+        if coll_name == collection and coll_paper_id:
+            eligible_lookup[coll_paper_id] = p
+        else:
+            excluded_count += 1
+
+    eligible_count = len(eligible_lookup)
+
+    if eligible_count == 0:
+        return LibraryRecommendResponse(
+            question=body.question,
+            library_id=lib_id,
+            collection=collection,
+            total_candidates=total_candidates,
+            eligible_candidates=0,
+            excluded_not_ingested=excluded_count,
+            recommendations=[],
+        )
+
+    # Run local RAG retrieval (over-retrieve to get enough distinct docs)
+    retrieval_top_k = min(body.top_k * 5, 100)
+    try:
+        svc = get_retrieval_service(collection=collection)
+        pack = svc.search(body.question, mode="local", top_k=retrieval_top_k)
+        chunks = pack.chunks
+    except Exception as exc:
+        logger.exception("[recommend] retrieval failed lib_id=%s: %s", lib_id, exc)
+        raise HTTPException(status_code=500, detail=f"检索失败: {exc}")
+
+    # Aggregate chunks -> library papers
+    aggregated = _aggregate_chunks_to_library_papers(
+        chunks=chunks,
+        eligible_lookup=eligible_lookup,
+        top_k=body.top_k,
+        max_snippets=3,
+    )
+
+    # Attach IF metadata by building minimal dicts compatible with _attach_impact_factor_metadata
+    raw_rows = [
+        {
+            "id": r["library_paper_id"],
+            "library_paper_id": r["library_paper_id"],
+            "collection_paper_id": r["collection_paper_id"],
+            "title": r["title"],
+            "doi": r["doi"],
+            "year": r["year"],
+            "venue": r["venue"],
+            "impact_factor": r["impact_factor"],
+            "score": r["score"],
+            "matched_chunks": r["matched_chunks"],
+            "best_chunk_score": r["best_chunk_score"],
+            "snippets": r["snippets"],
+        }
+        for r in aggregated
+    ]
+    enriched = _attach_impact_factor_metadata(raw_rows)
+
+    recommendations = [
+        LibraryRecommendItem(
+            library_paper_id=row["library_paper_id"],
+            collection_paper_id=row["collection_paper_id"],
+            title=row["title"],
+            doi=row.get("doi"),
+            year=row.get("year"),
+            venue=row.get("venue"),
+            impact_factor=row.get("impact_factor"),
+            score=row["score"],
+            matched_chunks=row["matched_chunks"],
+            best_chunk_score=row["best_chunk_score"],
+            snippets=row["snippets"],
+        )
+        for row in enriched
+    ]
+
+    return LibraryRecommendResponse(
+        question=body.question,
+        library_id=lib_id,
+        collection=collection,
+        total_candidates=total_candidates,
+        eligible_candidates=eligible_count,
+        excluded_not_ingested=excluded_count,
+        recommendations=recommendations,
+    )
 
 
 @router.post("/libraries/{lib_id:int}/ingest")
@@ -1383,7 +2111,25 @@ async def ingest_scholar_library(
     from src.retrieval.downloader.utils import is_valid_pdf
 
     file_paths: List[str] = []
+    file_metadata_map: Dict[str, Dict[str, Any]] = {}
     missing_rows: List[ScholarLibraryPaper] = []
+
+    def _record_file_metadata(path: Path, row: ScholarLibraryPaper) -> None:
+        file_metadata_map[str(path)] = {
+            "library_id": lib_id,
+            "library_paper_id": int(row.id) if row.id is not None else None,
+            "source": (row.source or "").strip() or "scholar_library",
+            "metadata": {
+                "doi": (row.doi or "").strip() or None,
+                "title": (row.title or "").strip() or None,
+                "authors": row.get_authors() or None,
+                "year": row.year,
+                "venue": (row.venue or "").strip() or None,
+                "url": (row.url or "").strip() or None,
+                "pdf_url": (row.pdf_url or "").strip() or None,
+            },
+        }
+
     for row in rows:
         stem = _library_paper_id(
             (row.doi or "").strip() or None,
@@ -1396,6 +2142,7 @@ async def ingest_scholar_library(
         candidate = pdfs_dir / f"{stem}.pdf"
         if candidate.is_file() and is_valid_pdf(str(candidate)):
             file_paths.append(str(candidate))
+            _record_file_metadata(candidate, row)
         else:
             missing_rows.append(row)
 
@@ -1406,7 +2153,7 @@ async def ingest_scholar_library(
     if body.auto_download_missing and missing_rows:
         from src.retrieval.downloader.adapter import get_adapter
 
-        adapter = get_adapter()
+        adapter = get_adapter(show_browser=body.show_browser)
         for row in missing_rows[: body.max_auto_download]:
             attempted_downloads += 1
             result = await adapter.download_paper(
@@ -1419,6 +2166,7 @@ async def ingest_scholar_library(
                 download_dir=download_dir,
                 llm_provider=body.llm_provider,
                 model_override=body.model_override,
+                assist_llm_mode=body.assist_llm_mode,
                 assist_llm_enabled=body.assist_llm_enabled,
                 show_browser=body.show_browser,
                 include_academia=body.include_academia,
@@ -1428,13 +2176,15 @@ async def ingest_scholar_library(
                 fp = str(result["filepath"])
                 if fp not in file_paths:
                     file_paths.append(fp)
+                _record_file_metadata(Path(fp), row)
                 downloaded_now += 1
-                try:
-                    from src.tasks.dispatcher import _mark_library_paper_downloaded
+                if result.get("should_mark_downloaded", True):
+                    try:
+                        from src.tasks.dispatcher import _mark_library_paper_downloaded
 
-                    _mark_library_paper_downloaded(row.id)
-                except Exception as e:
-                    logger.warning("mark downloaded_at failed for library paper %s: %s", row.id, e)
+                        _mark_library_paper_downloaded(row.id)
+                    except Exception as e:
+                        logger.warning("mark downloaded_at failed for library paper %s: %s", row.id, e)
             else:
                 failed_downloads += 1
 
@@ -1442,16 +2192,46 @@ async def ingest_scholar_library(
     if not unique_paths:
         raise HTTPException(status_code=400, detail="该文献库没有可入库的 PDF，请先下载文献")
 
+    collection_name = (body.collection or "").strip() or settings.collection.global_
+    current_library_paper_ids = {int(r.id) for r in rows if r.id is not None}
+    removed_papers = _sync_remove_library_deleted_papers(
+        collection_name=collection_name,
+        lib_id=lib_id,
+        user_id=user_id,
+        library_name=lib.name,
+        current_library_paper_ids=current_library_paper_ids,
+    )
+
     from src.indexing.ingest_job_store import create_job
 
-    collection_name = (body.collection or "").strip() or settings.collection.global_
     ingest_cfg = _build_library_ingest_cfg(
         file_paths=unique_paths,
         collection_name=collection_name,
         user_id=user_id,
+        library_name=lib.name,
         skip_duplicate_doi=body.skip_duplicate_doi,
         skip_unchanged=body.skip_unchanged,
+        file_metadata_map={p: file_metadata_map[p] for p in unique_paths if p in file_metadata_map},
     )
+    ingest_cfg["enrich_tables"] = body.enrich_tables
+    ingest_cfg["enrich_figures"] = body.enrich_figures
+    ingest_cfg["actual_skip"] = not (body.enrich_tables or body.enrich_figures)
+    # Table enrichment defaults to qwen (qwen3.5, no thinking) when not specified
+    if body.enrich_tables and not (body.llm_text_provider or "").strip():
+        ingest_cfg["llm_text_provider"] = "qwen"
+    elif body.llm_text_provider:
+        ingest_cfg["llm_text_provider"] = body.llm_text_provider
+    if body.llm_text_model:
+        ingest_cfg["llm_text_model"] = body.llm_text_model
+    if body.llm_text_concurrency:
+        ingest_cfg["llm_text_concurrency"] = body.llm_text_concurrency
+    if body.llm_vision_provider:
+        ingest_cfg["llm_vision_provider"] = body.llm_vision_provider
+    if body.llm_vision_model:
+        ingest_cfg["llm_vision_model"] = body.llm_vision_model
+    if body.llm_vision_concurrency:
+        ingest_cfg["llm_vision_concurrency"] = body.llm_vision_concurrency
+
     job = create_job(collection_name, ingest_cfg, total_files=len(unique_paths))
     job_id = job.get("job_id")
     if not job_id:
@@ -1468,6 +2248,7 @@ async def ingest_scholar_library(
         "attempted_downloads": attempted_downloads,
         "downloaded_now": downloaded_now,
         "failed_downloads": failed_downloads,
+        "removed_papers": removed_papers,
     }
 
 
@@ -1541,6 +2322,158 @@ async def upload_library_paper_pdf(
     return {"success": True, "paper_id": paper_id, "filename": f"{paper_id}.pdf"}
 
 
+def _extract_pdf_metadata_from_text(pdf_path: Path) -> Dict[str, Any]:
+    """
+    Lightweight full-text metadata extraction for library import.
+    Best effort only: title/doi/authors/year/venue; crossref fallback happens later.
+    """
+    out: Dict[str, Any] = {}
+    try:
+        import fitz
+        import re
+
+        lines: List[str] = []
+        with fitz.open(str(pdf_path)) as doc:
+            page_count = len(doc)
+            for page_idx in range(page_count):
+                text = (doc[page_idx].get_text() or "").strip()
+                if not text:
+                    continue
+                lines.extend([ln.strip() for ln in text.splitlines() if ln.strip()])
+                # Keep extraction bounded for very large files.
+                if len(lines) >= 600:
+                    break
+
+        if not lines:
+            return out
+
+        from src.retrieval.dedup import _extract_doi_from_text
+
+        head_text = "\n".join(lines[:120])
+        full_text = "\n".join(lines[:600])
+
+        doi = _extract_doi_from_text(head_text) or _extract_doi_from_text(full_text)
+        if doi:
+            out["doi"] = doi
+
+        # Title: prefer an early long, non-noisy line.
+        for line in lines[:40]:
+            ll = line.lower()
+            if len(line) < 12 or len(line) > 260:
+                continue
+            if ll.startswith(("doi", "http://", "https://", "arxiv:", "copyright", "abstract")):
+                continue
+            if sum(ch.isdigit() for ch in line) / max(len(line), 1) > 0.08:
+                continue
+            out["title"] = line
+            break
+
+        # Authors: try first page-ish region, comma/and separated names.
+        for line in lines[:30]:
+            if len(line) < 8 or len(line) > 220:
+                continue
+            ll = line.lower()
+            if any(k in ll for k in ("university", "department", "journal", "abstract", "doi")):
+                continue
+            parts = [p.strip() for p in line.replace(" and ", ",").split(",") if p.strip()]
+            if not (1 <= len(parts) <= 12):
+                continue
+            if all(2 <= len(p.split()) <= 4 for p in parts) and sum(ch.isdigit() for ch in line) == 0:
+                out["authors"] = parts
+                break
+
+        # Year: prefer a modern publication year candidate.
+        years = [int(y) for y in re.findall(r"\b(19\d{2}|20\d{2})\b", head_text)]
+        if years:
+            plausible = [y for y in years if 1900 <= y <= 2100]
+            if plausible:
+                out["year"] = max(plausible)
+
+        # Venue: simple first-match heuristic.
+        for line in lines[:120]:
+            ll = line.lower()
+            if any(k in ll for k in ("journal", "proceedings", "conference", "transactions on")):
+                out["venue"] = line[:300]
+                break
+    except Exception as e:
+        logger.debug("full-text metadata extraction failed for %s: %s", pdf_path, e)
+    return out
+
+
+def _resolve_library_import_metadata(raw_name: str, temp_path: Path) -> Dict[str, Any]:
+    from src.parser.pdf_parser import extract_native_metadata
+    from src.retrieval.dedup import (
+        crossref_fetch_by_doi,
+        _crossref_lookup_by_title,
+        extract_doi_from_filename,
+        extract_doi_from_pdf_tiered,
+        normalize_doi,
+    )
+
+    original_stem = Path(raw_name).stem
+    filename_doi = extract_doi_from_filename(raw_name)
+    extracted_doi, extracted_title = extract_doi_from_pdf_tiered(temp_path)
+    native_meta = extract_native_metadata(temp_path)
+    text_meta = _extract_pdf_metadata_from_text(temp_path)
+
+    ndoi = normalize_doi(
+        filename_doi
+        or extracted_doi
+        or text_meta.get("doi")
+        or native_meta.get("doi")
+    )
+    title = (
+        (
+            extracted_title
+            or text_meta.get("title")
+            or native_meta.get("title")
+            or original_stem
+            or ""
+        ).strip()
+        or "(无标题)"
+    )
+    authors: List[str] = (
+        text_meta.get("authors")
+        if isinstance(text_meta.get("authors"), list)
+        else []
+    )
+    year = text_meta.get("year") if isinstance(text_meta.get("year"), int) else None
+    venue = (text_meta.get("venue") or "").strip() if isinstance(text_meta.get("venue"), str) else ""
+
+    cr_meta = crossref_fetch_by_doi(ndoi) if ndoi else None
+    if not cr_meta and title:
+        cr_meta = _crossref_lookup_by_title(title)
+    if cr_meta:
+        # CrossRef-first: trust DOI metadata when present; keep PDF-derived values as fallback.
+        ndoi = normalize_doi(cr_meta.get("doi") or ndoi)
+        cr_title = str(cr_meta.get("title") or "").strip()
+        if cr_title:
+            title = cr_title
+        cr_authors = (
+            [str(a).strip() for a in (cr_meta.get("authors") or []) if str(a).strip()]
+            if isinstance(cr_meta.get("authors"), list)
+            else []
+        )
+        if cr_authors:
+            authors = cr_authors
+        cr_year = cr_meta.get("year")
+        if isinstance(cr_year, int):
+            year = int(cr_year)
+        elif isinstance(cr_year, str) and cr_year.isdigit():
+            year = int(cr_year)
+        cr_venue = str(cr_meta.get("venue") or "").strip()
+        if cr_venue:
+            venue = cr_venue
+
+    return {
+        "doi": ndoi,
+        "title": title,
+        "authors": authors,
+        "year": year,
+        "venue": venue,
+    }
+
+
 @router.post("/libraries/{lib_id:int}/import-pdfs", response_model=LibraryImportPdfSummary)
 async def import_library_pdfs(
     lib_id: int,
@@ -1560,8 +2493,7 @@ async def import_library_pdfs(
     pdfs_path.mkdir(parents=True, exist_ok=True)
 
     from src.indexing.paper_metadata_store import paper_meta_store
-    from src.parser.pdf_parser import extract_native_metadata
-    from src.retrieval.dedup import extract_doi_from_pdf_tiered, normalize_doi, normalize_title
+    from src.retrieval.dedup import normalize_doi, normalize_title
     from src.retrieval.downloader.adapter import _normalize_to_paper_id
 
     summary: Dict[str, Any] = {
@@ -1600,14 +2532,14 @@ async def import_library_pdfs(
 
                 temp_path.write_bytes(payload)
 
-                extracted_doi, extracted_title = extract_doi_from_pdf_tiered(temp_path)
-                native_meta = extract_native_metadata(temp_path)
-                title = (
-                    (extracted_title or native_meta.get("title") or original_stem or "").strip()
-                    or "(无标题)"
-                )
+                resolved = _resolve_library_import_metadata(raw_name, temp_path)
+                ndoi = normalize_doi(resolved.get("doi"))
+                title = (resolved.get("title") or original_stem or "").strip() or "(无标题)"
+                authors: List[str] = resolved.get("authors") if isinstance(resolved.get("authors"), list) else []
+                year = resolved.get("year") if isinstance(resolved.get("year"), int) else None
+                venue = (resolved.get("venue") or "").strip() if isinstance(resolved.get("venue"), str) else ""
+
                 ntitle = normalize_title(title)
-                ndoi = normalize_doi(extracted_doi)
                 if not ndoi:
                     summary["no_doi"] += 1
 
@@ -1636,6 +2568,15 @@ async def import_library_pdfs(
                     if title and ((existing.title or "").strip() in ("", "(无标题)")):
                         existing.title = title
                         changed = True
+                    if authors and (existing.authors or "").strip() in ("", "[]"):
+                        existing.authors = json.dumps(authors, ensure_ascii=False)
+                        changed = True
+                    if year is not None and existing.year is None:
+                        existing.year = year
+                        changed = True
+                    if venue and not (existing.venue or "").strip():
+                        existing.venue = venue
+                        changed = True
                     if not (existing.downloaded_at or "").strip():
                         existing.downloaded_at = now_iso
                         changed = True
@@ -1655,6 +2596,8 @@ async def import_library_pdfs(
                             target_path.stem,
                             doi=ndoi or None,
                             title=title,
+                            authors=authors or None,
+                            year=year,
                             source="library_folder_import",
                         )
                     except Exception:
@@ -1662,7 +2605,41 @@ async def import_library_pdfs(
                     continue
 
                 if target_path.exists():
-                    summary["skipped_duplicates"] += 1
+                    # File already on disk but no DB row matched (orphan file). Create library row and link so directory stays in sync.
+                    new_row = ScholarLibraryPaper(
+                        library_id=lib_id,
+                        title=title,
+                        authors=json.dumps(authors, ensure_ascii=False) if authors else "[]",
+                        year=year,
+                        doi=ndoi or "",
+                        pdf_url="",
+                        url="",
+                        source="folder_import",
+                        score=0.0,
+                        annas_md5="",
+                        added_at=now_iso,
+                        downloaded_at=now_iso,
+                        venue=venue or "",
+                    )
+                    session.add(new_row)
+                    session.flush()
+                    if ndoi:
+                        existing_by_doi[ndoi] = new_row
+                    if ntitle and ntitle not in existing_by_title:
+                        existing_by_title[ntitle] = new_row
+                    try:
+                        paper_meta_store.upsert(
+                            target_path.stem,
+                            doi=ndoi or None,
+                            title=title,
+                            authors=authors or None,
+                            year=year,
+                            source="library_folder_import",
+                        )
+                    except Exception:
+                        pass
+                    summary["imported"] += 1
+                    summary["linked_existing"] += 1
                     continue
 
                 temp_path.rename(target_path)
@@ -1673,8 +2650,8 @@ async def import_library_pdfs(
                 new_row = ScholarLibraryPaper(
                     library_id=lib_id,
                     title=title,
-                    authors="[]",
-                    year=None,
+                    authors=json.dumps(authors, ensure_ascii=False) if authors else "[]",
+                    year=year,
                     doi=ndoi or "",
                     pdf_url="",
                     url="",
@@ -1683,6 +2660,7 @@ async def import_library_pdfs(
                     annas_md5="",
                     added_at=now_iso,
                     downloaded_at=now_iso,
+                    venue=venue or "",
                 )
                 session.add(new_row)
                 session.flush()
@@ -1697,6 +2675,8 @@ async def import_library_pdfs(
                         target_path.stem,
                         doi=ndoi or None,
                         title=title,
+                        authors=authors or None,
+                        year=year,
                         source="library_folder_import",
                     )
                 except Exception:
@@ -1748,20 +2728,22 @@ def add_papers_to_scholar_library(lib_id: int, body: AddPapersToLibraryRequest, 
             added += 1
         entry["meta"]["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
         return {"added": added, "total_requested": len(body.papers)}
+    from src.retrieval.dedup import normalize_doi
     with Session(get_engine()) as session:
         lib = session.get(ScholarLibrary, lib_id)
         if not lib or getattr(lib, "user_id", None) != user_id:
             raise HTTPException(status_code=404, detail="库不存在")
         existing = list(session.exec(select(ScholarLibraryPaper).where(ScholarLibraryPaper.library_id == lib_id)).all())
-        existing_dois = {p.doi for p in existing if p.doi}
-        existing_by_doi = {p.doi: p for p in existing if p.doi}
+        existing_dois = {normalize_doi(p.doi or "") for p in existing if (p.doi or "").strip()}
+        existing_by_doi = {normalize_doi(p.doi or ""): p for p in existing if (p.doi or "").strip()}
         existing_titles = {p.title.strip().lower() for p in existing}
         added = 0
         for item in papers_to_add:
             paper = _paper_from_search_item(item)
             paper.library_id = lib_id
-            if paper.doi and paper.doi in existing_dois:
-                existing_row = existing_by_doi.get(paper.doi)
+            ndoi = normalize_doi(paper.doi or "") if (paper.doi or "").strip() else ""
+            if ndoi and ndoi in existing_dois:
+                existing_row = existing_by_doi.get(ndoi)
                 if existing_row and _scholar_source_priority(paper.source) < _scholar_source_priority(existing_row.source or ""):
                     existing_row.title = paper.title
                     existing_row.authors = paper.authors
@@ -1782,8 +2764,10 @@ def add_papers_to_scholar_library(lib_id: int, body: AddPapersToLibraryRequest, 
             session.add(paper)
             session.flush()
             if paper.doi:
-                existing_dois.add(paper.doi)
-                existing_by_doi[paper.doi] = paper
+                ndoi_add = normalize_doi(paper.doi)
+                if ndoi_add:
+                    existing_dois.add(ndoi_add)
+                    existing_by_doi[ndoi_add] = paper
             existing_titles.add(paper.title.strip().lower())
             added += 1
         session.commit()
@@ -1917,6 +2901,105 @@ def pdf_rename_dedup_library(lib_id: int, user_id: str = Depends(get_current_use
     synced = _sync_library_paper_downloaded_at(lib_id, pdfs_dir)
     stats["synced_downloaded"] = synced
     return stats
+
+
+@router.post("/libraries/{lib_id:int}/refresh-metadata", response_model=LibraryRefreshMetadataSummary)
+def refresh_library_metadata(lib_id: int, user_id: str = Depends(get_current_user_id)):
+    """Refresh title/authors/year/venue by DOI via CrossRef for all papers in a library."""
+    from src.retrieval.dedup import crossref_fetch_by_doi, normalize_doi
+    from src.retrieval.venue_utils import extract_clean_venue, normalize_journal_name
+
+    updated = 0
+    skipped_no_doi = 0
+    failed = 0
+
+    def _parse_crossref_authors(meta: Dict[str, Any]) -> List[str]:
+        raw = meta.get("authors")
+        if not isinstance(raw, list):
+            return []
+        return [str(a).strip() for a in raw if str(a).strip()]
+
+    def _parse_crossref_year(meta: Dict[str, Any]) -> Optional[int]:
+        y = meta.get("year")
+        if isinstance(y, int):
+            return int(y)
+        if isinstance(y, str) and y.isdigit():
+            return int(y)
+        return None
+
+    if _is_temp_library(lib_id):
+        if lib_id not in _temp_store:
+            raise HTTPException(status_code=404, detail="库不存在")
+        papers = list(_temp_store[lib_id].get("papers") or [])
+        for p in papers:
+            doi = normalize_doi((p.get("doi") or "").strip())
+            if not doi:
+                skipped_no_doi += 1
+                continue
+            try:
+                cr = crossref_fetch_by_doi(doi)
+            except Exception:
+                cr = None
+            if not cr:
+                failed += 1
+                continue
+            venue_raw = str(cr.get("venue") or "").strip()
+            venue = extract_clean_venue(venue_raw) if venue_raw else ""
+            p["doi"] = normalize_doi(cr.get("doi") or doi) or doi
+            if cr.get("title"):
+                p["title"] = str(cr.get("title")).strip() or p.get("title") or "(无标题)"
+            cr_authors = _parse_crossref_authors(cr)
+            if cr_authors:
+                p["authors"] = cr_authors
+            cr_year = _parse_crossref_year(cr)
+            if cr_year is not None:
+                p["year"] = cr_year
+            if venue:
+                p["venue"] = venue
+                p["normalized_journal_name"] = normalize_journal_name(venue)
+            updated += 1
+        _temp_store[lib_id]["papers"] = papers
+        _temp_store[lib_id]["meta"]["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+        return {"updated": updated, "skipped_no_doi": skipped_no_doi, "failed": failed}
+
+    with Session(get_engine()) as session:
+        lib = session.get(ScholarLibrary, lib_id)
+        if not lib or getattr(lib, "user_id", None) != user_id:
+            raise HTTPException(status_code=404, detail="库不存在")
+        rows = list(session.exec(select(ScholarLibraryPaper).where(ScholarLibraryPaper.library_id == lib_id)).all())
+        for row in rows:
+            doi = normalize_doi((row.doi or "").strip())
+            if not doi:
+                skipped_no_doi += 1
+                continue
+            try:
+                cr = crossref_fetch_by_doi(doi)
+            except Exception:
+                cr = None
+            if not cr:
+                failed += 1
+                continue
+
+            cr_doi = normalize_doi(cr.get("doi") or doi) or doi
+            cr_title = str(cr.get("title") or "").strip()
+            cr_authors = _parse_crossref_authors(cr)
+            cr_year = _parse_crossref_year(cr)
+            cr_venue_raw = str(cr.get("venue") or "").strip()
+            cr_venue = extract_clean_venue(cr_venue_raw) if cr_venue_raw else ""
+
+            row.doi = cr_doi
+            if cr_title:
+                row.title = cr_title
+            if cr_authors:
+                row.authors = json.dumps(cr_authors, ensure_ascii=False)
+            if cr_year is not None:
+                row.year = cr_year
+            if cr_venue:
+                row.venue = cr_venue
+                row.normalized_journal_name = normalize_journal_name(cr_venue)
+            updated += 1
+        session.commit()
+    return {"updated": updated, "skipped_no_doi": skipped_no_doi, "failed": failed}
 
 
 @router.post("/papers/extract-doi-dedup")

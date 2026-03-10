@@ -10,7 +10,7 @@ import tempfile
 
 # 导入显示器管理模块
 from .display_manager import ensure_display, get_display_mode, should_use_headed_mode
-from src.retrieval.browser_service import SharedBrowserService
+from src.retrieval.browser_service import SharedBrowserService, get_cdp_context_options
 
 # 尝试导入 playwright-stealth，如果失败则使用备用方案
 #
@@ -292,10 +292,11 @@ class BrowserManager:
         # 按需复用共享 CDP 浏览器。显式禁用时始终本地启动，适合需要真实可见窗口
         # 或依赖 user_data_dir / persistent context 语义的场景。
         if reuse_shared_cdp:
+            headed_slot_id = kwargs.get("headed_slot_id")
             if headless:
                 cdp_url = SharedBrowserService.get_cdp_url_headless()
             else:
-                cdp_url = SharedBrowserService.get_cdp_url_headed()
+                cdp_url = SharedBrowserService.get_cdp_url_headed(slot_id=headed_slot_id)
             if cdp_url and browser_type in ("chromium", "chrome"):
                 logger.info(f"连接共享浏览器 CDP: {cdp_url}")
                 browser = await self.playwright.chromium.connect_over_cdp(cdp_url)
@@ -518,10 +519,11 @@ class BrowserManager:
 
         # 对 persistent context，显式允许时优先复用共享 CDP（有头/无头双端口）；无 CDP 时回退到本地 launch。
         if reuse_shared_cdp:
+            headed_slot_id = kwargs.get("headed_slot_id")
             if headless:
                 cdp_url = SharedBrowserService.get_cdp_url_headless()
             else:
-                cdp_url = SharedBrowserService.get_cdp_url_headed()
+                cdp_url = SharedBrowserService.get_cdp_url_headed(slot_id=headed_slot_id)
             if cdp_url and browser_type in ("chromium", "chrome"):
                 logger.info(f"通过 CDP 复用共享浏览器: {cdp_url}")
                 if user_data_dir:
@@ -529,16 +531,10 @@ class BrowserManager:
 
                 browser = await self.playwright.chromium.connect_over_cdp(cdp_url)
                 self._cdp_browser_handle = browser
-                context_options_cdp = dict(
+                context_options_cdp = get_cdp_context_options(
+                    user_agent=user_agent,
+                    viewport=viewport,
                     accept_downloads=True,
-                    user_agent=user_agent or DEFAULT_USER_AGENT,
-                    viewport=viewport or DEFAULT_VIEWPORT,
-                    locale=DEFAULT_LOCALE,
-                    timezone_id=DEFAULT_TIMEZONE,
-                    geolocation=DEFAULT_GEOLOCATION,
-                    color_scheme="light",
-                    reduced_motion="no-preference",
-                    has_touch=False,
                 )
                 if downloads_path:
                     os.makedirs(downloads_path, exist_ok=True)
@@ -563,50 +559,49 @@ class BrowserManager:
         
         # 如果需要总是下载PDF或设置下载路径
         if (always_download_pdf or downloads_path) and "chrom" in browser_type:
-            # 对于持久化上下文，我们可以直接在用户数据目录中创建首选项文件
+            # 对于持久化上下文，在用户数据目录中创建/更新首选项文件。
+            # 必须包含 Chromium 期望的最小结构，否则有头模式会弹出「系统无法读取您的偏好设置」。
+            _MINIMAL_PREFS = {
+                "profile": {"exit_type": "Normal", "name": "Default"},
+                "browser": {"check_default_browser": False},
+            }
             default_dir = os.path.join(user_data_dir, "Default")
             os.makedirs(default_dir, exist_ok=True)
-            
             preferences_path = os.path.join(default_dir, "Preferences")
-            
-            # 如果文件已存在，读取并修改
             if os.path.exists(preferences_path):
                 try:
-                    with open(preferences_path, 'r') as f:
+                    with open(preferences_path, "r", encoding="utf-8") as f:
                         preferences = json.load(f)
                 except Exception as e:
-                    logger.warning(f"读取现有首选项文件失败: {e}，将创建新文件")
+                    logger.warning("读取现有首选项文件失败: %s，将使用最小有效结构", e)
                     preferences = {}
             else:
                 preferences = {}
-            
-            # 确保必要字段存在
+            for key, value in _MINIMAL_PREFS.items():
+                if key not in preferences:
+                    preferences[key] = dict(value) if isinstance(value, dict) else value
+                elif isinstance(value, dict) and isinstance(preferences.get(key), dict):
+                    for k, v in value.items():
+                        if k not in preferences[key]:
+                            preferences[key][k] = v
             if "plugins" not in preferences:
                 preferences["plugins"] = {}
             if "download" not in preferences:
                 preferences["download"] = {}
-            
-            # 设置总是外部打开PDF
             if always_download_pdf:
                 preferences["plugins"]["always_open_pdf_externally"] = True
-            
-            # 设置默认下载路径
             if downloads_path:
-                # 确保下载路径存在
                 os.makedirs(downloads_path, exist_ok=True)
                 abs_downloads_path = os.path.abspath(downloads_path)
-                
                 preferences["download"]["default_directory"] = abs_downloads_path
                 preferences["download"]["prompt_for_download"] = False
                 preferences["savefile"] = {"default_directory": abs_downloads_path}
-                
                 logger.info(f"已设置浏览器默认下载目录: {abs_downloads_path}")
-            
-            # 写回文件
-            with open(preferences_path, 'w') as f:
-                json.dump(preferences, f)
-                
-            logger.info(f"已更新浏览器首选项: {preferences_path}")
+            with open(preferences_path, "w", encoding="utf-8") as f:
+                json.dump(preferences, f, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            logger.info("已更新浏览器首选项: %s", preferences_path)
         
         # 添加代理配置
         if proxy:
@@ -787,44 +782,41 @@ class BrowserManager:
             raise
 
     async def _apply_stealth_mode(self, page: Page):
-        """
-        应用隐身模式，隐藏自动化信息
-        
-        Args:
-            page: 页面对象
-        """
-        logger.info("应用隐身模式脚本...")
-        
-        # 使用 playwright-stealth 隐藏自动化指纹
-        if STEALTH_AVAILABLE == "v2" and Stealth is not None:
-            # playwright-stealth v2.x：通过 Stealth 类应用
-            try:
-                s = Stealth()
-                await s.apply_stealth_async(page)
-                logger.info("隐身模式脚本应用完成（playwright-stealth v2）")
-                return
-            except Exception as e:
-                logger.warning(f"playwright-stealth v2 应用失败，将回退到基础脚本: {e}")
-        elif STEALTH_AVAILABLE == "async" and stealth_async is not None:
-            try:
-                await stealth_async(page)
-                logger.info("隐身模式脚本应用完成（playwright-stealth async API）")
-                return
-            except Exception as e:
-                logger.warning(f"playwright-stealth async API 应用失败，将回退到基础脚本: {e}")
-        elif STEALTH_AVAILABLE == "sync" and stealth_sync is not None:
-            try:
-                await page.evaluate("() => { }")  # 确保页面已加载
-                stealth_sync(page)
-                logger.info("隐身模式脚本应用完成（playwright-stealth sync API）")
-                return
-            except Exception as e:
-                logger.warning(f"playwright-stealth sync API 应用失败，将回退到基础脚本: {e}")
+        """Apply stealth to page (delegates to apply_stealth_to_page)."""
+        await apply_stealth_to_page(page)
 
-        # 备用方案：手动隐藏 webdriver 标志
-        else:
-            # 备用方案：手动隐藏 webdriver 标志
-            await page.add_init_script("""
+
+async def apply_stealth_to_page(page: Page) -> None:
+    """
+    Apply stealth / anti-detection to a Playwright page.
+    Shared by BrowserManager and WebContentFetcher. Tries playwright-stealth v2 -> async -> sync, then fallback script.
+    """
+    logger.debug("Applying stealth to page...")
+    if STEALTH_AVAILABLE == "v2" and Stealth is not None:
+        try:
+            s = Stealth()
+            await s.apply_stealth_async(page)
+            logger.info("隐身模式脚本应用完成（playwright-stealth v2）")
+            return
+        except Exception as e:
+            logger.warning(f"playwright-stealth v2 应用失败，将回退到基础脚本: {e}")
+    elif STEALTH_AVAILABLE == "async" and stealth_async is not None:
+        try:
+            await stealth_async(page)
+            logger.info("隐身模式脚本应用完成（playwright-stealth async API）")
+            return
+        except Exception as e:
+            logger.warning(f"playwright-stealth async API 应用失败，将回退到基础脚本: {e}")
+    elif STEALTH_AVAILABLE == "sync" and stealth_sync is not None:
+        try:
+            await page.evaluate("() => { }")  # 确保页面已加载
+            stealth_sync(page)
+            logger.info("隐身模式脚本应用完成（playwright-stealth sync API）")
+            return
+        except Exception as e:
+            logger.warning(f"playwright-stealth sync API 应用失败，将回退到基础脚本: {e}")
+    else:
+        await page.add_init_script("""
                 // 隐藏 webdriver 属性
                 Object.defineProperty(navigator, 'webdriver', {
                     get: () => undefined
@@ -848,7 +840,7 @@ class BrowserManager:
                     get: () => ['zh-CN', 'zh', 'en']
                 });
             """)
-            logger.info("隐身模式脚本应用完成（备用方案）")
+        logger.info("隐身模式脚本应用完成（备用方案）")
 
 # 修改原有函数以支持PDF下载选项
 async def setup_browser(

@@ -15,7 +15,7 @@ from collections import OrderedDict, defaultdict
 from typing import Any, Dict, List, Optional, Set, Tuple
 import socket
 from urllib.error import URLError
-from urllib.parse import unquote, urlparse, urlencode
+from urllib.parse import quote, unquote, urlparse, urlencode
 from urllib.request import Request, urlopen
 
 logger = logging.getLogger(__name__)
@@ -89,11 +89,47 @@ _ARXIV_ID_RE = re.compile(
     re.IGNORECASE,
 )
 
+# 从前两页正文中选取“像标题”的短句时跳过的标签（与 pdf_parser 中标题启发式对齐）
+_SKIP_TITLE_LABELS = frozenset([
+    "original article", "research article", "review", "letter",
+    "communication", "open", "open access", "article", "brief report",
+    "research paper", "full paper", "short communication",
+    "abstract", "abstract:", "data note", "introduction",
+    "keywords", "highlights", "graphical abstract", "contents",
+    "references", "bibliography", "supplementary", "supporting information",
+    "supplementary material", "appendix",
+])
+
+
+def _extract_title_from_page_text(text: str) -> Optional[str]:
+    """
+    从前两页拼接的正文中选取第一条“像标题”的行，用于 DOI 未命中时命名与 Tier 3 CrossRef。
+    跳过 Abstract/References/Supplementary 等小节标题，以及 URL、版权行。
+    """
+    if not text or not isinstance(text, str):
+        return None
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or len(s) < 10 or len(s) > 300:
+            continue
+        tl = s.lower()
+        if tl in _SKIP_TITLE_LABELS:
+            continue
+        if tl.startswith(("http", "www.", "\u00a9", "copyright", "©")):
+            continue
+        if re.search(r"\d{4}\s*(international|society|elsevier|springer|wiley|nature)", tl):
+            continue
+        digit_ratio = sum(c.isdigit() for c in s) / max(len(s), 1)
+        if digit_ratio > 0.08:
+            continue
+        return s
+    return None
+
 
 def extract_doi_from_pdf_tiered(pdf_path: "Path") -> Tuple[Optional[str], Optional[str]]:
     """
     从 PDF 分层提取 DOI（及可选 title）。供入库前去重、DOI 回填等使用。
-    Tier 1: 原生 PDF 元数据；Tier 2: 首页正文 DOI 正则；Tier 3: 标题 → CrossRef。
+    Tier 1: 原生 PDF 元数据；Tier 2: 前两页正文 DOI 正则 + 候选标题；Tier 3: 标题 → CrossRef。
     返回 (doi, title)，无则为 None。
     """
     from pathlib import Path
@@ -108,25 +144,33 @@ def extract_doi_from_pdf_tiered(pdf_path: "Path") -> Tuple[Optional[str], Option
             return meta.get("doi"), meta.get("title") or None
     except Exception:
         pass
-    # Tier 2: first-page text scan
+    # Tier 2: first two pages text scan (cover often has no DOI; second page may be copyright/abstract)
+    # 有 DOI 即返回，不再做标题提取（后续文献下载尽量用 DOI 命名）
+    title_from_pages: Optional[str] = None
     try:
         import fitz
         with fitz.open(str(path)) as doc:
             if len(doc) > 0:
-                text = doc[0].get_text() or ""
+                text_parts = []
+                for page_idx in range(min(2, len(doc))):
+                    text_parts.append(doc[page_idx].get_text() or "")
+                text = " ".join(text_parts)
                 m = _DOI_RE.search(text)
                 if m:
                     return m.group(1).rstrip(".:"), None
+                title_from_pages = _extract_title_from_page_text(text)
     except Exception:
         pass
-    # Tier 3: title -> CrossRef
+    # Tier 3: title -> CrossRef (title from native metadata or from first-two-pages)
     title = None
     try:
         from src.parser.pdf_parser import extract_native_metadata
         meta = extract_native_metadata(path)
-        title = (meta.get("title") or "").strip() or None
+        title = (meta.get("title") or title_from_pages or "").strip() or None
     except Exception:
         pass
+    if not title and title_from_pages:
+        title = title_from_pages.strip() if isinstance(title_from_pages, str) else None
     if not title or len(title) < 10:
         return None, None
     try:
@@ -263,6 +307,61 @@ def _extract_doi_from_text(text: str) -> str:
     return normalize_doi(m.group(1)) if m else ""
 
 
+def extract_doi_from_filename(filename: str) -> str:
+    """
+    Best-effort DOI extraction from PDF filename.
+    Handles common forms like:
+    - 10.1000/xyz.pdf
+    - https___doi.org_10.1000_xyz.pdf
+    - 10.1000_xyz.pdf (underscore as slash)
+    """
+    if not filename or not isinstance(filename, str):
+        return ""
+    name = filename.strip()
+    if not name:
+        return ""
+    # keep last path segment only
+    leaf = name.replace("\\", "/").split("/")[-1]
+    leaf = re.sub(r"\.pdf$", "", leaf, flags=re.IGNORECASE).strip()
+    if not leaf:
+        return ""
+
+    decoded = unquote(leaf).strip()
+    if not decoded:
+        return ""
+
+    candidates = [decoded]
+    compact = decoded.replace(" ", "")
+    if compact and compact not in candidates:
+        candidates.append(compact)
+    slash_norm = decoded.replace("／", "/").replace("∕", "/")
+    if slash_norm and slash_norm not in candidates:
+        candidates.append(slash_norm)
+    # Common local naming pattern: replace "_" with "/" when it looks DOI-like.
+    if decoded.lower().startswith("10.") and "/" not in decoded and "_" in decoded:
+        us = decoded.replace("_", "/")
+        if us not in candidates:
+            candidates.append(us)
+    # Some exporters flatten doi.org URLs with underscores.
+    if "doi.org" in decoded.lower() and "_" in decoded:
+        us = decoded.replace("_", "/")
+        if us not in candidates:
+            candidates.append(us)
+
+    for cand in candidates:
+        ndoi = _extract_doi_from_text(cand)
+        if ndoi:
+            if ndoi.startswith("10.") and "/" not in ndoi and "_" in ndoi:
+                ndoi = ndoi.replace("_", "/", 1)
+            return ndoi
+        ndoi = normalize_doi(cand)
+        if ndoi.startswith("10."):
+            if "/" not in ndoi and "_" in ndoi:
+                ndoi = ndoi.replace("_", "/", 1)
+            return ndoi
+    return ""
+
+
 def _token_set(text: str) -> Set[str]:
     if not text:
         return set()
@@ -275,6 +374,20 @@ def _title_overlap(a: str, b: str) -> float:
     if not sa or not sb:
         return 0.0
     return len(sa & sb) / max(len(sa), 1)
+
+
+def _parse_crossref_author(author_item: Dict[str, Any]) -> str:
+    """
+    从 CrossRef author 项解析显示名：优先 name/literal（团体作者），否则 given + family。
+    """
+    if not isinstance(author_item, dict):
+        return ""
+    name = (author_item.get("name") or author_item.get("literal") or "").strip()
+    if name:
+        return name
+    given = (author_item.get("given") or "").strip()
+    family = (author_item.get("family") or "").strip()
+    return f"{given} {family}".strip()
 
 
 def _crossref_lookup_by_title(title: str) -> Optional[Dict[str, Any]]:
@@ -357,7 +470,7 @@ def _crossref_lookup_by_title(title: str) -> Optional[Dict[str, Any]]:
 
     authors = []
     for a in best.get("author") or []:
-        name = f"{a.get('given', '')} {a.get('family', '')}".strip()
+        name = _parse_crossref_author(a)
         if name:
             authors.append(name)
 
@@ -378,7 +491,98 @@ def _crossref_lookup_by_title(title: str) -> Optional[Dict[str, Any]]:
     }
     _crossref_lru[key] = parsed
     try:
-        _get_paper_meta_store().crossref_put(title, parsed)
+        store = _get_paper_meta_store()
+        store.crossref_put(title, parsed)
+        store.crossref_put_by_doi(doi, parsed)
+    except Exception:
+        pass
+    doi_key = f"d:{normalize_doi(doi)}"
+    if doi_key and doi_key not in _crossref_lru:
+        _crossref_lru[doi_key] = parsed
+    return parsed
+
+
+def _crossref_lookup_by_doi(doi: str) -> Optional[Dict[str, Any]]:
+    """
+    用 DOI 查本地 CrossRef 缓存，返回 {doi,title,authors,year,venue} 或 None。
+    不发起网络请求；用于复用已由 title 拉取并缓存的结果。
+    """
+    ndoi = normalize_doi(doi)
+    if not ndoi:
+        return None
+    key = f"d:{ndoi}"
+    if key in _crossref_lru:
+        return _crossref_lru[key]
+    try:
+        cached = _get_paper_meta_store().crossref_get_by_doi(doi)
+        if cached is not None:
+            _crossref_lru[key] = cached
+            return cached
+    except Exception:
+        pass
+    return None
+
+
+def crossref_fetch_by_doi(doi: str) -> Optional[Dict[str, Any]]:
+    """
+    用 DOI 查 CrossRef，优先复用缓存；缓存未命中时发起 API 请求并回写缓存。
+    返回 {doi,title,authors,year,venue} 或 None。
+    """
+    ndoi = normalize_doi(doi)
+    if not ndoi:
+        return None
+
+    cached = _crossref_lookup_by_doi(ndoi)
+    if cached is not None:
+        return cached
+
+    req = Request(
+        f"{_CROSSREF_API}/{quote(ndoi, safe='')}",
+        headers={"User-Agent": "DeepSea-RAG/1.0", "Accept": "application/json"},
+        method="GET",
+    )
+    try:
+        with urlopen(req, timeout=_CROSSREF_TIMEOUT_SECONDS) as resp:
+            if getattr(resp, "status", 200) != 200:
+                return None
+            data = json.loads(resp.read().decode("utf-8"))
+    except (URLError, socket.timeout, Exception):
+        return None
+
+    message = (data.get("message") or {}) if isinstance(data, dict) else {}
+    cr_doi = normalize_doi(message.get("DOI")) or ndoi
+    title = ((message.get("title") or [""])[0] or "").strip()
+    authors: List[str] = []
+    for a in message.get("author") or []:
+        name = _parse_crossref_author(a)
+        if name:
+            authors.append(name)
+    year = None
+    for df in ("published-print", "published-online", "issued", "created"):
+        dp = (message.get(df) or {}).get("date-parts", [[]])
+        if dp and dp[0] and dp[0][0]:
+            year = dp[0][0]
+            break
+    venue = ((message.get("container-title") or [""])[0] or "").strip()
+    parsed = {
+        "doi": cr_doi,
+        "title": title or None,
+        "authors": authors or None,
+        "year": year,
+        "venue": venue or None,
+    }
+
+    doi_key = f"d:{cr_doi}"
+    _crossref_lru[doi_key] = parsed
+    if title:
+        title_key = normalize_title(title)
+        if title_key:
+            _crossref_lru[title_key] = parsed
+    try:
+        store = _get_paper_meta_store()
+        store.crossref_put_by_doi(cr_doi, parsed)
+        if title:
+            store.crossref_put(title, parsed)
     except Exception:
         pass
     return parsed

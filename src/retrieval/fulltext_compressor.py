@@ -12,11 +12,13 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-WORD_THRESHOLD_DEFAULT = 300
-MAX_OUTPUT_WORDS_DEFAULT = 400
+WORD_THRESHOLD_DEFAULT = 900
+CHAR_THRESHOLD_DEFAULT = 5500
+MAX_OUTPUT_WORDS_DEFAULT = 280
 FALLBACK_TRUNCATE_CHARS = 2000
 MAX_CONCURRENT_DEFAULT = 5
 LLM_MAX_TOKENS = 800
+INPUT_MAX_CHARS = 12000
 
 
 def _word_count(text: str) -> int:
@@ -35,6 +37,8 @@ def compress_evidence_text_sync(
     url: str = "",
     max_output_words: int = MAX_OUTPUT_WORDS_DEFAULT,
     fallback_chars: int = FALLBACK_TRUNCATE_CHARS,
+    max_input_chars: int = INPUT_MAX_CHARS,
+    llm_max_tokens: int = LLM_MAX_TOKENS,
 ) -> str:
     """
     Compress a single evidence text into a short, query-focused summary.
@@ -54,17 +58,18 @@ def compress_evidence_text_sync(
             query=query or "",
             title=(title or "").strip() or "(no title)",
             url=(url or "").strip(),
-            full_text=content[:12000],
+            max_output_words=max_output_words,
+            full_text=content[:max_input_chars],
         )
         resp = llm_client.chat(
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            max_tokens=LLM_MAX_TOKENS,
+            max_tokens=llm_max_tokens,
         )
         summary = (resp.get("final_text") or "").strip()
-        if summary and _word_count(summary) <= max_output_words * 2:
+        if summary and _word_count(summary) <= max_output_words:
             return summary
         raise ValueError("empty or too long summary")
     except Exception as e:
@@ -79,6 +84,8 @@ def _compress_one_hit(
     *,
     max_output_words: int = MAX_OUTPUT_WORDS_DEFAULT,
     fallback_chars: int = FALLBACK_TRUNCATE_CHARS,
+    max_input_chars: int = INPUT_MAX_CHARS,
+    llm_max_tokens: int = LLM_MAX_TOKENS,
 ) -> None:
     """
     Mutate hit: replace hit["content"] with LLM-compressed summary (<= max_output_words).
@@ -99,6 +106,8 @@ def _compress_one_hit(
         url=url,
         max_output_words=max_output_words,
         fallback_chars=fallback_chars,
+        max_input_chars=max_input_chars,
+        llm_max_tokens=llm_max_tokens,
     )
     hit["content"] = compressed
     metadata["content_type"] = "full_text_compressed"
@@ -113,12 +122,16 @@ def compress_fulltext_hits_sync(
     llm_client: Any,
     *,
     word_threshold: int = WORD_THRESHOLD_DEFAULT,
+    char_threshold: int = CHAR_THRESHOLD_DEFAULT,
     max_output_words: int = MAX_OUTPUT_WORDS_DEFAULT,
     fallback_chars: int = FALLBACK_TRUNCATE_CHARS,
+    max_input_chars: int = INPUT_MAX_CHARS,
+    llm_max_tokens: int = LLM_MAX_TOKENS,
     max_concurrent: int = MAX_CONCURRENT_DEFAULT,
 ) -> List[Dict[str, Any]]:
     """
-    In-place compress hits where metadata.content_type == "full_text" and word count > word_threshold.
+    In-place compress hits where metadata.content_type == "full_text" and
+    (word count > word_threshold OR char length > char_threshold).
     Uses llm_client (sync) with up to max_concurrent parallel calls. Returns the same list (mutated).
     """
     to_compress = []
@@ -127,7 +140,7 @@ def compress_fulltext_hits_sync(
         if meta.get("content_type") != "full_text":
             continue
         text = (h.get("content") or "").strip()
-        if _word_count(text) <= word_threshold:
+        if _word_count(text) <= word_threshold and len(text) <= char_threshold:
             continue
         to_compress.append(h)
 
@@ -136,7 +149,15 @@ def compress_fulltext_hits_sync(
 
     if max_concurrent <= 1:
         for h in to_compress:
-            _compress_one_hit(h, query, llm_client, max_output_words=max_output_words, fallback_chars=fallback_chars)
+            _compress_one_hit(
+                h,
+                query,
+                llm_client,
+                max_output_words=max_output_words,
+                fallback_chars=fallback_chars,
+                max_input_chars=max_input_chars,
+                llm_max_tokens=llm_max_tokens,
+            )
         return hits
 
     with ThreadPoolExecutor(max_workers=max_concurrent) as ex:
@@ -148,6 +169,8 @@ def compress_fulltext_hits_sync(
                 llm_client,
                 max_output_words=max_output_words,
                 fallback_chars=fallback_chars,
+                max_input_chars=max_input_chars,
+                llm_max_tokens=llm_max_tokens,
             ): h
             for h in to_compress
         }

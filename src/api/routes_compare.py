@@ -7,12 +7,14 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from config.settings import settings
+from src.api.routes_auth import get_optional_user_id
 from src.collaboration.memory.session_memory import get_session_store
 from src.log import get_logger
+from src.utils.path_manager import PathManager
 from src.utils.prompt_manager import PromptManager
 
 _pm = PromptManager()
@@ -55,20 +57,38 @@ class _CompareLLMResponse(BaseModel):
     narrative: str = ""
 
 
-def _load_paper_data(paper_id: str) -> Optional[Dict[str, Any]]:
+def _parsed_roots(user_id: Optional[str] = None) -> List[Path]:
+    roots: List[Path] = []
+    if user_id:
+        roots.extend(PathManager.get_user_all_library_parsed_paths(user_id))
+        roots.append(PathManager.get_user_parsed_path(user_id))
+    roots.append(settings.path.data / "parsed")
+    seen: set[str] = set()
+    deduped: List[Path] = []
+    for p in roots:
+        key = str(p.resolve()) if p.exists() else str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(p)
+    return deduped
+
+
+def _load_paper_data(paper_id: str, user_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """加载 enriched.json"""
-    parsed_dir = settings.path.data / "parsed"
-    # 尝试精确匹配和模糊匹配
-    candidates = list(parsed_dir.glob(f"{paper_id}/enriched.json"))
-    if not candidates:
-        candidates = list(parsed_dir.glob(f"*{paper_id}*/enriched.json"))
-    if not candidates:
-        return None
-    try:
-        with open(candidates[0], "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
+    for parsed_dir in _parsed_roots(user_id):
+        # 尝试精确匹配和模糊匹配
+        candidates = list(parsed_dir.glob(f"{paper_id}/enriched.json"))
+        if not candidates:
+            candidates = list(parsed_dir.glob(f"*{paper_id}*/enriched.json"))
+        if not candidates:
+            continue
+        try:
+            with open(candidates[0], "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            continue
+    return None
 
 
 def _extract_paper_summary(paper_id: str, data: Dict[str, Any]) -> PaperSummary:
@@ -144,13 +164,16 @@ def _extract_sections_text(data: Dict[str, Any], max_chars: int = 3000) -> str:
 
 
 @router.post("", response_model=CompareResponse)
-def compare_papers(body: CompareRequest) -> CompareResponse:
+def compare_papers(
+    body: CompareRequest,
+    user_id: Optional[str] = Depends(get_optional_user_id),
+) -> CompareResponse:
     """多文档对比：加载论文数据，LLM 生成结构化对比"""
     papers_data: List[tuple] = []
     summaries: List[PaperSummary] = []
 
     for pid in body.paper_ids:
-        data = _load_paper_data(pid)
+        data = _load_paper_data(pid, user_id=user_id)
         if data is None:
             raise HTTPException(status_code=404, detail=f"论文 '{pid}' 未找到（请确认已解析）")
         papers_data.append((pid, data))
@@ -226,6 +249,7 @@ def list_compare_candidates(
     scope: str = Query("session", description="session | current_turn"),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
+    user_id: Optional[str] = Depends(get_optional_user_id),
 ) -> Dict[str, Any]:
     """从会话引文中聚合对比候选：按 doc_id/doi/url/title 去重，带引用次数与最近引用轮次。"""
     store = get_session_store()
@@ -268,14 +292,12 @@ def list_compare_candidates(
                 agg[key]["last_cited_turn_index"], turn_index
             )
 
-    # Resolve paper_id for local check: use doc_id if it matches a parsed dir
-    parsed_dir = settings.path.data / "parsed"
     for key, row in agg.items():
         pid = row["paper_id"]
         if pid.startswith(("doi:", "url:", "title:")):
             row["is_local_ready"] = False
             continue
-        data = _load_paper_data(pid)
+        data = _load_paper_data(pid, user_id=user_id)
         if data is not None:
             row["is_local_ready"] = True
             if not row.get("abstract"):
@@ -299,22 +321,28 @@ def list_available_papers(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     q: Optional[str] = Query(None, description="搜索标题/paper_id"),
+    user_id: Optional[str] = Depends(get_optional_user_id),
 ) -> Dict[str, Any]:
     """列出所有可用于比较的论文，支持分页与搜索。"""
-    parsed_dir = settings.path.data / "parsed"
-    if not parsed_dir.exists():
+    parsed_dirs = [root for root in _parsed_roots(user_id) if root.exists()]
+    if not parsed_dirs:
         return {"papers": [], "total": 0}
 
     papers = []
-    for enriched_path in sorted(parsed_dir.glob("*/enriched.json")):
-        pid = enriched_path.parent.name
-        try:
-            with open(enriched_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            summary = _extract_paper_summary(pid, data)
-            papers.append(summary.model_dump())
-        except Exception:
-            papers.append({"paper_id": pid, "title": pid, "year": None, "abstract": ""})
+    seen: set[str] = set()
+    for parsed_dir in parsed_dirs:
+        for enriched_path in sorted(parsed_dir.glob("*/enriched.json")):
+            pid = enriched_path.parent.name
+            if pid in seen:
+                continue
+            seen.add(pid)
+            try:
+                with open(enriched_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                summary = _extract_paper_summary(pid, data)
+                papers.append(summary.model_dump())
+            except Exception:
+                papers.append({"paper_id": pid, "title": pid, "year": None, "abstract": ""})
 
     if q and q.strip():
         ql = q.strip().lower()

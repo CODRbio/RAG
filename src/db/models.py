@@ -308,6 +308,10 @@ class Paper(SQLModel, table=True):
     error_message: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
     content_hash: Optional[str] = Field(default=None, sa_column=Column(Text, nullable=True))
     created_at: float = Field(default_factory=_now_ts, sa_column=Column(Float, nullable=False))
+    # Link to scholar library when this paper came from library import / download+ingest
+    library_id: Optional[int] = Field(default=None, sa_column=Column(Integer, nullable=True))
+    library_paper_id: Optional[int] = Field(default=None, sa_column=Column(Integer, nullable=True))
+    source: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -343,6 +347,10 @@ class IngestJob(SQLModel, table=True):
         back_populates="job",
         sa_relationship_kwargs={"cascade": "all, delete-orphan"},
     )
+    checkpoints: List["IngestCheckpoint"] = Relationship(
+        back_populates="job",
+        sa_relationship_kwargs={"cascade": "all, delete-orphan"},
+    )
 
     def get_payload(self) -> Dict[str, Any]:
         try:
@@ -370,6 +378,32 @@ class IngestJobEvent(SQLModel, table=True):
     created_at: float = Field(default_factory=_now_ts, sa_column=Column(Float, nullable=False))
 
     job: Optional[IngestJob] = Relationship(back_populates="events")
+
+
+class IngestCheckpoint(SQLModel, table=True):
+    """Per-file, per-stage checkpoint for the ingest pipeline.
+    Composite PK (job_id, file_name, stage) allows upsert semantics.
+    Cleaned up on job done/cancel or at startup for stale interrupted jobs.
+    """
+    __tablename__ = "ingest_checkpoints"
+    __table_args__ = (
+        Index("idx_ingest_ckpt_job_file", "job_id", "file_name"),
+    )
+
+    job_id: str = Field(foreign_key="ingest_jobs.job_id", primary_key=True)
+    file_name: str = Field(primary_key=True)
+    stage: str = Field(primary_key=True)  # parsed/chunked/embedded/indexed
+    status: str = Field(default="done", sa_column=Column(Text, nullable=False, server_default="done"))  # done/error
+    detail_json: str = Field(default="{}", sa_column=Column(Text, nullable=False, server_default="{}"))
+    created_at: float = Field(default_factory=_now_ts, sa_column=Column(Float, nullable=False))
+
+    job: Optional[IngestJob] = Relationship(back_populates="checkpoints")
+
+    def get_detail(self) -> Dict[str, Any]:
+        try:
+            return json.loads(self.detail_json or "{}")
+        except Exception:
+            return {}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -594,6 +628,20 @@ class CrossrefCache(SQLModel, table=True):
     created_at: float = Field(default_factory=_now_ts, sa_column=Column(Float, nullable=False))
 
 
+class CrossrefCacheByDoi(SQLModel, table=True):
+    """Crossref cache keyed by normalized DOI for reuse when lookup by DOI is needed."""
+
+    __tablename__ = "crossref_cache_by_doi"
+
+    normalized_doi: str = Field(primary_key=True)
+    doi: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    title: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    authors: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    year: Optional[int] = Field(default=None, sa_column=Column(Integer, nullable=True))
+    venue: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    created_at: float = Field(default_factory=_now_ts, sa_column=Column(Float, nullable=False))
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 9. Auth  (JWT token revocation list)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -686,6 +734,9 @@ class ScholarLibraryPaper(SQLModel, table=True):
     downloaded_at: Optional[str] = Field(default=None, sa_column=Column(Text, nullable=True))
     venue: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
     normalized_journal_name: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    # Link back to collection when this library paper was ingested into a collection
+    collection_name: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    collection_paper_id: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
 
     library: Optional[ScholarLibrary] = Relationship(back_populates="papers")
 

@@ -19,6 +19,7 @@ Category C — DISCOVERY (exactly 1 query):
 - Purpose: background and conceptual gaps. One full natural-language question.
 - Suited for tavily.
 - Example: "What are the key immune mechanisms in deep-sea mussel symbiosis?"
+{precision_zh_instruction}
 
 Output format (strict, no numbering, no extra lines):
 RECALL:
@@ -27,8 +28,9 @@ PRECISION:
 <single line query>
 DISCOVERY:
 <single line query>
+{precision_zh_output_format}
 
 Rules:
 - Output exactly one query per category. No markdown, no bullets.
 - Avoid generic suffixes: review, survey, overview.
-- Use English for RECALL and PRECISION (indices are English). DISCOVERY may match question language.
+- Use English for RECALL and PRECISION (indices are English). DISCOVERY may match question language.{precision_zh_rule}

@@ -26,6 +26,7 @@ frontend/.env.local
 # Data & Logs
 logs/
 artifacts/
+backups/
 
 # 1. 忽略 data 目录下的一切（默认规则）
 data/*

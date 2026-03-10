@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
-import { GripVertical, RefreshCw, Settings, Sparkles } from 'lucide-react';
+import { GripVertical, Settings, Sparkles } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { listLLMProviders, type LLMProviderInfo } from '../../api/ingest';
 import type { ScholarDownloaderDefaults } from '../../types';
 import {
   DEFAULT_SCHOLAR_DOWNLOADER_DEFAULTS,
@@ -14,27 +13,6 @@ import { Modal } from '../ui/Modal';
 interface Props {
   open: boolean;
   onClose: () => void;
-}
-
-function scholarLlmGroupLabel(id: string): string {
-  const base = id.split('-')[0].toLowerCase();
-  const labels: Record<string, string> = {
-    openai: 'OpenAI',
-    deepseek: 'DeepSeek',
-    claude: 'Claude',
-    gemini: 'Gemini',
-    kimi: 'Kimi',
-    qwen: 'Qwen',
-    perplexity: 'Perplexity',
-    sonar: 'Perplexity',
-  };
-  return labels[base] || id;
-}
-
-function scholarLlmProviderOptionLabel(id: string): string {
-  const base = scholarLlmGroupLabel(id);
-  const suffix = id.split('-').slice(1).join('-');
-  return suffix ? `${base} · ${suffix}` : base;
 }
 
 function moveItem<T>(items: T[], fromIndex: number, toIndex: number): T[] {
@@ -56,8 +34,6 @@ export function ScholarAdvancedSettingsModal({ open, onClose }: Props) {
   const [draft, setDraft] = useState<ScholarDownloaderDefaults>(scholarDownloaderDefaults);
   const [draggingIndex, setDraggingIndex] = useState<number | null>(null);
   const [dragOverIndex, setDragOverIndex] = useState<number | null>(null);
-  const [llmProviders, setLlmProviders] = useState<LLMProviderInfo[]>([]);
-  const [isRefreshingLlm, setIsRefreshingLlm] = useState(false);
 
   useEffect(() => {
     if (!open) return;
@@ -66,36 +42,6 @@ export function ScholarAdvancedSettingsModal({ open, onClose }: Props) {
       strategyOrder: [...scholarDownloaderDefaults.strategyOrder],
     });
   }, [open, scholarDownloaderDefaults]);
-
-  const loadLlmProviders = async () => {
-    setIsRefreshingLlm(true);
-    try {
-      const data = await listLLMProviders();
-      setLlmProviders(data.providers || []);
-    } catch {
-      addToast(t('scholar.advancedSettingsLoadModelsError'), 'error');
-    } finally {
-      setIsRefreshingLlm(false);
-    }
-  };
-
-  useEffect(() => {
-    if (!open) return;
-    loadLlmProviders();
-  }, [open]);
-
-  const groupedProviders = useMemo(
-    () =>
-      Array.from(
-        llmProviders.reduce((acc, provider) => {
-          const group = scholarLlmGroupLabel(provider.id);
-          if (!acc.has(group)) acc.set(group, []);
-          acc.get(group)!.push(provider);
-          return acc;
-        }, new Map<string, LLMProviderInfo[]>()),
-      ),
-    [llmProviders],
-  );
 
   const strategyItems = useMemo(
     () =>
@@ -106,15 +52,6 @@ export function ScholarAdvancedSettingsModal({ open, onClose }: Props) {
       })),
     [draft.strategyOrder, t],
   );
-
-  const handleProviderChange = (providerId: string) => {
-    const provider = llmProviders.find((item) => item.id === providerId);
-    setDraft((prev) => ({
-      ...prev,
-      llmProvider: providerId,
-      llmModel: providerId ? provider?.default_model ?? '' : '',
-    }));
-  };
 
   const handleSave = () => {
     updateScholarDownloaderDefaults(draft);
@@ -201,55 +138,24 @@ export function ScholarAdvancedSettingsModal({ open, onClose }: Props) {
               <div className={draft.assistLlmEnabled ? 'space-y-3' : 'space-y-3 opacity-50'}>
                 <div>
                   <label className="block text-xs font-medium text-slate-400 mb-1.5">
-                    {t('scholar.llmForDownloadLabel')}
-                  </label>
-                  <div className="flex items-center gap-2">
-                    <select
-                      value={draft.llmProvider}
-                      onChange={(e) => handleProviderChange(e.target.value)}
-                      disabled={!draft.assistLlmEnabled}
-                      className="flex-1 rounded-lg border border-slate-600 bg-slate-800 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-1 focus:ring-sky-500 disabled:cursor-not-allowed"
-                    >
-                      <option value="">{t('scholar.llmDefault')}</option>
-                      {groupedProviders.map(([group, providers]) => (
-                        <optgroup key={group} label={group}>
-                          {providers.map((provider) => (
-                            <option key={provider.id} value={provider.id}>
-                              {scholarLlmProviderOptionLabel(provider.id)}
-                            </option>
-                          ))}
-                        </optgroup>
-                      ))}
-                    </select>
-                    <button
-                      type="button"
-                      onClick={() => loadLlmProviders()}
-                      disabled={isRefreshingLlm}
-                      className="rounded-lg border border-slate-600 bg-slate-800 p-2 text-slate-300 hover:text-sky-300 hover:border-slate-500 disabled:opacity-60"
-                      title={t('scholar.llmRefresh')}
-                    >
-                      <RefreshCw size={14} className={isRefreshingLlm ? 'animate-spin' : ''} />
-                    </button>
-                  </div>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-medium text-slate-400 mb-1.5">
-                    {t('scholar.llmModelLabel')}
+                    {t('scholar.assistLlmModeLabel')}
                   </label>
                   <select
-                    value={draft.llmModel}
-                    onChange={(e) => setDraft((prev) => ({ ...prev, llmModel: e.target.value }))}
-                    disabled={!draft.assistLlmEnabled || !draft.llmProvider}
+                    value={draft.assistLlmMode}
+                    onChange={(e) =>
+                      setDraft((prev) => ({
+                        ...prev,
+                        assistLlmMode: e.target.value as 'ultra-lite' | 'lite' | 'auto-upgrade',
+                      }))
+                    }
+                    disabled={!draft.assistLlmEnabled}
                     className="w-full rounded-lg border border-slate-600 bg-slate-800 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-1 focus:ring-sky-500 disabled:cursor-not-allowed"
                   >
-                    <option value="">{t('scholar.llmModelDefault')}</option>
-                    {(llmProviders.find((provider) => provider.id === draft.llmProvider)?.models ?? []).map((model) => (
-                      <option key={model} value={model}>
-                        {model}
-                      </option>
-                    ))}
+                    <option value="ultra-lite">{t('scholar.assistLlmModeUltraLite')}</option>
+                    <option value="lite">{t('scholar.assistLlmModeLite')}</option>
+                    <option value="auto-upgrade">{t('scholar.assistLlmModeAutoUpgrade')}</option>
                   </select>
+                  <div className="text-xs text-slate-400 mt-1">{t('scholar.assistLlmModeHint')}</div>
                 </div>
               </div>
             </div>

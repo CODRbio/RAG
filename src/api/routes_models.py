@@ -211,12 +211,13 @@ def list_all_live_models(
 
 
 # 用于长文本压缩等超轻量任务的 provider 配置键（与拉取模型列表比对后只返回可识别的）
-ULTRA_LITE_PROVIDER_KEYS = ["openai-mini", "gemini-flash", "deepseek", "claude-haiku"]
+ULTRA_LITE_PROVIDER_KEYS = ["openai-mini", "gemini-flash", "gemini-flash-lite", "deepseek", "claude-haiku"]
 
 # 展示用标签（provider_id -> 前端显示名）
 ULTRA_LITE_LABELS = {
     "openai-mini": "OpenAI (gpt-5-mini)",
     "gemini-flash": "Gemini Flash (gemini-flash-latest)",
+    "gemini-flash-lite": "Gemini Flash Lite (gemini-flash-lite-latest)",
     "deepseek": "DeepSeek (deepseek-chat)",
     "claude-haiku": "Claude Haiku (claude-haiku-4-5)",
 }

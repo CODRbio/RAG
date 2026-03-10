@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import multiprocessing
 import os
 import time
 from typing import Any, Dict, List
@@ -24,9 +25,19 @@ from src.log import get_logger
 logger = get_logger(__name__)
 
 # ── Concurrency caps ──────────────────────────────────────────────────────────
-# DR shares global slots with Chat (Redis); ingest remains independent
-_INGEST_MAX_CONCURRENT = 2
+# DR shares global slots with Chat (Redis); ingest remains independent.
+# _INGEST_MAX_CONCURRENT is resolved lazily from settings.tasks.ingest_max_concurrent
+# so that config changes (rag_config.json tasks.ingest_max_concurrent) take effect
+# without code changes.  The module-level default is used only as a fallback.
+_INGEST_MAX_CONCURRENT: int = 2  # fallback; overridden at first use via _get_ingest_max_concurrent()
 _POLL_INTERVAL = 5  # seconds
+
+
+def _get_ingest_max_concurrent() -> int:
+    try:
+        return max(1, int(settings.tasks.ingest_max_concurrent))
+    except Exception:
+        return _INGEST_MAX_CONCURRENT
 
 # ── Worker instance id (used by db resume-queue routing) ─────────────────────
 _WORKER_INSTANCE_ID = f"{os.getenv('HOSTNAME', 'local')}:{os.getpid()}"
@@ -48,6 +59,7 @@ def cleanup_stale_jobs() -> None:
     """
     now = time.time()
     stale_dr_slots: list[tuple[str, str]] = []  # (job_id, session_id)
+    stale_ingest_job_ids: list[str] = []
     try:
         with Session(get_engine()) as session:
             dr_rows = session.exec(
@@ -85,6 +97,7 @@ def cleanup_stale_jobs() -> None:
                 select(IngestJob).where(IngestJob.status.in_(["running", "cancelling"]))
             ).all()
             count_ingest = len(ingest_rows)
+            stale_ingest_job_ids = [row.job_id for row in ingest_rows]
             for row in ingest_rows:
                 row.status = "error"
                 row.error_message = "服务重启，任务中断"
@@ -102,6 +115,46 @@ def cleanup_stale_jobs() -> None:
 
     except Exception as e:
         logger.warning("[task_runner] cleanup_stale_jobs failed: %s", e)
+
+    # Purge checkpoints for stale ingest jobs that were interrupted by restart.
+    # Since retries always create new job_ids, these checkpoints have no resume value.
+    if stale_ingest_job_ids:
+        try:
+            from src.indexing.ingest_job_store import purge_ingest_checkpoints
+            total_purged = sum(purge_ingest_checkpoints(jid) for jid in stale_ingest_job_ids)
+            if total_purged:
+                logger.info("[task_runner] purged %d stale ingest checkpoint(s) on startup", total_purged)
+        except Exception as e:
+            logger.warning("[task_runner] stale ingest checkpoint purge failed: %s", e)
+
+    # TTL safety net: purge any remaining orphaned checkpoints older than 7 days.
+    try:
+        from src.indexing.ingest_job_store import purge_stale_ingest_checkpoints
+        ttl_purged = purge_stale_ingest_checkpoints(max_age_days=7)
+        if ttl_purged:
+            logger.info("[task_runner] TTL-purged %d orphaned ingest checkpoint(s) on startup", ttl_purged)
+    except Exception as e:
+        logger.warning("[task_runner] TTL ingest checkpoint purge failed: %s", e)
+
+    # Purge DR checkpoints for jobs interrupted by this restart.
+    stale_dr_job_ids = [jid for jid, _ in stale_dr_slots]
+    if stale_dr_job_ids:
+        try:
+            from src.collaboration.research.job_store import purge_dr_checkpoints
+            total_purged = sum(purge_dr_checkpoints(jid) for jid in stale_dr_job_ids)
+            if total_purged:
+                logger.info("[task_runner] purged %d stale DR checkpoint(s) on startup", total_purged)
+        except Exception as e:
+            logger.warning("[task_runner] stale DR checkpoint purge failed: %s", e)
+
+    # TTL safety net for DR checkpoints.
+    try:
+        from src.collaboration.research.job_store import purge_stale_dr_checkpoints
+        ttl_dr_purged = purge_stale_dr_checkpoints(max_age_days=7)
+        if ttl_dr_purged:
+            logger.info("[task_runner] TTL-purged %d orphaned DR checkpoint(s) on startup", ttl_dr_purged)
+    except Exception as e:
+        logger.warning("[task_runner] TTL DR checkpoint purge failed: %s", e)
 
     # Release Redis active-slot entries for stale DR jobs so that a new job for the
     # same session is not blocked by rag:active_tasks / rag:active_sessions leftovers.
@@ -201,12 +254,16 @@ def _claim_dr_job(job_id: str) -> bool:
 
 
 def _claim_ingest_job(job_id: str) -> bool:
-    """Atomically claim a pending ingest job: pending → running. Returns True on success."""
+    """Atomically claim a pending ingest job: pending → running, only if global running count is below cap."""
     now = time.time()
     try:
         with Session(get_engine()) as session:
             row = session.get(IngestJob, job_id)
             if not row or row.status != "pending":
+                return False
+            # Enforce global cap: do not claim if already at ingest_max_concurrent running jobs
+            running_count = len(session.exec(select(IngestJob).where(IngestJob.status == "running")).all())
+            if running_count >= _get_ingest_max_concurrent():
                 return False
             row.status = "running"
             row.message = "Worker 已领取任务，准备执行"
@@ -278,13 +335,55 @@ async def _exec_resume(job_id: str) -> None:
         raise
 
 
-async def _exec_ingest_job(job_id: str, cfg: dict) -> None:
-    """Execute an ingest job; wraps the existing sync business logic."""
-    try:
-        from src.api.routes_ingest import _run_ingest_job_safe
+def _ingest_subprocess_target(job_id: str, cfg: dict) -> None:
+    """Entry point for the ingest child process.
 
-        await asyncio.to_thread(_run_ingest_job_safe, job_id, cfg)
-    except Exception as e:
+    Runs in a freshly spawned process so that any OOM kill or segfault only
+    terminates this child, leaving the uvicorn worker alive to serve other users.
+    """
+    from src.api.routes_ingest import _run_ingest_job_safe
+    _run_ingest_job_safe(job_id, cfg)
+
+
+def _run_ingest_in_subprocess(job_id: str, cfg: dict) -> None:
+    """Run ingest job in a child process and block until it finishes.
+
+    Called from asyncio.to_thread so the event loop is not blocked.
+    If the child exits with a non-zero code (OOM, segfault, unhandled signal),
+    the job is marked as error without crashing the parent worker.
+    """
+    ctx = multiprocessing.get_context("spawn")
+    p = ctx.Process(target=_ingest_subprocess_target, args=(job_id, cfg), daemon=False)
+    p.start()
+    p.join()
+    exitcode = p.exitcode
+    if exitcode != 0:
+        # Child crashed (OOM, segfault, etc.) — mark job as error if still running
+        logger.error(
+            "[task_runner] ingest subprocess for job %s exited abnormally (exit=%s); "
+            "possibly OOM or segfault",
+            job_id, exitcode,
+        )
+        try:
+            from src.indexing.ingest_job_store import get_job, update_job
+            job = get_job(job_id)
+            if job and job.get("status") == "running":
+                update_job(
+                    job_id,
+                    status="error",
+                    error_message=f"入库进程异常退出 (exit={exitcode}，可能为内存不足或系统信号)",
+                    message=f"入库进程异常退出 (exit={exitcode})",
+                    finished_at=time.time(),
+                )
+        except Exception as mark_err:
+            logger.error("[task_runner] failed to mark ingest job %s as error: %s", job_id, mark_err)
+
+
+async def _exec_ingest_job(job_id: str, cfg: dict) -> None:
+    """Execute an ingest job in an isolated subprocess via asyncio.to_thread."""
+    try:
+        await asyncio.to_thread(_run_ingest_in_subprocess, job_id, cfg)
+    except BaseException as e:
         logger.error("[task_runner] ingest job %s failed: %s", job_id, e, exc_info=True)
         try:
             from src.indexing.ingest_job_store import update_job
@@ -395,7 +494,7 @@ async def run_background_worker() -> None:
         "[task_runner] background worker started (instance=%s, poll=%ds, ingest_max=%d)",
         _WORKER_INSTANCE_ID,
         _POLL_INTERVAL,
-        _INGEST_MAX_CONCURRENT,
+        _get_ingest_max_concurrent(),
     )
 
     dr_tasks: dict[str, asyncio.Task] = {}
@@ -517,8 +616,13 @@ async def run_background_worker() -> None:
                     logger.info("[task_runner] claimed DR job %s", jid)
                     dr_tasks[jid] = asyncio.create_task(_exec_dr_job(jid, data))
 
-            # ── Ingest: claim pending jobs ──
-            ingest_available = _INGEST_MAX_CONCURRENT - len(ingest_tasks)
+            # ── Ingest: claim pending jobs (global cap from DB running count) ──
+            try:
+                from src.indexing.ingest_job_store import count_jobs_by_status
+                running_count = count_jobs_by_status("running")
+            except Exception:
+                running_count = len(ingest_tasks)
+            ingest_available = max(0, _get_ingest_max_concurrent() - running_count)
             if ingest_available > 0:
                 pending = _fetch_pending_ingest(limit=ingest_available, exclude=set(ingest_tasks.keys()))
                 for job in pending:

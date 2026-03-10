@@ -38,9 +38,10 @@
       }
     },
     "_providers_note": "模型列表由前端实时从平台 API 拉取。default_model 仅在无 UI 选择时托底。params 用于 thinking 等参数注入。",
+    "_models_latest": "各 provider 当前默认模型：OpenAI gpt-5.4 | DeepSeek deepseek-chat/reasoner | Gemini gemini-3.1-pro-preview | Claude claude-sonnet-4-6 / haiku-4-5 | Kimi kimi-k2.5 | Sonar sonar-pro | Qwen qwen3.5-plus",
     "providers": {
-      "openai":           { "platform": "openai",     "default_model": "gpt-5.2"                },
-      "openai-thinking":  { "platform": "openai",     "default_model": "gpt-5.2",               "params": { "reasoning_effort": "high" } },
+      "openai":           { "platform": "openai",     "default_model": "gpt-5.4"                },
+      "openai-thinking":  { "platform": "openai",     "default_model": "gpt-5.4",               "params": { "reasoning_effort": "high" } },
       "openai-mini":      { "platform": "openai",     "default_model": "gpt-5-mini"            },
       "deepseek":         { "platform": "deepseek",   "default_model": "deepseek-chat"          },
       "deepseek-thinking":{ "platform": "deepseek",   "default_model": "deepseek-reasoner",     "params": { "thinking": { "type": "enabled" } } },
@@ -48,6 +49,7 @@
       "gemini-thinking":  { "platform": "gemini",     "default_model": "gemini-3.1-pro-preview","params": { "reasoning_effort": "high" } },
       "gemini-vision":    { "platform": "gemini",     "default_model": "gemini-3.1-pro-preview","params": { "temperature": 0.2 } },
       "gemini-flash":     { "platform": "gemini",     "default_model": "gemini-flash-latest"   },
+      "gemini-flash-lite":{ "platform": "gemini",     "default_model": "gemini-flash-lite-latest" },
       "claude":           { "platform": "claude",     "default_model": "claude-sonnet-4-6"      },
       "claude-thinking":  { "platform": "claude",     "default_model": "claude-sonnet-4-6",     "params": { "thinking": { "type": "enabled", "budget_tokens": 10000 } } },
       "claude-haiku":     { "platform": "claude",     "default_model": "claude-haiku-4-5"      },
@@ -75,6 +77,7 @@
     "llm_vision_provider": "gemini-vision",
     "llm_text_model": null,
     "llm_vision_model": null,
+    "pdf_concurrency": 3,
     "llm_vision_concurrency": 1,
     "_llm_max_tokens_note": "以下 max_tokens 仅为参考上限，实际由各 provider 能力决定；设为较大值表示不刻意限制输出长度。",
     "llm_text_max_tokens": 65536,
@@ -133,7 +136,8 @@
     "start_headed": true,
     "headless_port": 9222,
     "headed_port": 9223,
-    "headless_context_pool_size": 2,
+    "headless_context_pool_size": 4,
+    "headless_search_reserved_slots": 1,
     "headed_context_pool_size": 2,
     "context_acquire_timeout_seconds": 30,
     "context_idle_ttl_seconds": 300,
@@ -165,7 +169,8 @@
   "capsolver": {
     "enabled": true,
     "api_key": "",
-    "timeout_seconds": 120
+    "timeout_seconds": 120,
+    "preferred_for": ["recaptcha_v2", "recaptcha_v3", "hcaptcha", "funcaptcha"]
   },
   "semantic_scholar": {
     "enabled": false,
@@ -187,10 +192,12 @@
     "enabled": false,
     "only_academic": false,
     "max_content_length": 8000,
-    "timeout_seconds": 15,
+    "timeout_seconds": 30,
     "brightdata_api_key": "",
     "brightdata_zone": "",
     "two_captcha_api_key": "",
+    "capsolver_api_key": "",
+    "captcha_timeout_seconds": 120,
     "cache_enabled": true,
     "cache_ttl_seconds": 3600,
     "disk_cache_enabled": true,
@@ -199,8 +206,13 @@
     "disk_cache_dir": "data/cache",
     "max_concurrent": 5,
     "compress_long_fulltext": true,
-    "compress_word_threshold": 300,
-    "compress_max_output_words": 400
+    "compress_word_threshold": 900,
+    "compress_char_threshold": 5500,
+    "compress_max_output_words": 280,
+    "compress_fallback_chars": 2000,
+    "compress_input_max_chars": 12000,
+    "compress_llm_max_tokens": 800,
+    "compress_max_concurrent": 5
   },
   "scholar_downloader": {
     "_comment": "API Key 与 proxy 等敏感项请放在 rag_config.local.json 中覆盖",
@@ -272,7 +284,8 @@
       "max_workers": 4
     },
     "llm": {
-      "timeout_seconds": 120,
+      "_comment": "timeout_seconds: LLM API 单次请求读超时（秒），超时未收到响应会报 Read timed out",
+      "timeout_seconds": 180,
       "max_retries": 2,
       "retry_backoff": 1.5,
       "cache_enabled": false,

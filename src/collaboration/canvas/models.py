@@ -45,6 +45,7 @@ class Citation:
     year: Optional[int] = None
     doc_id: Optional[str] = None
     url: Optional[str] = None
+    pdf_url: Optional[str] = None
     doi: Optional[str] = None
     bibtex: Optional[str] = None
     cite_key: Optional[str] = None

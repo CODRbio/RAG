@@ -31,7 +31,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from sqlmodel import Session, select, and_
 
 from src.db.engine import get_engine
-from src.db.models import CrossrefCache, PaperMetadata
+from src.db.models import CrossrefCache, CrossrefCacheByDoi, PaperMetadata
 
 logger = logging.getLogger(__name__)
 
@@ -39,17 +39,15 @@ _JSON_PATH = Path("data/paper_metadata.json")
 
 
 def _normalize_doi(doi: Optional[str]) -> str:
-    if not doi or not isinstance(doi, str):
-        return ""
-    d = doi.strip().lower()
-    d = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", d)
-    return d.rstrip("/.")
+    """Delegate to dedup.normalize_doi for canonical DOI key (unquote, regex extract, lowercase)."""
+    from src.retrieval.dedup import normalize_doi
+    return normalize_doi(doi)
 
 
 def _normalize_title(title: Optional[str]) -> str:
-    if not title or not isinstance(title, str):
-        return ""
-    return re.sub(r"[^a-z0-9]+", "", title.lower())
+    """Delegate to dedup.normalize_title for consistency with dedup/crossref paths."""
+    from src.retrieval.dedup import normalize_title
+    return normalize_title(title or "")
 
 
 class PaperMetadataStore:
@@ -347,6 +345,62 @@ class PaperMetadataStore:
             return False
         with Session(get_engine()) as session:
             return session.get(CrossrefCache, nt) is not None
+
+    def crossref_get_by_doi(self, doi: str) -> Optional[Dict[str, Any]]:
+        """按 normalized_doi 查 CrossRef 缓存，命中返回 dict，未命中返回 None。"""
+        ndoi = _normalize_doi(doi)
+        if not ndoi:
+            return None
+        with Session(get_engine()) as session:
+            row = session.get(CrossrefCacheByDoi, ndoi)
+        if not row or not row.doi:
+            return None
+        authors = None
+        if row.authors:
+            try:
+                authors = json.loads(row.authors)
+            except Exception:
+                pass
+        return {"doi": row.doi, "title": row.title, "authors": authors, "year": row.year, "venue": row.venue}
+
+    def crossref_put_by_doi(self, doi: str, result: Optional[Dict[str, Any]]) -> None:
+        """按 DOI 写入 CrossRef 查询结果到缓存（与 title 缓存并存，便于按 DOI 复用）。"""
+        import time as _time
+        ndoi = _normalize_doi(doi)
+        if not ndoi:
+            return
+        if result:
+            cr_doi = result.get("doi") or ""
+            cr_title = result.get("title") or ""
+            authors = result.get("authors")
+            authors_str = json.dumps(authors, ensure_ascii=False) if authors else ""
+            year = result.get("year")
+            venue = result.get("venue") or ""
+        else:
+            cr_doi = cr_title = authors_str = venue = ""
+            year = None
+        with Session(get_engine()) as session:
+            row = session.get(CrossrefCacheByDoi, ndoi)
+            if row is None:
+                row = CrossrefCacheByDoi(
+                    normalized_doi=ndoi,
+                    doi=cr_doi,
+                    title=cr_title,
+                    authors=authors_str,
+                    year=year,
+                    venue=venue,
+                    created_at=_time.time(),
+                )
+                session.add(row)
+            else:
+                row.doi = cr_doi
+                row.title = cr_title
+                row.authors = authors_str
+                row.year = year
+                row.venue = venue
+                row.created_at = _time.time()
+                session.add(row)
+            session.commit()
 
     def close(self) -> None:
         """No-op: connection lifecycle managed by the shared engine."""

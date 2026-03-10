@@ -158,6 +158,44 @@ export function RetrievalDebugPanel({ summary }: Props) {
             </div>
           )}
 
+          {/* Final fusion diagnostics */}
+          {(diag?.pool_fusion || diag?.final_fusion) && (
+            <div>
+              <div className="font-medium text-gray-500 flex items-center gap-1 mb-1.5">
+                <BarChart3 size={11} /> 融合诊断
+              </div>
+              {(() => {
+                const pf = diag?.final_fusion || diag?.pool_fusion;
+                if (!pf) return null;
+                return (
+                  <div className="flex flex-wrap gap-2">
+                    <span className="px-2 py-0.5 rounded bg-gray-200 text-gray-600">
+                      in(main/gap/agent): {pf.main_in ?? 0}/{pf.gap_in ?? 0}/{pf.agent_in ?? 0}
+                    </span>
+                    <span className="px-2 py-0.5 rounded bg-gray-200 text-gray-600">
+                      out: {pf.output_count ?? summary.total_chunks}
+                    </span>
+                    {typeof pf.gap_in_output === 'number' && (
+                      <span className="px-2 py-0.5 rounded bg-blue-100 text-blue-700">
+                        gap {pf.gap_in_output}/{pf.gap_min_keep ?? 0}
+                      </span>
+                    )}
+                    {typeof pf.agent_in_output === 'number' && (
+                      <span className="px-2 py-0.5 rounded bg-cyan-100 text-cyan-700">
+                        agent {pf.agent_in_output}/{pf.agent_min_keep ?? 0}
+                      </span>
+                    )}
+                  </div>
+                );
+              })()}
+              {diag?.agent_refusion && (
+                <div className="mt-1 text-gray-400">
+                  agent回流: +{diag.agent_refusion.agent_extra_chunks ?? 0} chunks, 最终输出 {diag.agent_refusion.output_count ?? summary.total_chunks}
+                </div>
+              )}
+            </div>
+          )}
+
           {/* Evidence types */}
           {summary.evidence_type_breakdown && (
             <div>

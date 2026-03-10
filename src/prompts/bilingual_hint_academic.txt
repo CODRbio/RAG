@@ -1,7 +1,8 @@
-LANGUAGE RULE (topic is in Chinese — ACADEMIC ENGINE queries):
-For Recall and Precision categories (targeting ncbi / semantic / scholar):
+LANGUAGE RULE (topic is in Chinese — ENGLISH-ONLY ACADEMIC ENGINES):
+For Recall and Precision categories targeting ncbi or semantic only:
 ALL queries MUST be in English academic keywords.
 Translate every Chinese concept into the most accurate English academic terminology.
-Do NOT include any Chinese characters in these categories.
+Do NOT include any Chinese characters for ncbi/semantic.
 Chinese queries sent to these engines return near-zero results.
+(Scholar and Google support Chinese; they are not subject to this rule.)
 ---

@@ -222,6 +222,45 @@ def list_checkpoints(job_id: str) -> List[Dict[str, Any]]:
     return out
 
 
+def purge_dr_checkpoints(job_id: str) -> int:
+    """Delete all DRCheckpoint rows for a job. Called on job done, cancel, or error."""
+    with Session(get_engine()) as session:
+        stmt = select(DRCheckpoint).where(DRCheckpoint.job_id == job_id)
+        rows = session.exec(stmt).all()
+        count = len(rows)
+        for row in rows:
+            session.delete(row)
+        session.commit()
+    return count
+
+
+def purge_stale_dr_checkpoints(max_age_days: int = 7) -> int:
+    """TTL safety net: delete checkpoints whose parent job is terminal or older than max_age_days.
+    Called at startup alongside storage cleanup."""
+    cutoff = time.time() - max_age_days * 86400
+    with Session(get_engine()) as session:
+        terminal_job_ids_stmt = (
+            select(DeepResearchJob.job_id)
+            .where(DeepResearchJob.status.in_(["done", "error", "cancelled"]))
+        )
+        terminal_ids = list(session.exec(terminal_job_ids_stmt).all())
+        count = 0
+        if terminal_ids:
+            stmt = select(DRCheckpoint).where(DRCheckpoint.job_id.in_(terminal_ids))
+            rows = session.exec(stmt).all()
+            count += len(rows)
+            for row in rows:
+                session.delete(row)
+        old_stmt = select(DRCheckpoint).where(DRCheckpoint.created_at < cutoff)
+        old_rows = session.exec(old_stmt).all()
+        for row in old_rows:
+            if row not in session.identity_map.values():
+                count += 1
+                session.delete(row)
+        session.commit()
+    return count
+
+
 def list_events(job_id: str, after_id: int = 0, limit: int = 500) -> List[Dict[str, Any]]:
     after_id = max(0, int(after_id))
     limit = max(1, min(int(limit), 2000))

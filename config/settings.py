@@ -3,6 +3,8 @@
 - 配置文件: config/rag_config.json（LLM 等可调参数）
 - 本地覆盖: config/rag_config.local.json（本地私密配置）
 - 环境变量优先覆盖敏感项（API Key 等）
+
+运行时取值优先级：UI/请求入参（若有）> config > 代码默认值。使用方应在合并请求级覆盖后再读本模块。
 """
 
 import os
@@ -159,8 +161,10 @@ class SharedBrowserConfig:
     """CDP port for the headless shared browser."""
     headed_port: int = 9223
     """CDP port for the headed shared browser (minimized/hidden by default)."""
-    headless_context_pool_size: int = 2
+    headless_context_pool_size: int = 4
     """Number of resident headless contexts (shared by search + web_content_fetcher)."""
+    headless_search_reserved_slots: int = 1
+    """Number of headless slots reserved for search (Google/Scholar); rest are general."""
     headed_context_pool_size: int = 2
     """Number of resident headed contexts (used by scholar_downloader)."""
     context_acquire_timeout_seconds: float = 30.0
@@ -213,6 +217,11 @@ class CapSolverConfig:
     enabled: bool = True
     api_key: str = ""
     timeout_seconds: int = 120
+    # Types where CapSolver is tried *first* before 2Captcha fallback.
+    # Turnstile and image_text default to 2Captcha-primary; everything else to CapSolver-primary.
+    preferred_for: List[str] = field(
+        default_factory=lambda: ["recaptcha_v2", "recaptcha_v3", "hcaptcha", "funcaptcha"]
+    )
 
 
 @dataclass
@@ -238,14 +247,16 @@ class NCBIConfig:
 
 @dataclass
 class ContentFetcherConfig:
-    """WebContentFetcher 全文抓取配置"""
+    """WebContentFetcher 全文抓取配置。取值优先级：UI/请求入参（若有）> config > 本处默认。"""
     enabled: bool = False
     only_academic: bool = False
     max_content_length: int = 8000
-    timeout_seconds: int = 15
+    timeout_seconds: int = 30
     brightdata_api_key: str = ""
     brightdata_zone: str = ""
-    two_captcha_api_key: str = ""  # 与 BrightData 同时配置时，单页抓取上限 2 分钟
+    two_captcha_api_key: str = ""  # 与 BrightData 同时配置时，单页抓取上限 2 分钟；Cloudflare/Turnstile 优先用 2Captcha
+    capsolver_api_key: str = ""  # 其他验证码优先 CapSolver，失败再 2Captcha；可与全局 capsolver.api_key 一致
+    captcha_timeout_seconds: int = 120  # 验证码 API 轮询超时，与 downloader 一致
     cache_enabled: bool = True
     cache_ttl_seconds: int = 3600
     disk_cache_enabled: bool = True
@@ -254,8 +265,13 @@ class ContentFetcherConfig:
     disk_cache_dir: str = "data/cache"
     max_concurrent: int = 5
     compress_long_fulltext: bool = True
-    compress_word_threshold: int = 300
-    compress_max_output_words: int = 400
+    compress_word_threshold: int = 900
+    compress_char_threshold: int = 5500
+    compress_max_output_words: int = 280
+    compress_fallback_chars: int = 2000
+    compress_input_max_chars: int = 12000
+    compress_llm_max_tokens: int = 800
+    compress_max_concurrent: int = 5
 
 
 # 默认 downloader timeouts（与 paper_downloader_refactored 一致，可被 config 覆盖）
@@ -623,7 +639,7 @@ class RetrievalPerfSettings:
 @dataclass
 class LLMPerfSettings:
     """LLM：超时、重试、并发限流、缓存"""
-    timeout_seconds: int = 120
+    timeout_seconds: int = 180  # 单次 API 读超时（秒），可在 config 的 performance.llm.timeout_seconds 中修改
     max_retries: int = 2
     retry_backoff: float = 1.5
     cache_enabled: bool = False
@@ -699,6 +715,7 @@ class TaskQueueSettings:
     run_timeout_seconds: int = 600
     heartbeat_interval_seconds: int = 15
     task_state_ttl_seconds: int = 86400
+    ingest_max_concurrent: int = 2
 
 
 class Settings:
@@ -767,7 +784,14 @@ class Settings:
             start_headed=bool(sb.get("start_headed", True)),
             headless_port=int(sb.get("headless_port", 9222)),
             headed_port=int(sb.get("headed_port", 9223)),
-            headless_context_pool_size=max(1, int(sb.get("headless_context_pool_size", 2))),
+            headless_context_pool_size=max(1, int(sb.get("headless_context_pool_size", 4))),
+            headless_search_reserved_slots=max(
+                0,
+                min(
+                    int(sb.get("headless_search_reserved_slots", 1)),
+                    int(sb.get("headless_context_pool_size", 4)) - 1,
+                ),
+            ),
             headed_context_pool_size=max(1, int(sb.get("headed_context_pool_size", 2))),
             context_acquire_timeout_seconds=float(sb.get("context_acquire_timeout_seconds", 30)),
             context_idle_ttl_seconds=float(sb.get("context_idle_ttl_seconds", 300)),
@@ -799,10 +823,12 @@ class Settings:
             timeout_seconds=int(sp.get("timeout_seconds", 30)),
         )
         cs = _capsolver_from_config()
+        _cs_preferred = cs.get("preferred_for") or ["recaptcha_v2", "recaptcha_v3", "hcaptcha", "funcaptcha"]
         self.capsolver = CapSolverConfig(
             enabled=bool(cs.get("enabled", True)),
             api_key=(cs.get("api_key") or "").strip(),
             timeout_seconds=int(cs.get("timeout_seconds", 120)),
+            preferred_for=list(_cs_preferred),
         )
         ss = _semantic_scholar_from_config()
         self.semantic_scholar = SemanticScholarConfig(
@@ -822,14 +848,18 @@ class Settings:
             cache_maxsize=int(nc.get("cache_maxsize", 256)),
         )
         cf = _content_fetcher_from_config()
+        capsolver_cfg = _capsolver_from_config()
+        capsolver_key = (cf.get("capsolver_api_key") or capsolver_cfg.get("api_key") or "").strip()
         self.content_fetcher = ContentFetcherConfig(
             enabled=bool(cf.get("enabled", False)),
             only_academic=bool(cf.get("only_academic", False)),
             max_content_length=int(cf.get("max_content_length", 8000)),
-            timeout_seconds=int(cf.get("timeout_seconds", 15)),
+            timeout_seconds=int(cf.get("timeout_seconds", 30)),
             brightdata_api_key=(cf.get("brightdata_api_key") or "").strip(),
             brightdata_zone=(cf.get("brightdata_zone") or "").strip(),
             two_captcha_api_key=(cf.get("two_captcha_api_key") or "").strip(),
+            capsolver_api_key=capsolver_key,
+            captcha_timeout_seconds=int(cf.get("captcha_timeout_seconds", 120)),
             cache_enabled=bool(cf.get("cache_enabled", True)),
             cache_ttl_seconds=int(cf.get("cache_ttl_seconds", 3600)),
             disk_cache_enabled=bool(cf.get("disk_cache_enabled", True)),
@@ -838,8 +868,13 @@ class Settings:
             disk_cache_dir=str(cf.get("disk_cache_dir", "data/cache")),
             max_concurrent=int(cf.get("max_concurrent", 5)),
             compress_long_fulltext=bool(cf.get("compress_long_fulltext", True)),
-            compress_word_threshold=int(cf.get("compress_word_threshold", 300)),
-            compress_max_output_words=int(cf.get("compress_max_output_words", 400)),
+            compress_word_threshold=int(cf.get("compress_word_threshold", 900)),
+            compress_char_threshold=int(cf.get("compress_char_threshold", 5500)),
+            compress_max_output_words=int(cf.get("compress_max_output_words", 280)),
+            compress_fallback_chars=int(cf.get("compress_fallback_chars", 2000)),
+            compress_input_max_chars=int(cf.get("compress_input_max_chars", 12000)),
+            compress_llm_max_tokens=int(cf.get("compress_llm_max_tokens", 800)),
+            compress_max_concurrent=int(cf.get("compress_max_concurrent", cf.get("max_concurrent", 5))),
         )
         a = _api_from_config()
         self.api = ApiSettings(
@@ -870,7 +905,7 @@ class Settings:
             max_workers=int(rp.get("max_workers", 4)),
         )
         self.perf_llm = LLMPerfSettings(
-            timeout_seconds=int(lp.get("timeout_seconds", 120)),
+            timeout_seconds=int(lp.get("timeout_seconds", 180)),
             max_retries=int(lp.get("max_retries", 2)),
             retry_backoff=float(lp.get("retry_backoff", 1.5)),
             cache_enabled=bool(lp.get("cache_enabled", False)),
@@ -933,6 +968,7 @@ class Settings:
             run_timeout_seconds=int(tq.get("run_timeout_seconds", 600)),
             heartbeat_interval_seconds=int(tq.get("heartbeat_interval_seconds", 15)),
             task_state_ttl_seconds=int(tq.get("task_state_ttl_seconds", 86400)),
+            ingest_max_concurrent=int(tq.get("ingest_max_concurrent", 2)),
         )
         sd = _scholar_downloader_from_config()
         timeouts_raw = sd.get("timeouts") or {}

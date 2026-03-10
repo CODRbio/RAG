@@ -71,9 +71,13 @@ def fuse_pools_with_gap_protection(
     main_candidates: List[Dict[str, Any]],
     gap_candidates: List[Dict[str, Any]],
     top_k: int,
+    agent_candidates: Optional[List[Dict[str, Any]]] = None,
     *,
     gap_boost: float = _GAP_SCORE_BOOST,      # 0.10
-    gap_min_keep: Optional[int] = None,        # ceil(top_k * 0.25) when gap present
+    gap_min_keep: Optional[int] = None,        # ceil(top_k * 0.20) when gap present
+    gap_ratio: Optional[float] = None,         # default 0.20
+    agent_min_keep: Optional[int] = None,      # ceil(top_k * 0.10) when agent present
+    agent_ratio: Optional[float] = None,       # default 0.10
     reranker_mode: Optional[str] = None,
     skip_rerank: bool = False,
     diag: Optional[Dict[str, Any]] = None,

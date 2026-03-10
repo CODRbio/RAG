@@ -236,6 +236,7 @@ def chunk_to_citation(
     year = getattr(chunk, "year", None)
     doi = getattr(chunk, "doi", None) or None
     url = getattr(chunk, "url", None) or None
+    pdf_url = getattr(chunk, "pdf_url", None) or None
     doc_id = chunk.doc_id or None
 
     bbox = getattr(chunk, "bbox", None) or None
@@ -258,6 +259,7 @@ def chunk_to_citation(
         year=year,
         doc_id=doc_id,
         url=url,
+        pdf_url=pdf_url,
         doi=doi,
         cite_key="",
         bbox=bbox,
@@ -401,6 +403,7 @@ def resolve_response_citations(
                 year=temp.year,
                 doc_id=temp.doc_id,
                 url=temp.url,
+                pdf_url=getattr(temp, "pdf_url", None),
                 doi=getattr(temp, "doi", None),
                 cite_key="",
             )
@@ -425,6 +428,7 @@ def resolve_response_citations(
             year=best.year,
             doc_id=best.doc_id,
             url=best.url,
+            pdf_url=getattr(best, "pdf_url", None),
             doi=getattr(best, "doi", None),
             cite_key=cite_key,
             bbox=getattr(best, "bbox", None),

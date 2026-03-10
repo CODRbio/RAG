@@ -101,7 +101,7 @@ function SectionRow({
 export function ResearchProgressPanel({ dashboard, isActive }: Props) {
   const { t } = useTranslation();
   const addToast = useToastStore((s) => s.addToast);
-  const { setShowDeepResearchDialog, setDeepResearchActive, setDeepResearchTopic } = useChatStore();
+  const { setShowDeepResearchDialog, setDeepResearchActive, setDeepResearchTopic, streamingStep } = useChatStore();
   const [restarting, setRestarting] = useState(false);
   const [optimizing, setOptimizing] = useState<string | null>(null);
 
@@ -182,6 +182,13 @@ export function ResearchProgressPanel({ dashboard, isActive }: Props) {
 
   return (
     <div className="border rounded-lg bg-white shadow-sm overflow-hidden">
+      {/* Active step (Thinking-style) when job is running */}
+      {isActive && streamingStep && (
+        <div className="px-4 py-2 bg-slate-50 border-b border-slate-200 flex items-center gap-2 text-xs text-slate-500">
+          <span className="w-1.5 h-1.5 rounded-full bg-sky-400 animate-pulse flex-shrink-0" />
+          {t('chat.thinking', 'Thinking')}: {streamingStep.label}
+        </div>
+      )}
       {/* Header */}
       <div className="px-4 py-3 bg-gradient-to-r from-indigo-50 to-blue-50 border-b">
         <div className="flex items-center justify-between">

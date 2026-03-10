@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Database,
   HardDrive,
-  UploadCloud,
   Plus,
   FileText,
   Trash2,
@@ -11,11 +10,13 @@ import {
   CheckCircle2,
   AlertCircle,
   RefreshCw,
+  RotateCw,
   ChevronLeft,
   ChevronRight,
   List,
   Link2,
 } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
 import { useConfigStore, useUIStore, useToastStore } from '../stores';
 import { Modal } from '../components/ui/Modal';
 import {
@@ -26,20 +27,17 @@ import {
   updateCollectionScope,
   refreshCollectionScope,
   ensureCollectionLibraryBinding,
-  repairCollectionLibraryBinding,
   listPapers,
   deletePaper,
-  uploadFiles,
-  processFiles,
   cancelIngestJob,
+  getIngestJob,
   listIngestJobs,
   streamIngestJobEvents,
   listLLMProviders,
   type CollectionInfo,
   type IngestProgressEvent,
-  type LLMProviderInfo,
   type PaperInfo,
-  type UploadedFile,
+  type LLMProviderInfo,
   type EnrichmentOptions,
 } from '../api/ingest';
 import {
@@ -47,92 +45,93 @@ import {
   getLibraryPapers as getScholarLibraryPapers,
   ingestScholarLibrary,
   importLibraryPdfs,
+  createLibrary,
+  deleteLibrary,
   type LibraryImportPdfSummary,
   type ScholarLibrary,
 } from '../api/scholar';
+import { login as apiLogin } from '../api/auth';
+import { useAuthStore } from '../stores/useAuthStore';
 
 // ---- Types ----
 
-type FileStatus = 'pending' | 'uploading' | 'parsing' | 'chunking' | 'embedding' | 'indexing' | 'done' | 'error' | 'skipped';
-
-interface FileItem {
-  id: string;
+/** One knowledge base: merged by name from Scholar Library + Vector Collection. */
+export interface MergedBase {
   name: string;
-  size: number;
-  status: FileStatus;
-  message?: string;
-  chunks?: number;
-  /** 上传后后端返回的路径 */
-  serverPath?: string;
+  library: (ScholarLibrary & { downloaded_count: number }) | null;
+  collection: CollectionInfo | null;
 }
 
 interface IngestScholarLibraryOption extends ScholarLibrary {
   downloaded_count: number;
 }
 
-const STATUS_LABELS: Record<FileStatus, string> = {
-  pending: '待处理',
-  uploading: '上传中',
-  parsing: '解析中',
-  chunking: '切块中',
-  embedding: '向量化中',
-  indexing: '入库中',
-  done: '完成',
-  error: '失败',
-  skipped: '已跳过',
-};
-
-const STATUS_COLORS: Record<FileStatus, string> = {
-  pending: 'bg-gray-100 text-gray-500',
-  uploading: 'bg-blue-50 text-blue-600',
-  parsing: 'bg-blue-50 text-blue-600',
-  chunking: 'bg-blue-50 text-blue-600',
-  embedding: 'bg-purple-50 text-purple-600',
-  indexing: 'bg-orange-50 text-orange-600',
-  done: 'bg-green-50 text-green-600',
-  error: 'bg-red-50 text-red-600',
-  skipped: 'bg-gray-100 text-gray-500',
-};
-
-// ---- Collection Templates ----
-
-const COLLECTION_TEMPLATES = [
-  { name: 'deepsea_global', desc: '通用深海文献库' },
-  { name: 'deepsea_life', desc: '深海生物与生态' },
-  { name: 'deepsea_ocean', desc: '海洋学与地质' },
-  { name: 'deepsea_env', desc: '深海环境与保护' },
-];
-
 // ---- Component ----
 
 export function IngestPage() {
-  const { dbAddress, setDbStatus, currentCollection, setCurrentCollection, setCollections, setCollectionInfos, addCollection } =
+  const { t } = useTranslation();
+  const { dbAddress, setDbStatus, currentCollection, setCurrentCollection, setCollections, setCollectionInfos } =
     useConfigStore();
   const { showCreateCollectionModal, setShowCreateCollectionModal } = useUIStore();
   const addToast = useToastStore((s) => s.addToast);
+  const user = useAuthStore((s) => s.user);
 
   // Connection
   const [connectError, setConnectError] = useState('');
 
-  // Collections from backend
+  // Collections and libraries from backend
   const [backendCollections, setBackendCollections] = useState<CollectionInfo[]>([]);
   const [collectionsLoading, setCollectionsLoading] = useState(false);
+  const [scholarLibraries, setScholarLibraries] = useState<IngestScholarLibraryOption[]>([]);
+  const [scholarLibrariesLoading, setScholarLibrariesLoading] = useState(false);
 
-  // Papers in collection (持久化文件列表)
+  /** Merged knowledge bases by name (library + collection). */
+  const mergedBases = useMemo((): MergedBase[] => {
+    const names = new Set<string>([
+      ...scholarLibraries.filter((l) => l.id >= 0).map((l) => l.name),
+      ...backendCollections.map((c) => c.name),
+    ]);
+    return Array.from(names).map((name) => ({
+      name,
+      library: scholarLibraries.find((l) => l.name === name && l.id >= 0) ?? null,
+      collection: backendCollections.find((c) => c.name === name) ?? null,
+    }));
+  }, [scholarLibraries, backendCollections]);
+
+  /** Selected knowledge base by name (drives sync, upload, papers list). */
+  const [selectedBaseName, setSelectedBaseName] = useState<string | null>(null);
+
+  const selectedBase = useMemo(
+    () => (selectedBaseName ? mergedBases.find((b) => b.name === selectedBaseName) ?? null : null),
+    [mergedBases, selectedBaseName],
+  );
+  const selectedLibraryId = selectedBase?.library?.id ?? null;
+  const selectedLibrary = selectedBase?.library ?? null;
+
+  // Papers in selected collection (for "已入库文件" list)
   const [papers, setPapers] = useState<PaperInfo[]>([]);
   const [papersLoading, setPapersLoading] = useState(false);
   const [papersPageSize, setPapersPageSize] = useState<10 | 20>(10);
   const [papersPage, setPapersPage] = useState(1);
 
-  // Files
-  const [files, setFiles] = useState<FileItem[]>([]);
+  // Sync / ingest
   const [isProcessing, setIsProcessing] = useState(false);
   const [isCancelling, setIsCancelling] = useState(false);
   const [globalProgress, setGlobalProgress] = useState('');
+  const [activeJobId, setActiveJobId] = useState<string | null>(null);
+  const [enrichLogs, setEnrichLogs] = useState<Record<string, string[]>>({});
+  const [autoDownloadMissingScholarPdfs, setAutoDownloadMissingScholarPdfs] = useState(false);
+
+  // Upload PDFs to library (import to selected base's library)
+  const [boundLibraryImportFiles, setBoundLibraryImportFiles] = useState<File[]>([]);
+  const [boundLibraryImporting, setBoundLibraryImporting] = useState(false);
+  const [boundLibraryImportSummary, setBoundLibraryImportSummary] = useState<LibraryImportPdfSummary | null>(null);
+
+  // Enrichment options (table parsing defaults to qwen / qwen3.5 without thinking)
   const [enrichment, setEnrichment] = useState<EnrichmentOptions>({
     enrich_tables: false,
     enrich_figures: false,
-    llm_text_provider: null,
+    llm_text_provider: 'qwen',
     llm_text_model: null,
     llm_text_concurrency: 1,
     llm_vision_provider: null,
@@ -140,61 +139,59 @@ export function IngestPage() {
     llm_vision_concurrency: 1,
   });
   const [llmProviders, setLlmProviders] = useState<LLMProviderInfo[]>([]);
-  const [activeJobId, setActiveJobId] = useState<string | null>(null);
-  /** 解析状态：表格/图片 enrich 进度，按文件名聚合，用于解析阶段展示 */
-  const [enrichLogs, setEnrichLogs] = useState<Record<string, string[]>>({});
-  const [newCollectionName, setNewCollectionName] = useState('');
-  /** 上传后若发现已入库重复（按 content_hash），弹窗让用户选 跳过 / 覆盖 */
-  const [duplicateModal, setDuplicateModal] = useState<{
-    uploaded: UploadedFile[];
-    duplicatePairs: { uploadedFile: UploadedFile; existingPaper: PaperInfo }[];
-  } | null>(null);
-  /** 对本次及之后所有重复项执行相同操作，不弹窗 */
-  const [duplicateActionPreference, setDuplicateActionPreference] = useState<'skip' | 'overwrite' | null>(null);
-  /** 弹窗内勾选「应用到所有类似」 */
-  const [applyToAllSimilar, setApplyToAllSimilar] = useState(false);
-  /** 正在刷新覆盖范围摘要的集合名 */
+
+  const loadLlmProviderOptions = useCallback(async () => {
+    try {
+      const res = await listLLMProviders();
+      setLlmProviders(res.providers || []);
+    } catch (err) {
+      console.error('Failed to load LLM providers:', err);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadLlmProviderOptions();
+  }, [loadLlmProviderOptions]);
+
+  const tableProvider = useMemo(
+    () => llmProviders.find((p) => p.id === enrichment.llm_text_provider),
+    [llmProviders, enrichment.llm_text_provider]
+  );
+  const figureProvider = useMemo(
+    () => llmProviders.find((p) => p.id === enrichment.llm_vision_provider),
+    [llmProviders, enrichment.llm_vision_provider]
+  );
+
+  const concurrencyOptions = [1, 2, 4, 8, 16];
+
+  // Scope modal
   const [scopeRefreshingCollection, setScopeRefreshingCollection] = useState<string | null>(null);
-  /** 覆盖范围摘要弹窗：当前集合、摘要文本、更新时间、加载/保存中 */
   const [scopeModalOpen, setScopeModalOpen] = useState(false);
   const [scopeModalCollection, setScopeModalCollection] = useState<string | null>(null);
   const [scopeSummaryText, setScopeSummaryText] = useState('');
   const [scopeUpdatedAt, setScopeUpdatedAt] = useState<string | null>(null);
   const [scopeModalLoading, setScopeModalLoading] = useState(false);
   const [scopeModalSaving, setScopeModalSaving] = useState(false);
-  const [bindingEnsuringCollection, setBindingEnsuringCollection] = useState<string | null>(null);
-  const [bindingRepairingCollection, setBindingRepairingCollection] = useState<string | null>(null);
-  const [scholarLibraries, setScholarLibraries] = useState<IngestScholarLibraryOption[]>([]);
-  const [scholarLibrariesLoading, setScholarLibrariesLoading] = useState(false);
-  const [selectedScholarLibraryId, setSelectedScholarLibraryId] = useState<number | null>(null);
-  const [autoDownloadMissingScholarPdfs, setAutoDownloadMissingScholarPdfs] = useState(false);
-  const [boundLibraryImportFiles, setBoundLibraryImportFiles] = useState<File[]>([]);
-  const [boundLibraryImporting, setBoundLibraryImporting] = useState(false);
-  const [boundLibraryImportSummary, setBoundLibraryImportSummary] = useState<LibraryImportPdfSummary | null>(null);
-  const selectedScholarLibrary = useMemo(
-    () => scholarLibraries.find((lib) => lib.id === selectedScholarLibraryId) ?? null,
-    [scholarLibraries, selectedScholarLibraryId],
-  );
-  const currentCollectionInfo = useMemo(
-    () => backendCollections.find((c) => c.name === currentCollection),
-    [backendCollections, currentCollection],
-  );
-  const boundScholarLibraryId = currentCollectionInfo?.associated_library_id ?? null;
-  const boundScholarLibraryName = currentCollectionInfo?.associated_library_name || null;
-  const boundScholarLibrary = useMemo(
-    () =>
-      (boundScholarLibraryId != null
-        ? scholarLibraries.find((lib) => lib.id === boundScholarLibraryId) ?? null
-        : null),
-    [boundScholarLibraryId, scholarLibraries],
-  );
 
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const folderInputRef = useRef<HTMLInputElement>(null);
+  // New knowledge base modal
+  const [newCollectionName, setNewCollectionName] = useState('');
+
+  // Delete confirmation (password)
+  const [deleteConfirmModal, setDeleteConfirmModal] = useState<{ baseName: string; libraryId: number } | null>(null);
+  const [deletePassword, setDeletePassword] = useState('');
+  const [deleteVerifying, setDeleteVerifying] = useState(false);
+
+  // Sync selectedBaseName to config store for sidebar/chat
+  useEffect(() => {
+    if (selectedBaseName && selectedBaseName !== currentCollection) {
+      setCurrentCollection(selectedBaseName);
+    }
+  }, [selectedBaseName, currentCollection, setCurrentCollection]);
+
   const boundLibraryFolderInputRef = useRef<HTMLInputElement>(null);
+  const boundLibraryFileInputRef = useRef<HTMLInputElement>(null);
   const abortRef = useRef<AbortController | null>(null);
 
-  // ---- Auto-connect & load collections on mount ----
   const loadCollections = useCallback(async () => {
     setCollectionsLoading(true);
     setConnectError('');
@@ -202,46 +199,15 @@ export function IngestPage() {
       const cols = await listCollections();
       setBackendCollections(cols);
       setDbStatus('connected');
-      // Sync to config store
-      const names = cols.map((c) => c.name);
-      setCollections(names);
+      setCollections(cols.map((c) => c.name));
       setCollectionInfos(cols);
-      // If current collection not in list, select first
-      if (names.length > 0 && !names.includes(currentCollection)) {
-        setCurrentCollection(names[0]);
-      }
     } catch (err) {
       console.error('Failed to load collections:', err);
       setConnectError(err instanceof Error ? err.message : '无法连接后端服务');
     } finally {
       setCollectionsLoading(false);
     }
-  }, [currentCollection, setCollectionInfos, setCollections, setCurrentCollection, setDbStatus, addToast]);
-
-  const loadLlmProviderOptions = useCallback(async () => {
-    try {
-      const data = await listLLMProviders();
-      setLlmProviders(data.providers || []);
-      const defaults = data.parser_defaults || {};
-      setEnrichment((prev) => ({
-        ...prev,
-        llm_text_provider: defaults.llm_text_provider ?? prev.llm_text_provider,
-        llm_text_model: defaults.llm_text_model ?? prev.llm_text_model,
-        llm_text_concurrency:
-          typeof defaults.llm_text_concurrency === 'number'
-            ? defaults.llm_text_concurrency
-            : (prev.llm_text_concurrency ?? 1),
-        llm_vision_provider: defaults.llm_vision_provider ?? prev.llm_vision_provider,
-        llm_vision_model: defaults.llm_vision_model ?? prev.llm_vision_model,
-        llm_vision_concurrency:
-          typeof defaults.llm_vision_concurrency === 'number'
-            ? defaults.llm_vision_concurrency
-            : (prev.llm_vision_concurrency ?? 1),
-      }));
-    } catch (err) {
-      console.warn('Failed to load llm providers:', err);
-    }
-  }, []);
+  }, [setCollectionInfos, setCollections, setDbStatus]);
 
   const loadScholarLibrariesForIngest = useCallback(async () => {
     setScholarLibrariesLoading(true);
@@ -259,14 +225,14 @@ export function IngestPage() {
         }),
       );
       setScholarLibraries(enriched);
-      setSelectedScholarLibraryId((prev) => {
-        if (prev != null && enriched.some((lib) => lib.id === prev)) return prev;
-        return enriched[0]?.id ?? null;
+      setSelectedBaseName((prev) => {
+        if (prev && enriched.some((l) => l.name === prev)) return prev;
+        return enriched[0]?.name ?? null;
       });
     } catch (err) {
       console.warn('Failed to load scholar libraries for ingest', err);
       setScholarLibraries([]);
-      setSelectedScholarLibraryId(null);
+      setSelectedBaseName(null);
     } finally {
       setScholarLibrariesLoading(false);
     }
@@ -274,7 +240,6 @@ export function IngestPage() {
 
   useEffect(() => {
     loadCollections();
-    loadLlmProviderOptions();
     loadScholarLibrariesForIngest();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -288,10 +253,33 @@ export function IngestPage() {
         const savedJobId = localStorage.getItem('ingest_active_job_id');
         let targetJobId: string | null = savedJobId;
         if (!targetJobId) {
-          const running = await listIngestJobs(1, 'running');
-          targetJobId = running[0]?.job_id || null;
+          const [running, pending] = await Promise.all([
+            listIngestJobs(5, 'running'),
+            listIngestJobs(5, 'pending'),
+          ]);
+          targetJobId = running[0]?.job_id ?? pending[0]?.job_id ?? null;
         }
         if (!targetJobId || cancelled) return;
+
+        // Verify the job is still active before subscribing to its event stream.
+        // If the backend already finished/errored the job (e.g. worker restarted),
+        // we clear stale local state instead of getting stuck in isProcessing=true.
+        try {
+          const jobInfo = await getIngestJob(targetJobId);
+          const terminalStatuses = ['done', 'error', 'cancelled'];
+          if (terminalStatuses.includes(jobInfo.status)) {
+            localStorage.removeItem('ingest_active_job_id');
+            if (jobInfo.status === 'error') {
+              addToast(`上一入库任务已终止: ${jobInfo.error_message || jobInfo.status}`, 'info');
+            }
+            return;
+          }
+        } catch {
+          // If the job no longer exists (404 etc.), clear stale state and bail.
+          localStorage.removeItem('ingest_active_job_id');
+          return;
+        }
+
         setActiveJobId(targetJobId);
         setIsProcessing(true);
         setGlobalProgress('已恢复后台任务进度...');
@@ -323,12 +311,11 @@ export function IngestPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ---- Load papers when collection changes ----
   const loadPapers = useCallback(async (): Promise<PaperInfo[]> => {
-    if (!currentCollection) { setPapers([]); setPapersPage(1); return []; }
+    if (!selectedBaseName) { setPapers([]); setPapersPage(1); return []; }
     setPapersLoading(true);
     try {
-      const list = await listPapers(currentCollection);
+      const list = await listPapers(selectedBaseName);
       setPapers(list);
       setPapersPage(1);
       return list;
@@ -338,107 +325,31 @@ export function IngestPage() {
     } finally {
       setPapersLoading(false);
     }
-  }, [currentCollection]);
+  }, [selectedBaseName]);
 
   useEffect(() => {
     loadPapers();
   }, [loadPapers]);
 
-  // ---- Delete paper from collection ----
   const handleDeletePaper = async (paperId: string, filename: string) => {
+    if (!selectedBaseName) return;
     if (!window.confirm(`确定删除「${filename || paperId}」？\n将同时删除该文件在集合中的所有向量数据，不可恢复。`)) {
       return;
     }
     addToast(`正在删除 ${filename || paperId}...`, 'info');
     try {
-      const res = await deletePaper(currentCollection, paperId);
+      const res = await deletePaper(selectedBaseName, paperId);
       addToast(`已删除 ${filename || paperId} (${res.deleted_chunks} chunks)`, 'success');
       loadPapers();
-      loadCollections(); // 刷新集合记录数
+      loadCollections();
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       addToast(`删除失败: ${msg}`, 'error');
     }
   };
 
-  // ---- File selection helpers ----
-
-  const addFilesToList = (fileList: FileList | File[]) => {
-    const arr = Array.from(fileList);
-    const newItems: FileItem[] = arr
-      .filter((f) => f.name.toLowerCase().endsWith('.pdf'))
-      .map((f) => ({
-        id: `${f.name}-${f.size}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-        name: f.name,
-        size: f.size,
-        status: 'pending' as FileStatus,
-      }));
-    if (newItems.length === 0) {
-      addToast('未找到 PDF 文件', 'info');
-      return;
-    }
-    setFiles((prev) => [...prev, ...newItems]);
-    // Store raw File objects in a map for upload
-    for (const item of newItems) {
-      rawFileMap.current.set(item.id, arr.find((f) => f.name === item.name)!);
-    }
-  };
-
-  const rawFileMap = useRef<Map<string, File>>(new Map());
-
-  const handleSelectFiles = () => fileInputRef.current?.click();
-  const handleSelectFolder = () => folderInputRef.current?.click();
-
-  const handleFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files) addFilesToList(e.target.files);
-    e.target.value = ''; // reset so same files can be re-selected
-  };
-
-  const handleRemoveFile = (id: string) => {
-    setFiles((prev) => prev.filter((f) => f.id !== id));
-    rawFileMap.current.delete(id);
-  };
-
-  const removeFilesByStatuses = (statuses: FileStatus[]) => {
-    const target = new Set(statuses);
-    setFiles((prev) => {
-      const removeIds = prev.filter((f) => target.has(f.status)).map((f) => f.id);
-      for (const id of removeIds) {
-        rawFileMap.current.delete(id);
-      }
-      return prev.filter((f) => !target.has(f.status));
-    });
-  };
-
-  const handleClearDone = () => {
-    removeFilesByStatuses(['done', 'skipped']);
-  };
-
-  const handleRetryFailed = () => {
-    setFiles((prev) =>
-      prev.map((f) => (f.status === 'error' ? { ...f, status: 'pending' as FileStatus, message: undefined } : f)),
-    );
-  };
-
-  const handleClearFailed = () => {
-    removeFilesByStatuses(['error']);
-  };
-
-  const handleClearPending = () => {
-    removeFilesByStatuses(['pending']);
-  };
-
-  // ---- Drag & Drop ----
-
-  const [isDragOver, setIsDragOver] = useState(false);
-
-  const handleDrop = (e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragOver(false);
-    if (e.dataTransfer.files) addFilesToList(e.dataTransfer.files);
-  };
-
   const handlePickBoundLibraryFolder = () => boundLibraryFolderInputRef.current?.click();
+  const handlePickBoundLibraryFiles = () => boundLibraryFileInputRef.current?.click();
 
   const handleBoundLibraryFolderChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const picked = Array.from(e.target.files ?? []).filter((f) => f.name.toLowerCase().endsWith('.pdf'));
@@ -447,28 +358,36 @@ export function IngestPage() {
     if (picked.length === 0) {
       addToast('未找到可导入的 PDF 文件', 'info');
     } else {
-      addToast(`已选择 ${picked.length} 个 PDF，点击“导入到绑定文献库”开始`, 'info');
+      addToast(`已选择 ${picked.length} 个 PDF，点击“导入到文献库”开始`, 'info');
+    }
+    e.target.value = '';
+  };
+
+  const handleBoundLibraryFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const picked = Array.from(e.target.files ?? []).filter((f) => f.name.toLowerCase().endsWith('.pdf'));
+    setBoundLibraryImportFiles(picked);
+    setBoundLibraryImportSummary(null);
+    if (picked.length === 0) {
+      addToast('未找到可导入的 PDF 文件', 'info');
+    } else {
+      addToast(`已选择 ${picked.length} 个 PDF，点击「导入到文献库」开始`, 'info');
     }
     e.target.value = '';
   };
 
   const handleImportBoundLibraryPdfs = async () => {
-    if (!currentCollection) {
-      addToast('请先选择集合', 'info');
-      return;
-    }
-    if (boundScholarLibraryId == null || boundScholarLibraryId < 0) {
-      addToast('当前集合尚未绑定永久文献库，请先点击“确保绑定”', 'info');
+    if (selectedLibraryId == null || selectedLibraryId < 0) {
+      addToast('请先选择一个知识库（或新建知识库）', 'info');
       return;
     }
     if (boundLibraryImportFiles.length === 0) {
-      addToast('请先选择包含 PDF 的文件夹', 'info');
+      addToast('请先选择文件或文件夹', 'info');
       return;
     }
     if (boundLibraryImporting) return;
     setBoundLibraryImporting(true);
     try {
-      const summary = await importLibraryPdfs(boundScholarLibraryId, boundLibraryImportFiles);
+      const summary = await importLibraryPdfs(selectedLibraryId, boundLibraryImportFiles);
       setBoundLibraryImportSummary(summary);
       setBoundLibraryImportFiles([]);
       await loadScholarLibrariesForIngest();
@@ -531,27 +450,19 @@ export function IngestPage() {
       }
       case 'progress':
       case 'heartbeat': {
-        const fname = d.file as string;
-        const stage = d.stage as FileStatus;
         const message = d.message as string;
-        // 后端 events 流的连接保活 heartbeat 仅包含 {job_id, message}
-        // 不应当落入文件状态更新，否则会生成空文件行。
-        if (fname && stage) {
-          updateFileStatusByName(fname, stage, message);
-        }
         if (message) setGlobalProgress(message);
         break;
       }
-      case 'file_done': {
-        const fname = d.file as string;
-        const chunks = (d.chunks as number) || 0;
-        updateFileStatusByName(fname, 'done', `完成 (${chunks} chunks)`);
-        break;
-      }
+      case 'file_done':
       case 'file_error': {
-        const fname = d.file as string;
-        const errMsg = d.error as string;
-        updateFileStatusByName(fname, 'error', errMsg);
+        const message = d.message as string;
+        if (message) setGlobalProgress(message);
+        if (evt.event === 'file_done') {
+          loadPapers();
+          loadCollections();
+          loadScholarLibrariesForIngest();
+        }
         break;
       }
       case 'error':
@@ -563,7 +474,7 @@ export function IngestPage() {
           addToast('处理任务已取消', 'info');
         } else {
           setGlobalProgress(`完成: ${d.total_upserted} 条记录入库 (${d.total_chunks} chunks)`);
-          addToast(`入库完成: ${d.total_upserted} 条记录写入 ${currentCollection}`, 'success');
+          addToast(`入库完成: ${d.total_upserted} 条记录`, 'success');
         }
         loadCollections();
         loadPapers();
@@ -573,13 +484,6 @@ export function IngestPage() {
         break;
       case 'cancelled':
         setGlobalProgress('任务已取消');
-        setFiles((prev) =>
-          prev.map((f) =>
-            ['uploading', 'parsing', 'chunking', 'embedding', 'indexing'].includes(f.status)
-              ? { ...f, status: 'pending' as FileStatus, message: '已取消，可重新开始' }
-              : f,
-          ),
-        );
         setActiveJobId(null);
         localStorage.removeItem('ingest_active_job_id');
         setIsCancelling(false);
@@ -587,234 +491,82 @@ export function IngestPage() {
     }
   };
 
-  const handleStartProcess = async () => {
-    console.log('[IngestPage] handleStartProcess triggered');
-    const pendingFiles = files.filter((f) => f.status === 'pending');
-    console.log('[IngestPage] pendingFiles:', pendingFiles.length, 'rawFileMap keys:', Array.from(rawFileMap.current.keys()));
-    if (pendingFiles.length === 0) {
-      addToast('没有待处理的文件', 'info');
-      return;
-    }
-
-    setIsProcessing(true);
-    const abortCtrl = new AbortController();
-    abortRef.current = abortCtrl;
-
-    try {
-      // Step 1: Upload files to backend
-      setGlobalProgress('上传文件...');
-      for (const pf of pendingFiles) {
-        updateFileStatus(pf.id, 'uploading', '上传中...');
-      }
-
-      const rawFiles = pendingFiles
-        .map((pf) => {
-          const f = rawFileMap.current.get(pf.id);
-          console.log('[IngestPage] rawFileMap lookup:', pf.id, '->', f ? f.name : 'NOT FOUND');
-          return f;
-        })
-        .filter(Boolean) as File[];
-
-      console.log('[IngestPage] rawFiles count:', rawFiles.length, 'collection:', currentCollection);
-
-      if (rawFiles.length === 0) {
-        addToast('无法读取文件，请重新选择', 'error');
-        setIsProcessing(false);
-        return;
-      }
-
-      let uploaded: UploadedFile[];
-      try {
-        console.log('[IngestPage] calling uploadFiles...');
-        uploaded = await uploadFiles(rawFiles, currentCollection);
-        console.log('[IngestPage] upload success:', uploaded);
-      } catch (err: unknown) {
-        console.error('[IngestPage] upload failed:', err);
-        const msg = err instanceof Error ? err.message : String(err);
-        addToast(`上传失败: ${msg}`, 'error');
-        for (const pf of pendingFiles) {
-          updateFileStatus(pf.id, 'error', `上传失败: ${msg}`);
-        }
-        setIsProcessing(false);
-        return;
-      }
-
-      const pathMap: Record<string, string> = {};
-      for (const u of uploaded) {
-        pathMap[u.filename] = u.path;
-      }
-      setFiles((prev) =>
-        prev.map((f) => {
-          if (pathMap[f.name]) {
-            return { ...f, serverPath: pathMap[f.name], status: 'parsing' as FileStatus, message: '等待处理...' };
-          }
-          return f;
-        }),
-      );
-
-      // 检测已入库重复（按 content_hash），先刷新列表
-      const existingPapers = await loadPapers();
-      const existingHashes = new Set(
-        existingPapers.map((p) => p.content_hash).filter((h): h is string => Boolean(h)),
-      );
-      const duplicatePairs = uploaded
-        .filter((u) => u.content_hash && existingHashes.has(u.content_hash))
-        .map((u) => ({
-          uploadedFile: u,
-          existingPaper: existingPapers.find((p) => p.content_hash === u.content_hash)!,
-        }))
-        .filter((d) => d.existingPaper);
-      if (duplicatePairs.length > 0) {
-        const modalData = { uploaded, duplicatePairs };
-        if (duplicateActionPreference) {
-          setDuplicateModal(null);
-          await runProcessAfterDuplicateChoice(duplicateActionPreference, modalData);
-          return;
-        }
-        setIsProcessing(false);
-        setDuplicateModal(modalData);
-        return;
-      }
-
-      // Step 2: Process (SSE)
-      const filePaths = uploaded.map((u) => u.path);
-      const contentHashes = uploaded.reduce<Record<string, string>>((acc, u) => {
-        if (u.content_hash) acc[u.path] = u.content_hash;
-        return acc;
-      }, {});
-      setGlobalProgress('处理中...');
-      for await (const evt of processFiles(filePaths, currentCollection, enrichment, abortCtrl.signal, contentHashes)) {
-        console.log('[IngestPage] SSE event:', evt.event, evt.data);
-        applyIngestEvent(evt);
-      }
-    } catch (err: unknown) {
-      console.error('[IngestPage] process error:', err);
-      if ((err as Error).name !== 'AbortError') {
-        const msg = err instanceof Error ? err.message : String(err);
-        addToast(`处理失败: ${msg}`, 'error');
-        setGlobalProgress(`失败: ${msg}`);
-      }
-    } finally {
-      setIsProcessing(false);
-      setIsCancelling(false);
-      abortRef.current = null;
-    }
-  };
-
-  /** 用户选择 跳过/覆盖 后执行；modalData 可由调用方传入（自动应用偏好时） */
-  const runProcessAfterDuplicateChoice = async (
-    choice: 'skip' | 'overwrite',
-    modalData?: { uploaded: UploadedFile[]; duplicatePairs: { uploadedFile: UploadedFile; existingPaper: PaperInfo }[] },
-  ) => {
-    const data = modalData ?? duplicateModal;
-    if (!data) return;
-    const { uploaded, duplicatePairs } = data;
-    if (!modalData) setDuplicateModal(null);
-    if (applyToAllSimilar && !modalData) setDuplicateActionPreference(choice);
-    const dupPaths = new Set(duplicatePairs.map((d) => d.uploadedFile.path));
-    const contentHashesAll = uploaded.reduce<Record<string, string>>((acc, u) => {
-      if (u.content_hash) acc[u.path] = u.content_hash;
-      return acc;
-    }, {});
-
-    if (choice === 'skip') {
-      const toProcess = uploaded.filter((u) => !dupPaths.has(u.path));
-      const toProcessPaths = toProcess.map((u) => u.path);
-      setFiles((prev) =>
-        prev.map((f) => {
-          if (f.serverPath && dupPaths.has(f.serverPath)) return { ...f, status: 'skipped' as FileStatus, message: '已存在，已跳过' };
-          return f;
-        }),
-      );
-      if (toProcessPaths.length === 0) {
-        addToast('全部为重复文件，未入库', 'info');
-        return;
-      }
-      setGlobalProgress('处理中...');
-      setIsProcessing(true);
-      const abortCtrl = new AbortController();
-      abortRef.current = abortCtrl;
-      try {
-        const contentHashes = toProcess.reduce<Record<string, string>>((acc, u) => {
-          if (u.content_hash) acc[u.path] = u.content_hash;
-          return acc;
-        }, {});
-        for await (const evt of processFiles(toProcessPaths, currentCollection, enrichment, abortCtrl.signal, contentHashes)) {
-          applyIngestEvent(evt);
-        }
-      } catch (e) {
-        if ((e as Error).name !== 'AbortError') addToast(`处理失败: ${(e as Error).message}`, 'error');
-      } finally {
-        setIsProcessing(false);
-        setIsCancelling(false);
-        abortRef.current = null;
-      }
-      return;
-    }
-
-    // choice === 'overwrite': 按已存在 paper_id 删除再全量 process
-    setGlobalProgress('正在删除已存在记录...');
-    setIsProcessing(true);
-    const abortCtrl = new AbortController();
-    abortRef.current = abortCtrl;
-    try {
-      for (const d of duplicatePairs) {
-        await deletePaper(currentCollection, d.existingPaper.paper_id);
-      }
-      loadPapers();
-      setGlobalProgress('处理中...');
-      const filePaths = uploaded.map((u) => u.path);
-      for await (const evt of processFiles(filePaths, currentCollection, enrichment, abortCtrl.signal, contentHashesAll)) {
-        applyIngestEvent(evt);
-      }
-    } catch (e) {
-      if ((e as Error).name !== 'AbortError') addToast(`处理失败: ${(e as Error).message}`, 'error');
-    } finally {
-      setIsProcessing(false);
-      setIsCancelling(false);
-      abortRef.current = null;
-    }
-  };
-
   const handleStartScholarLibraryIngest = async () => {
-    if (!selectedScholarLibraryId) {
-      addToast('请先选择一个文献库', 'info');
+    if (!selectedBaseName) {
+      addToast('请先选择一个知识库', 'info');
       return;
     }
-    if (!currentCollection) {
-      addToast('请先选择一个目标集合', 'info');
+    if (selectedLibraryId == null || selectedLibraryId < 0) {
+      addToast('该知识库尚无文献库，请先新建文献库或从文献检索导入', 'info');
       return;
     }
     if (isProcessing) {
-      addToast('当前有任务正在运行，请稍后重试', 'info');
-      return;
+      // Before blocking the user, verify the job is still genuinely active on the backend.
+      // If the worker restarted and marked the job as terminal, clear stale frontend state
+      // so the user can proceed instead of being stuck on "任务正在运行".
+      if (activeJobId) {
+        try {
+          const jobInfo = await getIngestJob(activeJobId);
+          const terminalStatuses = ['done', 'error', 'cancelled'];
+          if (terminalStatuses.includes(jobInfo.status)) {
+            setActiveJobId(null);
+            setIsProcessing(false);
+            localStorage.removeItem('ingest_active_job_id');
+            // Fall through: allow the current action to continue
+          } else {
+            addToast('当前有任务正在运行，请稍后重试', 'info');
+            return;
+          }
+        } catch {
+          // Cannot verify — err on the side of allowing the action
+          setActiveJobId(null);
+          setIsProcessing(false);
+          localStorage.removeItem('ingest_active_job_id');
+        }
+      } else {
+        addToast('当前有任务正在运行，请稍后重试', 'info');
+        return;
+      }
     }
-    if (!selectedScholarLibrary) {
+    if (!selectedLibrary) {
       addToast('所选文献库不存在，请刷新后重试', 'error');
       return;
     }
-    if (!autoDownloadMissingScholarPdfs && selectedScholarLibrary.downloaded_count <= 0) {
-      addToast('该文献库暂无已下载 PDF，请先下载或开启“自动下载缺失 PDF”', 'info');
+    if (!autoDownloadMissingScholarPdfs && selectedLibrary.downloaded_count <= 0) {
+      addToast('该文献库暂无已下载 PDF，请先上传/导入 PDF 或开启“自动下载缺失 PDF”', 'info');
       return;
     }
-    const missingCount = Math.max(0, selectedScholarLibrary.paper_count - selectedScholarLibrary.downloaded_count);
+    const missingCount = Math.max(0, selectedLibrary.paper_count - selectedLibrary.downloaded_count);
     const confirmed = window.confirm(
-      `将从文献库「${selectedScholarLibrary.name}」向集合「${currentCollection}」发起增量建库。\n` +
-      `总文献 ${selectedScholarLibrary.paper_count}，已下载 ${selectedScholarLibrary.downloaded_count}，缺失 ${missingCount}。\n` +
+      `将文献库「${selectedLibrary.name}」同步到向量库「${selectedBaseName}」。\n` +
+      `总文献 ${selectedLibrary.paper_count}，已下载 ${selectedLibrary.downloaded_count}，缺失 ${missingCount}。\n` +
       `${autoDownloadMissingScholarPdfs ? '已开启自动下载缺失 PDF，任务耗时可能较长。' : '未开启自动下载缺失 PDF。'}\n继续执行吗？`,
     );
     if (!confirmed) return;
 
     setIsProcessing(true);
-    setGlobalProgress('正在提交文献库增量建库任务...');
+    setGlobalProgress('正在提交文献库→向量库同步任务...');
     const abortCtrl = new AbortController();
     abortRef.current = abortCtrl;
     try {
-      const res = await ingestScholarLibrary(selectedScholarLibraryId, {
-        collection: currentCollection,
+      if (!selectedBase?.collection) {
+        await createCollection(selectedBaseName);
+        await loadCollections();
+      }
+      await ensureCollectionLibraryBinding(selectedBaseName);
+      const res = await ingestScholarLibrary(selectedLibraryId, {
+        collection: selectedBaseName,
         skip_duplicate_doi: true,
         skip_unchanged: true,
         auto_download_missing: autoDownloadMissingScholarPdfs,
+        enrich_tables: enrichment.enrich_tables,
+        enrich_figures: enrichment.enrich_figures,
+        llm_text_provider: enrichment.llm_text_provider,
+        llm_text_model: enrichment.llm_text_model,
+        llm_text_concurrency: enrichment.llm_text_concurrency,
+        llm_vision_provider: enrichment.llm_vision_provider,
+        llm_vision_model: enrichment.llm_vision_model,
+        llm_vision_concurrency: enrichment.llm_vision_concurrency,
       });
       if (!res?.job_id) {
         throw new Error('未返回 job_id');
@@ -824,14 +576,19 @@ export function IngestPage() {
       setGlobalProgress(
         `任务已提交：准备入库 ${res.pdf_ready_count} 篇（缺失 PDF ${res.missing_pdf_count} 篇）`,
       );
-      if (res.attempted_downloads > 0) {
+      if ((res.removed_papers ?? 0) > 0) {
+        addToast(
+          `已从向量库移除 ${res.removed_papers} 篇（文献库中已删除）；可入库 ${res.pdf_ready_count} 篇`,
+          'success',
+        );
+      } else if (res.attempted_downloads > 0) {
         addToast(
           `任务已启动：可入库 ${res.pdf_ready_count} 篇；自动下载 ${res.downloaded_now}/${res.attempted_downloads} 成功`,
           'success',
         );
       } else {
         addToast(
-          `文献库增量建库任务已启动（可入库 ${res.pdf_ready_count} 篇）`,
+          `文献库→向量库同步任务已启动（可入库 ${res.pdf_ready_count} 篇）`,
           'success',
         );
       }
@@ -842,7 +599,7 @@ export function IngestPage() {
     } catch (err) {
       if ((err as Error).name !== 'AbortError') {
         const msg = err instanceof Error ? err.message : String(err);
-        addToast(`文献库增量建库失败: ${msg}`, 'error');
+        addToast(`文献库→向量库同步失败: ${msg}`, 'error');
         setGlobalProgress(`失败: ${msg}`);
       }
     } finally {
@@ -875,54 +632,19 @@ export function IngestPage() {
     }
   };
 
-  // ---- Helpers to update file status ----
+  // ---- Create knowledge base (library) ----
 
-  const updateFileStatus = (id: string, status: FileStatus, message?: string) => {
-    setFiles((prev) =>
-      prev.map((f) => (f.id === id ? { ...f, status, message } : f)),
-    );
-  };
-
-  const updateFileStatusByName = (name: string, status: FileStatus, message?: string) => {
-    if (!name || !status) return;
-    setFiles((prev) => {
-      let found = false;
-      const mapped = prev.map((f) => {
-        const serverName = f.serverPath ? f.serverPath.split(/[/\\]/).pop() : '';
-        // 优先匹配展示名；如果后端为重名文件加了后缀，则匹配 serverPath basename
-        if (f.name === name || serverName === name) {
-          found = true;
-          if (f.status !== 'done' && f.status !== 'error' && f.status !== 'skipped') {
-            return { ...f, status, message };
-          }
-        }
-        return f;
-      });
-      if (!found) {
-        mapped.push({
-          id: `resume-${name}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-          name,
-          size: 0,
-          status,
-          message,
-        });
-      }
-      return mapped;
-    });
-  };
-
-  // ---- Create collection ----
-
-  const handleCreateCollection = async () => {
+  const handleCreateKnowledgeBase = async () => {
     if (!newCollectionName.trim()) return;
     setShowCreateCollectionModal(false);
-    addToast(`正在创建集合: ${newCollectionName}...`, 'info');
+    addToast(`正在创建知识库: ${newCollectionName}...`, 'info');
     try {
-      await createCollection(newCollectionName.trim());
-      addCollection(newCollectionName.trim());
-      addToast(`集合 ${newCollectionName} 创建成功`, 'success');
+      await createLibrary({ name: newCollectionName.trim() });
+      addToast(`知识库 ${newCollectionName} 创建成功`, 'success');
       setNewCollectionName('');
-      loadCollections();
+      await loadScholarLibrariesForIngest();
+      await loadCollections();
+      setSelectedBaseName(newCollectionName.trim());
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       addToast(`创建失败: ${msg}`, 'error');
@@ -993,77 +715,98 @@ export function IngestPage() {
     }
   };
 
-  const handleEnsureBinding = async (name: string) => {
-    setBindingEnsuringCollection(name);
-    try {
-      const result = await ensureCollectionLibraryBinding(name);
-      addToast(
-        result.library_created
-          ? `已为「${name}」创建并绑定文献库「${result.associated_library_name}」`
-          : `已确认「${name}」绑定文献库「${result.associated_library_name}」`,
-        'success',
-      );
-      await loadCollections();
-      await loadScholarLibrariesForIngest();
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      addToast(`绑定失败: ${msg}`, 'error');
-    } finally {
-      setBindingEnsuringCollection(null);
-    }
-  };
+  const [forceRebuildingBase, setForceRebuildingBase] = useState<string | null>(null);
 
-  const handleRepairBinding = async (name: string) => {
-    setBindingRepairingCollection(name);
-    try {
-      const result = await repairCollectionLibraryBinding(name, { auto_create_binding: true, max_scan: 300 });
-      addToast(
-        `修复完成：扫描${result.scanned}，DOI匹配${result.matched_by_doi}，标题匹配${result.matched_by_title}，新增记录${result.created_library_records}，复制PDF${result.copied_pdfs}`,
-        'success',
-      );
-      await loadCollections();
-      await loadScholarLibrariesForIngest();
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      addToast(`修复失败: ${msg}`, 'error');
-    } finally {
-      setBindingRepairingCollection(null);
-    }
-  };
-
-  // ---- Delete collection ----
-  const handleDeleteCollection = async (name: string) => {
-    if (!window.confirm(`确定要删除集合「${name}」？此操作不可恢复，集合内所有数据将被永久删除。`)) {
+  const handleForceRebuild = async (baseName: string) => {
+    const base = mergedBases.find((b) => b.name === baseName);
+    if (!base?.library || base.library.id < 0) {
+      addToast('该知识库尚无文献库，无法重新建库', 'info');
       return;
     }
-    addToast(`正在删除集合: ${name}...`, 'info');
+    if (
+      !window.confirm(
+        `确定要强制重新建库「${baseName}」吗？\n将删除向量库数据并重新切块、向量化，文献库保留。此操作耗时较长。`,
+      )
+    ) {
+      return;
+    }
+    setForceRebuildingBase(baseName);
+    const abortCtrl = new AbortController();
+    abortRef.current = abortCtrl;
     try {
-      await deleteCollection(name);
-      addToast(`集合 ${name} 已删除`, 'success');
-      // If deleted the current selection, clear it
-      if (currentCollection === name) {
-        setCurrentCollection('');
+      if (base.collection) {
+        await deleteCollection(baseName);
+        await loadCollections();
       }
-      loadCollections();
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      addToast(`删除失败: ${msg}`, 'error');
+      await createCollection(baseName);
+      await loadCollections();
+      await ensureCollectionLibraryBinding(baseName);
+      const res = await ingestScholarLibrary(base.library.id, {
+        collection: baseName,
+        skip_duplicate_doi: true,
+        skip_unchanged: false,
+        auto_download_missing: false,
+        enrich_tables: enrichment.enrich_tables,
+        enrich_figures: enrichment.enrich_figures,
+        llm_text_provider: enrichment.llm_text_provider,
+        llm_text_model: enrichment.llm_text_model,
+        llm_text_concurrency: enrichment.llm_text_concurrency,
+        llm_vision_provider: enrichment.llm_vision_provider,
+        llm_vision_model: enrichment.llm_vision_model,
+        llm_vision_concurrency: enrichment.llm_vision_concurrency,
+      });
+      if (!res?.job_id) throw new Error('未返回 job_id');
+      setActiveJobId(res.job_id);
+      setGlobalProgress(`强制重新建库已启动：${baseName}`);
+      for await (const evt of streamIngestJobEvents(res.job_id, abortCtrl.signal, 0)) {
+        applyIngestEvent(evt);
+      }
+    } catch (err) {
+      if ((err as Error).name !== 'AbortError') {
+        const msg = err instanceof Error ? err.message : String(err);
+        addToast(`强制重新建库失败: ${msg}`, 'error');
+      }
+    } finally {
+      setForceRebuildingBase(null);
+      abortRef.current = null;
     }
   };
 
-  // ---- Stats ----
-  const pendingCount = files.filter((f) => f.status === 'pending').length;
-  const doneCount = files.filter((f) => f.status === 'done').length;
-  const skippedCount = files.filter((f) => f.status === 'skipped').length;
-  const errorCount = files.filter((f) => f.status === 'error').length;
+  const handleConfirmDeleteWithPassword = async () => {
+    if (!deleteConfirmModal || !deletePassword.trim() || !user) return;
+    setDeleteVerifying(true);
+    try {
+      await apiLogin({ user_id: user.user_id, password: deletePassword });
+      const { baseName, libraryId } = deleteConfirmModal;
+      if (libraryId >= 0) {
+        await deleteLibrary(libraryId);
+      }
+      try {
+        await deleteCollection(baseName);
+      } catch (e) {
+        // 可能仅有文献库无集合
+        if (String((e as Error).message).toLowerCase().includes('not found') === false) throw e;
+      }
+      addToast(`知识库 ${baseName} 已删除`, 'success');
+      if (selectedBaseName === baseName) {
+        setSelectedBaseName(null);
+        setCurrentCollection('');
+      }
+      setDeleteConfirmModal(null);
+      setDeletePassword('');
+      await loadScholarLibrariesForIngest();
+      await loadCollections();
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      addToast(msg.includes('Invalid') || msg.includes('401') ? '密码错误' : `删除失败: ${msg}`, 'error');
+    } finally {
+      setDeleteVerifying(false);
+    }
+  };
+
   const hasCollections = backendCollections.length > 0;
   const isConnected = !connectError && !collectionsLoading;
-  const canUpload = hasCollections && isConnected;
-  const tableProvider =
-    llmProviders.find((p) => p.id === enrichment.llm_text_provider) || null;
-  const figureProvider =
-    llmProviders.find((p) => p.id === enrichment.llm_vision_provider) || null;
-  const concurrencyOptions = [1, 2, 3, 4, 6, 8];
+  const canUploadToLibrary = isConnected && selectedLibraryId != null && selectedLibraryId >= 0;
 
   // ---- Connection error: show reconnect panel ----
   if (connectError && !collectionsLoading) {
@@ -1094,26 +837,13 @@ export function IngestPage() {
     <div className="max-w-5xl mx-auto space-y-8 p-8 animate-in fade-in">
       {/* Hidden file inputs */}
       <input
-        ref={fileInputRef}
-        id="ingest-file-input"
-        name="ingest-file-input"
+        ref={boundLibraryFileInputRef}
+        id="bound-library-file-input"
         type="file"
         accept=".pdf"
         multiple
         className="hidden"
-        onChange={handleFileInputChange}
-      />
-      <input
-        ref={folderInputRef}
-        id="ingest-folder-input"
-        name="ingest-folder-input"
-        type="file"
-        accept=".pdf"
-        multiple
-        // @ts-expect-error: webkitdirectory is non-standard but widely supported
-        webkitdirectory=""
-        className="hidden"
-        onChange={handleFileInputChange}
+        onChange={handleBoundLibraryFileChange}
       />
       <input
         ref={boundLibraryFolderInputRef}
@@ -1154,25 +884,25 @@ export function IngestPage() {
               <span>集合数:</span>
               <span className="text-white">{backendCollections.length}</span>
             </div>
-            {hasCollections && (
+            {selectedBaseName && (
               <>
                 <div className="flex justify-between">
-                  <span>当前集合:</span>
-                  <span className="text-green-400">{currentCollection}</span>
+                  <span>当前知识库:</span>
+                  <span className="text-green-400 truncate">{selectedBaseName}</span>
                 </div>
-                {currentCollectionInfo && (
+                {selectedBase?.collection && (
                   <div className="flex justify-between">
-                    <span>文档数:</span>
+                    <span>向量记录数:</span>
                     <span className="text-white">
-                      {currentCollectionInfo.count >= 0 ? currentCollectionInfo.count : '?'}
+                      {selectedBase.collection.count >= 0 ? selectedBase.collection.count : '?'}
                     </span>
                   </div>
                 )}
-                {currentCollectionInfo && (
+                {selectedBase?.library && (
                   <div className="flex justify-between gap-2">
-                    <span>关联文献库:</span>
+                    <span>文献:</span>
                     <span className="text-white truncate text-right">
-                      {currentCollectionInfo.associated_library_name || '未绑定'}
+                      {selectedBase.library.paper_count} 篇 · 已下载 {selectedBase.library.downloaded_count}
                     </span>
                   </div>
                 )}
@@ -1184,102 +914,91 @@ export function IngestPage() {
         <div className="col-span-2 bg-white border rounded-2xl p-6 shadow-sm flex flex-col justify-center">
           <div className="flex justify-between items-center mb-4">
             <div>
-              <h3 className="text-lg font-bold text-gray-900">选择集合 (Collection)</h3>
-              <p className="text-xs text-gray-500">将文档上传至指定的知识库分区</p>
+              <h3 className="text-lg font-bold text-gray-900">知识库列表</h3>
+              <p className="text-xs text-gray-500">文献库与向量库强绑定，以名称一致管理</p>
             </div>
             <div className="flex gap-2">
               <button
-                onClick={loadCollections}
-                disabled={collectionsLoading}
+                onClick={() => { loadCollections(); loadScholarLibrariesForIngest(); }}
+                disabled={collectionsLoading || scholarLibrariesLoading}
                 className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"
-                title="刷新集合列表"
+                title="刷新列表"
               >
-                <RefreshCw size={16} className={collectionsLoading ? 'animate-spin' : ''} />
+                <RefreshCw size={16} className={collectionsLoading || scholarLibrariesLoading ? 'animate-spin' : ''} />
               </button>
               <button
                 onClick={() => setShowCreateCollectionModal(true)}
                 className="flex items-center gap-2 px-4 py-2 bg-blue-50 text-blue-600 rounded-lg text-sm font-bold hover:bg-blue-100 transition-colors"
               >
-                <Plus size={16} /> 新建集合
+                <Plus size={16} /> 新建知识库
               </button>
             </div>
           </div>
 
-          {hasCollections ? (
-            <div className="space-y-2">
-              {backendCollections.map((c) => (
+          {mergedBases.length > 0 ? (
+            <div className="space-y-2 max-h-64 overflow-auto">
+              {mergedBases.map((base) => (
                 <div
-                  key={c.name}
-                  onClick={() => setCurrentCollection(c.name)}
+                  key={base.name}
+                  onClick={() => setSelectedBaseName(base.name)}
                   className={`flex items-center justify-between p-3 rounded-xl border cursor-pointer transition-colors ${
-                    currentCollection === c.name
+                    selectedBaseName === base.name
                       ? 'border-blue-400 bg-blue-50'
                       : 'border-gray-200 bg-gray-50 hover:border-gray-300'
                   }`}
                 >
                   <div className="flex items-center gap-3 min-w-0">
-                    <Database size={16} className={currentCollection === c.name ? 'text-blue-500' : 'text-gray-400'} />
+                    <Database size={16} className={selectedBaseName === base.name ? 'text-blue-500' : 'text-gray-400'} />
                     <div className="min-w-0">
-                      <div className="font-medium text-sm text-gray-800 truncate">{c.name}</div>
+                      <div className="font-medium text-sm text-gray-800 truncate">{base.name}</div>
                       <div className="text-xs text-gray-400">
-                        {c.count >= 0 ? `${c.count} 条记录` : '加载中...'}
-                      </div>
-                      <div className="text-[11px] text-gray-500 truncate">
-                        文献库: {c.associated_library_name || '未绑定'}
+                        {base.library
+                          ? `文献 ${base.library.paper_count} · 已下载 ${base.library.downloaded_count}`
+                          : '仅向量库'}
+                        {base.collection && base.collection.count >= 0
+                          ? ` · 向量 ${base.collection.count} 条`
+                          : ''}
                       </div>
                     </div>
                   </div>
-                  <div className="flex items-center gap-1">
+                  <div className="flex items-center gap-1 flex-shrink-0">
+                    {base.collection && (
+                      <>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); handleOpenScopeModal(base.name); }}
+                          className="p-1.5 text-gray-300 hover:text-emerald-600 hover:bg-emerald-50 rounded-lg transition-colors"
+                          title="查看/编辑覆盖范围摘要"
+                        >
+                          <List size={14} />
+                        </button>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); handleRefreshScope(base.name); }}
+                          disabled={scopeRefreshingCollection === base.name}
+                          className="p-1.5 text-gray-300 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors disabled:opacity-50"
+                          title="刷新覆盖范围摘要（LLM 重新生成）"
+                        >
+                          <RefreshCw size={14} className={scopeRefreshingCollection === base.name ? 'animate-spin' : ''} />
+                        </button>
+                        {base.library && base.library.id >= 0 && (
+                          <button
+                            onClick={(e) => { e.stopPropagation(); handleForceRebuild(base.name); }}
+                            disabled={forceRebuildingBase === base.name || isProcessing}
+                            className="p-1.5 text-gray-300 hover:text-amber-600 hover:bg-amber-50 rounded-lg transition-colors disabled:opacity-50"
+                            title="强制重新建库（清空向量后全量重新切块、向量化）"
+                          >
+                            {forceRebuildingBase === base.name ? <Loader2 size={14} className="animate-spin" /> : <RotateCw size={14} />}
+                          </button>
+                        )}
+                      </>
+                    )}
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
-                        handleEnsureBinding(c.name);
-                      }}
-                      disabled={bindingEnsuringCollection === c.name}
-                      className="p-1.5 text-gray-300 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition-colors disabled:opacity-50"
-                      title="确保知识库与文献库绑定"
-                    >
-                      {bindingEnsuringCollection === c.name ? <Loader2 size={14} className="animate-spin" /> : <Link2 size={14} />}
-                    </button>
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleRepairBinding(c.name);
-                      }}
-                      disabled={bindingRepairingCollection === c.name}
-                      className="p-1.5 text-gray-300 hover:text-violet-600 hover:bg-violet-50 rounded-lg transition-colors disabled:opacity-50"
-                      title="扫描 DOI/标题 修复文献库关联"
-                    >
-                      {bindingRepairingCollection === c.name ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
-                    </button>
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleOpenScopeModal(c.name);
-                      }}
-                      className="p-1.5 text-gray-300 hover:text-emerald-600 hover:bg-emerald-50 rounded-lg transition-colors"
-                      title="查看/编辑覆盖范围摘要"
-                    >
-                      <List size={14} />
-                    </button>
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleRefreshScope(c.name);
-                      }}
-                      disabled={scopeRefreshingCollection === c.name}
-                      className="p-1.5 text-gray-300 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors disabled:opacity-50"
-                      title="刷新覆盖范围摘要（LLM 重新生成）"
-                    >
-                      <RefreshCw size={14} className={scopeRefreshingCollection === c.name ? 'animate-spin' : ''} />
-                    </button>
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleDeleteCollection(c.name);
+                        setDeleteConfirmModal({ baseName: base.name, libraryId: base.library?.id ?? -1 });
+                        setDeletePassword('');
                       }}
                       className="p-1.5 text-gray-300 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors"
-                      title={`删除集合 ${c.name}`}
+                      title={`删除知识库 ${base.name}（需验证密码）`}
                     >
                       <Trash2 size={14} />
                     </button>
@@ -1289,68 +1008,75 @@ export function IngestPage() {
             </div>
           ) : (
             <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 text-center">
-              <p className="text-amber-700 text-sm font-medium mb-2">暂无集合</p>
+              <p className="text-amber-700 text-sm font-medium mb-2">暂无知识库</p>
               <p className="text-amber-600 text-xs mb-3">
-                请先创建一个向量集合，然后再上传文档进行入库
+                点击「新建知识库」创建文献库与向量库（名称一致）
               </p>
               <button
                 onClick={() => setShowCreateCollectionModal(true)}
                 className="px-4 py-2 bg-amber-600 text-white rounded-lg text-sm font-bold hover:bg-amber-700 transition-colors"
               >
-                <Plus size={14} className="inline mr-1 -mt-0.5" /> 创建第一个集合
+                <Plus size={14} className="inline mr-1 -mt-0.5" /> 新建知识库
               </button>
             </div>
           )}
         </div>
       </div>
 
-      {/* 绑定文献库管理：本地文件夹导入 PDF */}
+      {/* 同步文献库到向量库 + 上传本地 PDF 到文献库 */}
       <div className="bg-white border rounded-2xl p-6 shadow-sm">
         <div className="flex items-center justify-between mb-4">
           <div>
-            <h3 className="text-lg font-bold text-gray-900">绑定文献库管理</h3>
+            <h3 className="text-lg font-bold text-gray-900">同步文献库到向量库</h3>
             <p className="text-xs text-gray-500">
-              将本地文件夹中的 PDF 批量导入当前集合绑定的文献库，并按 DOI/标题规则自动关联命名
+              上传本地 PDF 到当前知识库文献库；将文献库增量同步到向量库（有则增删，无则初始化建库）
             </p>
           </div>
           <button
-            onClick={loadScholarLibrariesForIngest}
-            disabled={scholarLibrariesLoading || boundLibraryImporting}
+            onClick={() => { loadScholarLibrariesForIngest(); loadCollections(); }}
+            disabled={scholarLibrariesLoading}
             className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"
-            title="刷新文献库状态"
+            title="刷新"
           >
             <RefreshCw size={16} className={scholarLibrariesLoading ? 'animate-spin' : ''} />
           </button>
         </div>
 
-        {!currentCollection ? (
+        {!selectedBaseName ? (
           <div className="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
-            请先选择集合，再管理其绑定文献库。
+            请先在左侧选择一个知识库。
           </div>
-        ) : !boundScholarLibraryName ? (
+        ) : !selectedLibrary ? (
           <div className="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
-            当前集合尚未绑定文献库，请先在集合列表中点击“确保绑定”。
+            当前知识库尚无文献库，请先在「文献检索」页面创建并导入文献，或使用下方按钮上传 PDF 后刷新。
           </div>
         ) : (
           <div className="space-y-4">
             <div className="text-sm text-gray-700 bg-gray-50 border border-gray-200 rounded-lg px-3 py-2">
-              当前集合：<span className="font-semibold text-gray-900">{currentCollection}</span> · 绑定文献库：
-              <span className="font-semibold text-gray-900 ml-1">{boundScholarLibraryName}</span>
-              {boundScholarLibrary ? (
-                <span className="text-xs text-gray-500 ml-2">
-                  （总文献 {boundScholarLibrary.paper_count}，已下载 {boundScholarLibrary.downloaded_count}）
-                </span>
-              ) : null}
+              当前知识库：<span className="font-semibold text-gray-900">{selectedBaseName}</span>
+              {' · '}文献 {selectedLibrary.paper_count} · 已下载 {selectedLibrary.downloaded_count}
+              {selectedBase?.collection && (
+                <span> · 向量 {selectedBase.collection.count >= 0 ? selectedBase.collection.count : '?'} 条</span>
+              )}
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
+              <span className="text-xs text-gray-500 mr-1">上传本地 PDF 到文献库：</span>
+              <button
+                type="button"
+                onClick={handlePickBoundLibraryFiles}
+                disabled={boundLibraryImporting || isProcessing || !canUploadToLibrary}
+                className="flex items-center gap-2 px-4 py-2 rounded-lg border border-gray-300 text-gray-700 text-sm font-medium hover:bg-gray-50 disabled:opacity-50"
+              >
+                <FileText size={14} /> 选择文件
+              </button>
               <button
                 type="button"
                 onClick={handlePickBoundLibraryFolder}
-                disabled={boundLibraryImporting || isProcessing}
-                className="px-4 py-2 rounded-lg border border-gray-300 text-gray-700 text-sm font-medium hover:bg-gray-50 disabled:opacity-50"
+                disabled={boundLibraryImporting || isProcessing || !canUploadToLibrary}
+                className="flex items-center gap-2 px-4 py-2 rounded-lg border border-gray-300 text-gray-700 text-sm font-medium hover:bg-gray-50 disabled:opacity-50"
               >
-                选择本地 PDF 文件夹
+                <FolderOpen size={14} /> 选择文件夹
               </button>
               <button
                 type="button"
@@ -1359,7 +1085,7 @@ export function IngestPage() {
                 className="px-4 py-2 rounded-lg bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 disabled:opacity-50 inline-flex items-center gap-2"
               >
                 {boundLibraryImporting ? <Loader2 size={14} className="animate-spin" /> : null}
-                导入到绑定文献库
+                导入到文献库
               </button>
               {boundLibraryImportFiles.length > 0 && (
                 <span className="text-xs text-gray-500">已选择 {boundLibraryImportFiles.length} 个 PDF</span>
@@ -1382,84 +1108,197 @@ export function IngestPage() {
               <div className="text-xs text-gray-700 bg-blue-50 border border-blue-100 rounded-lg px-3 py-2 space-y-1">
                 <div>
                   导入统计：总计 {boundLibraryImportSummary.total_files}，新增 {boundLibraryImportSummary.imported}，关联已有{' '}
-                  {boundLibraryImportSummary.linked_existing}，重命名 {boundLibraryImportSummary.renamed}，跳过重复{' '}
-                  {boundLibraryImportSummary.skipped_duplicates}，无 DOI {boundLibraryImportSummary.no_doi}，无效 PDF{' '}
-                  {boundLibraryImportSummary.invalid_pdf}
+                  {boundLibraryImportSummary.linked_existing}，跳过重复 {boundLibraryImportSummary.skipped_duplicates}
                 </div>
                 {boundLibraryImportSummary.errors.length > 0 && (
-                  <div className="text-red-600">
-                    错误示例：{boundLibraryImportSummary.errors.slice(0, 2).join('；')}
-                  </div>
+                  <div className="text-red-600">错误示例：{boundLibraryImportSummary.errors.slice(0, 2).join('；')}</div>
                 )}
               </div>
             )}
-          </div>
-        )}
-      </div>
 
-      {/* 文献库 -> 增量建库 */}
-      <div className="bg-white border rounded-2xl p-6 shadow-sm">
-        <div className="flex items-center justify-between mb-4">
-          <div>
-            <h3 className="text-lg font-bold text-gray-900">从文献库增量建库</h3>
-            <p className="text-xs text-gray-500">将 Scholar 文献库中已下载的 PDF 增量入库到当前集合</p>
-          </div>
-          <button
-            onClick={loadScholarLibrariesForIngest}
-            disabled={scholarLibrariesLoading}
-            className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"
-            title="刷新文献库列表"
-          >
-            <RefreshCw size={16} className={scholarLibrariesLoading ? 'animate-spin' : ''} />
-          </button>
-        </div>
-
-        {scholarLibrariesLoading ? (
-          <div className="text-sm text-gray-500 flex items-center gap-2">
-            <Loader2 size={14} className="animate-spin" />
-            正在加载文献库...
-          </div>
-        ) : scholarLibraries.length === 0 ? (
-          <div className="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
-            暂无可用文献库。请先在“文献检索”页面创建并导入文献。
-          </div>
-        ) : (
-          <div className="space-y-4">
-            <div className="space-y-2 max-h-56 overflow-auto border rounded-xl bg-gray-50 p-2">
-              {scholarLibraries.map((lib) => (
-                <label
-                  key={lib.id}
-                  className={`flex items-center justify-between px-3 py-2 rounded-lg cursor-pointer border ${
-                    selectedScholarLibraryId === lib.id ? 'border-blue-400 bg-blue-50' : 'border-transparent hover:border-gray-300'
+            {/* LLM 增强选项 */}
+            <div className="pt-4 border-t border-gray-100">
+              <div className="text-xs font-semibold text-gray-700 mb-3">
+                入库解析选项
+              </div>
+              <div className="flex flex-col md:flex-row gap-3">
+                <div
+                  className={`flex-1 px-4 py-3 rounded-xl border transition-all ${
+                    enrichment.enrich_figures
+                      ? 'border-blue-400 bg-blue-50 text-blue-700 shadow-sm'
+                      : 'border-gray-200 bg-gray-50 text-gray-500 hover:border-gray-300'
                   }`}
                 >
-                  <span className="flex items-center gap-2 min-w-0">
+                  <label className="flex items-center gap-2.5 cursor-pointer">
                     <input
-                      type="radio"
-                      name="scholar-library-ingest"
-                      checked={selectedScholarLibraryId === lib.id}
-                      onChange={() => setSelectedScholarLibraryId(lib.id)}
-                      className="accent-blue-600"
+                      id="enrich-figures"
+                      name="enrich-figures"
+                      type="checkbox"
+                      checked={enrichment.enrich_figures}
+                      onChange={(e) =>
+                        setEnrichment((prev) => ({ ...prev, enrich_figures: e.target.checked }))
+                      }
+                      className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
                     />
-                    <span className="min-w-0">
-                      <span className="block text-sm font-medium text-gray-800 truncate">{lib.name}</span>
-                      <span className="block text-xs text-gray-500 truncate">
-                        总文献 {lib.paper_count} · 已下载 {lib.downloaded_count}
-                      </span>
-                    </span>
-                  </span>
-                </label>
-              ))}
-            </div>
-
-            {selectedScholarLibrary && (
-              <div className="text-xs text-gray-600 bg-gray-50 border border-gray-200 rounded-lg px-3 py-2">
-                已选：<span className="font-semibold text-gray-800">{selectedScholarLibrary.name}</span> ·
-                总文献 {selectedScholarLibrary.paper_count} ·
-                已下载 {selectedScholarLibrary.downloaded_count} ·
-                缺失 PDF {Math.max(0, selectedScholarLibrary.paper_count - selectedScholarLibrary.downloaded_count)}
+                    <div className="text-left">
+                      <div className="text-sm font-medium">图片描述</div>
+                      <div className="text-[10px] text-gray-400">Vision 模型解析图表含义</div>
+                    </div>
+                  </label>
+                  <div className="mt-2 space-y-1">
+                    <select
+                      value={enrichment.llm_vision_provider || ''}
+                      onChange={(e) => {
+                        const providerId = e.target.value || null;
+                        const provider = llmProviders.find((p) => p.id === providerId) || null;
+                        setEnrichment((prev) => ({
+                          ...prev,
+                          llm_vision_provider: providerId,
+                          llm_vision_model: provider?.default_model || null,
+                        }));
+                      }}
+                      disabled={isProcessing || llmProviders.length === 0}
+                      className="w-full rounded border border-gray-300 bg-white px-2 py-1 text-xs text-gray-700"
+                    >
+                      <option value="">选择 Provider</option>
+                      {llmProviders.map((p) => (
+                        <option key={`vision-provider-${p.id}`} value={p.id}>
+                          {p.id}
+                        </option>
+                      ))}
+                    </select>
+                    <select
+                      value={enrichment.llm_vision_model || '__default__'}
+                      onChange={(e) =>
+                        setEnrichment((prev) => ({
+                          ...prev,
+                          llm_vision_model: e.target.value === '__default__' ? null : e.target.value,
+                        }))
+                      }
+                      disabled={isProcessing || !figureProvider}
+                      className="w-full rounded border border-gray-300 bg-white px-2 py-1 text-xs text-gray-700"
+                    >
+                      <option value="__default__">模型默认（Provider default）</option>
+                      {(figureProvider?.models || []).map((m) => (
+                        <option key={`vision-model-${m}`} value={m}>
+                          {m}
+                        </option>
+                      ))}
+                    </select>
+                    <div className="flex items-center gap-2">
+                      <span className="text-[10px] text-gray-500 whitespace-nowrap">并发</span>
+                      <select
+                        value={enrichment.llm_vision_concurrency ?? 1}
+                        onChange={(e) =>
+                          setEnrichment((prev) => ({
+                            ...prev,
+                            llm_vision_concurrency: Number(e.target.value) || 1,
+                          }))
+                        }
+                        disabled={isProcessing}
+                        className="w-full rounded border border-gray-300 bg-white px-2 py-1 text-xs text-gray-700"
+                      >
+                        {concurrencyOptions.map((v) => (
+                          <option key={`vision-concurrency-${v}`} value={v}>
+                            {v}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+                </div>
+                <div
+                  className={`flex-1 px-4 py-3 rounded-xl border transition-all ${
+                    enrichment.enrich_tables
+                      ? 'border-purple-400 bg-purple-50 text-purple-700 shadow-sm'
+                      : 'border-gray-200 bg-gray-50 text-gray-500 hover:border-gray-300'
+                  }`}
+                >
+                  <label className="flex items-center gap-2.5 cursor-pointer">
+                    <input
+                      id="enrich-tables"
+                      name="enrich-tables"
+                      type="checkbox"
+                      checked={enrichment.enrich_tables}
+                      onChange={(e) =>
+                        setEnrichment((prev) => ({ ...prev, enrich_tables: e.target.checked }))
+                      }
+                      className="rounded border-gray-300 text-purple-600 focus:ring-purple-500"
+                    />
+                    <div className="text-left">
+                      <div className="text-sm font-medium">表格解析</div>
+                      <div className="text-[10px] text-gray-400">LLM 生成表格语义摘要</div>
+                    </div>
+                  </label>
+                  <div className="mt-2 space-y-1">
+                    <select
+                      value={enrichment.llm_text_provider || ''}
+                      onChange={(e) => {
+                        const providerId = e.target.value || null;
+                        const provider = llmProviders.find((p) => p.id === providerId) || null;
+                        setEnrichment((prev) => ({
+                          ...prev,
+                          llm_text_provider: providerId,
+                          llm_text_model: provider?.default_model || null,
+                        }));
+                      }}
+                      disabled={isProcessing || llmProviders.length === 0}
+                      className="w-full rounded border border-gray-300 bg-white px-2 py-1 text-xs text-gray-700"
+                    >
+                      <option value="">选择 Provider</option>
+                      {llmProviders.map((p) => (
+                        <option key={`text-provider-${p.id}`} value={p.id}>
+                          {p.id}
+                        </option>
+                      ))}
+                    </select>
+                    <select
+                      value={enrichment.llm_text_model || '__default__'}
+                      onChange={(e) =>
+                        setEnrichment((prev) => ({
+                          ...prev,
+                          llm_text_model: e.target.value === '__default__' ? null : e.target.value,
+                        }))
+                      }
+                      disabled={isProcessing || !tableProvider}
+                      className="w-full rounded border border-gray-300 bg-white px-2 py-1 text-xs text-gray-700"
+                    >
+                      <option value="__default__">模型默认（Provider default）</option>
+                      {(tableProvider?.models || []).map((m) => (
+                        <option key={`text-model-${m}`} value={m}>
+                          {m}
+                        </option>
+                      ))}
+                    </select>
+                    <div className="flex items-center gap-2">
+                      <span className="text-[10px] text-gray-500 whitespace-nowrap">并发</span>
+                      <select
+                        value={enrichment.llm_text_concurrency ?? 1}
+                        onChange={(e) =>
+                          setEnrichment((prev) => ({
+                            ...prev,
+                            llm_text_concurrency: Number(e.target.value) || 1,
+                          }))
+                        }
+                        disabled={isProcessing}
+                        className="w-full rounded border border-gray-300 bg-white px-2 py-1 text-xs text-gray-700"
+                      >
+                        {concurrencyOptions.map((v) => (
+                          <option key={`text-concurrency-${v}`} value={v}>
+                            {v}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+                </div>
               </div>
-            )}
+              {!enrichment.enrich_figures && !enrichment.enrich_tables && (
+                <p className="text-[10px] text-gray-400 mt-2">
+                  未选择增强项，将仅执行基础解析（速度更快）。
+                </p>
+              )}
+            </div>
 
             <label className="flex items-center gap-2 text-sm text-gray-700">
               <input
@@ -1468,20 +1307,29 @@ export function IngestPage() {
                 onChange={(e) => setAutoDownloadMissingScholarPdfs(e.target.checked)}
                 className="accent-blue-600"
               />
-              建库前自动尝试下载缺失 PDF（耗时较长）
+              同步前自动尝试下载缺失 PDF（耗时较长）
             </label>
 
             <div className="text-xs text-gray-500 bg-blue-50 border border-blue-100 rounded-lg px-3 py-2">
-              增量策略：默认启用 DOI 去重与未变化文件跳过（skip_unchanged），重复执行不会重复入库。
+              增量策略：默认启用 DOI 去重与未变化文件跳过，重复执行不会重复入库。
             </div>
 
-            <div className="flex justify-end">
+            <div className="flex justify-end gap-2">
+              {isProcessing && (
+                <button
+                  onClick={handleAbort}
+                  disabled={isCancelling}
+                  className="px-4 py-2 bg-red-50 text-red-600 rounded-lg text-sm font-medium hover:bg-red-100"
+                >
+                  {isCancelling ? '取消中...' : '取消任务'}
+                </button>
+              )}
               <button
                 onClick={handleStartScholarLibraryIngest}
-                disabled={!selectedScholarLibraryId || !currentCollection || isProcessing}
+                disabled={!selectedLibraryId || selectedLibraryId < 0 || isProcessing}
                 className="px-4 py-2 rounded-lg bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 disabled:opacity-50"
               >
-                一键增量建库到当前集合
+                同步文献库到向量库
               </button>
             </div>
           </div>
@@ -1489,7 +1337,7 @@ export function IngestPage() {
       </div>
 
       {/* 已入库文件列表 */}
-      {hasCollections && currentCollection && (() => {
+      {hasCollections && selectedBaseName && (() => {
         const totalPapers = papers.length;
         const totalPages = Math.max(1, Math.ceil(totalPapers / papersPageSize));
         const effectivePage = Math.min(Math.max(1, papersPage), totalPages);
@@ -1503,7 +1351,7 @@ export function IngestPage() {
               <div className="flex items-center gap-3 flex-wrap">
                 <span className="font-bold text-sm">已入库文件</span>
                 <span className="text-xs bg-gray-100 text-gray-500 px-2 py-0.5 rounded-full">
-                  {currentCollection}
+                  {selectedBaseName}
                 </span>
                 {totalPapers > 0 && (
                   <span className="text-xs text-gray-400">
@@ -1566,15 +1414,30 @@ export function IngestPage() {
                     {displayedPapers.map((p) => (
                       <tr key={p.paper_id} className="hover:bg-gray-50 transition-colors">
                         <td className="px-6 py-2.5 align-middle">
-                          <div className="flex items-center gap-2 min-w-0">
-                            <FileText size={16} className="text-gray-400 flex-shrink-0" />
-                            <span
-                              className="text-base text-gray-800 leading-relaxed truncate block min-w-0"
-                              style={{ maxWidth: '100%' }}
-                              title={p.filename || p.paper_id}
-                            >
-                              {p.filename || p.paper_id}
-                            </span>
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-2 min-w-0">
+                              <FileText size={16} className="text-gray-400 flex-shrink-0" />
+                              <span
+                                className="text-base text-gray-800 leading-relaxed truncate block min-w-0"
+                                style={{ maxWidth: '100%' }}
+                                title={p.filename || p.paper_id}
+                              >
+                                {p.filename || p.paper_id}
+                              </span>
+                              {p.library_id != null && (
+                                <span className="flex-shrink-0 inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-blue-50 text-blue-600" title={`文献库 ID: ${p.library_id}`}>
+                                  <Link2 size={10} className="mr-0.5" />
+                                  {t('ingest.fromLibrary')}
+                                </span>
+                              )}
+                            </div>
+                            {(p.title || p.doi || p.venue || p.year) && (
+                              <div className="mt-1 text-xs text-gray-500 truncate" title={p.title || p.doi || undefined}>
+                                {p.title && p.title !== p.filename ? p.title : p.doi || ''}
+                                {p.venue ? ` · ${p.venue}` : ''}
+                                {p.year != null ? ` · ${p.year}` : ''}
+                              </div>
+                            )}
                           </div>
                         </td>
                         <td className="px-6 py-2.5 text-gray-500">{formatSize(p.file_size)}</td>
@@ -1646,466 +1509,68 @@ export function IngestPage() {
         );
       })()}
 
-      {/* 上传区域 */}
-      <div
-        className={`bg-white p-8 rounded-2xl border-2 border-dashed shadow-sm text-center transition-colors ${
-          !canUpload
-            ? 'border-gray-100 opacity-60 pointer-events-none'
-            : isDragOver
-              ? 'border-blue-400 bg-blue-50'
-              : 'border-gray-200'
-        }`}
-        onDragOver={(e) => {
-          e.preventDefault();
-          if (canUpload) setIsDragOver(true);
-        }}
-        onDragLeave={() => setIsDragOver(false)}
-        onDrop={(e) => canUpload && handleDrop(e)}
-      >
-        <UploadCloud size={48} className="mx-auto text-blue-500 mb-4" />
-        <h2 className="text-xl font-bold">上传文档</h2>
-        <p className="text-gray-500 mt-2 mb-6">
-          {canUpload
-            ? '拖放 PDF 文件到此处，或点击下方按钮选择文件/文件夹'
-            : '请先选择或创建一个集合'}
-        </p>
-        <div className="flex justify-center gap-3">
-          <button
-            onClick={handleSelectFiles}
-            disabled={isProcessing || !canUpload}
-            className="flex items-center gap-2 bg-gray-900 text-white px-5 py-2.5 rounded-lg text-sm font-medium hover:bg-gray-800 disabled:opacity-50 transition-colors"
-          >
-            <FileText size={16} /> 选择文件
-          </button>
-          <button
-            onClick={handleSelectFolder}
-            disabled={isProcessing || !canUpload}
-            className="flex items-center gap-2 bg-white text-gray-700 border border-gray-300 px-5 py-2.5 rounded-lg text-sm font-medium hover:bg-gray-50 disabled:opacity-50 transition-colors"
-          >
-            <FolderOpen size={16} /> 选择文件夹
-          </button>
-        </div>
-
-        {/* LLM 增强选项 */}
-        <div className="mt-6 max-w-md mx-auto">
-          <div className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">
-            LLM 增强选项
-          </div>
-          <div className="flex justify-center items-stretch gap-3">
-            <div
-              className={`flex-1 px-4 py-3 rounded-xl border transition-all ${
-                enrichment.enrich_figures
-                  ? 'border-blue-400 bg-blue-50 text-blue-700 shadow-sm'
-                  : 'border-gray-200 bg-gray-50 text-gray-500 hover:border-gray-300'
-              }`}
-            >
-              <label className="flex items-center gap-2.5 cursor-pointer">
-                <input
-                  id="enrich-figures"
-                  name="enrich-figures"
-                  type="checkbox"
-                  checked={enrichment.enrich_figures}
-                  onChange={(e) =>
-                    setEnrichment((prev) => ({ ...prev, enrich_figures: e.target.checked }))
-                  }
-                  className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
-                />
-                <div className="text-left">
-                  <div className="text-sm font-medium">图片描述</div>
-                  <div className="text-[10px] text-gray-400">Vision 模型解析图表含义</div>
-                </div>
-              </label>
-              <div className="mt-2 space-y-1">
-                <select
-                  value={enrichment.llm_vision_provider || ''}
-                  onChange={(e) => {
-                    const providerId = e.target.value || null;
-                    const provider = llmProviders.find((p) => p.id === providerId) || null;
-                    setEnrichment((prev) => ({
-                      ...prev,
-                      llm_vision_provider: providerId,
-                      llm_vision_model: provider?.default_model || null,
-                    }));
-                  }}
-                  disabled={isProcessing || llmProviders.length === 0}
-                  className="w-full rounded border border-gray-300 bg-white px-2 py-1 text-xs text-gray-700"
-                >
-                  <option value="">选择 Provider</option>
-                  {llmProviders.map((p) => (
-                    <option key={`vision-provider-${p.id}`} value={p.id}>
-                      {p.id}
-                    </option>
-                  ))}
-                </select>
-                <select
-                  value={enrichment.llm_vision_model || '__default__'}
-                  onChange={(e) =>
-                    setEnrichment((prev) => ({
-                      ...prev,
-                      llm_vision_model: e.target.value === '__default__' ? null : e.target.value,
-                    }))
-                  }
-                  disabled={isProcessing || !figureProvider}
-                  className="w-full rounded border border-gray-300 bg-white px-2 py-1 text-xs text-gray-700"
-                >
-                  <option value="__default__">模型默认（Provider default）</option>
-                  {(figureProvider?.models || []).map((m) => (
-                    <option key={`vision-model-${m}`} value={m}>
-                      {m}
-                    </option>
-                  ))}
-                </select>
-                <div className="flex items-center gap-2">
-                  <span className="text-[10px] text-gray-500 whitespace-nowrap">并发</span>
-                  <select
-                    value={enrichment.llm_vision_concurrency ?? 1}
-                    onChange={(e) =>
-                      setEnrichment((prev) => ({
-                        ...prev,
-                        llm_vision_concurrency: Number(e.target.value) || 1,
-                      }))
-                    }
-                    disabled={isProcessing}
-                    className="w-full rounded border border-gray-300 bg-white px-2 py-1 text-xs text-gray-700"
-                  >
-                    {concurrencyOptions.map((v) => (
-                      <option key={`vision-concurrency-${v}`} value={v}>
-                        {v}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              </div>
-            </div>
-            <div
-              className={`flex-1 px-4 py-3 rounded-xl border transition-all ${
-                enrichment.enrich_tables
-                  ? 'border-purple-400 bg-purple-50 text-purple-700 shadow-sm'
-                  : 'border-gray-200 bg-gray-50 text-gray-500 hover:border-gray-300'
-              }`}
-            >
-              <label className="flex items-center gap-2.5 cursor-pointer">
-                <input
-                  id="enrich-tables"
-                  name="enrich-tables"
-                  type="checkbox"
-                  checked={enrichment.enrich_tables}
-                  onChange={(e) =>
-                    setEnrichment((prev) => ({ ...prev, enrich_tables: e.target.checked }))
-                  }
-                  className="rounded border-gray-300 text-purple-600 focus:ring-purple-500"
-                />
-                <div className="text-left">
-                  <div className="text-sm font-medium">表格解析</div>
-                  <div className="text-[10px] text-gray-400">LLM 生成表格语义摘要</div>
-                </div>
-              </label>
-              <div className="mt-2 space-y-1">
-                <select
-                  value={enrichment.llm_text_provider || ''}
-                  onChange={(e) => {
-                    const providerId = e.target.value || null;
-                    const provider = llmProviders.find((p) => p.id === providerId) || null;
-                    setEnrichment((prev) => ({
-                      ...prev,
-                      llm_text_provider: providerId,
-                      llm_text_model: provider?.default_model || null,
-                    }));
-                  }}
-                  disabled={isProcessing || llmProviders.length === 0}
-                  className="w-full rounded border border-gray-300 bg-white px-2 py-1 text-xs text-gray-700"
-                >
-                  <option value="">选择 Provider</option>
-                  {llmProviders.map((p) => (
-                    <option key={`text-provider-${p.id}`} value={p.id}>
-                      {p.id}
-                    </option>
-                  ))}
-                </select>
-                <select
-                  value={enrichment.llm_text_model || '__default__'}
-                  onChange={(e) =>
-                    setEnrichment((prev) => ({
-                      ...prev,
-                      llm_text_model: e.target.value === '__default__' ? null : e.target.value,
-                    }))
-                  }
-                  disabled={isProcessing || !tableProvider}
-                  className="w-full rounded border border-gray-300 bg-white px-2 py-1 text-xs text-gray-700"
-                >
-                  <option value="__default__">模型默认（Provider default）</option>
-                  {(tableProvider?.models || []).map((m) => (
-                    <option key={`text-model-${m}`} value={m}>
-                      {m}
-                    </option>
-                  ))}
-                </select>
-                <div className="flex items-center gap-2">
-                  <span className="text-[10px] text-gray-500 whitespace-nowrap">并发</span>
-                  <select
-                    value={enrichment.llm_text_concurrency ?? 1}
-                    onChange={(e) =>
-                      setEnrichment((prev) => ({
-                        ...prev,
-                        llm_text_concurrency: Number(e.target.value) || 1,
-                      }))
-                    }
-                    disabled={isProcessing}
-                    className="w-full rounded border border-gray-300 bg-white px-2 py-1 text-xs text-gray-700"
-                  >
-                    {concurrencyOptions.map((v) => (
-                      <option key={`text-concurrency-${v}`} value={v}>
-                        {v}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              </div>
-            </div>
-          </div>
-          {!enrichment.enrich_figures && !enrichment.enrich_tables && (
-            <p className="text-[10px] text-gray-400 mt-2 text-center">
-              未选择增强项，将仅执行基础解析（更快）
-            </p>
-          )}
-        </div>
-      </div>
-
-      {/* 解析状态：表格/图片 enrich 进度（仅在有解析中文件且有待展示日志时显示） */}
-      {isProcessing && Object.keys(enrichLogs).length > 0 && (
-        <div className="mb-4 bg-amber-50/80 border border-amber-200 rounded-xl overflow-hidden">
-          <div className="px-4 py-2 border-b border-amber-200 bg-amber-100/80 text-amber-800 text-sm font-medium">
-            解析状态（表格/图片）
-          </div>
-          <div className="px-4 py-3 max-h-40 overflow-y-auto space-y-2">
-            {Object.entries(enrichLogs).map(([file, lines]) => (
-              <div key={file} className="text-xs">
-                <div className="font-medium text-gray-700 mb-1 truncate" title={file}>
-                  {file}
-                </div>
-                <ul className="text-gray-600 space-y-0.5 font-mono">
-                  {lines.slice(-10).map((line, i) => (
-                    <li key={i}>{line}</li>
-                  ))}
-                </ul>
-              </div>
-            ))}
-          </div>
+      {/* 解析状态：同步任务进度 */}
+      {isProcessing && globalProgress && (
+        <div className="mb-4 bg-amber-50/80 border border-amber-200 rounded-xl px-4 py-3 flex items-center gap-2 text-sm text-amber-800">
+          <Loader2 size={18} className="animate-spin flex-shrink-0" />
+          {globalProgress}
         </div>
       )}
 
-      {/* 文件列表 + 处理 */}
-      {files.length > 0 && (
-        <div className="bg-white border rounded-2xl overflow-hidden shadow-sm">
-          <div className="px-6 py-4 border-b bg-gray-50 flex justify-between items-center">
-            <div className="flex items-center gap-3">
-              <span className="font-bold text-sm">
-                文件列表 ({files.length} 个)
-              </span>
-              {pendingCount > 0 && (
-                <span className="text-xs bg-blue-50 text-blue-600 px-2 py-0.5 rounded-full">
-                  {pendingCount} 待处理
-                </span>
-              )}
-              {doneCount > 0 && (
-                <span className="text-xs bg-green-50 text-green-600 px-2 py-0.5 rounded-full">
-                  {doneCount} 完成
-                </span>
-              )}
-              {errorCount > 0 && (
-                <span className="text-xs bg-red-50 text-red-600 px-2 py-0.5 rounded-full">
-                  {errorCount} 失败
-                </span>
-              )}
-            </div>
-            <div className="flex items-center gap-2">
-              {errorCount > 0 && !isProcessing && (
-                <button
-                  onClick={handleRetryFailed}
-                  className="text-xs text-orange-500 hover:text-orange-700 px-3 py-1 rounded-lg hover:bg-orange-50 font-medium"
-                >
-                  重试失败 ({errorCount})
-                </button>
-              )}
-              {pendingCount > 0 && !isProcessing && (
-                <button
-                  onClick={handleClearPending}
-                  className="text-xs text-gray-500 hover:text-gray-700 px-3 py-1 rounded-lg hover:bg-gray-100"
-                >
-                  删除待处理 ({pendingCount})
-                </button>
-              )}
-              {errorCount > 0 && !isProcessing && (
-                <button
-                  onClick={handleClearFailed}
-                  className="text-xs text-red-500 hover:text-red-700 px-3 py-1 rounded-lg hover:bg-red-50"
-                >
-                  删除失败 ({errorCount})
-                </button>
-              )}
-              {(doneCount > 0 || skippedCount > 0) && !isProcessing && (
-                <button
-                  onClick={handleClearDone}
-                  className="text-xs text-gray-400 hover:text-gray-600 px-3 py-1 rounded-lg hover:bg-gray-100"
-                >
-                  清除已完成 ({doneCount + skippedCount})
-                </button>
-              )}
-              {isProcessing ? (
-                <button
-                  onClick={handleAbort}
-                  disabled={isCancelling}
-                  className="px-4 py-2 bg-red-50 text-red-600 rounded-lg text-sm font-bold hover:bg-red-100 transition-colors"
-                >
-                  {isCancelling ? '取消中...' : '取消处理'}
-                </button>
-              ) : (
-                <button
-                  onClick={handleStartProcess}
-                  disabled={pendingCount === 0}
-                  className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-bold hover:bg-blue-700 disabled:opacity-50 transition-colors"
-                >
-                  开始入库 ({pendingCount})
-                </button>
-              )}
-            </div>
-          </div>
-
-          {/* Progress bar */}
-          {globalProgress && (
-            <div className="px-6 py-3 bg-blue-50 border-b text-sm text-blue-700 flex items-center gap-2">
-              {isProcessing && <Loader2 size={14} className="animate-spin" />}
-              {globalProgress}
-            </div>
-          )}
-
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="text-left text-gray-400 border-b">
-                <th className="px-6 py-3 font-medium">文件名</th>
-                <th className="px-6 py-3 font-medium w-24">大小</th>
-                <th className="px-6 py-3 font-medium w-32">状态</th>
-                <th className="px-6 py-3 font-medium">信息</th>
-                <th className="px-6 py-3 font-medium text-right w-16">操作</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y">
-              {files.map((item) => (
-                <tr key={item.id} className="hover:bg-gray-50 transition-colors">
-                  <td className="px-6 py-3 font-medium flex items-center gap-2">
-                    <FileText size={16} className="text-gray-400 flex-shrink-0" />
-                    <span className="truncate max-w-[300px]">{item.name}</span>
-                  </td>
-                  <td className="px-6 py-3 text-gray-500">
-                    {formatSize(item.size)}
-                  </td>
-                  <td className="px-6 py-3">
-                    <span
-                      className={`inline-flex items-center gap-1 px-2 py-1 rounded-full text-[10px] font-bold uppercase ${STATUS_COLORS[item.status]}`}
-                    >
-                      {item.status === 'done' && <CheckCircle2 size={10} />}
-                      {item.status === 'error' && <AlertCircle size={10} />}
-                      {['uploading', 'parsing', 'chunking', 'embedding', 'indexing'].includes(item.status) && (
-                        <Loader2 size={10} className="animate-spin" />
-                      )}
-                      {STATUS_LABELS[item.status]}
-                    </span>
-                  </td>
-                  <td className="px-6 py-3 text-gray-500 text-xs truncate max-w-[200px]">
-                    {item.message || '-'}
-                  </td>
-                  <td className="px-6 py-3 text-right">
-                    {item.status === 'pending' && !isProcessing && (
-                      <button
-                        onClick={() => handleRemoveFile(item.id)}
-                        className="text-gray-300 hover:text-red-500"
-                      >
-                        <Trash2 size={16} />
-                      </button>
-                    )}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-
-      {/* 重复文件确认 Modal（按 content_hash 判定） */}
+      {/* 删除知识库：密码确认 Modal */}
       <Modal
-        open={duplicateModal !== null}
-        onClose={() => setDuplicateModal(null)}
-        title="以下文件已在本集合中（内容相同）"
+        open={deleteConfirmModal !== null}
+        onClose={() => { setDeleteConfirmModal(null); setDeletePassword(''); }}
+        title="删除知识库（危险操作）"
         maxWidth="max-w-md"
       >
-        {duplicateModal && (
-          <>
-            <p className="text-sm text-gray-600 mb-3">
-              选择「跳过」不重复入库，选择「覆盖」将先删除该文件在本集合中的向量数据再重新入库。
+        {deleteConfirmModal && (
+          <div className="space-y-4">
+            <p className="text-sm text-gray-700">
+              将永久删除知识库「<strong>{deleteConfirmModal.baseName}</strong>」及其文献库、向量库与所有相关文件，此操作不可恢复。
             </p>
-            <ul className="mb-4 max-h-48 overflow-y-auto rounded-lg border border-gray-200 bg-gray-50 p-2 text-sm">
-              {duplicateModal.duplicatePairs.map((d) => (
-                <li key={d.uploadedFile.path} className="py-1 truncate" title={d.uploadedFile.filename}>
-                  {d.uploadedFile.filename}
-                </li>
-              ))}
-            </ul>
-            <label className="flex items-center gap-2 mb-4 text-sm text-gray-600">
-              <input
-                type="checkbox"
-                checked={applyToAllSimilar}
-                onChange={(e) => setApplyToAllSimilar(e.target.checked)}
-                className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
-              />
-              对本次及之后所有重复项执行相同操作
-            </label>
-            {duplicateActionPreference && (
-              <p className="text-xs text-gray-400 mb-2">
-                当前偏好：{duplicateActionPreference === 'skip' ? '跳过已存在' : '覆盖并重新入库'}
-                <button
-                  type="button"
-                  onClick={() => setDuplicateActionPreference(null)}
-                  className="ml-2 text-blue-600 hover:underline"
-                >
-                  清除偏好
-                </button>
-              </p>
-            )}
-            <div className="flex justify-end gap-2">
+            <p className="text-sm text-amber-700">
+              请输入当前登录账号密码以确认：
+            </p>
+            <input
+              type="password"
+              value={deletePassword}
+              onChange={(e) => setDeletePassword(e.target.value)}
+              placeholder="密码"
+              className="w-full border rounded-md p-2 text-sm focus:ring-2 focus:ring-red-500 outline-none"
+              onKeyDown={(e) => e.key === 'Enter' && handleConfirmDeleteWithPassword()}
+            />
+            <div className="flex justify-end gap-2 pt-2">
               <button
-                onClick={() => setDuplicateModal(null)}
+                onClick={() => { setDeleteConfirmModal(null); setDeletePassword(''); }}
                 className="px-4 py-2 text-gray-600 hover:bg-gray-100 rounded-lg text-sm"
               >
                 取消
               </button>
               <button
-                onClick={() => runProcessAfterDuplicateChoice('skip')}
-                className="px-4 py-2 bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 text-sm"
+                onClick={handleConfirmDeleteWithPassword}
+                disabled={!deletePassword.trim() || deleteVerifying}
+                className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50 text-sm flex items-center gap-2"
               >
-                跳过已存在
-              </button>
-              <button
-                onClick={() => runProcessAfterDuplicateChoice('overwrite')}
-                className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm"
-              >
-                覆盖并重新入库
+                {deleteVerifying ? <Loader2 size={14} className="animate-spin" /> : null}
+                确认删除
               </button>
             </div>
-          </>
+          </div>
         )}
       </Modal>
 
-      {/* 新建集合 Modal */}
+      {/* 新建知识库 Modal */}
       <Modal
         open={showCreateCollectionModal}
         onClose={() => setShowCreateCollectionModal(false)}
-        title="新建向量集合"
+        title="新建知识库"
         maxWidth="max-w-md"
       >
         <div className="space-y-4">
           <div>
             <label className="text-xs font-medium text-gray-500 uppercase">
-              集合名称
+              知识库名称（即文献库名称）
             </label>
             <input
               id="new-collection-name"
@@ -2113,37 +1578,13 @@ export function IngestPage() {
               type="text"
               value={newCollectionName}
               onChange={(e) => setNewCollectionName(e.target.value)}
-              placeholder="自定义集合名称，例如 my_research_2026"
+              placeholder="例如 my_research_2026"
               className="w-full mt-1 border rounded-md p-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none"
-              onKeyDown={(e) => e.key === 'Enter' && handleCreateCollection()}
+              onKeyDown={(e) => e.key === 'Enter' && handleCreateKnowledgeBase()}
             />
           </div>
-
-          {/* 推荐模板 */}
-          <div>
-            <label className="text-xs font-medium text-gray-500 uppercase mb-2 block">
-              快速选择模板
-            </label>
-            <div className="grid grid-cols-2 gap-2">
-              {COLLECTION_TEMPLATES.map((t) => (
-                <button
-                  key={t.name}
-                  onClick={() => setNewCollectionName(t.name)}
-                  className={`text-left p-2.5 rounded-lg border text-xs transition-colors ${
-                    newCollectionName === t.name
-                      ? 'border-blue-400 bg-blue-50 text-blue-700'
-                      : 'border-gray-200 hover:border-gray-300 text-gray-600'
-                  }`}
-                >
-                  <div className="font-medium">{t.name}</div>
-                  <div className="text-gray-400 mt-0.5">{t.desc}</div>
-                </button>
-              ))}
-            </div>
-          </div>
-
           <p className="text-xs text-gray-400">
-            使用 v2 schema (chunk_id 主键)，支持 upsert 去重。名称创建后不可修改。
+            将创建同名文献库，同步到向量库时再创建向量集合。
           </p>
         </div>
         <div className="mt-6 flex justify-end gap-2">
@@ -2154,7 +1595,7 @@ export function IngestPage() {
             取消
           </button>
           <button
-            onClick={handleCreateCollection}
+            onClick={handleCreateKnowledgeBase}
             disabled={!newCollectionName.trim()}
             className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 text-sm"
           >

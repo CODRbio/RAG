@@ -430,8 +430,9 @@ def _citation_to_dict(c: Citation) -> Dict[str, Any]:
         "year": c.year,
         "doi": c.doi,
         "url": c.url,
+        "pdf_url": getattr(c, "pdf_url", None),
         "bibtex": c.bibtex,
-        "created_at": c.created_at.isoformat(),
+        "created_at": c.created_at.isoformat() if hasattr(c.created_at, "isoformat") else str(c.created_at),
     }
 
 
@@ -533,6 +534,7 @@ def _apply_snapshot(store: CanvasStore, canvas_id: str, snap: Dict[str, Any]) ->
                 year=d.get("year"),
                 doi=d.get("doi"),
                 url=d.get("url"),
+                pdf_url=d.get("pdf_url"),
                 bibtex=d.get("bibtex"),
                 created_at=datetime.fromisoformat(d.get("created_at", datetime.now().isoformat())),
             )

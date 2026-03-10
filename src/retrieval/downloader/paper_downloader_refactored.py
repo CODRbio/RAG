@@ -31,6 +31,8 @@ try:
 except ImportError:
     TwoCaptcha = None  # optional: captcha solving disabled when not installed
 
+from .captcha_solver import CaptchaType, CaptchaSolver, CaptchaSolveResult  # noqa: E402
+
 # playwright-stealth 兼容层：
 # - v2.x：Stealth().apply_stealth_async(page)
 # - 少数旧版本：stealth_async(page) / stealth_sync(page)
@@ -112,7 +114,7 @@ def _load_rag_config() -> Tuple[dict, str]:
 def _normalize_rag_config_to_downloader(raw: dict) -> dict:
     """
     将 rag_config 结构转为 PaperDownloader 使用的结构：
-    api_keys (twocaptcha, brightdata), downloader (proxy, timeouts, experience_store_path, capsolver_extension_path)。
+    api_keys (twocaptcha, capsolver, brightdata), downloader (proxy, timeouts, experience_store_path, capsolver_extension_path)。
     与 adapter 中 initial_config 的构建逻辑对齐。
     """
     sd = raw.get("scholar_downloader") or {}
@@ -120,9 +122,13 @@ def _normalize_rag_config_to_downloader(raw: dict) -> dict:
     twocaptcha = (sd.get("twocaptcha_api_key") or "").strip()
     if not twocaptcha:
         twocaptcha = (cf.get("two_captcha_api_key") or "").strip()
+    # CapSolver API key from top-level capsolver section
+    capsolver = (raw.get("capsolver") or {}).get("api_key", "")
+    capsolver = (capsolver or sd.get("capsolver_api_key") or "").strip()
     brightdata = (cf.get("brightdata_api_key") or "").strip()
     api_keys = {
         "twocaptcha": twocaptcha,
+        "capsolver": capsolver,
         "brightdata": brightdata,
     }
     dl = {
@@ -200,15 +206,299 @@ class Blocker:
 
 @dataclass
 class ActionableElement:
-    """可操作元素"""
+    """可操作元素（含上下文与相对位置，供启发式打分与 LLM rerank 使用）"""
     selector: str
     tag: str
     text: str
+    element_id: str = ""
     href: Optional[str] = None
     is_visible: bool = True
+    is_fixed: bool = False
+    rect_top: float = 0.0
     position_y: int = 0
-    score: int = 0
+    score: float = 0.0
     attributes: Dict[str, str] = field(default_factory=dict)
+    # 上下文与相对位置（enrichment）
+    position_ratio: Optional[float] = None  # 元素顶部在文档中的相对位置 (0~1)
+    in_viewport: bool = False
+    ancestor_path: str = ""  # 祖先节点 id/class 路径，逗号分隔
+    nearby_text_before: str = ""
+    nearby_text_after: str = ""
+    ancestor_features: str = ""
+    container_role: str = ""  # header, main, sidebar, footer, reference, unknown
+    site_source: str = ""  # 当前页 host，由调用方从 page.url 填入
+
+
+@dataclass
+class ScoreConfig:
+    """PDF 主文下载候选的启发式打分配置（零侵入式可调）。"""
+    fixed_bonus: float = 40.0
+    fixed_top_bonus: float = 20.0
+    early_position_max_bonus: float = 30.0
+    late_position_penalty: float = 40.0
+    good_container_bonus: float = 20.0
+    sidebar_top_bonus: float = 15.0
+    danger_zone_penalty: float = 80.0
+    positive_text_bonus: float = 50.0
+    file_size_regex_bonus: float = 20.0
+    negative_text_penalty: float = 100.0
+    positive_href_bonus: float = 40.0
+    negative_href_penalty: float = 100.0
+    hard_reject_score: float = -9999.0
+    # 低置信度时返回空，不强行瞎选
+    min_confidence_to_accept: float = 0.50
+
+    positive_text_keywords: Tuple[str, ...] = (
+        "open pdf", "download pdf", "full text", "article pdf", "epdf",
+        "view pdf", "下载 pdf", "打开 pdf",
+    )
+    negative_text_keywords: Tuple[str, ...] = (
+        "supplement", "support", "reference", "citation", "export",
+        "figure", "table", "appendix", "data",
+    )
+    positive_href_keywords: Tuple[str, ...] = (
+        "/doi/pdf/", ".pdf", "/content/pdf/", "pdf?", "/epdf/",
+    )
+    negative_href_keywords: Tuple[str, ...] = (
+        "/suppl/", "supplementary", "appendix", "citation", "ris", "bib",
+    )
+    danger_zone_keywords: Tuple[str, ...] = (
+        "footer", "references", "related", "recommendation",
+        "metrics", "history", "advertisement",
+    )
+    sidebar_keywords: Tuple[str, ...] = (
+        "sidebar", "aside", "article-tools", "panel",
+    )
+    primary_zone_keywords: Tuple[str, ...] = (
+        "header", "navbar", "toolbar", "main",
+    )
+    file_size_regex: str = r"\d+(\.\d+)?\s*(mb|kb)"
+
+
+@dataclass
+class Candidate:
+    """PDF 候选元素。
+
+    注：前端提取 text 时应合并 innerText、aria-label、title 及内部 img/svg alt，
+    并在代码中统一转小写比对。
+    """
+    element_id: str
+    text: str
+    href: str
+    is_fixed: bool
+    rect_top: float
+    position_ratio: float
+    ancestor_features: str
+    is_visible: bool
+    score: float = 0.0
+
+
+class PDFExtractor:
+    """两阶段选择器：启发式粗排 + 单轮轻量 LLM 精排。"""
+
+    _RERANK_PROMPT_CACHE: Optional[str] = None
+
+    def __init__(self, logger: logging.Logger, score_config: Optional[ScoreConfig] = None):
+        self.logger = logger
+        self.score_config = score_config or ScoreConfig()
+        self._file_size_re = re.compile(self.score_config.file_size_regex, re.IGNORECASE)
+
+    @staticmethod
+    def _normalize_text(value: Optional[str]) -> str:
+        return (value or "").strip().lower()
+
+    @staticmethod
+    def _coerce_ratio(value: Optional[float]) -> float:
+        if value is None:
+            return 0.5
+        try:
+            return max(0.0, min(1.0, float(value)))
+        except Exception:
+            return 0.5
+
+    def to_candidate(self, elem: ActionableElement) -> Candidate:
+        return Candidate(
+            element_id=(getattr(elem, "element_id", "") or getattr(elem, "selector", "") or "").strip(),
+            text=self._normalize_text(getattr(elem, "text", "")),
+            href=self._normalize_text(getattr(elem, "href", "")),
+            is_fixed=bool(getattr(elem, "is_fixed", False)),
+            rect_top=float(getattr(elem, "rect_top", 0.0) or 0.0),
+            position_ratio=self._coerce_ratio(getattr(elem, "position_ratio", None)),
+            ancestor_features=self._normalize_text(
+                getattr(elem, "ancestor_features", "") or getattr(elem, "ancestor_path", "")
+            ),
+            is_visible=bool(getattr(elem, "is_visible", True)),
+            score=float(getattr(elem, "score", 0.0) or 0.0),
+        )
+
+    def _calculate_score(self, candidate: Candidate) -> float:
+        cfg = self.score_config
+        text = self._normalize_text(candidate.text)
+        href = self._normalize_text(candidate.href)
+        ancestor_features = self._normalize_text(candidate.ancestor_features)
+
+        if not candidate.is_visible or (not text and not href):
+            return cfg.hard_reject_score
+
+        score = 0.0
+
+        # 1) 位置与固定特征
+        if candidate.is_fixed:
+            score += cfg.fixed_bonus
+            if candidate.rect_top < 200:
+                score += cfg.fixed_top_bonus
+            # fixed/sticky 不能因整页位置靠后被扣分
+        else:
+            score += max(0.0, (1.0 - candidate.position_ratio) * cfg.early_position_max_bonus)
+            if candidate.position_ratio > 0.8:
+                score -= cfg.late_position_penalty
+
+        # 2) DOM 上下文区域
+        hit_danger_zone = any(kw in ancestor_features for kw in cfg.danger_zone_keywords)
+        if hit_danger_zone:
+            score -= cfg.danger_zone_penalty
+
+        hit_sidebar_zone = any(kw in ancestor_features for kw in cfg.sidebar_keywords)
+        if hit_sidebar_zone and not hit_danger_zone:
+            if candidate.is_fixed or candidate.position_ratio < 0.3:
+                score += cfg.sidebar_top_bonus
+
+        if any(kw in ancestor_features for kw in cfg.primary_zone_keywords):
+            score += cfg.good_container_bonus
+
+        # 3) 文案特征
+        if any(kw in text for kw in cfg.positive_text_keywords):
+            score += cfg.positive_text_bonus
+        if self._file_size_re.search(text):
+            score += cfg.file_size_regex_bonus
+        if any(kw in text for kw in cfg.negative_text_keywords):
+            score -= cfg.negative_text_penalty
+
+        # 4) 链接特征
+        if any(kw in href for kw in cfg.positive_href_keywords):
+            score += cfg.positive_href_bonus
+        if any(kw in href for kw in cfg.negative_href_keywords):
+            score -= cfg.negative_href_penalty
+
+        return score
+
+    def score_and_filter(self, candidates: List[Candidate]) -> List[Candidate]:
+        ranked: List[Candidate] = []
+        for candidate in candidates:
+            candidate.score = self._calculate_score(candidate)
+            if candidate.score >= 0:
+                ranked.append(candidate)
+        ranked.sort(key=lambda item: item.score, reverse=True)
+        return ranked
+
+    def _get_llm_clients(
+        self,
+        mode: str,
+        provider: Optional[str] = None,
+    ) -> List[Any]:
+        manager = get_manager()
+        normalized_mode = (mode or "ultra-lite").strip().lower()
+        if normalized_mode == "lite":
+            return [manager.get_lite_client(provider)]
+        if normalized_mode == "auto-upgrade":
+            # 先 ultra-lite，低置信度再升级到 lite
+            return [manager.get_ultra_lite_client(provider), manager.get_lite_client(provider)]
+        return [manager.get_ultra_lite_client(provider)]
+
+    @staticmethod
+    def _extract_first_json(text: str) -> Optional[Dict[str, Any]]:
+        raw = (text or "").strip()
+        if not raw:
+            return None
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\s*```$", "", raw)
+        # Find outermost {...} to tolerate leading/trailing prose from the LLM
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            return None
+        try:
+            parsed = json.loads(raw[start : end + 1])
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+        return None
+
+    async def rerank_candidates(
+        self,
+        candidates: List[Candidate],
+        *,
+        top_n: int = 3,
+        mode: str = "ultra-lite",
+        provider: Optional[str] = None,
+        model_override: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        ranked = self.score_and_filter(candidates)
+        if not ranked:
+            return None
+        selected = ranked[:max(1, top_n)]
+        payload = [
+            {
+                "id": item.element_id,
+                "text": item.text,
+                "href": item.href,
+                "is_fixed": item.is_fixed,
+                "position_ratio": item.position_ratio,
+                "score": item.score,
+            }
+            for item in selected
+        ]
+        if PDFExtractor._RERANK_PROMPT_CACHE is None:
+            prompt_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "prompts")
+            prompt_path = os.path.join(prompt_dir, "downloader_candidate_rerank.txt")
+            try:
+                with open(prompt_path, "r", encoding="utf-8") as f:
+                    PDFExtractor._RERANK_PROMPT_CACHE = f.read()
+            except Exception:
+                PDFExtractor._RERANK_PROMPT_CACHE = (
+                    "你是一个顶尖的学术网站解析专家。"
+                    "从候选 JSON 中仅选择一个正文 PDF 入口，证据不足返回 null。\n"
+                    "候选列表: {json_data}\n"
+                    "只返回 JSON: {{\"best_candidate_id\": null, \"confidence\": 0.0, \"reason\": \"...\"}}"
+                )
+        prompt = PDFExtractor._RERANK_PROMPT_CACHE.format(
+            json_data=json.dumps(payload, ensure_ascii=False),
+        )
+        for client in self._get_llm_clients(mode, provider=provider):
+            if not client:
+                continue
+            try:
+                resp = await asyncio.to_thread(
+                    client.chat,
+                    [{"role": "user", "content": prompt}],
+                    model=model_override or None,
+                )
+                data = self._extract_first_json((resp or {}).get("final_text", ""))
+                if not data:
+                    continue
+                best_candidate_id = data.get("best_candidate_id")
+                confidence = float(data.get("confidence", 0.0) or 0.0)
+                reason = str(data.get("reason", "") or "")
+                if best_candidate_id is None:
+                    if confidence >= self.score_config.min_confidence_to_accept:
+                        return {
+                            "best_candidate_id": None,
+                            "confidence": confidence,
+                            "reason": reason,
+                        }
+                    continue
+                valid_ids = {item.element_id for item in selected}
+                if best_candidate_id in valid_ids and confidence >= self.score_config.min_confidence_to_accept:
+                    return {
+                        "best_candidate_id": best_candidate_id,
+                        "confidence": confidence,
+                        "reason": reason,
+                    }
+            except Exception as e:
+                self.logger.debug(f"[PDFExtractor] LLM rerank failed: {e}")
+                continue
+        return None
 
 
 @dataclass
@@ -230,6 +520,7 @@ class PageAnalyzer:
 
     def __init__(self, logger: logging.Logger):
         self.logger = logger
+        self.pdf_extractor = PDFExtractor(logger)
         self.pdf_keywords = [
             "pdf", "download", "full text", "full-text", "view", "open", "read",
             "下载", "打开", "全文", "查看", "保存", "télécharger", "descargar", "herunterladen"
@@ -420,10 +711,27 @@ class PageAnalyzer:
                     return elements;
                 }
                 function getKey(el) {
-                    return el.tagName + '|' + (el.href || '') + '|' + (el.textContent || '').slice(0, 50);
+                    return el.tagName + '|' + (el.href || '') + '|' + (buildElementText(el) || '').slice(0, 50);
+                }
+                function buildElementText(el) {
+                    const chunks = [];
+                    const inner = (el.innerText || el.textContent || '').trim();
+                    const aria = (el.getAttribute('aria-label') || '').trim();
+                    const title = (el.getAttribute('title') || '').trim();
+                    if (inner) chunks.push(inner);
+                    if (aria) chunks.push(aria);
+                    if (title) chunks.push(title);
+                    try {
+                        const media = el.querySelectorAll('img[alt], svg[alt], [role="img"][aria-label]');
+                        media.forEach(m => {
+                            const alt = (m.getAttribute('alt') || m.getAttribute('aria-label') || '').trim();
+                            if (alt) chunks.push(alt);
+                        });
+                    } catch (_) {}
+                    return chunks.join(' ').replace(/\\s+/g, ' ').trim();
                 }
                 function isPdfRelated(el) {
-                    const text = (el.textContent || '').toLowerCase();
+                    const text = (buildElementText(el) || '').toLowerCase();
                     const href = (el.href || '').toLowerCase();
                     const className = (el.className || '').toLowerCase();
                     const title = (el.title || '').toLowerCase();
@@ -461,7 +769,8 @@ class PageAnalyzer:
                     const isBtn = tag === 'button' || el.getAttribute('role') === 'button' ||
                                   (tag === 'input' && (el.type === 'button' || el.type === 'submit'));
                     const className = typeof el.className === 'string' ? el.className.toLowerCase() : '';
-                    const exactText = (el.textContent || '').trim().toLowerCase();
+                    const mergedText = buildElementText(el);
+                    const exactText = (mergedText || '').trim().toLowerCase();
                     const isPseudoBtn = (tag === 'div' || tag === 'span' || tag === 'p') && (
                         exactText.includes('download free pdf') ||
                         exactText.includes('download pdf') ||
@@ -479,13 +788,49 @@ class PageAnalyzer:
                     const uid = 'dl-btn-' + (++uidCounter);
                     el.setAttribute('data-dl-uid', uid);
                     const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    const is_fixed = style && (style.position === 'fixed' || style.position === 'sticky');
+                    const docHeight = Math.max(1, document.body.scrollHeight || document.documentElement.scrollHeight);
+                    const topDoc = rect.top + window.scrollY;
+                    const position_ratio = Math.max(0, Math.min(1, topDoc / docHeight));
+                    const in_viewport = rect.top >= 0 && rect.top < window.innerHeight && rect.left >= 0 && rect.left < window.innerWidth;
+                    let ancestor_path = [];
+                    let node = el.parentElement;
+                    for (let d = 0; d < 5 && node; d++) {
+                        const id = node.id ? '#' + node.id : '';
+                        const cls = (typeof node.className === 'string' && node.className) ? node.className.trim().split(/\\s+/)[0] : '';
+                        if (id || cls) ancestor_path.push(id || (cls ? '.' + cls : ''));
+                        node = node.parentElement;
+                    }
+                    const ancestor_path_str = ancestor_path.join(',');
+                    let container_role = 'unknown';
+                    const ancLower = ancestor_path_str.toLowerCase();
+                    if (/header|article-toolbar|article__btn|toolbar|pdf-download|main-pdf/.test(ancLower)) container_role = 'header';
+                    else if (/main|content|article-body|article-content/.test(ancLower)) container_role = 'main';
+                    else if (/sidebar|aside|secondary|right-col|left-col/.test(ancLower)) container_role = 'sidebar';
+                    else if (/footer|bottom|ref-list|reference|bibliography|citation|cite/.test(ancLower)) container_role = 'footer';
+                    else if (/reference|bibliography|ref-list|reflist|cited-by/.test(ancLower)) container_role = 'reference';
+                    const prevSib = el.previousElementSibling;
+                    const nextSib = el.nextElementSibling;
+                    const nearby_text_before = (prevSib ? (prevSib.innerText || '').trim() : '').slice(0, 80);
+                    const nearby_text_after = (nextSib ? (nextSib.innerText || '').trim() : '').slice(0, 80);
                     results.push({
+                        element_id: uid,
                         selector: '[data-dl-uid="' + uid + '"]',
                         tag: tag,
-                        text: (el.textContent || el.value || '').replace(/\\s+/g, ' ').slice(0, 100).trim(),
+                        text: (mergedText || el.value || '').replace(/\\s+/g, ' ').slice(0, 160).trim(),
                         href: isLink ? (el.href || '') : null,
                         is_visible: rect.width > 0 && rect.height > 0 && el.offsetParent !== null,
-                        position_y: rect.top + window.scrollY,
+                        is_fixed: !!is_fixed,
+                        rect_top: Number(rect.top || 0),
+                        position_y: Math.round(topDoc),
+                        position_ratio: position_ratio,
+                        in_viewport: in_viewport,
+                        ancestor_path: ancestor_path_str,
+                        ancestor_features: ancestor_path_str.toLowerCase().replace(/[,.#]/g, ' '),
+                        nearby_text_before: nearby_text_before,
+                        nearby_text_after: nearby_text_after,
+                        container_role: container_role,
                         attributes: {
                             class: el.className || '',
                             title: el.title || '',
@@ -495,21 +840,38 @@ class PageAnalyzer:
                             'data-track-action': el.getAttribute('data-track-action') || '',
                             'data-item-name': el.getAttribute('data-item-name') || '',
                             'data-aa-name': el.getAttribute('data-aa-name') || '',
-                            'data-testid': el.getAttribute('data-testid') || ''
+                            'data-testid': el.getAttribute('data-testid') || '',
+                            'data-id': el.getAttribute('data-id') || ''
                         }
                     });
                 });
                 return results.slice(0, 50);
             }''')
+            page_url = page.url if hasattr(page, "url") else ""
+            try:
+                site_source = (urlparse(page_url).netloc or "").strip().lower() or ""
+            except Exception:
+                site_source = ""
             for raw in raw_elements:
                 elem = ActionableElement(
                     selector=raw["selector"],
                     tag=raw["tag"],
                     text=raw["text"],
+                    element_id=(raw.get("element_id") or "").strip(),
                     href=raw.get("href"),
                     is_visible=raw["is_visible"],
-                    position_y=int(raw["position_y"]),
-                    attributes=raw.get("attributes", {})
+                    is_fixed=bool(raw.get("is_fixed", False)),
+                    rect_top=float(raw.get("rect_top", 0.0) or 0.0),
+                    position_y=int(raw.get("position_y", 0)),
+                    attributes=raw.get("attributes", {}),
+                    position_ratio=raw.get("position_ratio"),
+                    in_viewport=bool(raw.get("in_viewport", False)),
+                    ancestor_path=(raw.get("ancestor_path") or "").strip(),
+                    ancestor_features=(raw.get("ancestor_features") or "").strip().lower(),
+                    nearby_text_before=(raw.get("nearby_text_before") or "").strip(),
+                    nearby_text_after=(raw.get("nearby_text_after") or "").strip(),
+                    container_role=(raw.get("container_role") or "unknown").strip().lower(),
+                    site_source=site_source,
                 )
                 elem.score = self._calculate_score(elem)
                 elements.append(elem)
@@ -518,119 +880,17 @@ class PageAnalyzer:
             self.logger.debug(f"元素发现出错: {e}")
         return elements
 
-    def _calculate_score(self, elem: ActionableElement) -> int:
-        """计算元素的PDF相关性评分"""
-        score = 0
-        text = elem.text.lower()
-        href = (elem.href or "").lower()
-        attrs = elem.attributes
-        attr_class = attrs.get("class", "").lower()
-        attr_title = attrs.get("title", "").lower()
-        attr_aria = attrs.get("aria-label", "").lower()
-        
-        combined_all = f"{text} {href} {attr_class} {attr_title} {attr_aria}"
-
-        # Academia early-pass: bypass all traps (ds-work-cover contains 'cover' which would zero score)
-        if 'ds-work-cover' in attr_class or text == 'download free pdf':
-            return max(0, min(85, 100))
-
-        # ====== 一票否决：陷阱/付费墙/引文导出（最优先检查）======
-        TRAP_KEYWORDS = [
-            'request full-text', 'request full text', 'ask author',
-            'review report', 'flyer', 'cover', 'toc',
-            'citation', 'cite this', 'export', 'ris', 'bibtex', 'endnote', 'mendeley',
-            'download citation', '导出', '引用',
-            'supplementary', 'supplement', 'supplemental', 'supporting', 'appendix',
-            'esm', 'moesm', 'mediaobject', '-sup-', '-si-', '/si/',
-            '/suppl/', 'suppl_file', '/doi/suppl/',
-            '附件', '附录', '补充材料', '支持材料',
-            'reference', 'bibliography', 'cited-by', 'ref-list', '/ref/', '#ref',
-            '参考文献',
-            'buy', 'purchase', 'rent', 'get access', 'subscribe',
-            'sign in', 'sign-in', 'log in', 'login', 'register',
-            'checkout', 'add to cart', 'institutional access', 'buy article',
-        ]
-        if any(kw in combined_all for kw in TRAP_KEYWORDS):
-            return 0
-        
-        # ====== 官方数据追踪埋点属性 — 绝对高分（保送机制）======
-        attrs_str = str(attrs).lower()
-        OFFICIAL_DATA_ATTRS = [
-            ('data-article-pdf', 'true'),
-            ('data-test', 'pdf-link'),
-            ('data-track-action', 'download pdf'),
-            ('data-track-action', 'pdf download'),
-            ('data-action', 'download-pdf'),
-            ('data-aa-name', 'srm-pdf-download'),
-            ('data-aa-name', 'btn-download-pdf'),
-            ('data-test-id', 'article-pdf-link'),
-            ('data-item-name', 'download-pdf'),
-            ('data-panel-name', 'article-pdf'),
-            ('data-testid', 'pdf-download-button'),
-        ]
-        for attr_name, attr_val in OFFICIAL_DATA_ATTRS:
-            if attr_name in attrs_str and attr_val in attrs_str:
-                score += 85
-                break
-        
-        # ScienceDirect pdfLink ID 保送
-        selector = getattr(elem, 'selector', '') or ''
-        if '#pdflink' in selector.lower():
-            score += 85
-
-        # Academia.edu ds2-5-button / ToolbarButton 高分保送
-        if any(cls in attr_class for cls in ['ds2-5-button', 'toolbarbutton']):
-            score += 85
-
-        # ASM / Atypon 正文入口保送：btn--pdf 与 /doi/pdf/ 直链优先于附件与 reader 页
-        if 'btn--pdf' in attr_class:
-            score += 85
-        if '/doi/pdf/' in href:
-            score += 60  # 直链正文 PDF 总分超过仅 btn--pdf 的 eReader 入口
-        if '/doi/reader/' in href:
-            score -= 55  # eReader 页不压过直链 PDF（扣足够多使总分低于 100 上限）
-
-        # ====== 基础加分逻辑 ======
-        if "pdf" in text:
-            score += 25
-        if "download" in text or "下载" in text:
-            score += 15
-        if "full text" in text or "full-text" in text or "全文" in text:
-            score += 15
-        if "view" in text or "open" in text or "打开" in text or "查看" in text:
-            score += 10
-        
-        # PDF + Download 黄金组合
-        if ("download" in text or "下载" in text) and "pdf" in text:
-            score += 30
-        
-        if href.endswith(".pdf"):
-            score += 40
-        elif ".pdf?" in href or "/pdf/" in href:
-            score += 30
-        if "download" in href:
-            score += 15
-        if "epdf" in href or "pdfdirect" in href or "pdfft" in href:
-            score += 25
-        
-        if attrs.get("download"):
-            score += 20
-        if "pdf" in attr_class:
-            score += 10
-        if "pdf" in attr_title or "pdf" in attr_aria:
-            score += 15
-        
-        if elem.is_visible:
-            score += 15
-        if 0 < elem.position_y < 400:
-            score += 10
-        elif elem.position_y < 800:
-            score += 5
-        
-        if elem.tag in ("a", "button"):
-            score += 5
-        
-        return max(0, min(score, 100))
+    def _calculate_score(self, elem: ActionableElement) -> float:
+        """按 ScoreConfig 的统一规则计算分数。"""
+        candidate = self.pdf_extractor.to_candidate(elem)
+        score = self.pdf_extractor._calculate_score(candidate)
+        nearby = f"{(elem.nearby_text_before or '').lower()} {(elem.nearby_text_after or '').lower()}".strip()
+        if nearby:
+            if any(kw in nearby for kw in self.pdf_extractor.score_config.negative_text_keywords):
+                score -= 20
+            if any(kw in nearby for kw in self.pdf_extractor.score_config.positive_text_keywords):
+                score += 10
+        return score
 
     async def _extract_raw_info(self, page) -> Dict[str, Any]:
         """提取原始页面信息（用于调试）"""
@@ -1163,6 +1423,77 @@ class LLMAssistant:
         
         return None
 
+    _RERANK_PROMPT_CACHE: Optional[str] = None
+
+    async def rerank_candidates(
+        self,
+        elements: List[ActionableElement],
+        top_n: int = 5,
+        ultra_lite_provider: Optional[str] = None,
+    ) -> Optional[List[ActionableElement]]:
+        """用 ultra-lite 对 top-N 候选做 rerank，返回重排后的列表；失败则返回 None 保持启发式顺序。"""
+        if not elements or top_n <= 0:
+            return None
+        try:
+            manager = get_manager()
+            client = manager.get_ultra_lite_client(ultra_lite_provider)
+            if not client:
+                return None
+        except Exception as e:
+            self.logger.debug(f"[LLM] ultra_lite 不可用，跳过 rerank: {e}")
+            return None
+        subset = elements[:top_n]
+        site_source = (getattr(subset[0], "site_source", None) or "") if subset else ""
+        candidates = []
+        for i, el in enumerate(subset):
+            candidates.append({
+                "index": i,
+                "text": (el.text or "")[:80],
+                "href": (el.href or "")[:100],
+                "position_ratio": getattr(el, "position_ratio", None),
+                "container_role": getattr(el, "container_role", "") or "unknown",
+                "nearby_before": (getattr(el, "nearby_text_before", None) or "")[:60],
+                "nearby_after": (getattr(el, "nearby_text_after", None) or "")[:60],
+            })
+        if LLMAssistant._RERANK_PROMPT_CACHE is None:
+            prompt_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "prompts")
+            try:
+                with open(os.path.join(prompt_dir, "downloader_candidate_rerank.txt"), "r", encoding="utf-8") as f:
+                    LLMAssistant._RERANK_PROMPT_CACHE = f.read()
+            except Exception as e:
+                self.logger.debug(f"[LLM] 加载 rerank 模板失败: {e}")
+                LLMAssistant._RERANK_PROMPT_CACHE = (
+                    "You are a PDF download helper. Pick the best candidate for main article PDF.\n\n"
+                    "Site: {site_source}\nCandidates: {candidates_json}\n\n"
+                    "Reply JSON only: {{\"best_index\": 0, \"confidence\": 0-100}}"
+                )
+        prompt = LLMAssistant._RERANK_PROMPT_CACHE.format(
+            site_source=site_source or "unknown",
+            candidates_json=json.dumps(candidates, ensure_ascii=False),
+        )
+        try:
+            resp = await asyncio.to_thread(client.chat, [{"role": "user", "content": prompt}], model=None)
+            text = (resp.get("final_text") or "").strip()
+            if not text:
+                return None
+            for start in range(len(text)):
+                if start < len(text) and text[start] == "{":
+                    try:
+                        data = json.loads(text[start:])
+                        best_index = data.get("best_index", -1)
+                        confidence = data.get("confidence", 0)
+                        if confidence >= 50 and 0 <= best_index < len(subset):
+                            reordered = [subset[best_index]] + [e for i, e in enumerate(subset) if i != best_index]
+                            self.logger.info(f"[LLM] rerank 选择 index={best_index}, confidence={confidence}")
+                            return reordered
+                        break
+                    except json.JSONDecodeError:
+                        continue
+            return None
+        except Exception as e:
+            self.logger.debug(f"[LLM] rerank 调用失败，使用启发式顺序: {e}")
+            return None
+
 
 @dataclass
 class _PaperDownloadContext:
@@ -1271,6 +1602,7 @@ class DownloadRequestContext:
     show_browser_override: Optional[bool] = None
     llm_provider_override: Optional[str] = None
     llm_model_override: Optional[str] = None
+    assist_llm_mode: Optional[str] = None
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None
     budget_controller: Optional[DownloadBudgetController] = None
     trace: DownloadAttemptTrace = field(default_factory=DownloadAttemptTrace)
@@ -1418,6 +1750,11 @@ class PaperDownloader:
                 'a[href*="/doi/pdf/"]',
                 'a[href*="/doi/epdf/"]',
                 'a[href*="/doi/reader/"]',
+            ],
+            'acs': [
+                'a[data-id="article_header_OpenPDF"]',
+                'a.article__btn__secondary--pdf[href*="/doi/pdf/"]',
+                'a[href*="/doi/pdf/"]',
             ],
             'researchgate': [
                 'a[data-testid="pdf-download-button"]',
@@ -1633,6 +1970,7 @@ class PaperDownloader:
         'ssrn': ['ssrn.com'],
         'science': ['science.org', 'sciencemag.org'],
         'asm': ['journals.asm.org'],
+        'acs': ['pubs.acs.org'],
         'researchgate': ['researchgate.net'],
         'arxiv': ['arxiv.org'],
         'biorxiv_medrxiv': ['biorxiv.org', 'medrxiv.org'],
@@ -1713,6 +2051,7 @@ class PaperDownloader:
         self.timeouts.update(self.config.get("downloader", {}).get("timeouts", {}))
         api_keys = self.config.get("api_keys", {})
         self.apikey = api_keys.get("twocaptcha", "")
+        self._capsolver_api_key = api_keys.get("capsolver", "")
         self.brightdata_api_key = api_keys.get("brightdata", "")
         self.download_dir = os.path.abspath(download_dir)
         # 注：download_tmp_dir 已废弃，改用任务专属临时目录 (.task_xxx)
@@ -1731,6 +2070,14 @@ class PaperDownloader:
             self._proxy = self._proxy.strip() or None
         _ext = dl_cfg.get("capsolver_extension_path") or None
         self._capsolver_extension_path = (_ext or "").strip() or None
+
+        # Build the unified captcha solver shared across all sessions
+        _cap_timeout = self.timeouts.get("captcha_timeout", 120)
+        self._captcha_solver = CaptchaSolver(
+            capsolver_api_key=self._capsolver_api_key,
+            twocaptcha_api_key=self.apikey,
+            timeout_seconds=_cap_timeout,
+        )
 
         # 确保下载目录存在
         os.makedirs(self.download_dir, exist_ok=True)
@@ -1798,6 +2145,7 @@ class PaperDownloader:
         
         # 页面分析器（阶段1：仅用于诊断）
         self.page_analyzer = PageAnalyzer(self.logger)
+        self.pdf_extractor = self.page_analyzer.pdf_extractor
 
         # ============================================================
         # 经验库（阶段3：智能学习）
@@ -1905,6 +2253,7 @@ class PaperDownloader:
         show_browser: Optional[bool] = None,
         llm_provider: Optional[str] = None,
         model_override: Optional[str] = None,
+        assist_llm_mode: Optional[str] = None,
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> DownloadRequestContext:
         limits = self._get_request_budget_settings()
@@ -1922,8 +2271,10 @@ class PaperDownloader:
             show_browser_override=show_browser,
             llm_provider_override=llm_provider,
             llm_model_override=model_override,
+            assist_llm_mode=assist_llm_mode,
             progress_callback=progress_callback,
             budget_controller=budget,
+            metadata={"assist_llm_mode": (assist_llm_mode or "ultra-lite")},
         )
 
     def _emit_progress_event(
@@ -2466,6 +2817,9 @@ class PaperDownloader:
                 f"{scheme}://{parsed.netloc}/doi/epdf/{encoded_doi}",
             ]
 
+        if host.endswith("pubs.acs.org"):
+            return [f"{scheme}://{parsed.netloc}/doi/pdf/{encoded_doi}"]
+
         return []
 
 # 尝试在动态加载的 iframe 中查找并点击 id="open-button" 的按钮，这在很多学术网站中非常重要，
@@ -2796,6 +3150,441 @@ class PaperDownloader:
         except Exception as e:
             self.logger.error(f"点击下载按钮时发生错误: {str(e)}")
             return False
+
+# ==================== Generic captcha type detection ====================
+
+    async def detect_captcha_type(self, page) -> CaptchaType:
+        """
+        Inspect the current page and return the most specific CaptchaType.
+
+        Checks are ordered roughly by specificity so the first match wins.
+        Returns CaptchaType.UNKNOWN when nothing is recognised.
+        """
+        try:
+            # --- Cloudflare Turnstile ---
+            turnstile_selectors = [
+                '.cf-turnstile',
+                'div[data-sitekey]',
+                'input[name="cf-turnstile-response"]',
+                '#cf-hcaptcha-container',  # CF sometimes wraps hCaptcha
+                'iframe[src*="challenges.cloudflare.com"]',
+                '#challenge-running',
+                '#cf-challenge-running',
+            ]
+            for sel in turnstile_selectors:
+                try:
+                    el = await page.query_selector(sel)
+                    if el:
+                        return CaptchaType.TURNSTILE
+                except Exception:
+                    pass
+
+            # --- reCAPTCHA ---
+            try:
+                rc_el = await page.query_selector('div.g-recaptcha[data-sitekey], iframe[src*="recaptcha"]')
+                if rc_el:
+                    # v3 usually has no visible widget; detect by absence of checkbox
+                    v3_el = await page.query_selector('div.g-recaptcha[data-size="invisible"]')
+                    if v3_el:
+                        return CaptchaType.RECAPTCHA_V3
+                    return CaptchaType.RECAPTCHA_V2
+            except Exception:
+                pass
+
+            # Try JS globals for reCAPTCHA
+            try:
+                has_rc = await page.evaluate(
+                    "() => !!(window.grecaptcha && (window.grecaptcha.render || window.grecaptcha.execute))"
+                )
+                if has_rc:
+                    invisible = await page.evaluate(
+                        "() => !!document.querySelector('.g-recaptcha[data-size=\"invisible\"]')"
+                    )
+                    return CaptchaType.RECAPTCHA_V3 if invisible else CaptchaType.RECAPTCHA_V2
+            except Exception:
+                pass
+
+            # --- hCaptcha ---
+            try:
+                hc_el = await page.query_selector('div.h-captcha[data-sitekey], iframe[src*="hcaptcha.com"]')
+                if hc_el:
+                    return CaptchaType.HCAPTCHA
+            except Exception:
+                pass
+
+            try:
+                has_hc = await page.evaluate("() => !!(window.hcaptcha)")
+                if has_hc:
+                    return CaptchaType.HCAPTCHA
+            except Exception:
+                pass
+
+            # --- FunCaptcha / Arkose Labs ---
+            try:
+                fc_el = await page.query_selector(
+                    '#FunCaptcha, [data-pkey], iframe[src*="arkoselabs"], iframe[src*="funcaptcha"]'
+                )
+                if fc_el:
+                    return CaptchaType.FUNCAPTCHA
+            except Exception:
+                pass
+
+            # --- Image/Text captcha (generic) ---
+            try:
+                img_captcha = await page.query_selector(
+                    'img[src*="captcha"], img[alt*="captcha"], img[id*="captcha"], '
+                    'img[class*="captcha"], .captcha-image, #captcha-image, '
+                    'img[src*="验证码"], img[alt*="验证码"]'
+                )
+                if img_captcha:
+                    return CaptchaType.IMAGE_TEXT
+            except Exception:
+                pass
+
+            # --- Text-based fallback ---
+            try:
+                body_text = await page.evaluate(
+                    '() => (document.body ? document.body.innerText : "").toLowerCase()'
+                )
+                if any(k in body_text for k in ("recaptcha", "g-recaptcha")):
+                    return CaptchaType.RECAPTCHA_V2
+                if "hcaptcha" in body_text:
+                    return CaptchaType.HCAPTCHA
+                if any(k in body_text for k in ("funcaptcha", "arkoselabs")):
+                    return CaptchaType.FUNCAPTCHA
+                if any(k in body_text for k in ("captcha", "验证码", "robot", "human")):
+                    return CaptchaType.IMAGE_TEXT  # generic fallback to image solve
+            except Exception:
+                pass
+
+        except Exception as e:
+            self.logger.debug("detect_captcha_type error: %s", e)
+
+        return CaptchaType.UNKNOWN
+
+    # ==================== Generic captcha parameter extraction ====================
+
+    async def _extract_recaptcha_params(self, page) -> Optional[Dict[str, Any]]:
+        """Extract reCAPTCHA sitekey and action from the current page."""
+        try:
+            # Try DOM attribute first
+            sitekey = await page.evaluate(
+                """() => {
+                    const el = document.querySelector('.g-recaptcha[data-sitekey]');
+                    if (el) return el.getAttribute('data-sitekey');
+                    const scripts = Array.from(document.querySelectorAll('script'));
+                    for (const s of scripts) {
+                        const m = s.textContent.match(/['"]sitekey['"]\\s*:\\s*['"]([^'"]+)['"]/);
+                        if (m) return m[1];
+                    }
+                    return null;
+                }"""
+            )
+            if not sitekey:
+                # Try iframe src parameter
+                iframe = await page.query_selector('iframe[src*="recaptcha"]')
+                if iframe:
+                    src = await iframe.get_attribute("src") or ""
+                    import re as _re
+                    m = _re.search(r"[?&]k=([^&]+)", src)
+                    sitekey = m.group(1) if m else None
+
+            if not sitekey:
+                return None
+
+            action = await page.evaluate(
+                """() => {
+                    const el = document.querySelector('.g-recaptcha[data-action]');
+                    return el ? el.getAttribute('data-action') : 'submit';
+                }"""
+            ) or "submit"
+
+            return {"sitekey": sitekey, "pageurl": page.url, "action": action}
+        except Exception as e:
+            self.logger.debug("_extract_recaptcha_params error: %s", e)
+            return None
+
+    async def _extract_hcaptcha_params(self, page) -> Optional[Dict[str, Any]]:
+        """Extract hCaptcha sitekey from the current page."""
+        try:
+            sitekey = await page.evaluate(
+                """() => {
+                    const el = document.querySelector('.h-captcha[data-sitekey]');
+                    if (el) return el.getAttribute('data-sitekey');
+                    const iframe = document.querySelector('iframe[src*="hcaptcha.com"]');
+                    if (iframe) {
+                        const m = iframe.src.match(/[?&]sitekey=([^&]+)/);
+                        if (m) return m[1];
+                    }
+                    return null;
+                }"""
+            )
+            return {"sitekey": sitekey, "pageurl": page.url} if sitekey else None
+        except Exception as e:
+            self.logger.debug("_extract_hcaptcha_params error: %s", e)
+            return None
+
+    async def _extract_funcaptcha_params(self, page) -> Optional[Dict[str, Any]]:
+        """Extract FunCaptcha public key from the current page."""
+        try:
+            publickey = await page.evaluate(
+                """() => {
+                    const el = document.querySelector('[data-pkey], #FunCaptcha');
+                    if (el) return el.getAttribute('data-pkey') || el.getAttribute('data-public-key');
+                    return null;
+                }"""
+            )
+            return {"publickey": publickey, "pageurl": page.url} if publickey else None
+        except Exception as e:
+            self.logger.debug("_extract_funcaptcha_params error: %s", e)
+            return None
+
+    async def _extract_image_captcha_params(self, page) -> Optional[Dict[str, Any]]:
+        """Screenshot the captcha image element and return it as base64."""
+        try:
+            img_el = await page.query_selector(
+                'img[src*="captcha"], img[alt*="captcha"], img[id*="captcha"], '
+                'img[class*="captcha"], .captcha-image, #captcha-image, '
+                'img[src*="验证码"], img[alt*="验证码"]'
+            )
+            if img_el:
+                img_bytes = await img_el.screenshot()
+                img_b64 = base64.b64encode(img_bytes).decode()
+                # Detect Chinese page context for language hint
+                body_text = await page.evaluate('() => (document.body || {innerText: ""}).innerText')
+                is_chinese = bool(
+                    any(ord(c) > 0x4E00 for c in body_text[:200])
+                )
+                return {
+                    "image_base64": img_b64,
+                    "pageurl": page.url,
+                    "is_chinese": is_chinese,
+                }
+            return None
+        except Exception as e:
+            self.logger.debug("_extract_image_captcha_params error: %s", e)
+            return None
+
+    async def _extract_captcha_params(
+        self, captcha_type: CaptchaType, page
+    ) -> Optional[Dict[str, Any]]:
+        """Dispatch to the correct extractor for the given captcha type."""
+        if captcha_type == CaptchaType.TURNSTILE:
+            return await self.get_captcha_params(page, self.intercept_script)
+        if captcha_type in (CaptchaType.RECAPTCHA_V2, CaptchaType.RECAPTCHA_V3):
+            return await self._extract_recaptcha_params(page)
+        if captcha_type == CaptchaType.HCAPTCHA:
+            return await self._extract_hcaptcha_params(page)
+        if captcha_type == CaptchaType.FUNCAPTCHA:
+            return await self._extract_funcaptcha_params(page)
+        if captcha_type == CaptchaType.IMAGE_TEXT:
+            return await self._extract_image_captcha_params(page)
+        return None
+
+    # ==================== Generic captcha token application ====================
+
+    async def _apply_captcha_token(
+        self, page, captcha_type: CaptchaType, token: str
+    ) -> None:
+        """Inject a solved captcha token/text back into the page."""
+        if captcha_type == CaptchaType.TURNSTILE:
+            await self.send_token_callback(page, token)
+        elif captcha_type in (CaptchaType.RECAPTCHA_V2, CaptchaType.RECAPTCHA_V3):
+            await page.evaluate(
+                """(token) => {
+                    const ta = document.getElementById('g-recaptcha-response');
+                    if (ta) {
+                        ta.value = token;
+                        ta.style.display = 'block';
+                    }
+                    // Fire the grecaptcha callback if registered
+                    const widget = document.querySelector('.g-recaptcha');
+                    if (widget) {
+                        const cb = widget.getAttribute('data-callback');
+                        if (cb && typeof window[cb] === 'function') {
+                            try { window[cb](token); } catch(e) {}
+                        }
+                    }
+                    if (window.grecaptcha && window.grecaptcha.__oncomplete__) {
+                        try { window.grecaptcha.__oncomplete__(token); } catch(e) {}
+                    }
+                }""",
+                token,
+            )
+        elif captcha_type == CaptchaType.HCAPTCHA:
+            await page.evaluate(
+                """(token) => {
+                    const ta = document.querySelector('[name="h-captcha-response"]');
+                    if (ta) ta.value = token;
+                    if (window.hcaptcha) {
+                        try { window.hcaptcha.execute(); } catch(e) {}
+                    }
+                }""",
+                token,
+            )
+        elif captcha_type == CaptchaType.IMAGE_TEXT:
+            # Fill the text input and submit the closest form
+            await page.evaluate(
+                """(text) => {
+                    const sel = 'input[name*="captcha"], input[id*="captcha"], input[placeholder*="captcha"],'
+                              + 'input[name*="验证码"], input[id*="验证码"]';
+                    const inp = document.querySelector(sel);
+                    if (inp) {
+                        inp.value = text;
+                        const form = inp.closest('form');
+                        if (form) form.submit();
+                    }
+                }""",
+                token,
+            )
+        # FUNCAPTCHA and UNKNOWN: no generic injection available
+
+    # ==================== Unified generic captcha solver ====================
+
+    async def solve_captcha_if_needed(
+        self,
+        page,
+        filepath: str = None,
+        max_retries: int = 2,
+        wait_after_solve: bool = True,
+        task_download_dir: Optional[str] = None,
+        request_context=None,
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Unified captcha handler for all non-Cloudflare challenge types.
+
+        Flow:
+          1. Detect the specific captcha type on the page.
+          2. If Turnstile/Cloudflare detected, delegate to solve_cloudflare_if_needed().
+          3. Wait a few seconds for extension auto-pass (CapSolver extension in headed mode).
+          4. If still present, extract params and call CaptchaSolver API (primary + fallback).
+          5. Apply token/text to the page.
+
+        Returns:
+            (True, None)      – no captcha, or captcha solved, page is usable
+            (True, filepath)  – captcha solved and triggered a download
+            (False, None)     – failed to solve
+        """
+        ctx = request_context or self._get_request_context()
+
+        for attempt in range(max_retries):
+            try:
+                captcha_type = await self.detect_captcha_type(page)
+
+                if captcha_type == CaptchaType.UNKNOWN:
+                    self.logger.debug("[captcha] no recognisable captcha – returning ok")
+                    return (True, None)
+
+                # Route Turnstile back to the dedicated Cloudflare solver
+                if captcha_type == CaptchaType.TURNSTILE:
+                    return await self.solve_cloudflare_if_needed(
+                        page,
+                        filepath=filepath,
+                        max_retries=max_retries,
+                        wait_after_solve=wait_after_solve,
+                        task_download_dir=task_download_dir,
+                        request_context=request_context,
+                    )
+
+                self._emit_progress_event(
+                    "blocker_detected",
+                    request_context=ctx,
+                    blocker=captcha_type.value,
+                    attempt=attempt + 1,
+                )
+                self.logger.info(
+                    "[captcha] detected type=%s attempt=%d/%d",
+                    captcha_type.value,
+                    attempt + 1,
+                    max_retries,
+                )
+
+                # Give the CapSolver extension 5-8 s to auto-solve in headed mode
+                if not self.headless:
+                    self.logger.info("[captcha] waiting for extension auto-pass…")
+                    await asyncio.sleep(6)
+                    post_type = await self.detect_captcha_type(page)
+                    if post_type == CaptchaType.UNKNOWN:
+                        self.logger.info("[captcha] extension auto-passed type=%s", captcha_type.value)
+                        self._emit_progress_event(
+                            "challenge_solved", request_context=ctx, method="extension_auto", captcha_type=captcha_type.value
+                        )
+                        return (True, None)
+
+                # API-based solving
+                if not self._captcha_solver.has_any_provider:
+                    self.logger.warning(
+                        "[captcha] no API keys configured; cannot solve type=%s", captcha_type.value
+                    )
+                    return (False, None)
+
+                params = await self._extract_captcha_params(captcha_type, page)
+                if not params:
+                    self.logger.error("[captcha] could not extract params for type=%s", captcha_type.value)
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(3)
+                        continue
+                    return (False, None)
+
+                solve_result: CaptchaSolveResult = await self._captcha_solver.solve(captcha_type, params)
+
+                if not solve_result.success or not solve_result.token:
+                    self.logger.error(
+                        "[captcha] solve failed type=%s error=%s",
+                        captcha_type.value,
+                        solve_result.error,
+                    )
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(4)
+                        continue
+                    return (False, None)
+
+                self.logger.info(
+                    "[captcha] solved type=%s provider=%s latency=%.0f ms",
+                    captcha_type.value,
+                    solve_result.provider,
+                    solve_result.latency_ms,
+                )
+
+                # Apply token/text to the page
+                await self._apply_captcha_token(page, captcha_type, solve_result.token)
+
+                if wait_after_solve:
+                    try:
+                        await page.wait_for_load_state(
+                            "domcontentloaded",
+                            timeout=self.timeouts.get("load_state_timeout", 10) * 1000,
+                        )
+                    except Exception:
+                        pass
+                    await asyncio.sleep(1)
+
+                # Verify the captcha is gone
+                post_type = await self.detect_captcha_type(page)
+                if post_type == CaptchaType.UNKNOWN:
+                    self._emit_progress_event(
+                        "challenge_solved",
+                        request_context=ctx,
+                        method=f"api_{solve_result.provider}",
+                        captcha_type=captcha_type.value,
+                        latency_ms=solve_result.latency_ms,
+                    )
+                    return (True, None)
+                else:
+                    self.logger.warning(
+                        "[captcha] still present after solve, type=%s", post_type.value
+                    )
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(5)
+                        continue
+
+            except Exception as exc:
+                self.logger.error("[captcha] unexpected error attempt=%d: %s", attempt + 1, exc)
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(3)
+                    continue
+
+        return (False, None)
 
 # 检查页面中的Cloudflare验证高置信度指标，由于Cloudflare验证的复杂性，需要多次检查，
 # 以及等待一段时间后再次检查，确保检测到Cloudflare验证。
@@ -6326,6 +7115,43 @@ class PaperDownloader:
                     analysis.actionable_elements
                 )
             # === 加成结束 ===
+
+            # === 单轮 LLM 候选精排（启发式粗排后）===
+            if analysis.actionable_elements and not (ctx and ctx.metadata.get("disable_assist_llm")):
+                try:
+                    # 传入已按启发式分数排好序的 top_n，避免在 rerank_candidates 内部重排导致
+                    # 索引错位；idx 搜索覆盖全列表以防元素出现在 top_n 之外。
+                    top_n = min(5, len(analysis.actionable_elements))
+                    assist_mode = ((ctx.metadata.get("assist_llm_mode") if ctx else None) or "ultra-lite").strip().lower()
+                    rerank_result = await self.pdf_extractor.rerank_candidates(
+                        [self.pdf_extractor.to_candidate(item) for item in analysis.actionable_elements[:top_n]],
+                        top_n=top_n,
+                        mode=assist_mode,
+                        provider=(ctx.llm_provider_override if ctx else None),
+                        model_override=(ctx.llm_model_override if ctx else None),
+                    )
+                    if rerank_result and rerank_result.get("best_candidate_id"):
+                        best_id = str(rerank_result.get("best_candidate_id"))
+                        idx = next(
+                            (
+                                i
+                                for i, item in enumerate(analysis.actionable_elements)
+                                if (getattr(item, "element_id", "") or item.selector) == best_id
+                            ),
+                            -1,
+                        )
+                        if idx >= 0:
+                            best = analysis.actionable_elements[idx]
+                            analysis.actionable_elements = [best] + [
+                                e for i, e in enumerate(analysis.actionable_elements) if i != idx
+                            ]
+                            self.logger.info(
+                                "[智能循环] LLM精排选择 id=%s confidence=%.2f",
+                                best_id[:80],
+                                float(rerank_result.get("confidence", 0.0) or 0.0),
+                            )
+                except Exception as rerank_e:
+                    self.logger.debug(f"[智能循环] 单轮 LLM 精排异常，保持启发式顺序: {rerank_e}")
             
             # the-innovation.org: Standard/Extended PDF 优先规则
             if "the-innovation.org" in domain:
@@ -6528,55 +7354,7 @@ class PaperDownloader:
         
         # 循环结束，常规方法都失败了
         
-        # === 阶段3：LLM兜底 ===
-        if self.llm_assistant.enabled and len(action_history) > 0 and not bool((request_context.metadata or {}).get("disable_assist_llm")):
-            self.logger.info(f"[智能循环] 常规方法失败，尝试LLM分析...")
-            try:
-                analysis = await self.page_analyzer.analyze(page)
-                override = self._get_current_llm_override()
-                suggestion = await self.llm_assistant.analyze_and_suggest(
-                    page, analysis, action_history,
-                    llm_provider_override=override[0], model_override=override[1],
-                )
-                
-                if suggestion and suggestion.get('type') == 'click':
-                    selector = suggestion.get('selector')
-                    if selector:
-                        self.logger.info(f"[智能循环] LLM建议点击: {selector[:50]}")
-                        try:
-                            locator = page.locator(selector).first
-                            if await locator.count() > 0:
-                                await locator.click(
-                                    timeout=self.timeouts.get("button_click_timeout", 5) * 1000,
-                                    force=True
-                                )
-                                await asyncio.sleep(self.timeouts.get("page_stable_wait", 2))
-                                if await self._wait_for_download_complete(
-                                    filepath,
-                                    timeout=self.timeouts.get("download_complete_timeout", 20),
-                                    task_download_dir=task_download_dir,
-                                    session_downloads_dir=session_downloads_dir,
-                                    initial_main_files=initial_main_files,
-                                    task_start_time=task_start_time,
-                                    request_context=ctx,
-                                ):
-                                    # LLM建议成功！记录经验
-                                    action_history.append({
-                                        'type': 'click',
-                                        'selector': selector,
-                                        'text': '',
-                                        'result': 'success',
-                                        'source': 'llm'
-                                    })
-                                    await self.experience_store.record_success(domain, url, action_history)
-                                    return True
-                        except Exception as e:
-                            self.logger.debug(f"[智能循环] LLM建议执行失败: {e}")
-                
-                elif suggestion and suggestion.get('type') == 'give_up':
-                    self.logger.warning(f"[智能循环] LLM建议放弃: {suggestion.get('reason', '')}")
-            except Exception as e:
-                self.logger.warning(f"[智能循环] LLM分析出错: {e}")
+        # 统一策略：仅保留“启发式 + 单轮候选精排”，不再执行页面级动作型 LLM 兜底。
         
         # 记录失败的选择器
         if failed_selectors:
@@ -6625,9 +7403,11 @@ class PaperDownloader:
                     return 'continue'  # 让循环继续尝试
             
             elif blocker.type == BlockerType.CAPTCHA:
-                self.logger.info(f"[阻断处理] 检测到验证码，尝试解决...")
-                success, _ = await self.solve_cloudflare_if_needed(
-                    page, task_download_dir=task_download_dir
+                self.logger.info("[阻断处理] 检测到验证码，尝试通用验证码路由求解...")
+                success, _ = await self.solve_captcha_if_needed(
+                    page,
+                    task_download_dir=task_download_dir,
+                    request_context=request_context,
                 )
                 if not success:
                     self._record_failure(
@@ -7255,6 +8035,7 @@ class PaperDownloader:
                                            source: Optional[str] = None,
                                            llm_provider: Optional[str] = None,
                                            model_override: Optional[str] = None,
+                                           assist_llm_mode: Optional[str] = None,
                                            progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
                                            show_browser: Optional[bool] = None,
                                            disable_assist_llm: bool = False,
@@ -7288,10 +8069,12 @@ class PaperDownloader:
                 show_browser=show_browser,
                 llm_provider=llm_provider,
                 model_override=model_override,
+                assist_llm_mode=assist_llm_mode,
                 progress_callback=progress_callback,
             )
             if disable_assist_llm:
                 active_context.metadata["disable_assist_llm"] = True
+            active_context.metadata["assist_llm_mode"] = (assist_llm_mode or "ultra-lite")
         else:
             restore_state = (
                 active_context.strategy,
@@ -7315,6 +8098,11 @@ class PaperDownloader:
             if llm_provider or model_override:
                 active_context.llm_provider_override = llm_provider
                 active_context.llm_model_override = model_override
+            if assist_llm_mode:
+                active_context.assist_llm_mode = assist_llm_mode
+                active_context.metadata["assist_llm_mode"] = assist_llm_mode
+            elif "assist_llm_mode" not in active_context.metadata:
+                active_context.metadata["assist_llm_mode"] = active_context.assist_llm_mode or "ultra-lite"
             if disable_assist_llm:
                 active_context.metadata["disable_assist_llm"] = True
             else:
@@ -8763,10 +9551,52 @@ def setup_signal_handlers(downloader):
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
+
+def _run_pdf_selector_mock_demo() -> None:
+    """Mock demo: print heuristic scores for three representative candidates."""
+    demo_logger = get_logger("scholar_downloader.PDFSelectorDemo")
+    extractor = PDFExtractor(demo_logger)
+    candidates = [
+        Candidate(
+            element_id="candidate_a_nature_sidebar_fixed",
+            text="open pdf",
+            href="https://www.nature.com/articles/s41586-2026-00001.pdf",
+            is_fixed=True,
+            rect_top=88.0,
+            position_ratio=0.12,
+            ancestor_features="sidebar article-tools header",
+            is_visible=True,
+        ),
+        Candidate(
+            element_id="candidate_b_elsevier_related",
+            text="pdf",
+            href="https://www.sciencedirect.com/science/article/pii/S0000000000000012/pdfft?isDTMRedir=true",
+            is_fixed=False,
+            rect_top=980.0,
+            position_ratio=0.92,
+            ancestor_features="sidebar related recommendation footer",
+            is_visible=True,
+        ),
+        Candidate(
+            element_id="candidate_c_supplementary",
+            text="supplementary material (2.1 mb)",
+            href="https://example.org/article/supplementary.pdf",
+            is_fixed=False,
+            rect_top=760.0,
+            position_ratio=0.68,
+            ancestor_features="main article-content",
+            is_visible=True,
+        ),
+    ]
+    print("\n=== PDF Selector Mock Demo ===")
+    for item in candidates:
+        score = extractor._calculate_score(item)
+        print(f"{item.element_id}: score={score:.1f} text='{item.text}' href='{item.href[:80]}'")
+
 async def main():
     """主函数，处理命令行参数并执行下载任务"""
     parser = argparse.ArgumentParser(description="从JSON搜索结果下载论文PDF文件")
-    parser.add_argument("input", help="输入JSON文件路径或包含JSON文件的目录")
+    parser.add_argument("input", nargs="?", default="", help="输入JSON文件路径或包含JSON文件的目录")
     parser.add_argument("--output", "-o", default="papers", help="下载文件保存目录")
     parser.add_argument("--concurrent", "-c", type=int, default=5, help="最大并发下载数")
     parser.add_argument("--show-browser", action="store_true", help="显示浏览器窗口，允许手动操作")
@@ -8783,9 +9613,19 @@ async def main():
                         help="")
     parser.add_argument("--no-stealth", action="store_false", dest="stealth_mode", 
                        help="禁用浏览器隐身模式（可能会被网站检测为机器人）", default=True)
+    parser.add_argument(
+        "--mock-pdf-selector-demo",
+        action="store_true",
+        help="运行 PDF 候选打分 Mock 演示并退出",
+    )
     
 
     args = parser.parse_args()
+    if args.mock_pdf_selector_demo:
+        _run_pdf_selector_mock_demo()
+        return 0
+    if not args.input:
+        parser.error("input is required unless --mock-pdf-selector-demo is set")
 
     cleanup_old_logs(log_dir = "logs", days = 1)
     

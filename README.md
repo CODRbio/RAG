@@ -54,9 +54,10 @@ bash scripts/verify_dependencies.sh
 
 - 敏感字段（API Key）建议放在 `config/rag_config.local.json`
 - 或使用环境变量覆盖：`RAG_LLM__{PROVIDER}__API_KEY`
-- 数据库默认使用 `database.url = sqlite:///data/rag.db`（可用 `RAG_DATABASE_URL` 覆盖）
+- 数据库默认使用 `database.url = sqlite:///data/rag.db`（推荐用 `RAG_DATABASE_URL` 切到 Docker PostgreSQL）
+- 队列推荐使用 `REDIS_URL=redis://127.0.0.1:6379/0`
 
-### 3) 启动基础服务（Milvus 等）
+### 3) 启动基础服务（PostgreSQL / Redis / Milvus 等）
 
 ```bash
 bash scripts/00_preflight_check.sh
@@ -123,7 +124,7 @@ bash scripts/start.sh
 ├── README.md                 # 项目入口
 ├── install.md                # 安装与依赖核对
 ├── requirements.txt          # Python 依赖
-├── docker-compose.yml        # Docker 服务（Milvus/etcd/MinIO）
+├── docker-compose.yml        # Docker 服务（PostgreSQL/Redis/Milvus/etcd/MinIO）
 ├── .env.example              # 环境变量模板
 │
 ├── config/                   # 配置中心
@@ -175,7 +176,7 @@ bash scripts/start.sh
 ├── tests/                    # pytest 测试
 ├── docs/                     # 文档中心
 ├── data/                     # 数据存储（raw/parsed/metadata/graph）
-├── volumes/                  # Docker 持久卷（Milvus/etcd/MinIO）
+├── volumes/                  # Docker 持久卷（Milvus/etcd/MinIO；PostgreSQL/Redis 使用 named volumes）
 └── logs/                     # 应用日志（含 LLM 原始响应日志）
 ```
 

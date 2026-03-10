@@ -96,6 +96,7 @@ pkgs = [
     "opentelemetry-exporter-prometheus",
     "prometheus-client",
     "mcp",
+    "psycopg",
     "pytest",
 ]
 

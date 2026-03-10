@@ -269,6 +269,16 @@ def repair_collection_library_links(
                 target.downloaded_at = now
                 session.add(target)
 
+            if getattr(target, "id", None) is not None:
+                row.library_id = int(lib.id)
+                row.library_paper_id = int(target.id)
+                if not (row.source or "").strip():
+                    row.source = "ingest_repair"
+                target.collection_name = collection_name
+                target.collection_paper_id = row.paper_id
+                session.add(row)
+                session.add(target)
+
             if pdf_root:
                 paper_id = _library_paper_id(
                     (target.doi or "").strip() or None,

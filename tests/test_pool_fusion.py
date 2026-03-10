@@ -107,9 +107,9 @@ def test_gap_quota_enforced_when_gap_would_be_excluded():
     assert len(result) == 3, "Output length must still equal top_k"
 
 
-def test_gap_min_keep_ratio_is_025():
-    """Global default gap quota ratio is 0.25."""
-    assert _GAP_MIN_KEEP_RATIO == 0.25
+def test_gap_min_keep_ratio_is_020():
+    """Global default gap quota ratio is 0.20."""
+    assert _GAP_MIN_KEEP_RATIO == 0.20
 
 
 def test_gap_quota_default_ratio():
@@ -235,7 +235,58 @@ def test_diagnostics_populated():
     assert "rank_pool_multiplier" in pf
     assert "gap_boost_abs" in pf
     assert "gap_min_keep" in pf
+    assert "agent_min_keep" in pf
     assert "output_count" in pf
+
+
+def test_three_pool_gap_agent_soft_targets():
+    """Three-pool fusion should protect both gap and agent when available."""
+    top_k = 10
+    # Make main dominate by score so quotas must backfill.
+    main = [_make_cand(f"m{i}", 1.0 - i * 0.01) for i in range(20)]
+    gap = [_make_cand(f"g{i}", 0.2 - i * 0.01) for i in range(5)]
+    agent = [_make_cand(f"a{i}", 0.1 - i * 0.01) for i in range(3)]
+    diag: Dict[str, Any] = {}
+    result = fuse_pools_with_gap_protection(
+        "q",
+        main,
+        gap,
+        top_k=top_k,
+        agent_candidates=agent,
+        gap_ratio=0.2,
+        agent_ratio=0.1,
+        diag=diag,
+    )
+    assert len(result) == top_k
+    pf = diag["pool_fusion"]
+    assert pf["gap_min_keep"] == math.ceil(top_k * 0.2)
+    assert pf["agent_min_keep"] == math.ceil(top_k * 0.1)
+    assert pf["gap_in_output"] >= pf["gap_min_keep"]
+    assert pf["agent_in_output"] >= pf["agent_min_keep"]
+
+
+def test_three_pool_soft_target_shortfall_backfills_by_relevance():
+    """If agent pool is insufficient, remaining slots should be filled by relevance."""
+    top_k = 10
+    main = [_make_cand(f"m{i}", 1.0 - i * 0.01) for i in range(20)]
+    gap = [_make_cand(f"g{i}", 0.2 - i * 0.01) for i in range(5)]
+    # only 0 agent candidates; soft target should not hard-fill
+    agent: List[Dict[str, Any]] = []
+    diag: Dict[str, Any] = {}
+    result = fuse_pools_with_gap_protection(
+        "q",
+        main,
+        gap,
+        top_k=top_k,
+        agent_candidates=agent,
+        gap_ratio=0.2,
+        agent_ratio=0.1,
+        diag=diag,
+    )
+    assert len(result) == top_k
+    pf = diag["pool_fusion"]
+    assert pf["agent_min_keep"] == 0
+    assert pf["agent_in_output"] == 0
 
 
 # ===========================================================================
@@ -246,6 +297,12 @@ def test_dr_gap_pool_sources_contains_eval_supplement():
     """The DR gap pool must include eval_supplement so gap protection activates."""
     from src.collaboration.research.agent import _DR_GAP_POOL_SOURCES
     assert "eval_supplement" in _DR_GAP_POOL_SOURCES
+
+
+def test_dr_agent_pool_sources_contains_agent_supplement():
+    """The DR agent pool must include agent_supplement for agent quota protection."""
+    from src.collaboration.research.agent import _DR_AGENT_POOL_SOURCES
+    assert "agent_supplement" in _DR_AGENT_POOL_SOURCES
 
 
 # ===========================================================================

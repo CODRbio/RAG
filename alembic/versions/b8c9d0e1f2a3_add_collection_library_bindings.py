@@ -19,6 +19,46 @@ depends_on: Union[str, Sequence[str], None] = None
 def upgrade() -> None:
     bind = op.get_bind()
     inspector = sa.inspect(bind)
+    if not inspector.has_table("scholar_libraries"):
+        op.create_table(
+            "scholar_libraries",
+            sa.Column("id", sa.Integer(), nullable=False),
+            sa.Column("user_id", sa.Text(), nullable=False, server_default="default"),
+            sa.Column("name", sa.Text(), nullable=False),
+            sa.Column("description", sa.Text(), nullable=False, server_default=""),
+            sa.Column("folder_path", sa.Text(), nullable=True),
+            sa.Column("created_at", sa.Text(), nullable=False),
+            sa.Column("updated_at", sa.Text(), nullable=False),
+            sa.PrimaryKeyConstraint("id"),
+            sa.UniqueConstraint("user_id", "name", name="uq_scholar_libraries_user_name"),
+        )
+    if not inspector.has_table("scholar_library_papers"):
+        op.create_table(
+            "scholar_library_papers",
+            sa.Column("id", sa.Integer(), nullable=False),
+            sa.Column("library_id", sa.Integer(), nullable=False),
+            sa.Column("title", sa.Text(), nullable=False, server_default=""),
+            sa.Column("authors", sa.Text(), nullable=False, server_default="[]"),
+            sa.Column("year", sa.Integer(), nullable=True),
+            sa.Column("doi", sa.Text(), nullable=False, server_default=""),
+            sa.Column("pdf_url", sa.Text(), nullable=False, server_default=""),
+            sa.Column("url", sa.Text(), nullable=False, server_default=""),
+            sa.Column("source", sa.Text(), nullable=False, server_default=""),
+            sa.Column("score", sa.Float(), nullable=False, server_default="0"),
+            sa.Column("annas_md5", sa.Text(), nullable=False, server_default=""),
+            sa.Column("added_at", sa.Text(), nullable=False),
+            sa.Column("downloaded_at", sa.Text(), nullable=True),
+            sa.Column("venue", sa.Text(), nullable=False, server_default=""),
+            sa.Column("normalized_journal_name", sa.Text(), nullable=False, server_default=""),
+            sa.ForeignKeyConstraint(["library_id"], ["scholar_libraries.id"]),
+            sa.PrimaryKeyConstraint("id"),
+        )
+        op.create_index(
+            "idx_scholar_lib_papers_library_id",
+            "scholar_library_papers",
+            ["library_id"],
+            unique=False,
+        )
     if not inspector.has_table("collection_library_bindings"):
         op.create_table(
             "collection_library_bindings",

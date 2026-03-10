@@ -5,6 +5,7 @@ Mac 和服务器使用完全相同的代码
 
 from typing import Optional
 
+import numpy as np
 from pymilvus import MilvusClient, DataType
 from config.settings import settings
 from src.log import get_logger
@@ -61,7 +62,7 @@ class MilvusOps:
         schema.add_field("chunk_type", DataType.VARCHAR, max_length=128)
         schema.add_field("section_path", DataType.VARCHAR, max_length=65535)
         schema.add_field("page", DataType.INT32)
-        schema.add_field("year", DataType.INT32, default_value=0)
+        schema.add_field("year", DataType.INT32, default_value=np.int32(0))
         index_params = self.client.prepare_index_params()
         index_params.add_index(field_name="dense_vector", **settings.index.params)
         index_params.add_index(
@@ -86,7 +87,7 @@ class MilvusOps:
         schema.add_field("chunk_type", DataType.VARCHAR, max_length=128)
         schema.add_field("section_path", DataType.VARCHAR, max_length=65535)
         schema.add_field("page", DataType.INT32)
-        schema.add_field("year", DataType.INT32, default_value=0)
+        schema.add_field("year", DataType.INT32, default_value=np.int32(0))
         index_params = self.client.prepare_index_params()
         index_params.add_index(field_name="dense_vector", **settings.index.params)
         index_params.add_index(

@@ -8,6 +8,7 @@ import {
   restartDeepResearchPhase,
   restartDeepResearchSection,
   getDeepResearchJob,
+  listDeepResearchJobs,
   streamDeepResearchEvents,
   cancelDeepResearchJob,
 } from '../../../api/chat';
@@ -124,6 +125,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
     selectedProvider,
     selectedModel,
     currentCollection,
+    selectedCollections,
     deepResearchDefaults,
   } = useConfigStore();
   const addToast = useToastStore((s) => s.addToast);
@@ -485,13 +487,22 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
               if (event === 'job_status') {
                 const status = typeof data.status === 'string' ? data.status : '';
                 if (status === 'done' || status === 'cancelled' || status === 'error') {
+                  useChatStore.getState().setStreamingStep(null);
                   await finalizeRunningJob(jobId);
                   return;
                 }
               }
+            } else if (event === 'step') {
+              const stepPayload = data as { step?: string | null; label?: string };
+              useChatStore.getState().setStreamingStep(
+                stepPayload?.step
+                  ? { step: stepPayload.step, label: stepPayload.label ?? stepPayload.step }
+                  : null
+              );
             } else if (event === 'error') {
               console.error('[DeepResearch] Backend emitted error:', data);
               if (String(data.message).includes('不存在')) {
+                useChatStore.getState().setStreamingStep(null);
                 await finalizeRunningJob(jobId);
                 return;
               }
@@ -526,16 +537,27 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
     })();
   };
 
-  // Restore job state when dialog opens; set stalledJob when job exists but is not runnable (半途死了)
+  // Restore job state when dialog opens; discover running job from backend if localStorage missing/stale
   useEffect(() => {
     if (!showDeepResearchDialog) return;
-    const savedJobId = localStorage.getItem(DEEP_RESEARCH_JOB_KEY);
-    if (!savedJobId || activeJobId) return;
+    if (activeJobId) return;
 
     let cancelled = false;
     (async () => {
       try {
-        const job = await getDeepResearchJob(savedJobId);
+        let targetJobId: string | null = localStorage.getItem(DEEP_RESEARCH_JOB_KEY);
+        if (!targetJobId) {
+          const [running, pending] = await Promise.all([
+            listDeepResearchJobs(10, 'running'),
+            listDeepResearchJobs(10, 'pending'),
+          ]);
+          const runnableStatuses = new Set(['planning', 'pending', 'running', 'cancelling', 'waiting_review']);
+          const candidate = [...running, ...pending].find((j) => runnableStatuses.has(j.status));
+          targetJobId = candidate?.job_id ?? null;
+        }
+        if (!targetJobId || cancelled) return;
+
+        const job = await getDeepResearchJob(targetJobId);
         if (cancelled) return;
         const isRunnable = job.status === 'planning'
           || job.status === 'pending'
@@ -548,12 +570,12 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
         const sameTopic = !requestedTopic || !runningTopic || requestedTopic === runningTopic;
         if (!isRunnable) {
           setStalledJob({
-            jobId: savedJobId,
+            jobId: targetJobId,
             topic: String(job.topic || ''),
             status: job.status,
             canvas_id: String(job.canvas_id || ''),
           });
-          archiveJobId(savedJobId);
+          archiveJobId(targetJobId);
           localStorage.removeItem(DEEP_RESEARCH_JOB_KEY);
           return;
         }
@@ -562,21 +584,25 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
           addToast('检测到其他进行中的 Deep Research 任务；当前按新主题进入大纲确认流程。', 'info');
           return;
         }
+        localStorage.setItem(DEEP_RESEARCH_JOB_KEY, targetJobId);
         setPhase('running');
         setIsStreaming(true);
         setDeepResearchActive(true);
-        startStreamingJob(savedJobId, false);
+        startStreamingJob(targetJobId, false);
         addToast('已恢复 Deep Research 后台任务状态', 'info');
       } catch (err) {
         console.debug('[DeepResearch] skip stale saved job:', err);
-        setStalledJob({
-          jobId: savedJobId,
-          topic: (useChatStore.getState().deepResearchTopic || '').trim(),
-          status: 'error',
-          canvas_id: '',
-        });
-        archiveJobId(savedJobId);
-        localStorage.removeItem(DEEP_RESEARCH_JOB_KEY);
+        const savedJobId = localStorage.getItem(DEEP_RESEARCH_JOB_KEY);
+        if (savedJobId) {
+          setStalledJob({
+            jobId: savedJobId,
+            topic: (useChatStore.getState().deepResearchTopic || '').trim(),
+            status: 'error',
+            canvas_id: '',
+          });
+          archiveJobId(savedJobId);
+          localStorage.removeItem(DEEP_RESEARCH_JOB_KEY);
+        }
       }
     })();
 
@@ -744,6 +770,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       session_id: sessionId || undefined,
       canvas_id: canvasId || undefined,
       collection: currentCollection || undefined,
+      collections: selectedCollections.length > 0 ? selectedCollections : undefined,
       search_mode: searchMode,
       max_sections: maxSections,
       llm_provider: selectedProvider || undefined,
@@ -755,7 +782,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       use_content_fetcher: webEnabled ? webSearchConfig.contentFetcherMode : undefined,
       gap_query_intent: gapQueryIntent,
       local_top_k: localEnabled ? ragConfig.localTopK : undefined,
-      local_threshold: localEnabled ? (ragConfig.localThreshold ?? undefined) : undefined,
+      fused_pool_score_threshold: ragConfig.fusedPoolScoreThreshold ?? 0.35,
       year_start: ragConfig.yearStart ?? undefined,
       year_end: ragConfig.yearEnd ?? undefined,
       step_top_k: deepStepTopK,
@@ -958,6 +985,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       session_id: sessionId || undefined,
       canvas_id: canvasId || undefined,
       collection: currentCollection || undefined,
+      collections: selectedCollections.length > 0 ? selectedCollections : undefined,
       search_mode: searchMode,
       confirmed_outline: filteredOutline,
       confirmed_brief: brief || undefined,
@@ -973,7 +1001,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       use_content_fetcher: webEnabled ? webSearchConfig.contentFetcherMode : undefined,
       gap_query_intent: gapQueryIntent,
       local_top_k: localEnabled ? ragConfig.localTopK : undefined,
-      local_threshold: localEnabled ? (ragConfig.localThreshold ?? undefined) : undefined,
+      fused_pool_score_threshold: ragConfig.fusedPoolScoreThreshold ?? 0.35,
       year_start: ragConfig.yearStart ?? undefined,
       year_end: ragConfig.yearEnd ?? undefined,
       step_top_k: deepStepTopK,

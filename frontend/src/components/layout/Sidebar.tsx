@@ -4,7 +4,6 @@ import {
   Layers,
   Shield,
   Cpu,
-  Filter,
   Globe,
   Database,
   Server,
@@ -99,8 +98,11 @@ export function Sidebar({ onStartResize }: SidebarProps) {
     dbStatus,
     setDbStatus,
     currentCollection,
+    selectedCollections,
     collections,
+    collectionInfos,
     setCurrentCollection,
+    toggleCollection,
     ragConfig,
     updateRagConfig,
     webSearchConfig,
@@ -151,6 +153,7 @@ export function Sidebar({ onStartResize }: SidebarProps) {
   ]);
 
   // 加载 Pre-Research 可选模型（与 Header LLM 选择同源：perplexity/sonar provider 的 models）
+  // 若 API 无可用模型或返回空列表则保留当前选项不覆盖，避免下拉只剩「关」无法切换
   useEffect(() => {
     listLLMProviders()
       .then((data) => {
@@ -159,17 +162,18 @@ export function Sidebar({ onStartResize }: SidebarProps) {
         if (!prelim?.models?.length) return;
         listAllLiveModels().then((live) => {
           const platform = prelim.platform ?? prelim.id.split('-')[0];
-          const liveModels = live.platforms?.[platform]?.models ?? prelim.models;
+          const liveModels = live.platforms?.[platform]?.models ?? prelim.models ?? [];
           const labelMap: Record<string, string> = {
             sonar: t('sidebar.sonarStrengthSonar', 'Sonar (fast)'),
             'sonar-pro': t('sidebar.sonarStrengthPro', 'Sonar Pro (balanced)'),
             'sonar-reasoning-pro': t('sidebar.sonarStrengthReasoningPro', 'Reasoning Pro (deep)'),
             'sonar-deep-research': t('sidebar.sonarStrengthDeepResearch', 'Deep Research'),
           };
-          setSonarModelOptions(
-            liveModels.map((id) => ({ value: id, label: labelMap[id] ?? id })),
-          );
-        }).catch(() => setSonarModelOptions((prev) => prev));
+          const next = Array.isArray(liveModels)
+            ? liveModels.map((id) => ({ value: id, label: labelMap[id] ?? id }))
+            : [];
+          setSonarModelOptions((prev) => (next.length > 0 ? next : prev));
+        }).catch(() => {});
       })
       .catch(() => {});
   }, [t]);
@@ -535,24 +539,43 @@ export function Sidebar({ onStartResize }: SidebarProps) {
               <div>
                 <div className="flex items-center justify-between text-[10px] text-slate-500 mb-1">
                   <span>{t('sidebar.queryCollection')}</span>
-                </div>
-                <select
-                  id="query-collection"
-                  name="query-collection"
-                  value={currentCollection || ''}
-                  onChange={(e) => setCurrentCollection(e.target.value)}
-                  className="w-full text-xs bg-slate-950 border border-slate-700 text-slate-300 rounded px-2 py-1.5 mb-2 focus:border-sky-500 focus:outline-none"
-                >
-                  {collections.length === 0 ? (
-                    <option value="">{t('sidebar.noCollection')}</option>
-                  ) : (
-                    collections.map((name) => (
-                      <option key={`query-collection-${name}`} value={name}>
-                        {name}
-                      </option>
-                    ))
+                  {selectedCollections.length > 1 && (
+                    <span className="text-sky-500 font-medium">{selectedCollections.length} selected</span>
                   )}
-                </select>
+                </div>
+                {collections.length === 0 ? (
+                  <div className="text-xs text-slate-600 italic py-1">{t('sidebar.noCollection')}</div>
+                ) : (
+                  <div className="flex flex-col gap-0.5 mb-2 max-h-32 overflow-y-auto pr-1 scrollbar-thin scrollbar-thumb-slate-700">
+                    {collections.map((name) => {
+                      const info = collectionInfos.find((c) => c.name === name);
+                      const isChecked = selectedCollections.includes(name);
+                      const tooltip = info?.scope_summary ? `${name}\n${info.scope_summary}` : name;
+                      return (
+                        <label
+                          key={`query-collection-${name}`}
+                          title={tooltip}
+                          className={`flex items-center gap-1.5 px-2 py-1 rounded cursor-pointer text-xs transition-colors ${
+                            isChecked
+                              ? 'bg-sky-950/60 text-sky-300 border border-sky-700/50'
+                              : 'text-slate-400 hover:bg-slate-800/60 border border-transparent'
+                          }`}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={isChecked}
+                            onChange={() => toggleCollection(name)}
+                            className="accent-sky-500 w-3 h-3 flex-shrink-0 cursor-pointer"
+                          />
+                          <span className="truncate flex-1">{name}</span>
+                          {info && info.count >= 0 && (
+                            <span className="text-slate-600 text-[10px] flex-shrink-0">{info.count}</span>
+                          )}
+                        </label>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
               )}
 
@@ -594,21 +617,6 @@ export function Sidebar({ onStartResize }: SidebarProps) {
                   className="w-full accent-sky-500 h-1.5 bg-slate-700 rounded-lg appearance-none cursor-pointer"
                 />
               </div>}
-
-              {/* Reranker 当前模式只读提示 — 完整配置请前往高级设置 */}
-              {ragConfig.enabled && (
-                <div className="flex items-center justify-between text-[10px] text-slate-500">
-                  <div className="flex items-center gap-1.5">
-                    <Filter size={11} className="text-slate-600" />
-                    <span>{t('sidebar.colbertReranker')}</span>
-                  </div>
-                  <span className="font-mono bg-slate-900 border border-slate-700 px-1.5 py-0.5 rounded text-slate-400">
-                    {ragConfig.enableReranker
-                      ? (localStorage.getItem('adv_reranker_mode') || 'cascade')
-                      : 'bge_only'}
-                  </span>
-                </div>
-              )}
             </div>
           </section>
         )}
@@ -748,45 +756,44 @@ export function Sidebar({ onStartResize }: SidebarProps) {
                 </div>
               </div>
 
-              {/* 相似度阈值 */}
+              {/* 合并池分数阈值 */}
               <div>
                 <div className="flex items-center justify-between text-[10px] text-slate-500 mb-1">
-                  <span>{t('sidebar.threshold')}</span>
+                  <span>{t('sidebar.fusedPoolScoreThreshold')}</span>
                   <div className="flex items-center gap-2">
                     <span className="font-mono bg-slate-950 px-1.5 py-0.5 rounded border border-slate-700 text-sky-400">
-                      {ragConfig.localThreshold?.toFixed(2) ?? '0.50'}
+                      {(ragConfig.fusedPoolScoreThreshold ?? 0.35).toFixed(2)}
                     </span>
                     <input
-                      id="threshold-num"
-                      name="threshold-num"
+                      id="fused-threshold-num"
+                      name="fused-threshold-num"
                       type="number"
                       min="0"
                       max="1"
-                      step="0.01"
-                      value={ragConfig.localThreshold ?? 0.5}
+                      step="0.05"
+                      value={ragConfig.fusedPoolScoreThreshold ?? 0.35}
                       onChange={(e) =>
-                        updateRagConfig({ localThreshold: Math.min(1, Math.max(0, Number(e.target.value))) })
+                        updateRagConfig({ fusedPoolScoreThreshold: Math.min(1, Math.max(0, Number(e.target.value) || 0.35)) })
                       }
                       className="w-16 text-[10px] bg-slate-950 border border-slate-700 text-slate-300 rounded px-1 py-0.5 focus:border-sky-500 focus:outline-none"
-                      title={t('sidebar.thresholdTitle')}
                     />
                   </div>
                 </div>
                 <input
-                  id="threshold-range"
-                  name="threshold-range"
+                  id="fused-threshold-range"
+                  name="fused-threshold-range"
                   type="range"
                   min="0"
                   max="1"
                   step="0.05"
-                  value={ragConfig.localThreshold ?? 0.5}
+                  value={ragConfig.fusedPoolScoreThreshold ?? 0.35}
                   onChange={(e) =>
-                    updateRagConfig({ localThreshold: Number(e.target.value) })
+                    updateRagConfig({ fusedPoolScoreThreshold: Number(e.target.value) })
                   }
                   className="w-full accent-emerald-500 h-1.5 bg-slate-700 rounded-lg appearance-none cursor-pointer"
                 />
                 <div className="text-[9px] text-slate-600 mt-0.5">
-                  {t('sidebar.thresholdDesc')}
+                  {t('sidebar.fusedPoolScoreThresholdDesc')}
                 </div>
               </div>
 

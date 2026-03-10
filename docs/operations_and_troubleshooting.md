@@ -305,7 +305,9 @@ python scripts/19_cleanup_storage.py --vacuum
 
 - 生产环境关闭默认管理员密码（`auth.secret_key` 必须替换）
 - 定期备份：
+  - `data/users/<user_id>/library/parsed_raw/`（用户侧文献库→向量库同步链路的解析产物主路径）
   - `data/parsed/`
+    - 说明：离线/批处理脚本当前仍使用 legacy 全局路径；本轮仅用户侧同步链路切换到 `parsed_raw`
   - `data/rag.db`
   - `data/*.db.bak`（如存在历史迁移备份）
   - 关键配置文件（脱敏后）
@@ -329,3 +331,37 @@ alembic upgrade head
   - 前端是否发送了 `Authorization: Bearer <token>`
   - 服务端与客户端是否存在明显时间偏差（JWT 过期判断依赖系统时间）
   - 数据库迁移是否已执行（缺少 `revoked_tokens` 表可能导致撤销/校验异常日志）
+
+## 九、Context 池排障
+
+### 启动日志确认
+
+正常启动应看到：
+
+```
+[context-pool] initialized headless=4 (general=3, search_reserved=1) headed=2
+```
+
+如果看到 `no shared_browser config, skip init`，检查 `rag_config.json` 中是否存在 `shared_browser` 配置块。
+
+### 常见警告
+
+| 日志 | 含义 | 处理方式 |
+| --- | --- | --- |
+| `pool event-loop mismatch` | 旧代码路径直接 acquire（应已被 bridge 替代） | 确认代码已更新为 `run_with_context` 桥接 |
+| `acquire headless timeout` | 所有 slot 都被占用，等待超时 | 增大 `headless_context_pool_size` 或检查是否有 slot 长期未释放 |
+| `create headless slot failed` | CDP 连接失败 | 检查 headless 浏览器是否正常运行、端口是否正确 |
+| `slot ... error_count=3, recreating` | 同一 slot 连续出错 3 次，自动重建 | 查看前序错误日志定位根因 |
+
+### 调整池大小
+
+修改 `config/rag_config.json`（或 `rag_config.local.json`）中的 `shared_browser` 块后，需**重启服务**生效（池在启动时一次性初始化）。
+
+### 验证 slot 利用率
+
+当前暂无内置指标暴露。可通过日志观察：
+
+- `[context-pool] acquired headless slot=headless-0` — 借出
+- `[context-pool] released headless slot=headless-0 cooldown=1.23s` — 归还
+
+如果频繁看到 `acquire headless timeout`，说明池容量不足，应增大 `headless_context_pool_size`。

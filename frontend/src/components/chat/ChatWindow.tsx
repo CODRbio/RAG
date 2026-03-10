@@ -159,6 +159,8 @@ export function ChatWindow() {
   const setCanvasId = useChatStore((s) => s.setCanvasId);
   const setResearchDashboard = useChatStore((s) => s.setResearchDashboard);
   const isStreaming = useChatStore((s) => s.isStreaming);
+  const streamingStep = useChatStore((s) => s.streamingStep);
+  const setStreamingStep = useChatStore((s) => s.setStreamingStep);
   // LocalDbChoiceDialog 由 App.tsx 全局挂载，ChatWindow 不再处理内联按钮
   const addToast = useToastStore((s) => s.addToast);
   const addComparePreselected = useCompareStore((s) => s.addComparePreselected);
@@ -249,6 +251,7 @@ export function ChatWindow() {
         setBackgroundJob(null);
         setBackgroundEventLines([]);
         setShowBackgroundLogs(false);
+        setStreamingStep(null);
       }
       trackedBackgroundJobIdRef.current = null;
       lastBackgroundEventIdRef.current = 0;
@@ -280,9 +283,17 @@ export function ChatWindow() {
             setBackgroundJob((prev) => mergeJobFromPayload(prev, data));
             const status = String(data.status || '');
             if (status === 'done' || status === 'error' || status === 'cancelled') {
+              setStreamingStep(null);
               clearState();
               break;
             }
+          } else if (event === 'step') {
+            const stepPayload = data as { step?: string | null; label?: string };
+            setStreamingStep(
+              stepPayload?.step
+                ? { step: stepPayload.step, label: stepPayload.label ?? stepPayload.step }
+                : null
+            );
           } else if (event === 'progress' || event === 'warning' || event === 'waiting_review') {
             setBackgroundEventLines((prev) => [...prev.slice(-9), toEventLine(event, data)]);
           }
@@ -320,7 +331,9 @@ export function ChatWindow() {
   };
 
   const handleOpenSource = (source: Source) => {
-    if (source.url) {
+    if (source.pdf_url) {
+      window.open(source.pdf_url, '_blank');
+    } else if (source.url) {
       window.open(source.url, '_blank');
     } else if (source.doi) {
       window.open(`https://doi.org/${source.doi}`, '_blank');
@@ -437,7 +450,7 @@ export function ChatWindow() {
   }, [activeLibraryId, libraries]);
 
   const handleImportSourcesClick = useCallback(async (messageKey: string, sources: Source[]) => {
-    const candidateSources = (sources || []).filter((s) => s && (s.title || s.doi || s.url || s.doc_id));
+    const candidateSources = (sources || []).filter((s) => s && (s.title || s.doi || s.url || s.pdf_url || s.doc_id));
     if (candidateSources.length === 0) {
       addToast('当前回答没有可导入的文献信息', 'info');
       return;
@@ -723,7 +736,7 @@ export function ChatWindow() {
                             );
                           })()}
                         </div>
-                        {(src.url || src.doi) && (
+                        {(src.pdf_url || src.url || src.doi) && (
                           <ExternalLink size={12} className="text-slate-500 group-hover/ref:text-sky-400 flex-shrink-0 mt-0.5 transition-colors" />
                         )}
                       </div>
@@ -735,8 +748,8 @@ export function ChatWindow() {
                         </div>
                       )}
                       
-                      {/* 第三行：作者 + 年份 */}
-                      <div className="flex items-center gap-3 text-xs text-slate-400">
+                      {/* 第三行：作者 + 年份 + DOI */}
+                      <div className="flex items-center gap-3 text-xs text-slate-400 flex-wrap">
                         {src.authors && src.authors.length > 0 && (
                           <span className="flex items-center gap-1">
                             <User size={10} className="opacity-60" />
@@ -749,7 +762,12 @@ export function ChatWindow() {
                             {src.year}
                           </span>
                         )}
-                        {src.doc_id && !src.url && (
+                        {src.doi && (
+                          <span className="flex items-center gap-1 text-slate-500 font-mono">
+                            DOI: {src.doi}
+                          </span>
+                        )}
+                        {src.doc_id && !src.url && !src.pdf_url && (
                           <span className="flex items-center gap-1 text-slate-500">
                             <FileText size={10} />
                             {t('chat.localDoc')}
@@ -798,6 +816,16 @@ export function ChatWindow() {
         </div>
       );
       })}
+
+      {/* Active step indicator (Thinking-style): while chat streaming or background Research has active step */}
+      {(isStreaming || backgroundJob) && streamingStep && (
+        <div className="flex justify-start animate-in fade-in duration-200">
+          <div className="rounded-full px-3 py-1.5 text-xs font-medium text-slate-400 bg-slate-800/60 border border-slate-700/50 inline-flex items-center gap-2">
+            <span className="w-1.5 h-1.5 rounded-full bg-sky-400 animate-pulse" />
+            {t('chat.thinking', 'Thinking')}: {streamingStep.label}
+          </div>
+        </div>
+      )}
 
       {/* PDF 溯源 Modal */}
       <PdfViewerModal

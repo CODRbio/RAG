@@ -13,7 +13,7 @@ import threading
 import uuid
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File
 from pydantic import BaseModel, Field
 from fastapi.responses import StreamingResponse
@@ -53,6 +53,8 @@ from src.api.schemas import (
     EvidenceSummary,
     IntentDetectRequest,
     IntentDetectResponse,
+    ChatSuggestionsRequest,
+    ChatSuggestionsResponse,
     SessionInfo,
     SessionListItem,
     TurnItem,
@@ -67,6 +69,7 @@ from src.collaboration.intent import (
     check_query_collection_scope,
     is_deep_research,
 )
+from src.collaboration.intent.commands import allocate_collection_quotas
 from src.collaboration.memory.session_memory import (
     SessionStore,
     get_session_store,
@@ -77,7 +80,15 @@ from src.collaboration.memory.persistent_store import get_user_profile
 from src.collaboration.workflow import run_workflow
 from src.llm.llm_manager import get_manager
 from src.llm.react_loop import react_loop
-from src.llm.tools import CORE_TOOLS, get_routed_skills, start_agent_chunk_collector, drain_agent_chunks, set_tool_collection, set_agent_sonar_model
+from src.llm.tools import (
+    CORE_TOOLS,
+    get_routed_skills,
+    start_agent_chunk_collector,
+    drain_agent_chunks,
+    set_tool_collection,
+    set_tool_step_top_k,
+    set_agent_sonar_model,
+)
 from src.collaboration.citation.manager import (
     _dedupe_citations,
     chunk_to_citation,
@@ -92,9 +103,12 @@ from src.retrieval.service import (
     fuse_pools_with_gap_protection,
     get_retrieval_service,
     _hit_to_chunk as service_hit_to_chunk,
+    _filter_fused_by_score_threshold,
 )
 from src.retrieval.evidence import EvidenceChunk, EvidencePack
 from src.generation.evidence_synthesizer import EvidenceSynthesizer, build_synthesis_system_prompt
+from src.utils.context_limits import summarize_if_needed, cap_and_log
+from src.utils.token_counter import count_tokens, get_context_window, needs_sliding_window
 from src.collaboration.auto_complete import AutoCompleteService
 from src.tasks import get_task_queue
 from src.tasks.task_state import TaskKind, TaskStatus
@@ -508,7 +522,7 @@ def _chunk_text(text: str, chunk_size: int = 20):
 def _serialize_citation(c: Citation | str) -> dict:
     """将 Citation 对象或字符串序列化为字典。"""
     if isinstance(c, str):
-        return {"cite_key": c, "title": "", "authors": [], "year": None, "doc_id": None, "url": None, "provider": None}
+        return {"cite_key": c, "title": "", "authors": [], "year": None, "doc_id": None, "url": None, "pdf_url": None, "provider": None}
     return {
         "cite_key": c.cite_key or c.id,
         "title": c.title or "",
@@ -516,6 +530,7 @@ def _serialize_citation(c: Citation | str) -> dict:
         "year": c.year,
         "doc_id": c.doc_id,
         "url": c.url,
+        "pdf_url": getattr(c, "pdf_url", None),
         "doi": c.doi,
         "bbox": getattr(c, "bbox", None),
         "page_num": getattr(c, "page_num", None),
@@ -534,14 +549,18 @@ def _build_filters(body: ChatRequest) -> dict:
         filters["serpapi_ratio"] = body.serpapi_ratio
     if body.use_query_expansion is not None:
         filters["use_query_expansion"] = body.use_query_expansion
-    if body.local_threshold is not None:
-        filters["local_threshold"] = body.local_threshold
+    # Fused-pool score threshold (after merge); backward compat: fallback from local_threshold
+    fused_threshold = getattr(body, "fused_pool_score_threshold", None)
+    if fused_threshold is None and body.local_threshold is not None:
+        fused_threshold = body.local_threshold
+    if fused_threshold is not None:
+        filters["fused_pool_score_threshold"] = fused_threshold
     if body.year_start is not None:
         filters["year_start"] = body.year_start
     if body.year_end is not None:
         filters["year_end"] = body.year_end
     if body.step_top_k is not None:
-        filters["step_top_k"] = body.step_top_k
+        filters["step_top_k"] = _chat_effective_step_top_k(body.step_top_k)
     if getattr(body, "write_top_k", None) is not None:
         filters["write_top_k"] = body.write_top_k
     if getattr(body, "graph_top_k", None) is not None:
@@ -554,12 +573,18 @@ def _build_filters(body: ChatRequest) -> dict:
         filters["ultra_lite_provider"] = body.ultra_lite_provider
     if body.model_override:
         filters["model_override"] = body.model_override
+    # 配置优先级：UI/请求入参 > config > 代码默认（见 docs/configuration.md）
     if body.use_content_fetcher is not None:
         filters["use_content_fetcher"] = body.use_content_fetcher
     if getattr(body, "agent_sonar_model", None):
         filters["agent_sonar_model"] = body.agent_sonar_model
     if body.collection:
         filters["collection"] = body.collection
+    _body_collections = getattr(body, "collections", None)
+    if _body_collections:
+        _valid_cols = [c.strip() for c in _body_collections if (c or "").strip()]
+        if _valid_cols:
+            filters["collections"] = _valid_cols
     # Main fusion rank-pool policy for chat requests (global local+web rerank).
     filters["rank_pool_multiplier"] = float(
         getattr(settings.search, "chat_rank_pool_multiplier", 3.0)
@@ -591,6 +616,165 @@ def _chat_web_queries_from_1plus1plus1(
 
 # ── Chat 证据充分性评估（LLM 判断，借鉴 Deep Research evaluate_sufficiency）──
 _CHAT_EVIDENCE_CONTEXT_CAP = 12000  # 送入评估的 evidence 最大字符，避免超长
+_CHAT_EVIDENCE_SOFT_MAX_CHARS = 40_000
+_CHAT_EVIDENCE_SUMMARIZE_TO_CHARS = 16_000
+_CHAT_EVIDENCE_HARD_MAX_CHARS = 55_000
+_CHAT_SYSTEM_HARD_MAX_CHARS = 70_000
+_CHAT_PROMPT_SAFETY_MARGIN = 0.10
+_CHAT_MIN_OUTPUT_TOKENS = 2048
+_AGENT_MIN_OUTPUT_TOKENS = 4096
+_CHAT_STEP_BUDGET_AMPLIFY = 1.2
+
+
+def _chat_effective_step_top_k(step_k: Optional[int]) -> Optional[int]:
+    """Chat-only internal step budget expansion for candidate recall."""
+    if step_k is None:
+        return None
+    try:
+        base = int(step_k)
+    except Exception:
+        return None
+    if base <= 0:
+        return None
+    return max(base, int(math.ceil(base * _CHAT_STEP_BUDGET_AMPLIFY)))
+
+
+def _message_content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return ""
+    try:
+        return json.dumps(content, ensure_ascii=False, default=str)
+    except Exception:
+        return str(content)
+
+
+def _estimate_prompt_tokens(messages: List[Dict[str, Any]]) -> int:
+    # Heuristic: role/header overhead + content tokens.
+    total = 0
+    for m in messages:
+        total += 6
+        total += count_tokens(_message_content_to_text(m.get("content")))
+    return total
+
+
+def _budget_chat_evidence_context(
+    context: str,
+    *,
+    llm_client: Any,
+    ultra_lite_provider: Optional[str],
+    purpose: str,
+) -> tuple[str, Dict[str, Any]]:
+    raw = (context or "").strip()
+    if not raw:
+        return "", {
+            "purpose": purpose,
+            "raw_chars": 0,
+            "after_soft_chars": 0,
+            "final_chars": 0,
+            "used_summary": False,
+            "used_hard_cap": False,
+        }
+
+    used_summary = False
+    after_soft = raw
+    if len(raw) > _CHAT_EVIDENCE_SOFT_MAX_CHARS:
+        after_soft = summarize_if_needed(
+            raw,
+            _CHAT_EVIDENCE_SUMMARIZE_TO_CHARS,
+            llm_client=llm_client,
+            ultra_lite_provider=ultra_lite_provider,
+            purpose=f"{purpose}_soft_budget",
+        )
+        used_summary = after_soft != raw
+    final = cap_and_log(
+        after_soft,
+        max_chars=_CHAT_EVIDENCE_HARD_MAX_CHARS,
+        purpose=f"{purpose}_hard_cap",
+    )
+    diag = {
+        "purpose": purpose,
+        "raw_chars": len(raw),
+        "after_soft_chars": len(after_soft),
+        "final_chars": len(final),
+        "used_summary": used_summary,
+        "used_hard_cap": len(final) < len(after_soft),
+        "soft_max_chars": _CHAT_EVIDENCE_SOFT_MAX_CHARS,
+        "soft_target_chars": _CHAT_EVIDENCE_SUMMARIZE_TO_CHARS,
+        "hard_max_chars": _CHAT_EVIDENCE_HARD_MAX_CHARS,
+    }
+    return final, diag
+
+
+def _apply_pre_send_prompt_budget(
+    messages: List[Dict[str, Any]],
+    *,
+    model: Optional[str],
+    min_output_tokens: int,
+    mode: str,
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    pruned = list(messages)
+    context_window = get_context_window(model)
+    prompt_tokens_before = _estimate_prompt_tokens(pruned)
+    trimmed_history = 0
+    trimmed_non_history = 0
+    used_system_cap = False
+
+    # Keep system + latest user; trim oldest middle turns first.
+    while len(pruned) > 2 and needs_sliding_window(
+        _estimate_prompt_tokens(pruned),
+        context_window,
+        safety_margin=_CHAT_PROMPT_SAFETY_MARGIN,
+        min_output_tokens=min_output_tokens,
+    ):
+        removed = pruned.pop(1)
+        if removed.get("role") in ("user", "assistant"):
+            trimmed_history += 1
+        else:
+            trimmed_non_history += 1
+
+    # Final safety on system prompt length.
+    if pruned and pruned[0].get("role") == "system":
+        sys_content = _message_content_to_text(pruned[0].get("content"))
+        capped = cap_and_log(
+            sys_content,
+            max_chars=_CHAT_SYSTEM_HARD_MAX_CHARS,
+            purpose=f"chat_system_pre_send_{mode}",
+        )
+        if capped != sys_content:
+            used_system_cap = True
+            pruned[0] = {**pruned[0], "content": capped}
+
+    # If still over budget, keep shrinking oldest non-system messages until fit.
+    while len(pruned) > 2 and needs_sliding_window(
+        _estimate_prompt_tokens(pruned),
+        context_window,
+        safety_margin=_CHAT_PROMPT_SAFETY_MARGIN,
+        min_output_tokens=min_output_tokens,
+    ):
+        removed = pruned.pop(1)
+        if removed.get("role") in ("user", "assistant"):
+            trimmed_history += 1
+        else:
+            trimmed_non_history += 1
+
+    prompt_tokens_after = _estimate_prompt_tokens(pruned)
+    diag = {
+        "mode": mode,
+        "model": model or "default",
+        "context_window": context_window,
+        "prompt_tokens_before": prompt_tokens_before,
+        "prompt_tokens_after": prompt_tokens_after,
+        "min_output_tokens": min_output_tokens,
+        "safety_margin": _CHAT_PROMPT_SAFETY_MARGIN,
+        "history_trimmed": trimmed_history,
+        "non_history_trimmed": trimmed_non_history,
+        "used_system_hard_cap": used_system_cap,
+        "message_count_before": len(messages),
+        "message_count_after": len(pruned),
+    }
+    return pruned, diag
 
 
 class _ChatSufficiencyResponse(BaseModel):
@@ -731,6 +915,7 @@ def _chunk_to_hit(c: EvidenceChunk) -> Dict[str, Any]:
         "authors": c.authors,
         "year": c.year,
         "url": c.url,
+        "pdf_url": getattr(c, "pdf_url", None),
         "doi": c.doi,
         "provider": c.provider,
     }
@@ -743,6 +928,138 @@ def _chunk_to_hit(c: EvidenceChunk) -> Dict[str, Any]:
     }
 
 
+def _fuse_chat_main_gap_agent_candidates(
+    *,
+    query: str,
+    message: str,
+    main_chunks: List[EvidenceChunk],
+    gap_candidate_hits: List[Dict[str, Any]],
+    agent_chunks: List[EvidenceChunk],
+    write_k: int,
+    filters: Dict[str, Any],
+) -> tuple[List[EvidenceChunk], Dict[str, Any]]:
+    """Fuse main/gap/agent candidate pools for final chat-visible evidence."""
+    chat_gap_ratio = float(getattr(settings.search, "chat_gap_ratio", 0.2))
+    chat_agent_ratio = float(getattr(settings.search, "chat_agent_ratio", 0.1))
+    main_candidates = [_chunk_to_hit(c) for c in main_chunks]
+    agent_candidates = [_chunk_to_hit(c) for c in agent_chunks]
+    total = len(main_candidates) + len(gap_candidate_hits) + len(agent_candidates)
+    if total <= 0:
+        return [], {}
+    final_top_k = min(max(int(write_k), 1), total)
+    fusion_diag: Dict[str, Any] = {}
+    fused_hits = fuse_pools_with_gap_protection(
+        query=query or message,
+        main_candidates=main_candidates,
+        gap_candidates=gap_candidate_hits,
+        top_k=final_top_k,
+        agent_candidates=agent_candidates,
+        gap_ratio=chat_gap_ratio,
+        agent_ratio=chat_agent_ratio,
+        gap_min_keep=math.ceil(final_top_k * chat_gap_ratio),
+        agent_min_keep=math.ceil(final_top_k * chat_agent_ratio),
+        rank_pool_multiplier=float(getattr(settings.search, "chat_rank_pool_multiplier", 3.0)),
+        trace_ctx={"phase": "chat_agent_final_fusion", "section": "chat"},
+        reranker_mode=(filters or {}).get("reranker_mode") or "bge_only",
+        diag=fusion_diag,
+    )
+    fused_hits = _filter_fused_by_score_threshold(
+        fused_hits, (filters or {}).get("fused_pool_score_threshold")
+    )
+    final_chunks = [
+        service_hit_to_chunk(h, h.get("_source_type", "dense"), query or message)
+        for h in fused_hits
+    ]
+    return final_chunks, (fusion_diag.get("pool_fusion") or {})
+
+
+def _chunk_to_cache_payload(c: EvidenceChunk) -> Dict[str, Any]:
+    """EvidenceChunk -> compact JSON payload for session reuse cache."""
+    return {
+        "chunk_id": c.chunk_id,
+        "doc_id": c.doc_id,
+        "text": c.text,
+        "score": c.score,
+        "source_type": c.source_type,
+        "doc_title": c.doc_title,
+        "authors": c.authors,
+        "year": c.year,
+        "url": c.url,
+        "pdf_url": getattr(c, "pdf_url", None),
+        "doi": c.doi,
+        "page_num": c.page_num,
+        "section_title": c.section_title,
+        "evidence_type": c.evidence_type,
+        "bbox": c.bbox,
+        "provider": c.provider,
+    }
+
+
+def _cache_payload_to_chunk(payload: Dict[str, Any]) -> Optional[EvidenceChunk]:
+    """Deserialize one cached payload back into EvidenceChunk."""
+    if not isinstance(payload, dict):
+        return None
+    chunk_id = str(payload.get("chunk_id") or "").strip()
+    doc_id = str(payload.get("doc_id") or "").strip()
+    text = str(payload.get("text") or "").strip()
+    if not chunk_id or not doc_id or not text:
+        return None
+    source_type = str(payload.get("source_type") or "dense").strip().lower()
+    if source_type not in ("dense", "sparse", "graph", "web"):
+        source_type = "dense"
+    try:
+        score = float(payload.get("score") or 0.0)
+    except Exception:
+        score = 0.0
+    authors = payload.get("authors")
+    if not isinstance(authors, list):
+        authors = None
+    year_raw = payload.get("year")
+    year = int(year_raw) if isinstance(year_raw, int) else None
+    page_num_raw = payload.get("page_num")
+    page_num = int(page_num_raw) if isinstance(page_num_raw, int) else None
+    bbox = payload.get("bbox") if isinstance(payload.get("bbox"), list) else None
+    return EvidenceChunk(
+        chunk_id=chunk_id,
+        doc_id=doc_id,
+        text=text,
+        score=score,
+        source_type=source_type,
+        doc_title=(str(payload.get("doc_title") or "").strip() or None),
+        authors=authors,
+        year=year,
+        url=(str(payload.get("url") or "").strip() or None),
+        pdf_url=(str(payload.get("pdf_url") or "").strip() or None),
+        doi=(str(payload.get("doi") or "").strip() or None),
+        page_num=page_num,
+        section_title=(str(payload.get("section_title") or "").strip() or None),
+        evidence_type=(str(payload.get("evidence_type") or "").strip() or None),
+        bbox=bbox,
+        provider=(str(payload.get("provider") or "").strip() or None),
+    )
+
+
+def _load_recent_cached_chunks(store: SessionStore, session_id: str, max_turns: int = 4) -> List[EvidenceChunk]:
+    """Load and flatten recent cached evidence chunks from session preferences."""
+    rows = store.get_recent_evidence_cache(session_id)
+    if not rows:
+        return []
+    selected = rows[-max(1, int(max_turns)):]
+    out: List[EvidenceChunk] = []
+    for row in selected:
+        for payload in (row.get("chunks") or []):
+            if isinstance(payload, dict):
+                c = _cache_payload_to_chunk(payload)
+                if c is not None:
+                    out.append(c)
+    dedup: Dict[str, EvidenceChunk] = {}
+    for c in out:
+        key = c.chunk_id or c.doc_group_key
+        if key and key not in dedup:
+            dedup[key] = c
+    return list(dedup.values())
+
+
 def _build_deep_research_filters(body: Any) -> dict:
     """Build filters from deep-research start/confirm request objects."""
     filters: Dict[str, Any] = {}
@@ -751,6 +1068,7 @@ def _build_deep_research_filters(body: Any) -> dict:
         "web_source_configs",
         "serpapi_ratio",
         "local_top_k",
+        "fused_pool_score_threshold",
         "local_threshold",
         "year_start",
         "year_end",
@@ -769,6 +1087,12 @@ def _build_deep_research_filters(body: Any) -> dict:
         val = getattr(body, key, None)
         if val is not None and val != "":
             filters[key] = val
+    # Multi-collection support
+    _cols = getattr(body, "collections", None)
+    if _cols:
+        _valid = [c.strip() for c in _cols if (c or "").strip()]
+        if _valid:
+            filters["collections"] = _valid
     filters["rank_pool_multiplier"] = float(
         getattr(settings.search, "research_rank_pool_multiplier", 3.0)
     )
@@ -864,10 +1188,15 @@ def _request_debug_level(body: ChatRequest):
 def _run_chat_impl(
     body: ChatRequest,
     optional_user_id: str | None = None,
+    step_callback: Optional[Callable[[Optional[str], str], None]] = None,
 ) -> tuple[str, str, list[Citation], EvidenceSummary, ParsedIntent, dict | None, list | None, dict[str, str], dict | None, bool, Optional[str]]:
     import time as _time
     from src.debug import get_debug_logger
     dbg = get_debug_logger()
+
+    def _step(step_id: Optional[str], label: str) -> None:
+        if step_callback:
+            step_callback(step_id, label or "")
 
     t_start = _time.perf_counter()
 
@@ -895,6 +1224,7 @@ def _run_chat_impl(
         _chat_logger.info("[chat] 0½ 写入 session 偏好 local_db=%s", pref_local)
         empty_ev = EvidenceSummary(query=message or "", total_chunks=0, sources_used=[], retrieval_time_ms=0)
         _parsed = ParsedIntent(intent_type=IntentType.CHAT, confidence=1.0, raw_input=message or "")
+        _step(None, "")
         return session_id, confirm, [], empty_ev, _parsed, None, None, {}, None, False, None
     # 仅当会话尚无标题时用首条消息生成短标题（提交时已用问题作为标题的则保留）
     meta = store.get_session_meta(session_id)
@@ -963,6 +1293,7 @@ def _run_chat_impl(
         )
     else:
         # 统一上下文分析：一次 ultra-lite 调用完成 意图分类 + 指代检测 + query 重写/澄清
+        _step("analyzing", "Analyzing query...")
         t_analyze = _time.perf_counter()
         ctx_analysis = analyze_chat_context(
             message=message,
@@ -994,12 +1325,14 @@ def _run_chat_impl(
             ctx_analysis.action, ctx_analysis.context_status,
             (ctx_analysis.rewritten_query or "")[:60], analyze_ms,
         )
+        _step(None, "")
 
     meta = store.get_session_meta(session_id)
     canvas_id = (meta or {}).get("canvas_id") or ""
 
     # ── Deep Research 分支 ──
     if is_deep_research(parsed):
+        _step(None, "")
         _chat_logger.info("[work=research] 开始")
         _chat_logger.info("[chat] ── 进入 Deep Research 分支 ──")
         topic = (parsed.params.get("args") or message).strip() or "综述"
@@ -1059,6 +1392,7 @@ def _run_chat_impl(
     _chat_logger.info("[work=chat] 第1轮")
     # ── 2½. 指代澄清短路（LLM 判定无法推断时直接追问用户）──
     if ctx_analysis and ctx_analysis.context_status == "needs_clarification" and ctx_analysis.clarification:
+        _step(None, "")
         _chat_logger.info("[chat] ②½ 指代不明 → 返回澄清问题，跳过检索")
         memory.add_turn("user", message)
         memory.add_turn("assistant", ctx_analysis.clarification, citations=[])
@@ -1087,15 +1421,30 @@ def _run_chat_impl(
     else:
         # /command 或前端指定 mode 时，走原有 _classify_query 兜底
         query_needs_rag = _classify_query(message, history_for_intent, lite_client)
-    do_retrieval = search_mode != "none" and query_needs_rag and agent_mode != "autonomous"
+    followup_mode = (ctx_analysis.followup_mode if ctx_analysis else "fresh").strip().lower()
+    if followup_mode not in ("fresh", "reuse_only", "reuse_and_search"):
+        followup_mode = "fresh"
+    topic_relevance = (ctx_analysis.topic_relevance if ctx_analysis else "low").strip().lower()
+    if topic_relevance not in ("low", "medium", "high"):
+        topic_relevance = "low"
+    target_span = (ctx_analysis.target_span if ctx_analysis else "").strip()
+    # 追问高相关场景优先复用已有证据；是否补搜交给后续 Agent/证据缺口判断。
+    # 仅 fresh（低相关/新主题）走常规预检索。
+    do_retrieval = (
+        search_mode != "none"
+        and query_needs_rag
+        and followup_mode == "fresh"
+        and agent_mode != "autonomous"
+    )
     _agent_mode_before_route = agent_mode
-    if not query_needs_rag:
+    if not query_needs_rag and followup_mode != "reuse_and_search":
         agent_mode = "standard"
 
     _chat_logger.info(
-        "[chat] ③ 查询路由 → %s | do_retrieval=%s (search_mode=%s, agent_mode=%s)",
+        "[chat] ③ 查询路由 → %s | do_retrieval=%s | followup_mode=%s relevance=%s target=%r"
+        " (search_mode=%s, agent_mode=%s)",
         "rag" if query_needs_rag else "chat",
-        do_retrieval, search_mode, agent_mode,
+        do_retrieval, followup_mode, topic_relevance, target_span[:40], search_mode, agent_mode,
     )
     if _agent_mode_before_route != agent_mode:
         _chat_logger.info(
@@ -1113,8 +1462,28 @@ def _run_chat_impl(
         latency_ms=0,
     )
 
-    # ── 4. 检索 query 构建（仅 rag 模式）──
-    if do_retrieval:
+    # ── 3.5 读取会话证据缓存（用于 follow-up reuse）──
+    _reuse_cache_turns = int(getattr(settings.search, "chat_followup_cache_turns", 4) or 4)
+    cached_reuse_chunks = _load_recent_cached_chunks(store, session_id, max_turns=_reuse_cache_turns)
+    reuse_enabled = (
+        followup_mode in ("reuse_only", "reuse_and_search")
+        and topic_relevance in ("medium", "high")
+        and len(cached_reuse_chunks) > 0
+    )
+    if followup_mode in ("reuse_only", "reuse_and_search") and not reuse_enabled:
+        _chat_logger.info(
+            "[chat] ③½ %s requested but cache unavailable/low relevance → fallback fresh",
+            followup_mode,
+        )
+        followup_mode = "fresh"
+        do_retrieval = (
+            search_mode != "none"
+            and query_needs_rag
+            and agent_mode != "autonomous"
+        )
+
+    # ── 4. 检索 query 构建（检索或复用时）──
+    if do_retrieval or reuse_enabled:
         # 若上下文分析已完成指代补全，使用 rewritten_query 作为输入（避免重复 LLM 调用）
         effective_msg = (
             ctx_analysis.rewritten_query
@@ -1129,8 +1498,8 @@ def _run_chat_impl(
         )
         query_ms = (_time.perf_counter() - t_query) * 1000
         _chat_logger.info(
-            "[chat] ④ Query 构建 | original=%r → effective=%r → query=%r | 耗时=%.0fms",
-            message[:40], effective_msg[:40], query[:60], query_ms,
+            "[chat] ④ Query 构建 | original=%r → effective=%r → query=%r | mode=%s | 耗时=%.0fms",
+            message[:40], effective_msg[:40], query[:60], followup_mode, query_ms,
         )
         dbg.log_query_build(
             session_id,
@@ -1141,7 +1510,7 @@ def _run_chat_impl(
         )
     else:
         query = message
-        _chat_logger.info("[chat] ④ Query 构建 → 跳过 (不需要检索)")
+        _chat_logger.info("[chat] ④ Query 构建 → 跳过 (无需检索/复用)")
 
     # ── 4½. 本会话「不用本地库」偏好（session 变量）──
     meta = store.get_session_meta(session_id) or {}
@@ -1154,9 +1523,22 @@ def _run_chat_impl(
     if effective_search_mode == "none" and do_retrieval:
         do_retrieval = False
 
-    # ── 4¾. 查询与本地库范围检查：明显不符则提示换库/本会话不用本地库 ──
-    target_collection = (body.collection or "").strip() or None
+    # ── 4¾. 解析目标知识库列表，并执行范围检查（单库）或配额分配（多库）──
+    # Resolve target_collections from body.collections > body.collection > default
+    _raw_collections = body.collections if getattr(body, "collections", None) else None
+    if _raw_collections:
+        target_collections = [c.strip() for c in _raw_collections if (c or "").strip()]
+    elif (body.collection or "").strip():
+        target_collections = [(body.collection or "").strip()]
+    else:
+        target_collections = []
+    # Derive single-collection shortcut (for backward-compat paths)
+    target_collection = target_collections[0] if target_collections else None
     actual_collection = target_collection or settings.collection.global_
+    # Multi-collection: use quota allocation; skip single-collection mismatch prompt
+    _is_multi_collection = len(target_collections) > 1
+    _collection_quotas: Dict[str, float] = {}
+
     if (
         do_retrieval
         and effective_use_local
@@ -1164,41 +1546,46 @@ def _run_chat_impl(
         and actual_collection
         and query
     ):
-        scope_result = check_query_collection_scope(actual_collection, query, lite_client)
-        # 用户已在本会话中明确选择「仍使用当前库」时，不再提示，直接走检索
-        if scope_result == "mismatch" and session_preferences.get("local_db") != "use":
-            mismatch_msg = (
-                f"当前问题与本地知识库（{actual_collection}）主题可能不符。"
-                "您可以选择：**本会话暂不使用本地库**（仅用网络检索），或**仍使用当前库**继续检索。"
-            )
-            _chat_logger.info("[chat] ④¾ 查询与本地库范围不符 → 提示用户选择")
-            memory.add_turn("user", message)
-            memory.add_turn("assistant", mismatch_msg, citations=[])
-            memory.update_rolling_summary(client)
-            empty_evidence = EvidenceSummary(
-                query=query or message,
-                total_chunks=0,
-                sources_used=[],
-                retrieval_time_ms=0,
-            )
-            return (
-                session_id,
-                mismatch_msg,
-                [],
-                empty_evidence,
-                parsed,
-                None,
-                None,
-                {},
-                None,
-                True,
-                mismatch_msg,
-            )
+        if _is_multi_collection:
+            # LLM allocates per-collection retrieval quota based on scope relevance
+            _collection_quotas = allocate_collection_quotas(query, target_collections, lite_client)
+            _chat_logger.info("[chat] ④¾ 多库配额分配 | collections=%s quotas=%s", target_collections, _collection_quotas)
+        else:
+            scope_result = check_query_collection_scope(actual_collection, query, lite_client)
+            # 用户已在本会话中明确选择「仍使用当前库」时，不再提示，直接走检索
+            if scope_result == "mismatch" and session_preferences.get("local_db") != "use":
+                _step(None, "")
+                mismatch_msg = (
+                    f"当前问题与本地知识库（{actual_collection}）主题可能不符。"
+                    "您可以选择：**本会话暂不使用本地库**（仅用网络检索），或**仍使用当前库**继续检索。"
+                )
+                _chat_logger.info("[chat] ④¾ 查询与本地库范围不符 → 提示用户选择")
+                memory.add_turn("user", message)
+                memory.add_turn("assistant", mismatch_msg, citations=[])
+                memory.update_rolling_summary(client)
+                empty_evidence = EvidenceSummary(
+                    query=query or message,
+                    total_chunks=0,
+                    sources_used=[],
+                    retrieval_time_ms=0,
+                )
+                return (
+                    session_id,
+                    mismatch_msg,
+                    [],
+                    empty_evidence,
+                    parsed,
+                    None,
+                    None,
+                    {},
+                    None,
+                    True,
+                    mismatch_msg,
+                )
 
     # ── 4.9 Sonar 前置知识（可选）：sonar_strength 不为 off 时调用 Perplexity Sonar，注入 system prompt 并纳入引文池 ──
     preliminary_knowledge_block = ""
     sonar_chunks: list = []
-    sonar_gap_hits: List[Dict[str, Any]] = []
     _sonar_strength = (getattr(body, "sonar_strength", None) or "").strip().lower() or None
     _use_sonar = _sonar_strength and _sonar_strength != "off"
     if not _use_sonar and getattr(body, "use_sonar_prelim", False):
@@ -1207,6 +1594,7 @@ def _run_chat_impl(
     elif _use_sonar and not _sonar_strength:
         _sonar_strength = "sonar-reasoning-pro"
     if do_retrieval and _use_sonar:
+        _step("pre_research", "Pre-research")
         _prelim_provider = None
         if manager.is_available("sonar"):
             _prelim_provider = "sonar"
@@ -1216,11 +1604,12 @@ def _run_chat_impl(
             _prelim_model = _sonar_strength or "sonar-reasoning-pro"
             try:
                 _ppl_client = manager.get_client(_prelim_provider)
-                # Perplexity 支持长 query，直接用用户原始提问，不做预先改写
+                # 使用已补全的检索 query（context resolved 时为完整主题句），避免原始短消息导致前置知识偏离主题
+                _prelim_query = (query or message or "").strip()
                 _prelim_prompt = (
                     "Provide a brief, high-level overview answering the following question. "
                     "Outline key points and main sources. Keep it under 350 words. Respond in the same language as the question.\n\n"
-                ) + (message or "").strip()
+                ) + _prelim_query
                 _prelim_resp = _ppl_client.chat(
                     [{"role": "user", "content": _prelim_prompt}],
                     model=_prelim_model,
@@ -1241,15 +1630,15 @@ def _run_chat_impl(
                     citations=_citations,
                     search_results=_search_results,
                     response_text=_prelim_text,
-                    query=message or "",
+                    query=_prelim_query,
                 )
-                sonar_gap_hits = [_chunk_to_hit(c) for c in sonar_chunks]
                 _chat_logger.info(
                     "[chat] ④.9 Sonar 前置知识 | provider=%s model=%s prelim_len=%d sonar_chunks=%d",
                     _prelim_provider, _prelim_model, len(preliminary_knowledge_block), len(sonar_chunks),
                 )
             except Exception as _e:
                 _chat_logger.debug("[chat] ④.9 Sonar 前置知识失败（静默降级）: %s", _e)
+        _step(None, "")
 
     # Round 1 fallback: no Perplexity or sonar_strength=off → local LLM cognition (no search) for hybrid/web
     if (
@@ -1258,7 +1647,7 @@ def _run_chat_impl(
         and not preliminary_knowledge_block.strip()
     ):
         try:
-            _cog_prompt = _pm.render("chat_local_cognition.txt", query=(message or "").strip())
+            _cog_prompt = _pm.render("chat_local_cognition.txt", query=(query or message or "").strip())
             _cog_resp = lite_client.chat(
                 [{"role": "user", "content": _cog_prompt}],
                 model=body.model_override or None,
@@ -1272,12 +1661,24 @@ def _run_chat_impl(
                 )
         except Exception as _e:
             _chat_logger.debug("[chat] ④.9 本地认知失败: %s", _e)
+        _step(None, "")
+
+    # 送入 LLM 的证据窗口上限：显式 write_top_k > step_top_k > fallback(15)
+    _write_k_raw = getattr(body, "write_top_k", None) or body.step_top_k
+    write_k = int(_write_k_raw) if _write_k_raw else 15
+    if write_k <= 0:
+        write_k = 15
+    filters: Dict[str, Any] = {}
+    chat_gap_candidates_hits: List[Dict[str, Any]] = []
 
     # ── 5. 检索执行 ──
     if do_retrieval:
+        _step("retrieval", "Searching (1+1+1)")
         t_retrieval = _time.perf_counter()
-        retrieval = get_retrieval_service(collection=target_collection)
         filters = _build_filters(body)
+        if filters.get("step_top_k") is None:
+            _fallback_step = body.local_top_k if body.local_top_k is not None else 20
+            filters["step_top_k"] = _chat_effective_step_top_k(_fallback_step)
         filters["trace_phase"] = "chat_main"
         filters["trace_section"] = "chat"
         filters["job_id"] = f"chat_{session_id}"
@@ -1292,7 +1693,7 @@ def _run_chat_impl(
         ]
         if effective_search_mode in ("hybrid", "web"):
             structured = _generate_chat_structured_queries(
-                message or "",
+                search_query,  # 使用已补全的检索 query，避免短消息"请重新总结"等导致关键词漂移
                 preliminary_knowledge_block,
                 lite_client,
                 model_override=body.model_override or None,
@@ -1309,27 +1710,98 @@ def _run_chat_impl(
                     )
             else:
                 _chat_logger.warning("[chat] ⑤ Round2 1+1+1 解析失败，使用单 query 检索")
-        _gap_hits = sonar_gap_hits if (effective_search_mode == "hybrid" and sonar_gap_hits) else None
         main_filters = dict(filters)
         main_filters["web_providers"] = _no_sonar
-        pack = retrieval.search(
-            query=search_query,
-            mode=effective_search_mode,
-            filters=main_filters or None,
-            top_k=body.local_top_k,
-            gap_candidates_hits=_gap_hits,
-        )
-        # When sonar prelim was used but mode was local/web, append sonar chunks so they enter citation pool
-        if sonar_chunks and effective_search_mode != "hybrid":
-            pack.chunks.extend(sonar_chunks)
+
+        if _is_multi_collection and _collection_quotas:
+            # ── 5a. 多库并行检索 + 配额分配合并 ──
+            total_step_k = filters.get("step_top_k") or 20
+            active_quotas = {k: v for k, v in _collection_quotas.items() if v >= 0.05}
+            if not active_quotas:
+                active_quotas = _collection_quotas  # fallback: use all
+
+            def _search_one_collection(col_name: str, ratio: float) -> EvidencePack:
+                col_step_k = max(3, math.ceil(total_step_k * ratio))
+                col_filters = dict(main_filters)
+                col_filters["step_top_k"] = col_step_k
+                col_filters["trace_phase"] = f"chat_main_col_{col_name}"
+                svc = get_retrieval_service(collection=col_name)
+                return svc.search(
+                    query=search_query,
+                    mode=effective_search_mode,
+                    filters=col_filters or None,
+                    top_k=body.local_top_k,
+                    gap_candidates_hits=None,
+                )
+
+            col_packs: List[EvidencePack] = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(active_quotas)) as _col_ex:
+                futures_map = {
+                    _col_ex.submit(_search_one_collection, col, ratio): col
+                    for col, ratio in active_quotas.items()
+                }
+                for fut in concurrent.futures.as_completed(futures_map, timeout=120):
+                    col_name = futures_map[fut]
+                    try:
+                        col_packs.append(fut.result())
+                    except Exception as _ce:
+                        _chat_logger.warning("[chat] ⑤ 多库检索 col=%s 失败: %s", col_name, _ce)
+
+            # Merge all chunks: dedup by chunk_id, sort by relevance_score desc, truncate to write_top_k
+            merged_chunks: List[EvidenceChunk] = []
+            seen_chunk_ids: set = set()
+            for _cp in col_packs:
+                for _c in _cp.chunks:
+                    if _c.chunk_id not in seen_chunk_ids:
+                        merged_chunks.append(_c)
+                        seen_chunk_ids.add(_c.chunk_id)
+            merged_chunks.sort(key=lambda c: getattr(c, "relevance_score", 0.0) or 0.0, reverse=True)
+
+            merged_sources = list(dict.fromkeys(s for _cp in col_packs for s in _cp.sources_used))
+            merged_time = sum(_cp.retrieval_time_ms for _cp in col_packs)
+            pack = EvidencePack(
+                query=search_query,
+                chunks=merged_chunks,
+                total_candidates=sum(_cp.total_candidates for _cp in col_packs),
+                retrieval_time_ms=merged_time,
+                sources_used=merged_sources,
+            )
+            _chat_logger.info(
+                "[chat] ⑤ 多库合并 | collections=%s | per_pack_chunks=%s | merged=%d",
+                list(active_quotas.keys()),
+                [len(cp.chunks) for cp in col_packs],
+                len(merged_chunks),
+            )
+        else:
+            # ── 5b. 单库检索（原有路径）──
+            retrieval = get_retrieval_service(collection=target_collection)
+            pack = retrieval.search(
+                query=search_query,
+                mode=effective_search_mode,
+                filters=main_filters or None,
+                top_k=body.local_top_k,
+                gap_candidates_hits=None,
+            )
+        # Sonar pre-research chunks belong to main pool; merge into pack for all modes.
+        if sonar_chunks:
+            _existing = {c.chunk_id for c in pack.chunks}
+            for c in sonar_chunks:
+                if c.chunk_id not in _existing:
+                    pack.chunks.append(c)
+                    _existing.add(c.chunk_id)
             if "sonar" not in pack.sources_used:
                 pack.sources_used.append("sonar")
         # write_top_k = 混合检索后的最终保留数（送入 LLM 的 evidence 上限）。UI 传 ragConfig.writeTopK，此处生效。
-        # Chat 单轮 Q&A = 一个产出单元；无 write_top_k 时回退 step_top_k 再回退全量。
-        write_k = getattr(body, "write_top_k", None) or body.step_top_k or len(pack.chunks)
+        # Chat 单轮 Q&A = 一个产出单元；无 write_top_k 时使用默认窗口。
         max_chunks_for_context = min(write_k, len(pack.chunks))
         synthesizer = EvidenceSynthesizer(max_chunks=max_chunks_for_context)
         context_str, synthesis_meta = synthesizer.synthesize(pack)
+        context_str, _ctx_budget_diag = _budget_chat_evidence_context(
+            context_str,
+            llm_client=lite_client,
+            ultra_lite_provider=getattr(body, "ultra_lite_provider", None),
+            purpose="chat_retrieval_context",
+        )
         synth_dict = synthesis_meta.to_dict()
         retrieval_ms = (_time.perf_counter() - t_retrieval) * 1000
         evidence_summary = EvidenceSummary(
@@ -1353,14 +1825,20 @@ def _run_chat_impl(
         _chat_logger.info(
             "[chat] ⑤ 检索完成 | mode=%s | top_k=%s | step_top_k=%s | write_top_k=%s | reranker_mode=%s"
             " | chunks=%d | context_max=%d | sources=%s | fusion(main=%s,gap=%s,out=%s)"
+            " | ctx_budget(raw=%d,soft=%d,final=%d,summary=%s,hard_cap=%s)"
             " | soft_wait_ms=%s | 耗时=%.0fms",
-            search_mode, body.local_top_k, body.step_top_k,
+            search_mode, body.local_top_k, filters.get("step_top_k"),
             getattr(body, "write_top_k", None),
             filters.get("reranker_mode", "bge_only"),
             len(pack.chunks), max_chunks_for_context, ",".join(pack.sources_used),
             _fusion_diag.get("main_in", "-"),
             _fusion_diag.get("gap_in", "-"),
             _fusion_diag.get("output_count", "-"),
+            _ctx_budget_diag.get("raw_chars", 0),
+            _ctx_budget_diag.get("after_soft_chars", 0),
+            _ctx_budget_diag.get("final_chars", 0),
+            _ctx_budget_diag.get("used_summary", False),
+            _ctx_budget_diag.get("used_hard_cap", False),
             _diag.get("soft_wait_ms", "-"),
             retrieval_ms,
         )
@@ -1374,6 +1852,7 @@ def _run_chat_impl(
             diagnostics=pack.diagnostics,
             source_breakdown=synth_dict.get("unique_source_breakdown") or synth_dict.get("source_breakdown"),
             year_range=synth_dict.get("year_range"),
+            context_budget=_ctx_budget_diag,
         )
     else:
         context_str = ""
@@ -1387,12 +1866,142 @@ def _run_chat_impl(
         citations: list[Citation] = []
         _chat_logger.info("[chat] ⑤ 检索 → 跳过 (路由判定为 chat)")
 
+    # ── 5.1 follow-up 证据复用（reuse_only / reuse_and_search）──
+    if reuse_enabled:
+        reuse_hits = [_chunk_to_hit(c) for c in cached_reuse_chunks]
+        reuse_diag: Dict[str, Any] = {
+            "followup_mode": followup_mode,
+            "topic_relevance": topic_relevance,
+            "cached_chunk_count": len(cached_reuse_chunks),
+            "fresh_chunk_count": len(pack.chunks) if pack else 0,
+            "target_span": target_span,
+        }
+        if followup_mode == "reuse_only" or not do_retrieval:
+            fusion_diag: Dict[str, Any] = {}
+            fused_hits = fuse_pools_with_gap_protection(
+                query=query or message,
+                main_candidates=reuse_hits,
+                gap_candidates=[],
+                top_k=min(write_k, len(reuse_hits)),
+                rank_pool_multiplier=float(getattr(settings.search, "chat_rank_pool_multiplier", 3.0)),
+                reranker_mode="bge_only",
+                diag=fusion_diag,
+            )
+            fused_hits = _filter_fused_by_score_threshold(fused_hits, filters.get("fused_pool_score_threshold"))
+            reused_chunks = [
+                service_hit_to_chunk(h, h.get("_source_type", "dense"), query or message)
+                for h in fused_hits
+            ]
+            reuse_diag["reuse_selected"] = len(reused_chunks)
+            reuse_diag["fresh_chunk_count"] = 0
+            reuse_diag["pool_fusion"] = fusion_diag.get("pool_fusion")
+            pack = EvidencePack(
+                query=query or message,
+                chunks=reused_chunks,
+                total_candidates=len(reuse_hits),
+                retrieval_time_ms=0.0,
+                sources_used=list(
+                    dict.fromkeys(
+                        (c.provider or ("local" if c.source_type in ("dense", "graph") else "web"))
+                        for c in reused_chunks
+                    )
+                ),
+                diagnostics={"followup_reuse": reuse_diag},
+            )
+            max_chunks_for_context = min(write_k, len(pack.chunks))
+            synthesizer = EvidenceSynthesizer(max_chunks=max_chunks_for_context)
+            context_str, synthesis_meta = synthesizer.synthesize(pack)
+            context_str, _ctx_budget_diag = _budget_chat_evidence_context(
+                context_str,
+                llm_client=lite_client,
+                ultra_lite_provider=getattr(body, "ultra_lite_provider", None),
+                purpose="chat_followup_reuse_only",
+            )
+            synth_dict = synthesis_meta.to_dict()
+            evidence_summary = EvidenceSummary(
+                query=pack.query,
+                total_chunks=len(pack.chunks),
+                sources_used=pack.sources_used,
+                retrieval_time_ms=0.0,
+                year_range=synth_dict.get("year_range"),
+                source_breakdown=synth_dict.get("unique_source_breakdown") or synth_dict.get("source_breakdown"),
+                evidence_type_breakdown=synth_dict.get("evidence_type_breakdown"),
+                cross_validated_count=synth_dict.get("cross_validated_count", 0),
+                total_documents=synth_dict.get("total_documents", 0),
+                diagnostics=pack.diagnostics,
+            )
+            _chat_logger.info(
+                "[chat] ⑤.1 followup reuse_only | cached=%d selected=%d write_k=%d",
+                len(cached_reuse_chunks), len(pack.chunks), write_k,
+            )
+        elif followup_mode == "reuse_and_search" and pack:
+            fusion_diag = dict(pack.diagnostics or {})
+            merged_diag: Dict[str, Any] = {}
+            _cached_ids = {x.chunk_id for x in cached_reuse_chunks}
+            fused_hits = fuse_pools_with_gap_protection(
+                query=query or message,
+                main_candidates=[_chunk_to_hit(c) for c in pack.chunks] + reuse_hits,
+                gap_candidates=[],
+                top_k=min(write_k, len(pack.chunks) + len(reuse_hits)),
+                rank_pool_multiplier=float(getattr(settings.search, "chat_rank_pool_multiplier", 3.0)),
+                reranker_mode="bge_only",
+                diag=merged_diag,
+            )
+            fused_hits = _filter_fused_by_score_threshold(fused_hits, filters.get("fused_pool_score_threshold"))
+            merged_chunks = [
+                service_hit_to_chunk(h, h.get("_source_type", "dense"), query or message)
+                for h in fused_hits
+            ]
+            reuse_diag["reuse_selected"] = sum(
+                1 for c in merged_chunks if c.chunk_id in _cached_ids
+            )
+            reuse_diag["fresh_chunk_count"] = len(pack.chunks)
+            reuse_diag["merged_chunk_count"] = len(merged_chunks)
+            reuse_diag["pool_fusion"] = merged_diag.get("pool_fusion")
+            fusion_diag["followup_reuse"] = reuse_diag
+            pack = EvidencePack(
+                query=pack.query,
+                chunks=merged_chunks,
+                total_candidates=pack.total_candidates + len(reuse_hits),
+                retrieval_time_ms=pack.retrieval_time_ms,
+                sources_used=list(
+                    dict.fromkeys(
+                        (c.provider or ("local" if c.source_type in ("dense", "graph") else "web"))
+                        for c in merged_chunks
+                    )
+                ),
+                diagnostics=fusion_diag,
+            )
+            max_chunks_for_context = min(write_k, len(pack.chunks))
+            synthesizer = EvidenceSynthesizer(max_chunks=max_chunks_for_context)
+            context_str, synthesis_meta = synthesizer.synthesize(pack)
+            context_str, _ctx_budget_diag = _budget_chat_evidence_context(
+                context_str,
+                llm_client=lite_client,
+                ultra_lite_provider=getattr(body, "ultra_lite_provider", None),
+                purpose="chat_followup_reuse_and_search",
+            )
+            synth_dict = synthesis_meta.to_dict()
+            evidence_summary.query = pack.query
+            evidence_summary.total_chunks = len(pack.chunks)
+            evidence_summary.sources_used = pack.sources_used
+            evidence_summary.year_range = synth_dict.get("year_range")
+            evidence_summary.source_breakdown = synth_dict.get("unique_source_breakdown") or synth_dict.get("source_breakdown")
+            evidence_summary.evidence_type_breakdown = synth_dict.get("evidence_type_breakdown")
+            evidence_summary.cross_validated_count = synth_dict.get("cross_validated_count", 0)
+            evidence_summary.total_documents = synth_dict.get("total_documents", 0)
+            evidence_summary.diagnostics = pack.diagnostics
+            _chat_logger.info(
+                "[chat] ⑤.1 followup reuse_and_search | cached=%d fresh=%d merged=%d write_k=%d",
+                len(cached_reuse_chunks), reuse_diag["fresh_chunk_count"], len(pack.chunks), write_k,
+            )
+
     # ── 5.5 证据充分性检查：LLM 判断是否有一致、实质的证据支撑（借鉴 DR），失败时用数量兜底 ──
     evidence_scarce = False
     _evidence_distinct_docs = 0
     _coverage_score: Optional[float] = None
     _sufficiency_reason: Optional[str] = None
-    if do_retrieval and pack:
+    if pack:
         _doc_keys: set[str] = set()
         for c in pack.chunks:
             if getattr(c, "doi", None):
@@ -1471,6 +2080,8 @@ def _run_chat_impl(
             _chat_logger.info(
                 "[chat] ⑤½ 证据不足 → 自动升级 agent_mode: standard → assist (允许工具补搜)",
             )
+    if do_retrieval:
+        _step(None, "")
 
     # ── 5.6 证据不足时：生成 gap query、补搜、main+gap 一次融合（借鉴 DR）──
     if (
@@ -1480,6 +2091,7 @@ def _run_chat_impl(
         and query_needs_rag
         and effective_search_mode != "none"
     ):
+        _step("gap_fill", "Gap fill")
         gap_queries = _generate_chat_gap_queries(
             message,
             context_str or "",
@@ -1488,7 +2100,7 @@ def _run_chat_impl(
         )
         gap_queries = [q for q in (gap_queries or []) if (q or "").strip()][:3]
         if gap_queries:
-            step_k = body.step_top_k or body.local_top_k or 20
+            step_k = _chat_effective_step_top_k(body.step_top_k or body.local_top_k or 20) or 20
             supp_k = max(10, step_k)
             main_candidates = [_chunk_to_hit(c) for c in pack.chunks]
             gap_candidates: List[Dict[str, Any]] = []
@@ -1522,6 +2134,7 @@ def _run_chat_impl(
                     except Exception as e:
                         _chat_logger.warning("[chat] gap supplement search failed for %r: %s", gq[:50], e)
             if gap_candidates:
+                chat_gap_candidates_hits = list(gap_candidates)
                 fusion_diag: Dict[str, Any] = {}
                 _gap_fusion_k = write_k or step_k  # final output uses write_top_k; intermediate steps use step_top_k
                 fused = fuse_pools_with_gap_protection(
@@ -1536,6 +2149,7 @@ def _run_chat_impl(
                     reranker_mode=(filters or {}).get("reranker_mode") or "bge_only",
                     diag=fusion_diag,
                 )
+                fused = _filter_fused_by_score_threshold(fused, (filters or {}).get("fused_pool_score_threshold"))
                 new_chunks = [
                     service_hit_to_chunk(h, h.get("_source_type", "dense"), query or message)
                     for h in fused
@@ -1557,6 +2171,12 @@ def _run_chat_impl(
                 max_chunks_for_context = min(write_k or len(pack.chunks), len(pack.chunks))
                 synthesizer = EvidenceSynthesizer(max_chunks=max_chunks_for_context)
                 context_str, synthesis_meta = synthesizer.synthesize(pack)
+                context_str, _ctx_budget_diag = _budget_chat_evidence_context(
+                    context_str,
+                    llm_client=lite_client,
+                    ultra_lite_provider=getattr(body, "ultra_lite_provider", None),
+                    purpose="chat_gap_fusion_context",
+                )
                 synth_dict = synthesis_meta.to_dict()
                 evidence_summary.query = pack.query
                 evidence_summary.total_chunks = len(pack.chunks)
@@ -1570,9 +2190,16 @@ def _run_chat_impl(
                 if canvas_id:
                     sync_evidence_to_canvas(canvas_id, pack)
                 _chat_logger.info(
-                    "[chat] ⑤¾ gap 补搜完成 | gap_queries=%d | gap_candidates=%d | fused_out=%d | fusion=%s",
+                    "[chat] ⑤¾ gap 补搜完成 | gap_queries=%d | gap_candidates=%d | fused_out=%d | fusion=%s"
+                    " | ctx_budget(raw=%d,soft=%d,final=%d,summary=%s,hard_cap=%s)",
                     len(gap_queries), len(gap_candidates), len(new_chunks), _pf,
+                    _ctx_budget_diag.get("raw_chars", 0),
+                    _ctx_budget_diag.get("after_soft_chars", 0),
+                    _ctx_budget_diag.get("final_chars", 0),
+                    _ctx_budget_diag.get("used_summary", False),
+                    _ctx_budget_diag.get("used_hard_cap", False),
                 )
+        _step(None, "")
 
     # ── 6. System Prompt 组装 ──
     wf = run_workflow(
@@ -1654,7 +2281,16 @@ def _run_chat_impl(
     messages.append({"role": "user", "content": message})
 
     # ── 8. LLM 生成 ──
-    use_agent = agent_mode in ("assist", "autonomous")
+    skip_assist_agent_for_sufficient_context = (
+        agent_mode == "assist"
+        and query_needs_rag
+        and do_retrieval
+        and bool(context_str and context_str.strip())
+        and not evidence_scarce
+    )
+    use_agent = agent_mode == "autonomous" or (
+        agent_mode == "assist" and not skip_assist_agent_for_sufficient_context
+    )
     _chat_logger.info(
         "[chat] ⑦½ Agent 决策 | use_agent=%s | agent_mode=%s (用户请求=%s) | "
         "query_needs_rag=%s | search_mode=%s | evidence_scarce=%s | do_retrieval=%s",
@@ -1663,6 +2299,10 @@ def _run_chat_impl(
         evidence_scarce if do_retrieval and pack else "N/A(未检索)",
         do_retrieval,
     )
+    if skip_assist_agent_for_sufficient_context:
+        _chat_logger.info(
+            "[chat] ⑦½ Agent 跳过 | reason=sufficient_retrieval_context | mode=assist→direct"
+        )
     tool_trace = None
 
     # 根据模式注入不同的 Agent hint
@@ -1676,6 +2316,26 @@ def _run_chat_impl(
         messages[0]["content"] = messages[0]["content"] + _pm.render("chat_agent_hint.txt")
     elif agent_mode == "autonomous":
         messages[0]["content"] = messages[0]["content"] + _pm.render("chat_agent_autonomous_hint.txt")
+
+    # 发送前进行消息预算控制：优先裁剪最旧历史，其次做系统提示硬上限保护。
+    _pre_send_min_out = _AGENT_MIN_OUTPUT_TOKENS if use_agent else _CHAT_MIN_OUTPUT_TOKENS
+    messages, _prompt_budget_diag = _apply_pre_send_prompt_budget(
+        messages,
+        model=body.model_override or None,
+        min_output_tokens=_pre_send_min_out,
+        mode="agent" if use_agent else "direct",
+    )
+    _chat_logger.info(
+        "[chat] ⑦¼ Prompt预算 | mode=%s | tokens=%s→%s | messages=%d→%d | history_trimmed=%d | non_history_trimmed=%d | system_hard_cap=%s",
+        "agent" if use_agent else "direct",
+        _prompt_budget_diag.get("prompt_tokens_before", 0),
+        _prompt_budget_diag.get("prompt_tokens_after", 0),
+        _prompt_budget_diag.get("message_count_before", len(messages)),
+        _prompt_budget_diag.get("message_count_after", len(messages)),
+        _prompt_budget_diag.get("history_trimmed", 0),
+        _prompt_budget_diag.get("non_history_trimmed", 0),
+        _prompt_budget_diag.get("used_system_hard_cap", False),
+    )
 
     gen_mode = agent_mode if use_agent else "direct"
     _chat_logger.info(
@@ -1692,8 +2352,13 @@ def _run_chat_impl(
     t_llm = _time.perf_counter()
     try:
         if use_agent:
+            _step("agent", "Agent reasoning")
             start_agent_chunk_collector()
-            set_tool_collection(target_collection)
+            # For multi-collection, pass the full list so agent tools can search across all
+            set_tool_collection(target_collection, collections=target_collections if _is_multi_collection else None)
+            set_tool_step_top_k(
+                _chat_effective_step_top_k(body.step_top_k or body.local_top_k or 20)
+            )
             set_agent_sonar_model(getattr(body, "agent_sonar_model", None) or "sonar-pro")
             routed_tools = get_routed_skills(
                 message=message,
@@ -1708,22 +2373,12 @@ def _run_chat_impl(
                 max_iterations=getattr(body, "max_iterations", None) or 2,
                 model=body.model_override or None,
                 session_id=session_id,
+                prompt_budget_min_output_tokens=_AGENT_MIN_OUTPUT_TOKENS,
+                prompt_budget_safety_margin=_CHAT_PROMPT_SAFETY_MARGIN,
                 max_tokens=None,
             )
             agent_extra_chunks = drain_agent_chunks()
             agent_chunk_ids = {c.chunk_id for c in agent_extra_chunks}
-            if agent_extra_chunks:
-                if pack is None:
-                    pack = EvidencePack(query=query or message, chunks=[])
-                existing_ids = {c.chunk_id for c in pack.chunks}
-                for c in agent_extra_chunks:
-                    if c.chunk_id not in existing_ids:
-                        pack.chunks.append(c)
-                        existing_ids.add(c.chunk_id)
-                _chat_logger.info(
-                    "[chat] ⑧a Agent 工具证据合并 | extra_chunks=%d | total_chunks=%d",
-                    len(agent_extra_chunks), len(pack.chunks),
-                )
             response_text = react_result.final_text.strip()
             tool_trace = react_result.tool_trace if react_result.tool_trace else None
             llm_ms = (_time.perf_counter() - t_llm) * 1000
@@ -1732,7 +2387,101 @@ def _run_chat_impl(
                 react_result.iterations, len(react_result.tool_trace),
                 len(routed_tools), len(CORE_TOOLS), llm_ms,
             )
+
+            # Agent evidence must re-enter final fused context before final answer generation.
+            if agent_extra_chunks:
+                if pack is None:
+                    pack = EvidencePack(query=query or message, chunks=[])
+                final_chunks, final_pool_fusion = _fuse_chat_main_gap_agent_candidates(
+                    query=query or message,
+                    message=message,
+                    main_chunks=pack.chunks,
+                    gap_candidate_hits=chat_gap_candidates_hits,
+                    agent_chunks=agent_extra_chunks,
+                    write_k=write_k,
+                    filters=filters or {},
+                )
+                base_diag = dict(pack.diagnostics or {})
+                base_diag["pool_fusion"] = final_pool_fusion
+                base_diag["agent_refusion"] = {
+                    "agent_extra_chunks": len(agent_extra_chunks),
+                    "gap_candidates": len(chat_gap_candidates_hits),
+                    "main_candidates": len(pack.chunks),
+                    "output_count": len(final_chunks),
+                }
+                pack = EvidencePack(
+                    query=pack.query,
+                    chunks=final_chunks,
+                    total_candidates=max(
+                        pack.total_candidates,
+                        len(pack.chunks) + len(chat_gap_candidates_hits) + len(agent_extra_chunks),
+                    ),
+                    retrieval_time_ms=pack.retrieval_time_ms,
+                    sources_used=list(
+                        dict.fromkeys(
+                            (c.provider or ("local" if c.source_type in ("dense", "graph") else "web"))
+                            for c in final_chunks
+                        )
+                    ),
+                    diagnostics=base_diag,
+                )
+                max_chunks_for_context = min(write_k, len(pack.chunks))
+                synthesizer = EvidenceSynthesizer(max_chunks=max_chunks_for_context)
+                context_str, synthesis_meta = synthesizer.synthesize(pack)
+                context_str, _ctx_budget_diag = _budget_chat_evidence_context(
+                    context_str,
+                    llm_client=lite_client,
+                    ultra_lite_provider=getattr(body, "ultra_lite_provider", None),
+                    purpose="chat_agent_refusion_context",
+                )
+                synth_dict = synthesis_meta.to_dict()
+                evidence_summary.query = pack.query
+                evidence_summary.total_chunks = len(pack.chunks)
+                evidence_summary.sources_used = pack.sources_used
+                evidence_summary.year_range = synth_dict.get("year_range")
+                evidence_summary.source_breakdown = synth_dict.get("unique_source_breakdown") or synth_dict.get("source_breakdown")
+                evidence_summary.evidence_type_breakdown = synth_dict.get("evidence_type_breakdown")
+                evidence_summary.cross_validated_count = synth_dict.get("cross_validated_count", 0)
+                evidence_summary.total_documents = synth_dict.get("total_documents", 0)
+                evidence_summary.diagnostics = pack.diagnostics
+                if canvas_id:
+                    sync_evidence_to_canvas(canvas_id, pack)
+
+                agent_notes = react_result.final_text.strip()
+                regen_messages = [{"role": "system", "content": messages[0]["content"]}]
+                for t in history:
+                    regen_messages.append({"role": t.role, "content": t.content})
+                regen_messages.append({"role": "assistant", "content": agent_notes})
+                regen_messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Please provide the final answer using the updated fused evidence context below. "
+                            "If agent notes conflict with fused evidence, trust fused evidence.\n\n"
+                            f"{context_str}"
+                        ),
+                    }
+                )
+                regen_messages, _ = _apply_pre_send_prompt_budget(
+                    regen_messages,
+                    model=body.model_override or None,
+                    min_output_tokens=_CHAT_MIN_OUTPUT_TOKENS,
+                    mode="direct",
+                )
+                _step("answering", "Writing answer")
+                t_regen = _time.perf_counter()
+                regen_resp = client.chat(regen_messages, model=body.model_override or None, max_tokens=None)
+                response_text = (regen_resp.get("final_text") or "").strip() or response_text
+                regen_ms = (_time.perf_counter() - t_regen) * 1000
+                _chat_logger.info(
+                    "[chat] ⑧b Agent 回流重生成 | fused_chunks=%d | agent_chunks=%d | regen_ms=%.0f",
+                    len(pack.chunks), len(agent_extra_chunks), regen_ms,
+                )
+            else:
+                _chat_logger.info("[chat] ⑧b Agent 无新增检索块，复用 agent 最终回答")
+            _step(None, "")
         else:
+            _step("answering", "Writing answer")
             react_result = None
             resp = client.chat(messages, model=body.model_override or None, max_tokens=None)
             response_text = (resp.get("final_text") or "").strip()
@@ -1750,8 +2499,10 @@ def _run_chat_impl(
                 tokens=dict(usage) if usage else None,
                 latency_ms=round(llm_ms),
                 message_count=len(messages),
+                prompt_budget=_prompt_budget_diag,
             )
     except Exception as llm_err:
+        _step(None, "")
         react_result = None
         llm_ms = (_time.perf_counter() - t_llm) * 1000
         _chat_logger.error("[chat] ⑧ LLM 失败 | error=%s | 耗时=%.0fms", llm_err, llm_ms)
@@ -1836,6 +2587,23 @@ def _run_chat_impl(
             "cited_from_agent": cited_from_agent_count,
         }
 
+    # ── 9d. 写入会话证据缓存（用于后续 follow-up reuse）──
+    if pack and pack.chunks:
+        try:
+            _cache_turns = int(getattr(settings.search, "chat_followup_cache_turns", 4) or 4)
+            _cache_chunks_per_turn = int(
+                getattr(settings.search, "chat_followup_cache_chunks_per_turn", 36) or 36
+            )
+            store.append_recent_evidence_cache(
+                session_id=session_id,
+                query=query or message,
+                chunks=[_chunk_to_cache_payload(c) for c in pack.chunks],
+                max_turns=_cache_turns,
+                max_chunks_per_turn=_cache_chunks_per_turn,
+            )
+        except Exception as cache_err:
+            _chat_logger.debug("[chat] evidence cache write failed: %s", cache_err)
+
     # ── 10. 写入 Memory ──
     memory.add_turn("user", message)
     citations_data = [_serialize_citation(c) for c in citations] if citations else []
@@ -1863,17 +2631,18 @@ def _run_chat_impl(
         tools_contributed=tools_contributed if use_agent else None,
         agent_stats=(react_result.agent_stats if react_result else None),
     )
-
+    _step(None, "")
     return session_id, response_text, citations, evidence_summary, parsed, None, tool_trace, ref_map, agent_debug_data, False, None
 
 
 def _run_chat(
     body: ChatRequest,
     optional_user_id: str | None = None,
+    step_callback: Optional[Callable[[Optional[str], str], None]] = None,
 ) -> tuple[str, str, list[Citation], EvidenceSummary, ParsedIntent, dict | None, list | None, dict[str, str], dict | None, bool, Optional[str]]:
     """包装 _run_chat_impl：当前端开启调试面板时临时提升本请求的日志级别为 DEBUG。"""
     with _request_debug_level(body):
-        return _run_chat_impl(body, optional_user_id)
+        return _run_chat_impl(body, optional_user_id, step_callback)
 
 
 def _citation_to_chat_citation(c: Citation) -> ChatCitation:
@@ -1885,6 +2654,7 @@ def _citation_to_chat_citation(c: Citation) -> ChatCitation:
         year=c.year,
         doc_id=c.doc_id,
         url=c.url,
+        pdf_url=getattr(c, "pdf_url", None),
         doi=c.doi,
         bbox=getattr(c, "bbox", None),
         page_num=getattr(c, "page_num", None),
@@ -2119,6 +2889,37 @@ def detect_intent(body: IntentDetectRequest) -> IntentDetectResponse:
         needs_retrieval=True,  # 检索由 UI 决定，此字段不再有实际意义
         suggested_search_mode="hybrid",
     )
+
+
+@router.post("/chat/suggestions", response_model=ChatSuggestionsResponse)
+def chat_suggestions(body: ChatSuggestionsRequest) -> ChatSuggestionsResponse:
+    """
+    Chat 输入建议：根据前缀与会话历史返回候选（Google-style）。
+    可选：后续可接入 ultra_lite 做排序或扩展。
+    """
+    prefix = (body.prefix or "").strip()
+    limit = body.limit or 5
+    suggestions: List[str] = []
+
+    if body.session_id and prefix:
+        store = get_session_store()
+        turns = store.get_turns(body.session_id, limit=50, order_desc=True)
+        seen: set = set()
+        for t in turns:
+            if t.role != "user" or not (t.content or "").strip():
+                continue
+            s = (t.content or "").strip()
+            if s in seen:
+                continue
+            lower = s.lower()
+            pre = prefix.lower()
+            if lower.startswith(pre) or pre in lower:
+                seen.add(s)
+                suggestions.append(s)
+                if len(suggestions) >= limit:
+                    break
+
+    return ChatSuggestionsResponse(suggestions=suggestions)
 
 
 @router.post("/deep-research/clarify", response_model=ClarifyResponse)
@@ -2592,10 +3393,37 @@ def _run_deep_research_job_safe(
     user_id = optional_user_id or body.user_id or ""
     filters = _build_deep_research_filters(body)
 
+    def _format_dr_step_label(event_type: str, payload: Dict[str, Any]) -> str:
+        section = str((payload or {}).get("section") or "").strip()
+        if event_type == "scope_done":
+            return "Scoping"
+        if event_type == "section_research_start":
+            return f"Researching: {section}" if section else "Researching section"
+        if event_type in ("research_main_1p1p1", "section_agent_supplement"):
+            return f"Searching (1+1+1): {section}" if section else "Searching (1+1+1)"
+        if event_type in ("evidence_insufficient", "quick_coverage_check"):
+            return f"Checking coverage: {section}" if section else "Checking coverage"
+        if event_type in ("tier1_sufficient", "tier2_sufficient", "tier3_start"):
+            return f"Searching: {section}" if section else "Searching"
+        if event_type in ("revise_started", "revise_queued"):
+            return f"Revising: {section}" if section else "Revising"
+        if event_type == "section_research_done":
+            return f"Section done: {section}" if section else "Section done"
+        if event_type == "section_verify_done":
+            return f"Verifying: {section}" if section else "Verifying"
+        if event_type == "evidence_optimization_start":
+            return "Optimizing evidence"
+        if event_type == "evidence_optimization_done":
+            return "Evidence optimized"
+        if section:
+            return f"{event_type.replace('_', ' ').title()}: {section}"
+        return event_type.replace("_", " ").title() if event_type else ""
+
     def _progress_cb(event_type: str, payload: Dict[str, Any]) -> None:
         append_event(job_id, "progress" if event_type != "warning" else "warning", {"type": event_type, **(payload or {})})
         stage = str(payload.get("section") or payload.get("type") or "")
         update_job(job_id, current_stage=stage, message=str(payload.get("message") or payload.get("section") or event_type))
+        append_event(job_id, "step", {"step": event_type, "label": _format_dr_step_label(event_type, payload or {})})
 
     try:
         update_job(job_id, status="running", message="Deep Research 任务已启动", started_at=_time.time())
@@ -3023,6 +3851,14 @@ def _run_deep_research_job_safe(
             total_time_ms=(_time.perf_counter() - t0) * 1000,
         )
         append_event(job_id, status, {"message": msg, "error": "" if cancelled else str(e)})
+        append_event(job_id, "step", {"step": None, "label": ""})
+        try:
+            from src.collaboration.research.job_store import purge_dr_checkpoints
+            purged = purge_dr_checkpoints(job_id)
+            if purged:
+                _chat_logger.debug("Purged %d DR checkpoint(s) for %s job %s", purged, status, job_id)
+        except Exception as _ce:
+            _chat_logger.debug("purge_dr_checkpoints on %s failed (non-fatal): %s", status, _ce)
         _dr_pop_suspended_runtime(job_id)
     finally:
         _dr_clear_cancel_event(job_id)
@@ -3065,6 +3901,14 @@ def _complete_deep_research_job(*, job_id: str, session_id: str, topic: str, res
         total_time_ms=total_time_ms,
         finished_at=_time.time(),
     )
+    append_event(job_id, "step", {"step": None, "label": ""})
+    try:
+        from src.collaboration.research.job_store import purge_dr_checkpoints
+        purged = purge_dr_checkpoints(job_id)
+        if purged:
+            _chat_logger.debug("Purged %d DR checkpoint(s) for completed job %s", purged, job_id)
+    except Exception as _e:
+        _chat_logger.debug("purge_dr_checkpoints on done failed (non-fatal): %s", _e)
     append_event(
         job_id,
         "done",
@@ -3093,6 +3937,11 @@ def _resume_suspended_job(job_id: str) -> None:
     if compiled is None or not isinstance(config, dict):
         _dr_pop_suspended_runtime(job_id)
         update_job(job_id, status="error", message="任务恢复失败：缺少挂起上下文")
+        try:
+            from src.collaboration.research.job_store import purge_dr_checkpoints
+            purge_dr_checkpoints(job_id)
+        except Exception:
+            pass
         return
 
     job = get_job(job_id) or {}
@@ -3146,6 +3995,13 @@ def _resume_suspended_job(job_id: str) -> None:
             total_time_ms=(_time.perf_counter() - started_at_perf) * 1000,
         )
         append_event(job_id, status, {"message": msg, "error": "" if cancelled else str(e)})
+        try:
+            from src.collaboration.research.job_store import purge_dr_checkpoints
+            purged = purge_dr_checkpoints(job_id)
+            if purged:
+                _chat_logger.debug("Purged %d DR checkpoint(s) for resumed job %s (%s)", purged, job_id, status)
+        except Exception as _ce:
+            _chat_logger.debug("purge_dr_checkpoints on resume %s failed (non-fatal): %s", status, _ce)
         _dr_pop_suspended_runtime(job_id)
     finally:
         _dr_set_resume_idle(job_id)
@@ -3456,6 +4312,14 @@ def cancel_deep_research_job(job_id: str, force: bool = False) -> dict:
         msg = "任务已强制取消" if force and current_status not in ("pending", "planning") else "任务已取消（未启动）"
         update_job(job_id, status="cancelled", message=msg, finished_at=_t.time())
         append_event(job_id, "cancelled", {"job_id": job_id, "message": msg})
+        append_event(job_id, "step", {"step": None, "label": ""})
+        try:
+            from src.collaboration.research.job_store import purge_dr_checkpoints
+            purged = purge_dr_checkpoints(job_id)
+            if purged:
+                _chat_logger.debug("Purged %d DR checkpoint(s) for force-cancelled job %s", purged, job_id)
+        except Exception as _ce:
+            _chat_logger.debug("purge_dr_checkpoints on force-cancel failed (non-fatal): %s", _ce)
         _dr_request_cancel(job_id)  # signal the thread too so it exits cleanly
         _dr_release_slot_eager(job_id)
         return {"ok": True, "job_id": job_id, "status": "cancelled"}
@@ -3794,6 +4658,7 @@ def optimize_section_evidence_endpoint(
         filters["web_providers"] = body.web_providers
     if body.web_source_configs is not None:
         filters["web_source_configs"] = body.web_source_configs
+    # 配置优先级：UI/请求入参 > config > 代码默认（见 docs/configuration.md）
     if body.use_content_fetcher is not None:
         filters["use_content_fetcher"] = body.use_content_fetcher
 
@@ -4055,6 +4920,7 @@ def get_session(session_id: str) -> SessionInfo:
                 year=c.get("year"),
                 doc_id=c.get("doc_id"),
                 url=c.get("url"),
+                pdf_url=c.get("pdf_url"),
                 doi=c.get("doi"),
                 bbox=c.get("bbox"),
                 page_num=c.get("page_num"),

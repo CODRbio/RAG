@@ -3,6 +3,7 @@ Embedding 服务封装
 自动根据环境选择设备
 """
 
+import time
 from pymilvus.model.hybrid import BGEM3EmbeddingFunction
 from pymilvus.model.reranker import BGERerankFunction
 from config.settings import settings
@@ -62,7 +63,11 @@ class Embedder:
 
     def encode(self, texts: list) -> dict:
         """生成 Dense + Sparse 向量"""
-        return self.ef(texts)
+        start = time.time()
+        logger.debug(f"[Embedder.encode] start, num_texts={len(texts)}")
+        res = self.ef(texts)
+        logger.debug(f"[Embedder.encode] end, num_texts={len(texts)}, elapsed={time.time()-start:.2f}s")
+        return res
 
     def rerank(self, query: str, docs: list, top_k: int = None) -> list:
         """重排序"""

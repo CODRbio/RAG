@@ -25,8 +25,90 @@ from src.llm.tools import (
 )
 from src.log import get_logger
 from src.observability.tracing import traceable
+from src.utils.token_counter import count_tokens, get_context_window, needs_sliding_window
 
 logger = get_logger(__name__)
+
+_REACT_SYSTEM_HARD_MAX_CHARS = 50_000
+
+
+def _message_content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return ""
+    try:
+        return _json.dumps(content, ensure_ascii=False, default=str)
+    except Exception:
+        return str(content)
+
+
+def _estimate_prompt_tokens(messages: List[Dict[str, Any]]) -> int:
+    total = 0
+    for m in messages:
+        total += 6
+        total += count_tokens(_message_content_to_text(m.get("content")))
+    return total
+
+
+def _apply_iteration_prompt_budget(
+    messages: List[Dict[str, Any]],
+    *,
+    model: Optional[str],
+    min_output_tokens: int,
+    safety_margin: float,
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    pruned = list(messages)
+    context_window = get_context_window(model)
+    before = _estimate_prompt_tokens(pruned)
+    trimmed_messages = 0
+    trimmed_tool_like = 0
+    used_system_cap = False
+
+    while len(pruned) > 2 and needs_sliding_window(
+        _estimate_prompt_tokens(pruned),
+        context_window,
+        safety_margin=safety_margin,
+        min_output_tokens=min_output_tokens,
+    ):
+        removed = pruned.pop(1)
+        trimmed_messages += 1
+        if removed.get("role") in ("tool", "assistant"):
+            trimmed_tool_like += 1
+
+    if pruned and pruned[0].get("role") == "system":
+        sys_text = _message_content_to_text(pruned[0].get("content"))
+        if len(sys_text) > _REACT_SYSTEM_HARD_MAX_CHARS:
+            pruned[0] = {
+                **pruned[0],
+                "content": sys_text[:_REACT_SYSTEM_HARD_MAX_CHARS] + "\n\n[budget-trimmed]",
+            }
+            used_system_cap = True
+
+    while len(pruned) > 2 and needs_sliding_window(
+        _estimate_prompt_tokens(pruned),
+        context_window,
+        safety_margin=safety_margin,
+        min_output_tokens=min_output_tokens,
+    ):
+        removed = pruned.pop(1)
+        trimmed_messages += 1
+        if removed.get("role") in ("tool", "assistant"):
+            trimmed_tool_like += 1
+
+    after = _estimate_prompt_tokens(pruned)
+    return pruned, {
+        "prompt_tokens_before": before,
+        "prompt_tokens_after": after,
+        "message_count_before": len(messages),
+        "message_count_after": len(pruned),
+        "trimmed_messages": trimmed_messages,
+        "trimmed_tool_like": trimmed_tool_like,
+        "used_system_hard_cap": used_system_cap,
+        "context_window": context_window,
+        "min_output_tokens": min_output_tokens,
+        "safety_margin": safety_margin,
+    }
 
 
 @dataclass
@@ -72,6 +154,8 @@ def react_loop(
     max_iterations: int = 10,
     model: Optional[str] = None,
     session_id: str = "",
+    prompt_budget_min_output_tokens: int = 4096,
+    prompt_budget_safety_margin: float = 0.10,
     **llm_kwargs,
 ) -> ReactResult:
     """
@@ -115,6 +199,25 @@ def react_loop(
     for iteration in range(max_iterations):
         result.iterations = iteration + 1
 
+        working_messages, _budget_diag = _apply_iteration_prompt_budget(
+            working_messages,
+            model=model,
+            min_output_tokens=max(512, int(prompt_budget_min_output_tokens or 4096)),
+            safety_margin=float(prompt_budget_safety_margin or 0.10),
+        )
+        if _budget_diag.get("trimmed_messages", 0) or _budget_diag.get("used_system_hard_cap", False):
+            logger.info(
+                "ReAct [%d] prompt budget applied | tokens=%s→%s | messages=%d→%d | trimmed=%d | trimmed_tool_like=%d | system_hard_cap=%s",
+                iteration,
+                _budget_diag.get("prompt_tokens_before"),
+                _budget_diag.get("prompt_tokens_after"),
+                _budget_diag.get("message_count_before"),
+                _budget_diag.get("message_count_after"),
+                _budget_diag.get("trimmed_messages"),
+                _budget_diag.get("trimmed_tool_like"),
+                _budget_diag.get("used_system_hard_cap"),
+            )
+
         # ── LLM 调用（计时）──
         # 最后一轮不传 tools，强制模型只输出总结，避免到上限时 response_len=0
         is_last_round = iteration == max_iterations - 1
@@ -140,11 +243,30 @@ def react_loop(
                         "content_len": len(content) if isinstance(content, str) else len(str(content)),
                     }
                 )
+            # Log API error body when available (e.g. OpenAI 400 with error.message)
+            api_error_detail = None
+            if hasattr(e, "response") and e.response is not None:
+                try:
+                    body = e.response.text
+                    if body:
+                        api_error_detail = body[:1000] if len(body) > 1000 else body
+                        try:
+                            data = _json.loads(body)
+                            err = data.get("error") or data
+                            if isinstance(err, dict):
+                                api_error_detail = err.get("message", api_error_detail)
+                                if err.get("code"):
+                                    api_error_detail = f"[{err['code']}] {api_error_detail}"
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
             logger.error(
-                "ReAct LLM call failed at iteration %d: %s | message_preview=%s",
+                "ReAct LLM call failed at iteration %d: %s | message_preview=%s%s",
                 iteration,
                 e,
                 msg_preview,
+                f" | api_error={api_error_detail}" if api_error_detail else "",
             )
             result.final_text = f"[LLM 调用失败: {e}]"
             break
@@ -222,6 +344,7 @@ def react_loop(
                     for m in working_messages
                 ],
                 llm_raw_final_text=resp.get("final_text", "")[:1000],
+                prompt_budget=_budget_diag,
             )
 
         # ── 将 tool call + results 追加到消息历史 ──

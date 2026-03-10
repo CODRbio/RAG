@@ -42,7 +42,10 @@ from urllib.parse import urlparse
 from pydantic import BaseModel, Field
 
 from src.log import get_logger
-from src.retrieval.browser_service import SharedBrowserService
+from src.retrieval.browser_service import SharedBrowserService, get_cdp_context_options
+from src.retrieval.downloader.browser_manager import apply_stealth_to_page
+from src.retrieval.downloader.captcha_page_runner import run_captcha_flow
+from src.retrieval.downloader.captcha_solver import CaptchaSolver
 from src.utils.cache import DiskCache, TTLCache, _make_key, get_cache, get_disk_cache
 from src.utils.prompt_manager import PromptManager
 
@@ -199,16 +202,18 @@ class WebContentFetcher:
     """
     网络搜索结果全文抓取器。
 
-    三级提取策略自动降级：trafilatura → BrightData → Playwright
+    三级提取策略自动降级：trafilatura → Playwright → BrightData
     """
 
     enabled: bool = True
     only_academic: bool = False
     max_content_length: int = 8000
-    timeout_seconds: int = 15
+    timeout_seconds: int = 60
     brightdata_api_key: str = ""
     brightdata_zone: str = ""
-    two_captcha_api_key: str = ""  # 与 BrightData 同时启用时，单页抓取上限提高到 2 分钟
+    two_captcha_api_key: str = ""  # 与 BrightData 同时启用时，单页抓取上限提高到 2 分钟；Cloudflare/Turnstile 仅用 2Captcha
+    capsolver_api_key: str = ""  # 其他验证码优先 CapSolver，失败再 2Captcha
+    captcha_timeout_seconds: int = 120
     cache_enabled: bool = True
     cache_ttl_seconds: int = 3600
     disk_cache_enabled: bool = True
@@ -237,6 +242,13 @@ class WebContentFetcher:
                 promote_threshold=self.disk_cache_promote_threshold,
             )
         self._inflight: Dict[str, asyncio.Future] = {}
+        self._captcha_solver: Optional[CaptchaSolver] = None
+        if self.two_captcha_api_key or self.capsolver_api_key:
+            self._captcha_solver = CaptchaSolver(
+                capsolver_api_key=self.capsolver_api_key,
+                twocaptcha_api_key=self.two_captcha_api_key,
+                timeout_seconds=self.captcha_timeout_seconds,
+            )
 
     def _per_page_timeout_cap_seconds(self) -> int:
         """单页抓取总时长上限：启用 BrightData 且配置 2captcha 时为 2 分钟，否则 1 分钟。"""
@@ -251,7 +263,7 @@ class WebContentFetcher:
 
     @classmethod
     def from_settings(cls) -> "WebContentFetcher":
-        """从 config/settings.py 全局 settings 加载配置"""
+        """从 config/settings 加载配置。取值优先级：请求/UI 入参（若有）> config > 代码默认；此处仅使用 config + 默认。"""
         try:
             from config.settings import settings
             cfg = getattr(settings, "content_fetcher", None)
@@ -260,10 +272,12 @@ class WebContentFetcher:
                     enabled=getattr(cfg, "enabled", False),
                     only_academic=getattr(cfg, "only_academic", False),
                     max_content_length=getattr(cfg, "max_content_length", 8000),
-                    timeout_seconds=getattr(cfg, "timeout_seconds", 15),
+                    timeout_seconds=getattr(cfg, "timeout_seconds", 30),
                     brightdata_api_key=getattr(cfg, "brightdata_api_key", ""),
                     brightdata_zone=getattr(cfg, "brightdata_zone", ""),
                     two_captcha_api_key=getattr(cfg, "two_captcha_api_key", ""),
+                    capsolver_api_key=getattr(cfg, "capsolver_api_key", ""),
+                    captcha_timeout_seconds=getattr(cfg, "captcha_timeout_seconds", 120),
                     cache_enabled=getattr(cfg, "cache_enabled", True),
                     cache_ttl_seconds=getattr(cfg, "cache_ttl_seconds", 3600),
                     disk_cache_enabled=getattr(cfg, "disk_cache_enabled", True),
@@ -326,7 +340,7 @@ class WebContentFetcher:
             return None
 
     # --------------------------------------------------------
-    # 第二级：BrightData Web Unlocker
+    # 第三级：BrightData Web Unlocker
     # --------------------------------------------------------
 
     async def _fetch_brightdata(self, url: str) -> Optional[str]:
@@ -389,7 +403,7 @@ class WebContentFetcher:
             return None
 
     # --------------------------------------------------------
-    # 第三级：Playwright 浏览器
+    # 第二级：Playwright 浏览器
     # --------------------------------------------------------
 
     async def _fetch_playwright(self, url: str) -> Optional[str]:
@@ -403,44 +417,46 @@ class WebContentFetcher:
         try:
             from playwright.async_api import async_playwright
 
-            stealth_fn = None
-            try:
-                from playwright_stealth import stealth_async
-                stealth_fn = stealth_async
-            except ImportError:
-                pass
-
-            # Prefer headless context pool
+            # Prefer headless context pool (bridge-safe: worker runs on owner loop)
             try:
                 from config.settings import settings
-                from src.retrieval.context_pool import (
-                    SharedContextPool,
-                    acquire_headless_context,
-                    release_context as release_context_lease,
-                )
-                pool = SharedContextPool.get_instance()
-                if pool.is_initialized():
-                    cfg = getattr(settings, "shared_browser", None)
-                    acquire_timeout = getattr(cfg, "context_acquire_timeout_seconds", 30.0) if cfg else 30.0
-                    lease = await acquire_headless_context(timeout=acquire_timeout, purpose="content_fetcher")
-                    if lease is not None:
-                        try:
-                            context = lease.context
-                            page = await context.new_page()
-                            if stealth_fn:
-                                await stealth_fn(page)
-                            await page.goto(
-                                url,
-                                wait_until="domcontentloaded",
-                                timeout=self.effective_timeout_seconds * 1000,
+                from src.retrieval.context_pool import run_with_headless_context
+
+                cfg = getattr(settings, "shared_browser", None)
+                acquire_timeout = getattr(cfg, "context_acquire_timeout_seconds", 30.0) if cfg else 30.0
+                timeout_ms = self.effective_timeout_seconds * 1000
+
+                async def _pool_worker(context):
+                    page = await context.new_page()
+                    try:
+                        await apply_stealth_to_page(page)
+                        await page.goto(
+                            url,
+                            wait_until="domcontentloaded",
+                            timeout=timeout_ms,
+                        )
+                        await page.wait_for_timeout(2000)
+                        if self._captcha_solver and self._captcha_solver.has_any_provider:
+                            await run_captcha_flow(
+                                page,
+                                self._captcha_solver,
+                                self.two_captcha_api_key,
+                                captcha_timeout_seconds=self.captcha_timeout_seconds,
+                                max_retries=2,
                             )
-                            await page.wait_for_timeout(2000)
-                            html = await page.content()
-                            await page.close()
-                        finally:
-                            await release_context_lease(lease, had_error=False)
+                        return await page.content()
+                    finally:
+                        await page.close()
+
+                pool_html = await run_with_headless_context(
+                    _pool_worker,
+                    timeout=acquire_timeout,
+                    purpose="content_fetcher",
+                )
+                if pool_html and len(pool_html) >= 200:
+                    html = pool_html
             except Exception as e:
-                logger.debug("[web_content_fetcher] pool acquire failed, fallback: %s", e)
+                logger.debug("[web_content_fetcher] pooled fetch failed, fallback: %s", e)
 
             # Fallback: ephemeral browser/context (only if pool did not produce html)
             if not (html and len(html) >= 200):
@@ -453,23 +469,23 @@ class WebContentFetcher:
                         browser = await p.chromium.launch(headless=True)
                         own_browser = True
                     try:
-                        context = await browser.new_context(
-                            user_agent=(
-                                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                "Chrome/120.0.0.0 Safari/537.36"
-                            ),
-                            viewport={"width": 1280, "height": 800},
-                        )
+                        context = await browser.new_context(**get_cdp_context_options())
                         page = await context.new_page()
-                        if stealth_fn:
-                            await stealth_fn(page)
+                        await apply_stealth_to_page(page)
                         await page.goto(
                             url,
                             wait_until="domcontentloaded",
                             timeout=self.effective_timeout_seconds * 1000,
                         )
                         await page.wait_for_timeout(2000)
+                        if self._captcha_solver and self._captcha_solver.has_any_provider:
+                            await run_captcha_flow(
+                                page,
+                                self._captcha_solver,
+                                self.two_captcha_api_key,
+                                captcha_timeout_seconds=self.captcha_timeout_seconds,
+                                max_retries=2,
+                            )
                         html = await page.content()
                         await context.close()
                     finally:
@@ -531,7 +547,7 @@ class WebContentFetcher:
         """
         抓取 URL 全文内容，三级策略自动降级。
 
-        trafilatura → BrightData → Playwright
+        trafilatura → Playwright → BrightData
 
         同 URL 并发请求自动合并（in-flight dedup），周期内 TTLCache 防止重复抓取。
 
@@ -576,9 +592,9 @@ class WebContentFetcher:
         async def _fetch_with_cap() -> Optional[str]:
             text = await self._fetch_trafilatura(url)
             if text is None:
-                text = await self._fetch_brightdata(url)
-            if text is None:
                 text = await self._fetch_playwright(url)
+            if text is None:
+                text = await self._fetch_brightdata(url)
             return text
 
         try:

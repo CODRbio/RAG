@@ -1,0 +1,84 @@
+---
+description: Unified Chat/Research workflow contract and pool-fusion invariants that must not be broken
+alwaysApply: true
+---
+
+# Chat/Research Workflow Contract
+
+## Core Framework (Do Not Drift)
+
+For workflow-level changes, keep this backbone:
+
+- **Chat**: `pre-research -> 1+1+1 -> gap(max1) -> agent(optional) -> final fuse(write_top_k) -> answer`
+- **Research(section)**: `1+1+1 -> gap x N -> agent -> section fuse(write_top_k) -> write/verify`
+- **Research(final synthesize)**: integrate section outputs (not a second full chapter-level `write_top_k` fusion).
+
+Do not replace this with a different architecture unless both contract doc and rule are updated together.
+
+## TopK Semantics
+
+- `step_top_k`: per-step retrieval output cap (`1+1+1`, `gap`, `agent` each step).
+- `write_top_k`: cap for **final fusion of one output unit** (Chat turn / Research section).
+- Final synthesize is **not** a chapter-level output unit for `write_top_k`; it integrates section outputs and may add small agent supplements (still bounded per-call by `step_top_k`).
+- Chat-only internal budget expansion is allowed to avoid underfilled candidate pools when step count is low:
+  - `chat_effective_step_k = ceil(step_top_k * 1.2)`
+  - This expansion is for candidate recall/prefilter only, and MUST NOT replace `write_top_k` as final fusion cap.
+
+## Pool Strategy and Sampling
+
+- Keep existing recall/pool-amplification behavior.
+- Keep “amplified candidate pool -> one global rerank -> final sampling” pattern.
+- No extra score weighting.
+- Target quotas are soft targets (not hard guarantees):
+  - gap target: 20%
+  - agent target: 10%
+- If pool has insufficient gap/agent candidates, do not hard-fill; backfill by relevance order.
+
+## Global Fusion Invariants
+
+Never return evidence by concatenating pools and slicing before one global rerank.
+Authoritative pattern:
+
+```
+source hits (pre-filter only) -> fuse/rerank once -> final top_k
+```
+
+`src/retrieval/service.py::fuse_pools_with_gap_protection()` remains the source of truth for fusion logic.
+
+## Hybrid Retrieval Timing Invariant
+
+Keep hybrid timeout behavior:
+
+- local: hard timeout (`timeout_s`)
+- web: soft wait (`min(timeout_s * 5, 300)`)
+
+Do not remove the `ex.shutdown(wait=False)` non-blocking behavior in hybrid search.
+
+## Chat-Specific Guardrails
+
+- Agent-added chunks must participate in final fused evidence for model-visible context (not citation-only sink).
+- Do not let `write_top_k` degrade to “synthesizer truncation only” without final fused pool semantics.
+- Chat step retrieval may use `ceil(step_top_k * 1.2)` as internal candidate budget, but final model-visible evidence MUST still be governed by `write_top_k`.
+
+## Research-Specific Guardrails
+
+- Section evidence must follow section-level fusion semantics with `write_top_k`.
+- Final synthesize should primarily integrate section outputs and existing citations.
+- Final synthesize may use optional final agent supplement, but must not become a full re-run of chapter-level fusion over all raw evidence.
+- Final bibliography/material volume at synthesize stage is not hard-capped by `write_top_k`; budget pressure is handled via prompt/context compression, not by redefining `write_top_k`.
+- Keep DR gap-source mapping in section pool rerank (`_DR_GAP_POOL_SOURCES`, notably `eval_supplement`).
+
+## Legacy Retrieval Invariants (Still Mandatory)
+
+- Do not replace calls to `fuse_pools_with_gap_protection()` with `_rerank_candidates()` only.
+- Keep `local_recall_k = min(actual_recall, max(result_limit * 2, 20))`; do not collapse it to `result_limit`.
+- Keep hybrid `ex.shutdown(wait=False)` behavior (already required above).
+- Keep final truncation as a post-fusion guard only; do not add extra pre-fusion hard cuts that bypass global rerank.
+
+## DO NOT
+
+- Replace one global rerank with per-pool sort + concat + truncate.
+- Remove gap/agent target-protection semantics from final sampling.
+- Introduce score weighting that changes ranking semantics.
+- Change core recall/pool-amplification shape without updating this rule and the contract doc.
+- Change final sampling into random/uniform/per-source-equal sampling.

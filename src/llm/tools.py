@@ -32,9 +32,33 @@ logger = get_logger(__name__)
 _agent_chunks_local = threading.local()
 
 
-def set_tool_collection(collection: Optional[str]) -> None:
-    """Set the Milvus collection for search_local/search_web in this thread."""
+def set_tool_collection(collection: Optional[str], collections: Optional[List[str]] = None) -> None:
+    """Set the Milvus collection(s) for search_local/search_web in this thread.
+    
+    If ``collections`` is provided with more than one entry, a MultiCollectionRetrievalService
+    will be used with equal quota split. ``collection`` is kept as the primary fallback.
+    """
     _agent_chunks_local.collection = collection or None
+    # Store multi-collection list (None or a list of >=2 names)
+    _agent_chunks_local.collections = (
+        [c.strip() for c in collections if (c or "").strip()]
+        if collections and len(collections) > 1
+        else None
+    )
+
+
+def set_tool_step_top_k(step_top_k: Optional[int]) -> None:
+    """Set request-scoped step_top_k for agent retrieval tools."""
+    try:
+        v = int(step_top_k) if step_top_k is not None else None
+    except Exception:
+        v = None
+    _agent_chunks_local.step_top_k = v if (v is not None and v > 0) else None
+
+
+def get_tool_step_top_k() -> Optional[int]:
+    """Return request-scoped step_top_k if available."""
+    return getattr(_agent_chunks_local, "step_top_k", None)
 
 
 def set_agent_sonar_model(model: Optional[str]) -> None:
@@ -152,6 +176,23 @@ def tools_to_prompt(tools: List[ToolDef]) -> str:
 def parse_tool_calls_openai(raw: Dict[str, Any]) -> List[ToolCall]:
     """从 OpenAI-compatible 响应中解析 tool_calls"""
     calls = []
+    if (raw.get("_api_mode") or "") == "responses" or raw.get("output"):
+        for item in raw.get("output") or []:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") != "function_call":
+                continue
+            args_str = item.get("arguments", "{}")
+            try:
+                args = json.loads(args_str) if isinstance(args_str, str) else args_str
+            except json.JSONDecodeError:
+                args = {"_raw": args_str}
+            calls.append(ToolCall(
+                id=item.get("call_id", "") or item.get("id", ""),
+                name=item.get("name", ""),
+                arguments=args,
+            ))
+        return calls
     choices = raw.get("choices") or []
     if not choices:
         return calls
@@ -240,14 +281,19 @@ def has_tool_calls(raw: Dict[str, Any], is_anthropic: bool = False) -> bool:
             if isinstance(block, dict) and block.get("type") == "tool_use":
                 return True
     else:
-        choices = raw.get("choices") or []
-        if choices:
-            msg = choices[0].get("message") or {}
-            if msg.get("tool_calls"):
-                return True
-            finish = choices[0].get("finish_reason", "")
-            if finish in ("tool_calls", "function_call"):
-                return True
+        if (raw.get("_api_mode") or "") == "responses" or raw.get("output"):
+            for item in raw.get("output") or []:
+                if isinstance(item, dict) and item.get("type") == "function_call":
+                    return True
+        else:
+            choices = raw.get("choices") or []
+            if choices:
+                msg = choices[0].get("message") or {}
+                if msg.get("tool_calls"):
+                    return True
+                finish = choices[0].get("finish_reason", "")
+                if finish in ("tool_calls", "function_call"):
+                    return True
     return False
 
 
@@ -441,24 +487,46 @@ _SEARCH_NCBI_SCHEMA = {
 
 # ── Handler 实现 ──
 
-def _handle_search_local(query: str, top_k: int = 10, **_) -> str:
-    from src.retrieval.service import get_retrieval_service
+def _get_tool_retrieval_svc():
+    """Return the appropriate retrieval service for the current thread (single or multi-collection)."""
+    from src.retrieval.service import get_retrieval_service, get_multi_collection_retrieval_service
+
+    multi_cols = getattr(_agent_chunks_local, "collections", None)
+    if multi_cols and len(multi_cols) > 1:
+        equal = 1.0 / len(multi_cols)
+        return get_multi_collection_retrieval_service(
+            collection_quotas={c: equal for c in multi_cols}
+        )
     col = getattr(_agent_chunks_local, "collection", None)
-    svc = get_retrieval_service(collection=col)
+    return get_retrieval_service(collection=col)
+
+
+def _handle_search_local(query: str, top_k: int = 10, **_) -> str:
+    requested_top_k = max(1, int(top_k or 10))
+    step_top_k = get_tool_step_top_k()
+    effective_top_k = min(requested_top_k, step_top_k) if step_top_k else requested_top_k
+    svc = _get_tool_retrieval_svc()
     # Chat 场景下 Agent 检索固定 bge_only，与主检索一致，不用 ColBERT
-    pack = svc.search(query=query, mode="local", top_k=top_k, filters={"reranker_mode": "bge_only"})
-    _collect_chunks(pack.chunks[:min(top_k, 15)])
-    return pack.to_context_string(max_chunks=min(top_k, 15))
+    tool_filters: Dict[str, Any] = {"reranker_mode": "bge_only"}
+    if step_top_k:
+        tool_filters["step_top_k"] = step_top_k
+    pack = svc.search(query=query, mode="local", top_k=effective_top_k, filters=tool_filters)
+    _collect_chunks(pack.chunks[:min(effective_top_k, 15)])
+    return pack.to_context_string(max_chunks=min(effective_top_k, 15))
 
 
 def _handle_search_web(query: str, top_k: int = 10, **_) -> str:
-    from src.retrieval.service import get_retrieval_service
-    col = getattr(_agent_chunks_local, "collection", None)
-    svc = get_retrieval_service(collection=col)
+    requested_top_k = max(1, int(top_k or 10))
+    step_top_k = get_tool_step_top_k()
+    effective_top_k = min(requested_top_k, step_top_k) if step_top_k else requested_top_k
+    svc = _get_tool_retrieval_svc()
     # Chat 场景下 Agent 检索固定 bge_only，与主检索一致，不用 ColBERT
-    pack = svc.search(query=query, mode="web", top_k=top_k, filters={"reranker_mode": "bge_only"})
-    _collect_chunks(pack.chunks[:min(top_k, 15)])
-    return pack.to_context_string(max_chunks=min(top_k, 15))
+    tool_filters: Dict[str, Any] = {"reranker_mode": "bge_only"}
+    if step_top_k:
+        tool_filters["step_top_k"] = step_top_k
+    pack = svc.search(query=query, mode="web", top_k=effective_top_k, filters=tool_filters)
+    _collect_chunks(pack.chunks[:min(effective_top_k, 15)])
+    return pack.to_context_string(max_chunks=min(effective_top_k, 15))
 
 
 def invoke_sonar_search(query: str, model: str = "sonar-pro") -> tuple:
@@ -521,23 +589,44 @@ def _handle_search_sonar(query: str, **_) -> str:
 
 def _handle_search_scholar(query: str, year_from: Optional[int] = None, limit: int = 5, **_) -> str:
     try:
-        from src.retrieval.semantic_scholar import SemanticScholarSearch
+        import asyncio
+        from src.retrieval.semantic_scholar import SemanticScholarSearcher
         from src.retrieval.evidence import EvidenceChunk
-        ss = SemanticScholarSearch()
-        results = ss.search(query, year_from=year_from, limit=limit)
+        ss = SemanticScholarSearcher()
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    future = pool.submit(
+                        asyncio.run,
+                        ss.search(query, limit=limit, year_start=year_from),
+                    )
+                    results = future.result(timeout=45)
+            else:
+                results = loop.run_until_complete(
+                    ss.search(query, limit=limit, year_start=year_from),
+                )
+        except RuntimeError:
+            results = asyncio.run(ss.search(query, limit=limit, year_start=year_from))
         if not results:
             return "未找到相关学术论文。"
         lines = []
         chunks = []
         for r in results[:limit]:
-            title = r.get("title", "")
-            year = r.get("year", "")
-            abstract = (r.get("abstract") or "")[:300]
-            doi = r.get("externalIds", {}).get("DOI", "")
-            paper_id = r.get("paperId", "")
-            authors_raw = r.get("authors") or []
-            author_names = [a.get("name", "") for a in authors_raw if isinstance(a, dict)]
-            url = f"https://api.semanticscholar.org/CorpusID:{paper_id}" if paper_id else ""
+            meta = r.get("metadata", {})
+            title = meta.get("title", r.get("content", ""))
+            year = meta.get("year", "")
+            abstract = (r.get("content") or "")[:300]
+            doi = meta.get("doi", "")
+            paper_id = meta.get("paper_id", "")
+            authors_raw = meta.get("authors") or []
+            author_names = (
+                [a.get("name", "") for a in authors_raw if isinstance(a, dict)]
+                if authors_raw and isinstance(authors_raw[0], dict)
+                else [str(a) for a in authors_raw]
+            )
+            url = meta.get("url") or (f"https://www.semanticscholar.org/paper/{paper_id}" if paper_id else "")
             chunk = EvidenceChunk(
                 chunk_id=f"scholar_{paper_id or title[:20]}",
                 doc_id=doi or paper_id or title[:30],

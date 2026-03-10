@@ -29,6 +29,12 @@
 | `actual_recall` | 内部 | `max(80, result_limit × 4)`；传给本地检索的召回放大系数，确保重排有足够候选 |
 | `local_recall_k` | 内部 | `min(actual_recall, result_limit × 2)`；hybrid 模式下本地内部重排后的输出上限（为全局融合提供更多候选） |
 
+当前前端默认建议：
+
+- Chat / Hybrid 默认 `local_top_k = 45`
+- 保持 `step_top_k = 10`、`write_top_k = 15`
+- 如果出现“本地库明明有内容，但最终混合结果里本地占比很低”，优先先提高 `local_top_k`，而不是先改 hybrid 融合逻辑
+
 ---
 
 ## 二、Chat 路径

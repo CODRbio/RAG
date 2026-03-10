@@ -65,17 +65,34 @@ def search_web(query: str, top_k: int = 10) -> str:
 def search_scholar(query: str, year_from: Optional[int] = None, limit: int = 5) -> str:
     """学术论文搜索（Semantic Scholar），查找特定领域的学术文献，获取标题、摘要、DOI。"""
     try:
-        from src.retrieval.semantic_scholar import SemanticScholarSearch
-        ss = SemanticScholarSearch()
-        results = ss.search(query, year_from=year_from, limit=limit)
+        import asyncio
+        from src.retrieval.semantic_scholar import SemanticScholarSearcher
+        ss = SemanticScholarSearcher()
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    future = pool.submit(
+                        asyncio.run,
+                        ss.search(query, limit=limit, year_start=year_from),
+                    )
+                    results = future.result(timeout=45)
+            else:
+                results = loop.run_until_complete(
+                    ss.search(query, limit=limit, year_start=year_from),
+                )
+        except RuntimeError:
+            results = asyncio.run(ss.search(query, limit=limit, year_start=year_from))
         if not results:
             return "未找到相关学术论文。"
         lines = []
         for r in results[:limit]:
-            title = r.get("title", "")
-            year = r.get("year", "")
-            abstract = (r.get("abstract") or "")[:300]
-            doi = r.get("externalIds", {}).get("DOI", "")
+            meta = r.get("metadata", {})
+            title = meta.get("title", r.get("content", ""))
+            year = meta.get("year", "")
+            abstract = (r.get("content") or "")[:300]
+            doi = meta.get("doi", "")
             lines.append(f"- **{title}** ({year}) DOI:{doi}\n  {abstract}")
         return "\n".join(lines)
     except Exception as e:

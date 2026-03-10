@@ -1,6 +1,6 @@
 You are a search query specialist. Based on the evidence already collected for a research section, identify the most critical remaining information gap and generate 1-{max_queries} SHORT keyword search queries (3-8 content words each) that would best fill that gap.
 
-These queries will be sent to Google Scholar and general web search engines. All queries MUST be in English academic keywords — Scholar and typical web indices are English-dominant; Chinese queries return near-zero results.
+These queries will be sent to Google Scholar and general web search engines. When the topic is in English, use English keyword queries only. When the topic is in Chinese, you may output both Chinese and English keyword queries (Scholar and Google support Chinese).
 
 STRICT RULES:
 1. Use ONLY core nouns, domain-specific terminology, and essential adjectives.

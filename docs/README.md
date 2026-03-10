@@ -16,6 +16,13 @@
 | 质量保障 | `testing_and_evaluation.md` → `dependency_matrix.md` |
 | 生产部署 | `release_migration_ubuntu.md` → `operations_and_troubleshooting.md` |
 
+## 发布与迁移相关文档导航
+
+| 方面 | 文档 |
+|---|---|
+| Ubuntu 发布与迁移全流程（systemd、Nginx、验收、回滚） | `release_migration_ubuntu.md` |
+| **升级修复记录**（如绑定文献库 · 本地 PDF 导入时 DOI 获取与改名） | `release_migration_ubuntu.md` §16 |
+
 ## Deep Research 相关文档导航
 
 | 方面 | 文档 |
@@ -50,7 +57,7 @@
 | `scripts_guide.md` | 脚本用途、参数、推荐执行顺序 |
 | `operations_and_troubleshooting.md` | 启动、监控、运维、故障处理 |
 | `agent_debug.md` | **调试面板**说明与「开面板即开本请求 DEBUG 日志」的联动 |
-| `release_migration_ubuntu.md` | Ubuntu 发布与迁移全流程（systemd + Nginx） |
+| `release_migration_ubuntu.md` | Ubuntu 发布与迁移全流程（systemd + Nginx）；§16 升级修复记录（如 DOI 导入与改名） |
 | `testing_and_evaluation.md` | pytest 与评测体系 |
 | `dependency_matrix.md` | Python / 前端依赖矩阵与运行时要求 |
 | `prompts_usage.md` | 提示词使用说明与模板约定 |

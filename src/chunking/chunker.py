@@ -6,9 +6,12 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any, Iterator, Optional
+
+logger = logging.getLogger(__name__)
 
 # Block 可以是 dict（JSON）或带 heading_path/text/table_data/figure_data 的对象
 
@@ -193,9 +196,102 @@ def _finalize_buffer(
         return []
     meta = _merge_metadata(buffer, doc_id, "text")
     if len(text) > max_c:
-        return _split_long_block_by_sentences(text, meta, doc_id, target, overlap_sent)
+        return _split_long_block_by_sentences(text, meta, doc_id, min(target, max_c), overlap_sent)
     cid = _generate_stable_id(doc_id, meta.get("section_path", ""), meta.get("page_range", [0, 0])[0], text[:32])
     return [Chunk(chunk_id=cid, text=text, content_type="text", meta=meta)]
+
+
+def _clone_block_with_text(block: dict | Any, text: str) -> dict:
+    return {
+        "block_type": _block_type(block),
+        "heading_path": list(getattr(block, "heading_path", None) or (block.get("heading_path", []) if isinstance(block, dict) else [])),
+        "text": text,
+        "page_index": _page_index(block),
+        "block_id": _block_id(block),
+        "bbox": _block_bbox(block),
+    }
+
+
+def _split_paragraphs(text: str) -> list[str]:
+    if _is_blank(text):
+        return []
+    parts = [p.strip() for p in re.split(r"\n\s*\n+", text) if p and p.strip()]
+    return parts or [text.strip()]
+
+
+def _merge_chunk_meta(left: dict, right: dict) -> dict:
+    out = dict(left or {})
+    l_page = (left or {}).get("page_range") or [0, 0]
+    r_page = (right or {}).get("page_range") or [0, 0]
+    try:
+        out["page_range"] = [min(int(l_page[0]), int(r_page[0])), max(int(l_page[1]), int(r_page[1]))]
+    except Exception:
+        pass
+    left_types = list((left or {}).get("block_types") or [])
+    right_types = list((right or {}).get("block_types") or [])
+    out["block_types"] = list(dict.fromkeys(left_types + right_types))
+    left_bbox = list((left or {}).get("bbox") or [])
+    right_bbox = list((right or {}).get("bbox") or [])
+    if left_bbox or right_bbox:
+        out["bbox"] = left_bbox + right_bbox
+    return out
+
+
+def _merge_tiny_text_chunks(chunks: list[Chunk], doc_id: str, min_c: int, max_c: int) -> list[Chunk]:
+    if not chunks:
+        return []
+    out: list[Chunk] = []
+    i = 0
+    while i < len(chunks):
+        cur = chunks[i]
+        if cur.content_type != "text" or len(cur.text or "") >= min_c:
+            out.append(cur)
+            i += 1
+            continue
+
+        prev = out[-1] if out else None
+        nxt = chunks[i + 1] if i + 1 < len(chunks) else None
+        cur_sec = str((cur.meta or {}).get("section_path") or "")
+        merged = False
+
+        if (
+            prev
+            and prev.content_type == "text"
+            and str((prev.meta or {}).get("section_path") or "") == cur_sec
+            and len((prev.text or "") + "\n\n" + (cur.text or "")) <= max_c
+        ):
+            merged_text = (prev.text or "").strip() + "\n\n" + (cur.text or "").strip()
+            merged_meta = _merge_chunk_meta(prev.meta, cur.meta)
+            cid = _generate_stable_id(
+                doc_id,
+                merged_meta.get("section_path", ""),
+                (merged_meta.get("page_range") or [0, 0])[0],
+                merged_text[:32],
+            )
+            out[-1] = Chunk(chunk_id=cid, text=merged_text, content_type="text", meta=merged_meta)
+            merged = True
+        elif (
+            nxt
+            and nxt.content_type == "text"
+            and str((nxt.meta or {}).get("section_path") or "") == cur_sec
+            and len((cur.text or "") + "\n\n" + (nxt.text or "")) <= max_c
+        ):
+            merged_text = (cur.text or "").strip() + "\n\n" + (nxt.text or "").strip()
+            merged_meta = _merge_chunk_meta(cur.meta, nxt.meta)
+            cid = _generate_stable_id(
+                doc_id,
+                merged_meta.get("section_path", ""),
+                (merged_meta.get("page_range") or [0, 0])[0],
+                merged_text[:32],
+            )
+            out.append(Chunk(chunk_id=cid, text=merged_text, content_type="text", meta=merged_meta))
+            i += 1
+            merged = True
+
+        if not merged:
+            out.append(cur)
+        i += 1
+    return out
 
 
 def chunk_table_block(block: dict | Any, doc_id: str, max_chars: int, rows_per_chunk: int = 10) -> list[Chunk]:
@@ -279,6 +375,7 @@ def chunk_blocks(
     config: Optional[ChunkConfig] = None,
     claims: Optional[list[dict]] = None,
 ) -> list[Chunk]:
+    logger.debug(f"[chunk_blocks] start: doc_id={doc_id}, input_blocks={len(blocks)}")
     cfg = config or ChunkConfig()
     target, min_c, max_c, overlap_sent = cfg.target_chars, cfg.min_chars, cfg.max_chars, cfg.overlap_sentences
     chunks = []
@@ -306,34 +403,42 @@ def chunk_blocks(
         if bt in ("caption", "footnote", "formula"):
             continue
 
-        text = _block_text(block)
-        if _is_blank(text):
+        raw_text = _block_text(block)
+        if _is_blank(raw_text):
             continue
 
         section = _section_path(block)
-
-        if section != current_section and buffer_len >= min_c:
+        if section != current_section and buffer_len > 0:
             chunks += _finalize_buffer(buffer, doc_id, target, max_c, overlap_sent)
             buffer, buffer_len = [], 0
-
         current_section = section
 
-        if buffer_len + len(text) <= max_c:
-            buffer.append(block)
-            buffer_len += len(text)
-            if buffer_len >= target:
-                chunks += _finalize_buffer(buffer, doc_id, target, max_c, overlap_sent)
-                buffer, buffer_len, current_section = [], 0, None
-        else:
-            if buffer_len > 0:
+        # Semantic-first: use paragraph units and only split by sentences as an oversized fallback.
+        units = _split_paragraphs(raw_text)
+        for unit_text in units:
+            if _is_blank(unit_text):
+                continue
+            if len(unit_text) > max_c:
+                if buffer_len > 0:
+                    chunks += _finalize_buffer(buffer, doc_id, target, max_c, overlap_sent)
+                    buffer, buffer_len = [], 0
+                meta = _merge_metadata([block], doc_id)
+                chunks += _split_long_block_by_sentences(unit_text, meta, doc_id, min(target, max_c), overlap_sent)
+                current_section = None
+                continue
+
+            if buffer_len > 0 and buffer_len + len(unit_text) > max_c:
                 chunks += _finalize_buffer(buffer, doc_id, target, max_c, overlap_sent)
                 buffer, buffer_len = [], 0
-            meta = _merge_metadata([block], doc_id)
-            chunks += _split_long_block_by_sentences(text, meta, doc_id, target, overlap_sent)
-            current_section = None
+
+            unit_block = _clone_block_with_text(block, unit_text)
+            buffer.append(unit_block)
+            buffer_len += len(unit_text)
 
     if buffer_len > 0:
         chunks += _finalize_buffer(buffer, doc_id, target, max_c, overlap_sent)
+
+    chunks = _merge_tiny_text_chunks(chunks, doc_id=doc_id, min_c=min_c, max_c=max_c)
 
     # 注入 claims 到 chunk.meta
     if claims:
@@ -342,4 +447,5 @@ def chunk_blocks(
             if matched:
                 chunk.meta["claims"] = matched
 
+    logger.debug(f"[chunk_blocks] end: doc_id={doc_id}, output_chunks={len(chunks)}")
     return chunks

@@ -154,7 +154,8 @@ def _sanitize_query(provider: str, q: str) -> str:
 
 
 # Engines that do not support Chinese meaningfully; always use English queries only.
-_ENGLISH_ONLY_ENGINES = frozenset({"ncbi", "semantic", "scholar"})
+# Scholar and Google support Chinese; only ncbi and semantic are English-only.
+_ENGLISH_ONLY_ENGINES = frozenset({"ncbi", "semantic"})
 
 
 class SmartQueryOptimizer:

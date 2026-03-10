@@ -8,7 +8,8 @@
 #   bash scripts/start.sh --debug    # 调试模式：后端与日志从启动起即为 DEBUG 级别
 #   bash scripts/start.sh --backend-only   # 仅启动后端
 #   bash scripts/start.sh --frontend-only  # 仅启动前端
-#   bash scripts/start.sh --no-redis       # 不自动检查/拉起 Redis（不推荐）
+#   bash scripts/start.sh --no-infra       # 不自动检查/拉起 docker compose 基础服务
+#   bash scripts/start.sh --no-redis       # 跳过 Redis 检查（兼容旧参数）
 #   API_PORT=8000 bash scripts/start.sh   # 自定义后端端口
 #
 # 退出: Ctrl+C 会同时关闭后端和前端进程
@@ -18,6 +19,15 @@ set -e
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+
+# ── 加载本地 .env（若存在） ──
+# 让 start.sh 与 docker compose / RAG_DATABASE_URL / REDIS_URL 使用同一份环境配置。
+if [ -f "$ROOT/.env" ]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$ROOT/.env"
+  set +a
+fi
 
 # ── 运行时命令解析（优先 conda 环境） ──
 # 目标：迁移时尽量复用 conda 管理，不依赖系统级 python/npm 绝对路径
@@ -34,6 +44,11 @@ if command -v conda >/dev/null 2>&1; then
       NPM_CMD=(conda run -n "$CONDA_ENV_NAME" npm)
     fi
   fi
+fi
+
+DOCKER_COMPOSE_AVAILABLE=0
+if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+  DOCKER_COMPOSE_AVAILABLE=1
 fi
 
 # ── HuggingFace 下载源（中国网络默认镜像 + 官方回退） ──
@@ -114,6 +129,7 @@ NC='\033[0m'
 # ── 参数解析 ──
 RUN_BACKEND=true
 RUN_FRONTEND=true
+RUN_INFRA=true
 RUN_REDIS=true
 QUICK_START=false
 DEBUG_MODE=false
@@ -121,6 +137,7 @@ for arg in "$@"; do
   case "$arg" in
     --backend-only)  RUN_FRONTEND=false ;;
     --frontend-only) RUN_BACKEND=false ;;
+    --no-infra)      RUN_INFRA=false ;;
     --no-redis)      RUN_REDIS=false ;;
     --quick)         QUICK_START=true ;;
     --debug)         DEBUG_MODE=true ;;
@@ -218,32 +235,120 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# ── Redis 就绪检查（队列模式必需） ──
-ensure_redis() {
-  local redis_host redis_port
-  redis_host="${REDIS_HOST:-127.0.0.1}"
-  redis_port="${REDIS_PORT:-6379}"
+# ── URL / 服务解析辅助 ──
+get_resolved_db_url() {
+  "${PY_CMD[@]}" -c 'from src.db.engine import get_resolved_db_url; print(get_resolved_db_url())'
+}
 
-  if ! command -v redis-cli >/dev/null 2>&1; then
-    echo -e "${YELLOW}[start.sh] 未找到 redis-cli，请先安装 Redis（例如: brew install redis）${NC}"
-    return 1
+get_resolved_redis_url() {
+  "${PY_CMD[@]}" -c 'from config.settings import settings; print(settings.tasks.redis_url)'
+}
+
+parse_url_host_port() {
+  local url="$1"
+  URL_TO_PARSE="$url" "${PY_CMD[@]}" -c 'import os; from urllib.parse import urlparse; url=(os.environ.get("URL_TO_PARSE") or "").strip(); url=("postgresql://" + url[len("postgresql+psycopg://"):]) if url.startswith("postgresql+psycopg://") else url; parsed=urlparse(url); host=parsed.hostname or ""; port=parsed.port or (5432 if parsed.scheme.startswith("postgres") else 6379 if parsed.scheme.startswith("redis") else 0); print(f"{host}|{port}")'
+}
+
+is_loopback_host() {
+  case "$1" in
+    localhost|127.0.0.1) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+probe_postgres_url() {
+  local url="$1"
+  RAG_DATABASE_URL="$url" "${PY_CMD[@]}" -c 'import os; from sqlalchemy import create_engine, text; engine=create_engine(os.environ["RAG_DATABASE_URL"], pool_pre_ping=True); conn=engine.connect(); conn.execute(text("SELECT 1")); conn.close(); print("ok")'
+}
+
+probe_redis_url() {
+  local url="$1"
+  REDIS_TARGET_URL="$url" "${PY_CMD[@]}" -c 'import os; from redis import Redis; client=Redis.from_url(os.environ["REDIS_TARGET_URL"], socket_connect_timeout=2, socket_timeout=2); print(client.ping())'
+}
+
+ensure_postgres() {
+  local db_url host_port db_host db_port
+  db_url="$(get_resolved_db_url)"
+  case "$db_url" in
+    sqlite://*)
+      echo -e "${CYAN}[start.sh] 当前数据库为 SQLite，跳过 PostgreSQL 基础服务检查${NC}"
+      return 0
+      ;;
+    postgresql*://*)
+      :
+      ;;
+    *)
+      echo -e "${YELLOW}[start.sh] 未识别的数据库 URL：${db_url}，跳过 PostgreSQL 自动拉起${NC}"
+      return 0
+      ;;
+  esac
+
+  host_port="$(parse_url_host_port "$db_url")"
+  db_host="${host_port%%|*}"
+  db_port="${host_port##*|}"
+
+  if probe_postgres_url "$db_url" >/dev/null 2>&1; then
+    echo -e "${GREEN}[start.sh] PostgreSQL 已就绪 ✓ (${db_host}:${db_port})${NC}"
+    return 0
   fi
 
-  if redis-cli -h "$redis_host" -p "$redis_port" ping >/dev/null 2>&1; then
+  if [ "$RUN_INFRA" = true ] && [ "$DOCKER_COMPOSE_AVAILABLE" = "1" ] && is_loopback_host "$db_host"; then
+    echo -e "${CYAN}[start.sh] 检测到本地 PostgreSQL，尝试通过 docker compose 拉起 postgres...${NC}"
+    docker compose up -d postgres >/dev/null
+  fi
+
+  echo -e "${CYAN}[start.sh] 等待 PostgreSQL 就绪 (${db_host}:${db_port})...${NC}"
+  for _ in $(seq 1 30); do
+    if probe_postgres_url "$db_url" >/dev/null 2>&1; then
+      echo -e "${GREEN}[start.sh] PostgreSQL 已就绪 ✓ (${db_host}:${db_port})${NC}"
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo -e "${YELLOW}[start.sh] PostgreSQL 未就绪，请检查 RAG_DATABASE_URL / docker compose 日志。${NC}"
+  return 1
+}
+
+# ── Redis 就绪检查（队列模式必需） ──
+ensure_redis() {
+  local redis_url host_port redis_host redis_port
+  redis_url="$(get_resolved_redis_url)"
+  host_port="$(parse_url_host_port "$redis_url")"
+  redis_host="${host_port%%|*}"
+  redis_port="${host_port##*|}"
+
+  if probe_redis_url "$redis_url" >/dev/null 2>&1; then
     echo -e "${GREEN}[start.sh] Redis 已就绪 ✓ (${redis_host}:${redis_port})${NC}"
     return 0
   fi
 
-  if ! command -v redis-server >/dev/null 2>&1; then
-    echo -e "${YELLOW}[start.sh] Redis 未运行且未找到 redis-server，可手动启动后重试。${NC}"
+  if [ "$RUN_INFRA" = true ] && [ "$DOCKER_COMPOSE_AVAILABLE" = "1" ] && is_loopback_host "$redis_host"; then
+    echo -e "${CYAN}[start.sh] Redis 未就绪，尝试通过 docker compose 拉起 redis...${NC}"
+    docker compose up -d redis >/dev/null
+    for _ in $(seq 1 20); do
+      if probe_redis_url "$redis_url" >/dev/null 2>&1; then
+        echo -e "${GREEN}[start.sh] Redis 已就绪 ✓ (${redis_host}:${redis_port})${NC}"
+        return 0
+      fi
+      sleep 1
+    done
+  fi
+
+  if ! is_loopback_host "$redis_host"; then
+    echo -e "${YELLOW}[start.sh] 远端 Redis 未就绪：${redis_url}${NC}"
     return 1
   fi
 
-  echo -e "${CYAN}[start.sh] Redis 未就绪，尝试自动启动 (${redis_host}:${redis_port})...${NC}"
-  # 仅用于本地开发，禁用持久化以便快速拉起
+  if ! command -v redis-server >/dev/null 2>&1; then
+    echo -e "${YELLOW}[start.sh] Redis 未运行且未找到 redis-server，可手动启动或使用 docker compose。${NC}"
+    return 1
+  fi
+
+  echo -e "${CYAN}[start.sh] Redis 未就绪，回退到本地 redis-server (${redis_host}:${redis_port})...${NC}"
   redis-server --port "$redis_port" --save "" --appendonly no --daemonize yes >/dev/null 2>&1 || true
   sleep 1
-  if redis-cli -h "$redis_host" -p "$redis_port" ping >/dev/null 2>&1; then
+  if probe_redis_url "$redis_url" >/dev/null 2>&1; then
     REDIS_STARTED_BY_SCRIPT=1
     echo -e "${GREEN}[start.sh] Redis 启动成功 ✓ (${redis_host}:${redis_port})${NC}"
     return 0
@@ -258,6 +363,11 @@ if [ "$RUN_BACKEND" = true ]; then
   BACKEND_PORT="${API_PORT:-9999}"
   BACKEND_HOST="${API_HOST:-127.0.0.1}"
   kill_port "$BACKEND_PORT" "后端 API"
+  # 释放共享 CDP 浏览器端口，避免残留 Chromium 导致 Address already in use
+  kill_port "9222" "CDP headless"
+  kill_port "9223" "CDP headed"
+
+  ensure_postgres || exit 1
 
   if [ "$RUN_REDIS" = true ]; then
     ensure_redis || exit 1

@@ -1,6 +1,8 @@
 import client from './client';
 import type { ScholarDownloadStrategyId } from '../types';
 
+const BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api';
+
 export interface ScholarResultMetadata {
   source: string;
   title: string;
@@ -44,11 +46,27 @@ export function isSubmittedTask(
   return (r as SubmittedTask).task_id !== undefined;
 }
 
+/** Known payload fields for download+ingest tasks (stage, ingest job link, paper_id). */
+export interface ScholarDownloadTaskPayload {
+  total?: number;
+  completed?: number;
+  failed?: number;
+  stage?: string;
+  progress?: number;
+  ingest_job_id?: string;
+  ingest_poll_url?: string;
+  paper_id?: string;
+  filepath?: string;
+  collection?: string;
+  library_id?: number;
+  [key: string]: unknown;
+}
+
 export interface DownloadTaskStatus {
   task_id: string;
   status: string;
   error_message?: string | null;
-  payload: Record<string, unknown>;
+  payload: ScholarDownloadTaskPayload | Record<string, unknown>;
   started_at?: number | null;
   finished_at?: number | null;
 }
@@ -105,6 +123,10 @@ export interface ScholarLibraryPaper {
   jif_5year?: number | null;
   /** Derived: true when downloaded_at is set. */
   is_downloaded?: boolean;
+  /** True when this paper is ingested into the collection requested via getLibraryPapers(..., collection). */
+  in_collection?: boolean;
+  /** paper_id in that collection when in_collection is true. */
+  collection_paper_id?: string | null;
 }
 
 export type ScholarSource = 'google_scholar' | 'google' | 'semantic' | 'semantic_relevance' | 'semantic_bulk' | 'ncbi' | 'annas_archive';
@@ -136,6 +158,32 @@ export async function searchScholar(params: {
   return Array.isArray(res?.data?.results) ? res.data.results : [];
 }
 
+export async function searchScholarBatch(params: {
+  query: string;
+  sources?: ScholarSource[];
+  limit_per_source?: number;
+  year_start?: number;
+  year_end?: number;
+  optimize?: boolean;
+}): Promise<{ results: ScholarSearchResult[]; source_counts: Record<string, number> }> {
+  const res = await client.post<{ results?: ScholarSearchResult[]; source_counts?: Record<string, number> }>(
+    '/scholar/search/batch',
+    {
+      query: params.query,
+      sources: params.sources ?? null,
+      limit_per_source: params.limit_per_source ?? 20,
+      year_start: params.year_start,
+      year_end: params.year_end,
+      optimize: params.optimize ?? true,
+    },
+    { timeout: 300000 },
+  );
+  return {
+    results: Array.isArray(res?.data?.results) ? res.data.results : [],
+    source_counts: res?.data?.source_counts ?? {},
+  };
+}
+
 export async function downloadPaper(params: {
   title: string;
   doi?: string;
@@ -150,6 +198,7 @@ export async function downloadPaper(params: {
   library_id?: number;
   llm_provider?: string | null;
   model_override?: string | null;
+  assist_llm_mode?: 'ultra-lite' | 'lite' | 'auto-upgrade';
   assist_llm_enabled?: boolean;
   show_browser?: boolean | null;
   include_academia?: boolean;
@@ -176,6 +225,7 @@ export async function batchDownloadPapers(
     library_id?: number;
     llm_provider?: string | null;
     model_override?: string | null;
+    assist_llm_mode?: 'ultra-lite' | 'lite' | 'auto-upgrade';
     assist_llm_enabled?: boolean;
     show_browser?: boolean | null;
     include_academia?: boolean;
@@ -189,6 +239,7 @@ export async function batchDownloadPapers(
     library_id: options?.library_id,
     llm_provider: options?.llm_provider ?? undefined,
     model_override: options?.model_override ?? undefined,
+    assist_llm_mode: options?.assist_llm_mode ?? undefined,
     assist_llm_enabled: options?.assist_llm_enabled,
     show_browser: options?.show_browser ?? undefined,
     include_academia: options?.include_academia ?? false,
@@ -288,8 +339,13 @@ export async function deleteLibrary(libId: number): Promise<void> {
   await client.delete(`/scholar/libraries/${libId}`);
 }
 
-export async function getLibraryPapers(libId: number): Promise<ScholarLibraryPaper[]> {
-  const res = await client.get<ScholarLibraryPaper[]>(`/scholar/libraries/${libId}/papers`);
+export async function getLibraryPapers(
+  libId: number,
+  options?: { collection?: string },
+): Promise<ScholarLibraryPaper[]> {
+  const res = await client.get<ScholarLibraryPaper[]>(`/scholar/libraries/${libId}/papers`, {
+    params: options?.collection ? { collection: options.collection } : undefined,
+  });
   return res.data;
 }
 
@@ -372,11 +428,26 @@ export interface PdfRenameDedupResult {
   synced_downloaded?: number;
 }
 
+export interface RefreshLibraryMetadataResult {
+  updated: number;
+  skipped_no_doi: number;
+  failed: number;
+}
+
 export async function pdfRenameDedup(
   libId: number,
 ): Promise<PdfRenameDedupResult> {
   const res = await client.post<PdfRenameDedupResult>(
     `/scholar/libraries/${libId}/pdf-rename-dedup`,
+  );
+  return res.data;
+}
+
+export async function refreshLibraryMetadata(
+  libId: number,
+): Promise<RefreshLibraryMetadataResult> {
+  const res = await client.post<RefreshLibraryMetadataResult>(
+    `/scholar/libraries/${libId}/refresh-metadata`,
   );
   return res.data;
 }
@@ -422,6 +493,8 @@ export interface ScholarLibraryIngestResult {
   attempted_downloads: number;
   downloaded_now: number;
   failed_downloads: number;
+  /** Number of papers removed from vector store (were in collection but deleted from library). */
+  removed_papers?: number;
 }
 
 export async function ingestScholarLibrary(
@@ -432,6 +505,14 @@ export async function ingestScholarLibrary(
     skip_unchanged?: boolean;
     auto_download_missing?: boolean;
     max_auto_download?: number;
+    enrich_tables?: boolean;
+    enrich_figures?: boolean;
+    llm_text_provider?: string | null;
+    llm_text_model?: string | null;
+    llm_text_concurrency?: number;
+    llm_vision_provider?: string | null;
+    llm_vision_model?: string | null;
+    llm_vision_concurrency?: number;
   },
 ): Promise<ScholarLibraryIngestResult> {
   const res = await client.post<ScholarLibraryIngestResult>(
@@ -439,4 +520,127 @@ export async function ingestScholarLibrary(
     payload,
   );
   return res.data;
+}
+
+// ---------------------------------------------------------------------------
+// Library Recommend
+// ---------------------------------------------------------------------------
+
+export interface LibraryRecommendRequest {
+  question: string;
+  collection?: string;
+  candidate_library_paper_ids?: number[];
+  top_k?: number;
+}
+
+export interface LibraryRecommendItem {
+  library_paper_id: number;
+  collection_paper_id: string;
+  title: string;
+  doi: string | null;
+  year: number | null;
+  venue: string | null;
+  impact_factor: number | null;
+  score: number;
+  matched_chunks: number;
+  best_chunk_score: number;
+  snippets: string[];
+}
+
+export interface LibraryRecommendResponse {
+  question: string;
+  library_id: number;
+  collection: string;
+  total_candidates: number;
+  eligible_candidates: number;
+  excluded_not_ingested: number;
+  recommendations: LibraryRecommendItem[];
+}
+
+export async function recommendLibraryPapers(
+  libId: number,
+  params: LibraryRecommendRequest,
+): Promise<LibraryRecommendResponse> {
+  const res = await client.post<LibraryRecommendResponse>(
+    `/scholar/libraries/${libId}/recommend`,
+    params,
+    { timeout: 120000 },
+  );
+  return res.data;
+}
+
+/** Response from POST .../recommend/start (async recommend task). */
+export interface RecommendStartResponse {
+  task_id: string;
+  status: string;
+  message?: string;
+}
+
+/** Start an async recommend task; use streamScholarTaskEvents(task_id) for progress and result. */
+export async function submitRecommendTask(
+  libId: number,
+  params: LibraryRecommendRequest,
+): Promise<RecommendStartResponse> {
+  const res = await client.post<RecommendStartResponse>(
+    `/scholar/libraries/${libId}/recommend/start`,
+    params,
+  );
+  return res.data;
+}
+
+/** SSE event from scholar task stream (progress, heartbeat, done, error). */
+export interface ScholarTaskStreamEvent {
+  event: string;
+  data: Record<string, unknown>;
+}
+
+/**
+ * SSE stream for scholar tasks (e.g. recommend, batch download).
+ * GET /scholar/task/{taskId}/stream with optional after_id for resume.
+ */
+export async function* streamScholarTaskEvents(
+  taskId: string,
+  signal?: AbortSignal,
+  afterId: string = '-',
+): AsyncGenerator<ScholarTaskStreamEvent> {
+  const token = localStorage.getItem('token');
+  const url = `${BASE_URL}/scholar/task/${encodeURIComponent(taskId)}/stream?after_id=${encodeURIComponent(afterId)}`;
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: {
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    signal,
+  });
+  if (!response.ok) {
+    const errBody = await response.text().catch(() => '');
+    throw new Error(`HTTP ${response.status}: ${response.statusText} - ${errBody}`);
+  }
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error('No response body');
+
+  const decoder = new TextDecoder();
+  let buffer = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+
+    let currentEvent = '';
+    for (const line of lines) {
+      if (line.startsWith('event: ')) {
+        currentEvent = line.slice(7).trim();
+      } else if (line.startsWith('data: ')) {
+        const dataStr = line.slice(6);
+        try {
+          const data = JSON.parse(dataStr) as Record<string, unknown>;
+          yield { event: currentEvent, data };
+        } catch {
+          yield { event: currentEvent, data: { raw: dataStr } };
+        }
+      }
+    }
+  }
 }

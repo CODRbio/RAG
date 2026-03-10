@@ -77,8 +77,12 @@ def run_chat_task_sync(task_id: str, payload: Dict[str, Any]) -> None:
 
     try:
         body = ChatRequest(**payload)
+
+        def _step_cb(step_id, label):
+            q.push_event(task_id, "step", {"step": step_id or "", "label": label or ""})
+
         (session_id_out, response_text, citations, evidence_summary, parsed, dashboard_data, tool_trace_data, ref_map,
-         agent_debug, _prompt_local_db, _local_db_msg) = _run_chat(body, optional_user_id)
+         agent_debug, _prompt_local_db, _local_db_msg) = _run_chat(body, optional_user_id, step_callback=_step_cb)
         session_id = session_id_out or session_id
         store = get_session_store()
         current_stage = store.get_session_stage(session_id) or "explore"
@@ -314,7 +318,7 @@ async def process_download_and_ingest(
         except Exception as e:
             logger.warning("process_download_and_ingest resolve bound library failed: %s", e)
 
-    adapter = get_adapter()
+    adapter = get_adapter(show_browser=show_browser)
     try:
         heartbeat_task = asyncio.create_task(_heartbeat_loop())
         dl_result = await adapter.download_paper(
@@ -372,6 +376,32 @@ async def process_download_and_ingest(
         q.push_event(task_id, "error", {"message": state.error_message})
         return {**dl_result, "ingest_triggered": False}
 
+    # ── Supplementary early-exit ─────────────────────────────────────────────
+    if dl_result.get("is_supplementary"):
+        state.status = TaskStatus.completed
+        state.finished_at = time.time()
+        state.payload["stage"] = "SUPPLEMENTARY_SAVED"
+        state.payload["progress"] = 100
+        state.payload["download_result"] = dl_result
+        state.payload["is_supplementary"] = True
+        state.payload["paper_id"] = dl_result.get("paper_id")
+        state.payload["filepath"] = dl_result.get("filepath")
+        state.payload["primary_paper_id"] = dl_result.get("primary_paper_id")
+        state.payload["supplementary_reason"] = dl_result.get("supplementary_reason")
+        q.set_state(state)
+        q.push_event(
+            task_id,
+            "progress",
+            {
+                "progress": 100,
+                "stage": "SUPPLEMENTARY_SAVED",
+                "is_supplementary": True,
+                "paper_id": dl_result.get("paper_id"),
+                "primary_paper_id": dl_result.get("primary_paper_id"),
+            },
+        )
+        return {**dl_result, "ingest_triggered": False}
+
     paper_id = dl_result["paper_id"]
     filepath = dl_result["filepath"]
     collection_name = collection or settings.collection.global_
@@ -382,26 +412,34 @@ async def process_download_and_ingest(
     q.set_state(state)
     q.push_event(task_id, "progress", {"progress": 50, "stage": "INGESTING"})
 
+    metadata = {
+        "source": "scholar_download",
+        "download_method": dl_result.get("message", ""),
+        "doi": paper_info.get("doi"),
+        "title": paper_info.get("title"),
+        "authors": paper_info.get("authors"),
+        "year": paper_info.get("year"),
+        "venue": paper_info.get("venue"),
+        "url": paper_info.get("url"),
+        "pdf_url": paper_info.get("pdf_url"),
+        "arxiv_id": paper_info.get("arxiv_id"),
+    }
     ingest_job_id = _trigger_ingest_pipeline(
         filepath=filepath,
         paper_id=paper_id,
         collection_name=collection_name,
-        metadata={
-            "source": "scholar_download",
-            "download_method": dl_result.get("message", ""),
-            "doi": paper_info.get("doi"),
-            "authors": paper_info.get("authors"),
-            "year": paper_info.get("year"),
-        },
+        metadata=metadata,
+        library_id=library_id,
+        library_paper_id=library_paper_id,
+        user_id=user_id,
     )
 
     if library_paper_id is not None:
         _mark_library_paper_downloaded(library_paper_id)
 
-    state.status = TaskStatus.completed
-    state.finished_at = time.time()
-    state.payload["progress"] = 100
-    state.payload["stage"] = "DOWNLOAD_DONE_INGEST_PENDING"
+    # Keep scholar task running until ingest job finishes; watcher will set completed/error.
+    state.payload["progress"] = 50
+    state.payload["stage"] = "INGEST_QUEUED"
     state.payload["ingest_job_id"] = ingest_job_id
     state.payload["ingest_poll_url"] = f"/ingest/jobs/{ingest_job_id}"
     state.payload["paper_id"] = paper_id
@@ -412,13 +450,22 @@ async def process_download_and_ingest(
     q.set_state(state)
     q.push_event(
         task_id,
-        "done",
+        "progress",
         {
+            "progress": 50,
+            "stage": "INGEST_QUEUED",
             "ingest_job_id": ingest_job_id,
-            "paper_id": paper_id,
             "ingest_poll_url": f"/ingest/jobs/{ingest_job_id}",
         },
     )
+
+    watcher = threading.Thread(
+        target=_watch_ingest_and_update_scholar_task,
+        args=(task_id, ingest_job_id),
+        daemon=True,
+        name=f"scholar-ingest-watch-{task_id}",
+    )
+    watcher.start()
 
     return {
         **dl_result,
@@ -429,13 +476,72 @@ async def process_download_and_ingest(
     }
 
 
+def _watch_ingest_and_update_scholar_task(task_id: str, ingest_job_id: str) -> None:
+    """Background thread: poll ingest job until terminal, then set scholar task completed or error."""
+    from src.indexing.ingest_job_store import get_job
+
+    q = get_task_queue()
+    poll_interval = 2.0
+    deadline = time.time() + 30 * 60  # 30 min max wait
+
+    while time.time() < deadline:
+        time.sleep(poll_interval)
+        job = get_job(ingest_job_id)
+        if not job:
+            continue
+        status = (job.get("status") or "").strip().lower()
+        if status == "done":
+            state = q.get_state(task_id)
+            if state and not state.is_terminal():
+                state.status = TaskStatus.completed
+                state.finished_at = time.time()
+                state.payload["progress"] = 100
+                state.payload["stage"] = "INGEST_DONE"
+                q.set_state(state)
+                q.push_event(
+                    task_id,
+                    "done",
+                    {"ingest_job_id": ingest_job_id, "stage": "INGEST_DONE"},
+                )
+            return
+        if status in ("error", "cancelled"):
+            state = q.get_state(task_id)
+            if state and not state.is_terminal():
+                state.status = TaskStatus.error
+                state.finished_at = time.time()
+                state.error_message = job.get("error_message") or job.get("message") or f"Ingest {status}"
+                state.payload["progress"] = 50
+                state.payload["stage"] = "INGEST_FAILED"
+                state.payload["ingest_job_status"] = status
+                q.set_state(state)
+                q.push_event(
+                    task_id,
+                    "error",
+                    {"message": state.error_message, "ingest_job_id": ingest_job_id},
+                )
+            return
+
+    # Timeout: mark scholar task error
+    state = q.get_state(task_id)
+    if state and not state.is_terminal():
+        state.status = TaskStatus.error
+        state.finished_at = time.time()
+        state.error_message = "Ingest job did not finish within 30 minutes"
+        state.payload["stage"] = "INGEST_TIMEOUT"
+        q.set_state(state)
+        q.push_event(task_id, "error", {"message": state.error_message})
+
+
 def _trigger_ingest_pipeline(
     filepath: str,
     paper_id: str,
     collection_name: str,
     metadata: Dict[str, Any],
+    library_id: Optional[int] = None,
+    library_paper_id: Optional[int] = None,
+    user_id: Optional[str] = None,
 ) -> str:
-    """Start ingest job in a background thread; returns ingest job_id (from create_job so it is trackable)."""
+    """Start ingest job in a background thread; returns ingest job_id. Full payload (incl. metadata, library link, user_id) is passed to runner."""
     from src.api.routes_ingest import _run_ingest_job_safe
     from src.indexing.ingest_job_store import create_job
 
@@ -453,7 +559,14 @@ def _trigger_ingest_pipeline(
         "llm_vision_model": None,
         "llm_vision_concurrency": None,
     }
-    payload = {**ingest_cfg, "source": "scholar_download", "metadata": metadata}
+    payload = {
+        **ingest_cfg,
+        "source": "scholar_download",
+        "metadata": metadata,
+        "library_id": library_id,
+        "library_paper_id": library_paper_id,
+        "user_id": user_id if user_id is not None else "default",
+    }
     created = create_job(collection_name, payload, total_files=1)
     job_id = (created or {}).get("job_id")
     if not job_id:
@@ -462,7 +575,7 @@ def _trigger_ingest_pipeline(
 
     thread = threading.Thread(
         target=_run_ingest_job_safe,
-        args=(job_id, ingest_cfg),
+        args=(job_id, payload),
         daemon=True,
         name=f"ingest-{job_id}",
     )

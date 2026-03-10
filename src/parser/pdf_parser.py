@@ -241,6 +241,7 @@ class ParserConfig:
     llm_vision_provider: str = "gemini-vision"
     llm_text_model: Optional[str] = None
     llm_vision_model: Optional[str] = None
+    pdf_concurrency: int = 2
     llm_text_concurrency: int = 1
     llm_vision_concurrency: int = 1
     llm_text_max_tokens: int = 500
@@ -277,6 +278,7 @@ class ParserConfig:
             llm_vision_provider=p.get("llm_vision_provider", "gemini-vision"),
             llm_text_model=p.get("llm_text_model"),
             llm_vision_model=p.get("llm_vision_model"),
+            pdf_concurrency=max(1, int(p.get("pdf_concurrency", 2) or 2)),
             llm_text_concurrency=max(1, int(p.get("llm_text_concurrency", 1) or 1)),
             llm_vision_concurrency=max(1, int(p.get("llm_vision_concurrency", 1) or 1)),
             llm_text_max_tokens=int(p.get("llm_text_max_tokens", 500)),

@@ -2,6 +2,8 @@
 
 本文档描述 DeepSea RAG 的真实代码架构与核心数据流，便于开发、排障和二次扩展。
 
+相关框架约束请同时参阅：`docs/chat_research_workflow_contract.md`。
+
 ## 一、总体分层
 
 ```text

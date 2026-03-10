@@ -23,6 +23,7 @@ _pm = PromptManager()
 logger = get_logger(__name__)
 
 T = TypeVar("T")
+_EVIDENCE_CACHE_MAX_TEXT_CHARS = 2200
 
 
 def _retry_on_locked(fn: Callable[[], T], max_retries: int = 3) -> T:
@@ -168,6 +169,91 @@ class SessionStore:
                 session.commit()
 
         _retry_on_locked(_do)
+
+    def get_recent_evidence_cache(self, session_id: str) -> List[Dict[str, Any]]:
+        """读取会话内最近证据缓存（保存在 preferences.recent_evidence_cache）。"""
+        meta = self.get_session_meta(session_id)
+        if not meta:
+            return []
+        prefs = meta.get("preferences") or {}
+        raw = prefs.get("recent_evidence_cache")
+        if not isinstance(raw, list):
+            return []
+        cleaned: List[Dict[str, Any]] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            chunks = item.get("chunks")
+            if not isinstance(chunks, list):
+                continue
+            cleaned_chunks = [self._sanitize_cached_chunk(c) for c in chunks if isinstance(c, dict)]
+            cleaned.append(
+                {
+                    "query": str(item.get("query") or "").strip(),
+                    "timestamp": str(item.get("timestamp") or ""),
+                    "chunks": [c for c in cleaned_chunks if c],
+                }
+            )
+        return cleaned
+
+    def append_recent_evidence_cache(
+        self,
+        session_id: str,
+        query: str,
+        chunks: List[Dict[str, Any]],
+        *,
+        max_turns: int = 4,
+        max_chunks_per_turn: int = 36,
+    ) -> None:
+        """追加会话证据缓存并按轮次截断。"""
+        if not session_id or not chunks:
+            return
+        existing = self.get_recent_evidence_cache(session_id)
+        cleaned_chunks = [
+            self._sanitize_cached_chunk(c)
+            for c in chunks[: max(1, int(max_chunks_per_turn))]
+            if isinstance(c, dict)
+        ]
+        cleaned_chunks = [c for c in cleaned_chunks if c]
+        if not cleaned_chunks:
+            return
+        existing.append(
+            {
+                "query": (query or "").strip()[:500],
+                "timestamp": datetime.now().isoformat(),
+                "chunks": cleaned_chunks,
+            }
+        )
+        keep = max(1, int(max_turns))
+        existing = existing[-keep:]
+        self.update_session_meta(
+            session_id,
+            {"preferences": {"recent_evidence_cache": existing}},
+        )
+
+    @staticmethod
+    def _sanitize_cached_chunk(chunk: Dict[str, Any]) -> Dict[str, Any]:
+        """Reduce cached chunk payload size while keeping rerank-relevant fields."""
+        text = str(chunk.get("text") or "")
+        if len(text) > _EVIDENCE_CACHE_MAX_TEXT_CHARS:
+            text = text[:_EVIDENCE_CACHE_MAX_TEXT_CHARS]
+        return {
+            "chunk_id": str(chunk.get("chunk_id") or ""),
+            "doc_id": str(chunk.get("doc_id") or ""),
+            "text": text,
+            "score": float(chunk.get("score") or 0.0),
+            "source_type": str(chunk.get("source_type") or "dense"),
+            "doc_title": str(chunk.get("doc_title") or "") or None,
+            "authors": list(chunk.get("authors") or []) if isinstance(chunk.get("authors"), list) else None,
+            "year": int(chunk["year"]) if isinstance(chunk.get("year"), int) else None,
+            "url": str(chunk.get("url") or "") or None,
+            "doi": str(chunk.get("doi") or "") or None,
+            "page_num": int(chunk["page_num"]) if isinstance(chunk.get("page_num"), int) else None,
+            "section_title": str(chunk.get("section_title") or "") or None,
+            "evidence_type": str(chunk.get("evidence_type") or "") or None,
+            "bbox": list(chunk.get("bbox") or []) if isinstance(chunk.get("bbox"), list) else None,
+            "provider": str(chunk.get("provider") or "") or None,
+        }
 
     def touch_session(self, session_id: str) -> None:
         """仅更新 updated_at，用于「重新激活」后使会话排到历史列表最前。"""

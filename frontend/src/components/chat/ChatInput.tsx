@@ -1,8 +1,8 @@
-import { useState, useRef, useCallback, useEffect, type KeyboardEvent } from 'react';
+import { useState, useRef, useCallback, useEffect, useMemo, type KeyboardEvent } from 'react';
 import { useTranslation } from 'react-i18next';
 import { ArrowRight, Loader2, Telescope, Settings } from 'lucide-react';
 import { useChatStore, useConfigStore, useToastStore, useCanvasStore, useUIStore } from '../../stores';
-import { submitChat, streamChatByTaskId, clarifyForDeepResearch } from '../../api/chat';
+import { submitChat, streamChatByTaskId, clarifyForDeepResearch, getChatSuggestions } from '../../api/chat';
 import { exportCanvas, getCanvas } from '../../api/canvas';
 import { CommandPalette, DeepResearchSettingsPopover } from '../workflow';
 import { COMMAND_LIST } from '../../types';
@@ -11,10 +11,49 @@ import type { ChatRequest, Source, EvidenceSummary, IntentInfo, CommandDefinitio
 /** 1 分钟未选择时默认「本会话不用本地库」的间隔（毫秒） */
 const LOCAL_DB_CHOICE_TIMEOUT_MS = 60_000;
 
+/** Chat input history (localStorage) for cross-session suggestions */
+const CHAT_INPUT_HISTORY_KEY = 'chat_input_history_v1';
+const CHAT_INPUT_HISTORY_MAX = 30;
+const SUGGESTIONS_MIN_PREFIX = 2;
+const SUGGESTIONS_MAX = 8;
+
+function loadChatInputHistory(): string[] {
+  try {
+    const raw = localStorage.getItem(CHAT_INPUT_HISTORY_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.map((item: unknown) => String(item ?? '').trim()).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function saveChatInputHistory(message: string) {
+  const trimmed = message.trim();
+  if (!trimmed) return;
+  try {
+    const prev = loadChatInputHistory();
+    const next = prev.filter((s) => s !== trimmed);
+    next.push(trimmed);
+    localStorage.setItem(
+      CHAT_INPUT_HISTORY_KEY,
+      JSON.stringify(next.slice(-CHAT_INPUT_HISTORY_MAX)),
+    );
+  } catch {
+    // ignore quota errors
+  }
+}
+
 export function ChatInput() {
   const [inputValue, setInputValue] = useState('');
   const [showDRSettings, setShowDRSettings] = useState(false);
+  const [suggestionIndex, setSuggestionIndex] = useState(-1);
+  const [dismissedSuggestions, setDismissedSuggestions] = useState(false);
+  const [backendSuggestions, setBackendSuggestions] = useState<string[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
+  const suggestionsDropdownRef = useRef<HTMLDivElement>(null);
+  const suggestionsDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   /** 用 ref 保存 runChoice，确保 1 分钟定时器触发时一定能执行，不依赖 store 状态 */
   const localDbChoiceRunRef = useRef<((choice: 'no_local' | 'use') => Promise<void>) | null>(null);
   const localDbChoiceTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -33,6 +72,7 @@ export function ChatInput() {
   const {
     sessionId,
     canvasId,
+    messages,
     addMessage,
     appendToMessageById,
     setMessageSourcesById,
@@ -44,6 +84,7 @@ export function ChatInput() {
     setClarificationQuestions,
     setStreamingTask,
     clearStreamingTask,
+    setStreamingStep,
     streamingTasks,
     setMessageAgentDebugById,
     updateMessageTimestampById,
@@ -58,6 +99,7 @@ export function ChatInput() {
     selectedProvider,
     selectedModel,
     currentCollection,
+    selectedCollections,
     deepResearchDefaults,
   } = useConfigStore();
   const addToast = useToastStore((s) => s.addToast);
@@ -69,6 +111,107 @@ export function ChatInput() {
       Object.values(streamingTasks).some(
         (task) => task.sessionId === sessionId && (task.status === 'queued' || task.status === 'running')
       )
+  );
+
+  const prefix = inputValue.trim();
+  const prefixLower = prefix.toLowerCase();
+  const isCommandMode = inputValue.startsWith('/');
+
+  const suggestions = useMemo(() => {
+    if (isCommandMode || prefix.length < SUGGESTIONS_MIN_PREFIX) return [];
+    const sessionContents = messages
+      .filter((m) => m.role === 'user' && typeof m.content === 'string' && (m.content as string).trim())
+      .map((m) => (m.content as string).trim());
+    const fromSession = sessionContents
+      .slice()
+      .reverse()
+      .filter(
+        (s) => s.toLowerCase().startsWith(prefixLower) || s.toLowerCase().includes(prefixLower),
+      );
+    const fromStorage = loadChatInputHistory().filter(
+      (s) => s.toLowerCase().startsWith(prefixLower) || s.toLowerCase().includes(prefixLower),
+    );
+    const seen = new Set<string>();
+    const merged: string[] = [];
+    for (const s of fromSession) {
+      if (!seen.has(s)) {
+        seen.add(s);
+        merged.push(s);
+      }
+    }
+    for (const s of fromStorage) {
+      if (!seen.has(s)) {
+        seen.add(s);
+        merged.push(s);
+      }
+    }
+    for (const s of backendSuggestions) {
+      if (!seen.has(s)) {
+        seen.add(s);
+        merged.push(s);
+      }
+    }
+    return merged.slice(0, SUGGESTIONS_MAX);
+  }, [messages, prefix, prefixLower, isCommandMode, backendSuggestions]);
+
+  const showSuggestionsDropdown =
+    suggestions.length > 0 && prefix.length >= SUGGESTIONS_MIN_PREFIX && !isCommandMode && !dismissedSuggestions;
+
+  useEffect(() => {
+    if (!showSuggestionsDropdown) {
+      setSuggestionIndex(-1);
+      return;
+    }
+    setSuggestionIndex((i) => (i < 0 || i >= suggestions.length ? 0 : Math.min(i, suggestions.length - 1)));
+  }, [showSuggestionsDropdown, suggestions.length]);
+
+  useEffect(() => {
+    function handleClickOutside(event: MouseEvent) {
+      if (
+        suggestionsDropdownRef.current &&
+        !suggestionsDropdownRef.current.contains(event.target as Node)
+      ) {
+        setDismissedSuggestions(true);
+        setSuggestionIndex(-1);
+      }
+    }
+    if (showSuggestionsDropdown) {
+      document.addEventListener('mousedown', handleClickOutside);
+      return () => document.removeEventListener('mousedown', handleClickOutside);
+    }
+  }, [showSuggestionsDropdown]);
+
+  useEffect(() => {
+    if (prefix.length < SUGGESTIONS_MIN_PREFIX || isCommandMode || !sessionId) {
+      setBackendSuggestions([]);
+      if (suggestionsDebounceRef.current) {
+        clearTimeout(suggestionsDebounceRef.current);
+        suggestionsDebounceRef.current = null;
+      }
+      return;
+    }
+    suggestionsDebounceRef.current = setTimeout(() => {
+      suggestionsDebounceRef.current = null;
+      getChatSuggestions({ prefix, session_id: sessionId, limit: 5 })
+        .then((r) => setBackendSuggestions(r.suggestions || []))
+        .catch(() => setBackendSuggestions([]));
+    }, 250);
+    return () => {
+      if (suggestionsDebounceRef.current) {
+        clearTimeout(suggestionsDebounceRef.current);
+        suggestionsDebounceRef.current = null;
+      }
+    };
+  }, [prefix, isCommandMode, sessionId]);
+
+  const acceptSuggestion = useCallback(
+    (suggestion: string) => {
+      setInputValue(suggestion);
+      setDismissedSuggestions(true);
+      setSuggestionIndex(-1);
+      inputRef.current?.focus();
+    },
+    [],
   );
 
   /**
@@ -216,6 +359,7 @@ export function ChatInput() {
       canvas_id: canvasId || undefined,
       message: userMessage,
       collection: currentCollection || undefined,
+      collections: selectedCollections.length > 0 ? selectedCollections : undefined,
       search_mode: searchMode,
       mode,
       llm_provider: selectedProvider || undefined,
@@ -225,7 +369,7 @@ export function ChatInput() {
       web_source_configs: (searchMode !== 'none' && webEnabled && Object.keys(webSourceConfigs).length > 0) ? webSourceConfigs : undefined,
       serpapi_ratio: (searchMode !== 'none' && webEnabled && hasAnySerpapi) ? (webSearchConfig.serpapiRatio ?? 50) / 100 : undefined,
       local_top_k: (searchMode !== 'none' && localEnabled) ? ragConfig.localTopK : undefined,
-      local_threshold: (searchMode !== 'none' && localEnabled) ? (ragConfig.localThreshold ?? undefined) : undefined,
+      fused_pool_score_threshold: (searchMode !== 'none') ? (ragConfig.fusedPoolScoreThreshold ?? 0.35) : undefined,
       year_start: ragConfig.yearStart ?? undefined,
       year_end: ragConfig.yearEnd ?? undefined,
       step_top_k: (searchMode !== 'none') ? (ragConfig.stepTopK ?? 10) : undefined,
@@ -262,7 +406,7 @@ export function ChatInput() {
     // ── 引用类型（供本轮所有流处理函数共享）─────────────────────────────────────
     interface CitationData {
       cite_key: string; title: string; authors: string[];
-      year?: number | null; doc_id?: string | null; url?: string | null;
+      year?: number | null; doc_id?: string | null; url?: string | null; pdf_url?: string | null;
       doi?: string | null; bbox?: number[]; page_num?: number | null; provider?: string;
     }
 
@@ -338,20 +482,25 @@ export function ChatInput() {
               if (m.citations?.length) {
                 const srcs: Source[] = m.citations.map((c, i) => ({
                   id: i + 1, cite_key: c.cite_key, title: c.title || c.cite_key, authors: c.authors || [], year: c.year,
-                  doc_id: c.doc_id, url: c.url, doi: c.doi, bbox: c.bbox, page_num: c.page_num,
-                  type: c.url ? 'web' : 'local', provider: c.provider || (c.url ? 'web' : 'local'),
+                  doc_id: c.doc_id, url: c.url, pdf_url: c.pdf_url, doi: c.doi, bbox: c.bbox, page_num: c.page_num,
+                  type: c.url || c.pdf_url ? 'web' : 'local', provider: c.provider || (c.url || c.pdf_url ? 'web' : 'local'),
                 }));
                 setMessageSourcesById(newAssistantId, srcs, m.evidence_summary?.provider_stats);
               }
             }
+            if (ev === 'step') {
+              const stepPayload = d as { step?: string | null; label?: string };
+              setStreamingStep(stepPayload?.step ? { step: stepPayload.step, label: stepPayload.label ?? stepPayload.step } : null);
+            }
             if (ev === 'delta') appendToMessageById(newAssistantId, (d as { delta: string }).delta);
-            if (ev === 'done') { updateMessageTimestampById(newAssistantId); setWorkflowStep('idle'); }
-            if (ev === 'error' || ev === 'cancelled' || ev === 'timeout') { updateMessageTimestampById(newAssistantId); break; }
+            if (ev === 'done') { setStreamingStep(null); updateMessageTimestampById(newAssistantId); setWorkflowStep('idle'); }
+            if (ev === 'error' || ev === 'cancelled' || ev === 'timeout') { setStreamingStep(null); updateMessageTimestampById(newAssistantId); break; }
           }
         } catch (e) {
           console.error('[ChatInput] localDbChoice follow-up error:', e);
           addToast(t('chat.sendFailed'), 'error');
         } finally {
+          setStreamingStep(null);
           if (secondTaskId) clearStreamingTask(secondTaskId);
         }
       };
@@ -402,8 +551,8 @@ export function ChatInput() {
             const sources: Source[] = meta.citations.map((cite, idx) => ({
               id: idx + 1, cite_key: cite.cite_key, title: cite.title || cite.cite_key,
               authors: cite.authors || [], year: cite.year, doc_id: cite.doc_id,
-              url: cite.url, doi: cite.doi, bbox: cite.bbox, page_num: cite.page_num,
-              type: cite.url ? 'web' : 'local', provider: cite.provider || (cite.url ? 'web' : 'local'),
+              url: cite.url, pdf_url: cite.pdf_url, doi: cite.doi, bbox: cite.bbox, page_num: cite.page_num,
+              type: cite.url || cite.pdf_url ? 'web' : 'local', provider: cite.provider || (cite.url || cite.pdf_url ? 'web' : 'local'),
             }));
             setMessageSourcesById(assistantMessageId, sources, meta.evidence_summary?.provider_stats || undefined);
           }
@@ -432,6 +581,14 @@ export function ChatInput() {
         } else if (event === 'agent_debug') {
           setMessageAgentDebugById(assistantMessageId, data as import('../../types').AgentDebugData);
 
+        } else if (event === 'step') {
+          const stepPayload = data as { step?: string | null; label?: string };
+          setStreamingStep(
+            stepPayload?.step
+              ? { step: stepPayload.step, label: stepPayload.label ?? stepPayload.step }
+              : null
+          );
+
         } else if (event === 'delta') {
           const delta = (data as { delta: string }).delta;
           appendToMessageById(assistantMessageId, delta);
@@ -446,10 +603,13 @@ export function ChatInput() {
           }
 
         } else if (event === 'done') {
+          setStreamingStep(null);
           updateMessageTimestampById(assistantMessageId);
           setWorkflowStep('refine');
           setTimeout(() => setWorkflowStep('idle'), 1000);
+          saveChatInputHistory(userMessage);
         } else if (event === 'error' || event === 'cancelled' || event === 'timeout') {
+          setStreamingStep(null);
           updateMessageTimestampById(assistantMessageId);
           if (event === 'error') {
             appendToMessageById(assistantMessageId, '\n\n' + (t('chat.requestError') || 'Error'));
@@ -473,6 +633,7 @@ export function ChatInput() {
       updateMessageTimestampById(assistantMessageId);
       appendToMessageById(assistantMessageId, '\n\n' + (t('chat.requestError') || '请求失败'));
     } finally {
+      setStreamingStep(null);
       if (taskId) clearStreamingTask(taskId);
     }
     } catch (err) {
@@ -489,6 +650,31 @@ export function ChatInput() {
     : [];
 
   const handleKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
+    if (showSuggestionsDropdown && suggestions.length > 0) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        setSuggestionIndex((i) => Math.min(i + 1, suggestions.length - 1));
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        setSuggestionIndex((i) => Math.max(i - 1, 0));
+        return;
+      }
+      if (e.key === 'Tab' || e.key === 'Enter') {
+        if (suggestionIndex >= 0 && suggestions[suggestionIndex]) {
+          e.preventDefault();
+          acceptSuggestion(suggestions[suggestionIndex]);
+          return;
+        }
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        setDismissedSuggestions(true);
+        setSuggestionIndex(-1);
+        return;
+      }
+    }
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleSend();
@@ -581,17 +767,51 @@ export function ChatInput() {
             <DeepResearchSettingsPopover open={showDRSettings} onClose={closeDRSettings} />
           </div>
 
-          {/* 输入框 */}
-          <div className="flex-1 relative">
+          {/* 输入框 + 历史建议下拉 */}
+          <div ref={suggestionsDropdownRef} className="flex-1 relative">
             <input
               ref={inputRef}
               type="text"
               value={inputValue}
-              onChange={(e) => setInputValue(e.target.value)}
+              onChange={(e) => {
+                setInputValue(e.target.value);
+                setDismissedSuggestions(false);
+              }}
               onKeyDown={handleKeyDown}
               placeholder={t('chatInput.placeholder')}
               className="w-full bg-slate-900/60 border border-slate-700 text-slate-200 rounded-xl py-3 pl-4 pr-12 shadow-sm focus:ring-1 focus:ring-sky-500 focus:border-sky-500 placeholder-slate-500 outline-none transition-all"
+              aria-autocomplete="list"
+              aria-controls="chat-suggestions-listbox"
+              aria-expanded={showSuggestionsDropdown}
+              aria-activedescendant={
+                showSuggestionsDropdown && suggestionIndex >= 0
+                  ? `chat-suggestion-${suggestionIndex}`
+                  : undefined
+              }
             />
+            {showSuggestionsDropdown && (
+              <ul
+                id="chat-suggestions-listbox"
+                role="listbox"
+                aria-label={t('chatInput.suggestionsFromHistory')}
+                className="absolute top-full left-0 right-0 mt-1 max-h-56 overflow-y-auto rounded-xl border border-slate-700/50 bg-slate-900/95 backdrop-blur-md shadow-xl z-50 py-1 animate-in fade-in slide-in-from-top-1 duration-150"
+              >
+                {suggestions.map((s, i) => (
+                  <li
+                    key={`${i}-${s.slice(0, 40)}`}
+                    id={`chat-suggestion-${i}`}
+                    role="option"
+                    aria-selected={i === suggestionIndex}
+                    className={`px-4 py-2.5 text-sm text-left cursor-pointer truncate max-w-full ${
+                      i === suggestionIndex ? 'bg-sky-900/30 text-sky-200' : 'text-slate-300 hover:bg-slate-800/60'
+                    }`}
+                    onClick={() => acceptSuggestion(s)}
+                  >
+                    {s}
+                  </li>
+                ))}
+              </ul>
+            )}
             <button
               onClick={() => handleSend()}
               disabled={!inputValue.trim()}
@@ -612,6 +832,8 @@ export function ChatInput() {
             {t('chatInput.inputCommand')} <kbd className="px-1 py-0.5 bg-slate-800 rounded text-slate-400">/</kbd> {t('chatInput.viewCommands')}
             {' | '}
             <kbd className="px-1 py-0.5 bg-slate-800 rounded text-slate-400">/auto</kbd> {t('chatInput.deepResearch')}
+            {' | '}
+            <kbd className="px-1 py-0.5 bg-slate-800 rounded text-slate-400">Tab</kbd> {t('chatInput.tabToConfirmSuggestion')}
           </span>
           <span>
             {t('chatInput.pressEnter')} <kbd className="px-1 py-0.5 bg-slate-800 rounded text-slate-400">Enter</kbd> {t('chatInput.toSend')}

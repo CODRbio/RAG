@@ -1,0 +1,16 @@
+User query: {query}
+
+Available local knowledge bases:
+{collections_block}
+
+Task: Allocate retrieval quota (0.0–1.0) across these knowledge bases based on how relevant each is to the query.
+Rules:
+- All ratios must sum to exactly 1.0
+- A collection with clearly no relevance to the query may receive 0.0
+- At least one collection must receive a ratio > 0
+- Be proportional: if two collections are equally relevant, give them equal weight
+
+Output a single JSON object where keys are the exact collection names and values are decimal ratios, for example:
+{{"DeepSea_symbiosis": 0.6, "deepsea_ocean": 0.3, "deepsea_env": 0.1}}
+
+Output only the JSON object, no explanation.

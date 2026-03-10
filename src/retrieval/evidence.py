@@ -31,6 +31,7 @@ class EvidenceChunk:
     authors: Optional[List[str]] = None
     year: Optional[int] = None
     url: Optional[str] = None
+    pdf_url: Optional[str] = None
     doi: Optional[str] = None
     page_num: Optional[int] = None
     section_title: Optional[str] = None

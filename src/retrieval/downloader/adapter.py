@@ -19,7 +19,7 @@ from config.settings import settings
 from src.log import get_logger
 from src.utils.path_manager import PathManager
 
-from .utils import is_valid_pdf
+from .utils import classify_pdf_supplementary, is_valid_pdf
 
 logger = get_logger(__name__)
 
@@ -115,16 +115,23 @@ def _doi_to_paper_id(doi: str) -> str:
     return slug[:100] if slug else hashlib.md5(doi.encode()).hexdigest()[:16]
 
 
+def _is_supplementary_paper_id(paper_id: str) -> bool:
+    """True for paper_ids that represent a supplementary/supporting PDF."""
+    return (paper_id or "").startswith("supplementary_")
+
+
 class ScholarDownloaderAdapter:
     """
     RAG ↔ PaperDownloader adapter.
     Search: RAG modules only. Download: background event loop → shared PaperDownloader.
+    Each instance is fixed to one browser mode (headed or headless) to avoid cross-request mutation.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, headed: bool = False) -> None:
         cfg = settings.scholar_downloader
         self.download_dir = str(PathManager.get_user_raw_papers_path(PathManager.DEFAULT_USER_ID))
-        self.show_browser = cfg.show_browser
+        self._headed = headed
+        self.show_browser = headed
         self.persist_browser = cfg.persist_browser
         self.proxy = cfg.proxy
         self.extension_path = getattr(settings, "capsolver_extension_path", "extra_tools/CapSolverExtension") or "extra_tools/CapSolverExtension"
@@ -141,6 +148,9 @@ class ScholarDownloaderAdapter:
             api_keys["twocaptcha"] = (getattr(cf, "two_captcha_api_key", "") or "").strip()
         cf = getattr(settings, "content_fetcher", None)
         api_keys["brightdata"] = (getattr(cf, "brightdata_api_key", "") or "").strip()
+        # CapSolver API key from global capsolver settings
+        _cs_cfg = getattr(settings, "capsolver", None)
+        api_keys["capsolver"] = (getattr(_cs_cfg, "api_key", "") or "").strip()
         default_llm = getattr(cfg, "llm_provider", None) or "qwen-thinking"
         ext_path = (getattr(settings, "capsolver_extension_path", "") or "").strip() or None
         dl_opts: Dict[str, Any] = {
@@ -162,7 +172,7 @@ class ScholarDownloaderAdapter:
 
         self._dl = PaperDownloader(
             download_dir=self.download_dir,
-            show_browser=self.show_browser,
+            show_browser=bool(self._headed),
             persist_browser=True,
             max_concurrent=self.max_concurrent,
             download_timeout=getattr(cfg, "download_timeout", 200),
@@ -290,6 +300,7 @@ class ScholarDownloaderAdapter:
         download_dir: Optional[str] = None,
         llm_provider: Optional[str] = None,
         model_override: Optional[str] = None,
+        assist_llm_mode: Optional[str] = None,
         assist_llm_enabled: Optional[bool] = None,
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         show_browser: Optional[bool] = None,
@@ -305,6 +316,7 @@ class ScholarDownloaderAdapter:
             download_dir=download_dir,
             llm_provider=llm_provider,
             model_override=model_override,
+            assist_llm_mode=assist_llm_mode,
             assist_llm_enabled=assist_llm_enabled,
             progress_callback=progress_callback,
             show_browser=show_browser,
@@ -324,6 +336,7 @@ class ScholarDownloaderAdapter:
         download_dir: Optional[str] = None,
         llm_provider: Optional[str] = None,
         model_override: Optional[str] = None,
+        assist_llm_mode: Optional[str] = None,
         assist_llm_enabled: Optional[bool] = None,
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         show_browser: Optional[bool] = None,
@@ -353,14 +366,25 @@ class ScholarDownloaderAdapter:
                     "paper_id": paper_id,
                     "filepath": filepath,
                     "message": "已存在，跳过下载",
+                    "is_supplementary": False,
+                    "should_mark_downloaded": True,
+                    "should_auto_ingest": True,
+                    "primary_paper_id": None,
+                    "supplementary_reason": None,
                 }
 
             # Same paper may exist under a different paper_id (e.g. different title normalization). Look up by DOI.
+            # IMPORTANT: skip supplementary_* entries — they use a suffixed pseudo-DOI so this branch
+            # should not see them, but guard here as well to avoid erroneously treating a previously
+            # downloaded supplementary file as the main article.
             if doi:
                 try:
                     from src.indexing.paper_metadata_store import paper_meta_store
                     for pid in paper_meta_store.get_paper_ids_by_doi(doi):
                         if pid == paper_id:
+                            continue
+                        if _is_supplementary_paper_id(pid):
+                            logger.debug("Same-DOI skip: ignoring supplementary entry %s", pid)
                             continue
                         candidate_path = os.path.join(target_dir, f"{pid}.pdf")
                         if os.path.exists(candidate_path) and is_valid_pdf(candidate_path):
@@ -374,22 +398,16 @@ class ScholarDownloaderAdapter:
                                 "paper_id": pid,
                                 "filepath": candidate_path,
                                 "message": "已存在（同 DOI），跳过下载",
+                                "is_supplementary": False,
+                                "should_mark_downloaded": True,
+                                "should_auto_ingest": True,
+                                "primary_paper_id": None,
+                                "supplementary_reason": None,
                             }
                 except Exception as e:
                     logger.debug("DOI-based skip check failed (non-fatal): %s", e)
 
-            # Persist the caller's browser mode onto the shared downloader instance.
-            # The session pool/context lifecycle must follow this instance-level override
-            # instead of the per-request ContextVar used inside individual page flows.
-            logger.info(
-                "[headed-diag] adapter: show_browser=%r (from API), "
-                "current _show_browser_override=%r, self._dl.headless=%s",
-                show_browser,
-                getattr(self._dl, "_show_browser_override", None),
-                self._dl.headless,
-            )
-            self._dl.set_show_browser_override(show_browser)
-
+            # This adapter instance is already fixed to headed or headless; no per-request override.
             # Make sure shared browser context is healthy; no-op when already ready.
             await self._dl.initialize()
 
@@ -399,6 +417,7 @@ class ScholarDownloaderAdapter:
             pdf_url_is_academia = _is_academia_pdf_url(pdf_url)
             article_url_is_academia = _is_academia_url(url)
             llm_disabled = assist_llm_enabled is False
+            effective_assist_mode = (assist_llm_mode or "ultra-lite").strip().lower()
             effective_llm_provider = None if llm_disabled else llm_provider
             effective_model_override = None if llm_disabled else model_override
             doi_str = (doi or "").strip()
@@ -485,6 +504,7 @@ class ScholarDownloaderAdapter:
                         year=year,
                         llm_provider=effective_llm_provider,
                         model_override=effective_model_override,
+                        assist_llm_mode=effective_assist_mode,
                         progress_callback=cb,
                         show_browser=show_browser,
                         disable_assist_llm=llm_disabled,
@@ -517,6 +537,7 @@ class ScholarDownloaderAdapter:
                             year=year,
                             llm_provider=effective_llm_provider,
                             model_override=effective_model_override,
+                            assist_llm_mode=effective_assist_mode,
                             progress_callback=cb,
                             show_browser=show_browser,
                             disable_assist_llm=llm_disabled,
@@ -698,6 +719,71 @@ class ScholarDownloaderAdapter:
                     "message": "下载的文件不是有效 PDF",
                 }
 
+            # ── Supplementary detection ──────────────────────────────────────
+            supp_result = classify_pdf_supplementary(
+                filepath,
+                ultra_lite_provider=effective_llm_provider,
+            )
+            if supp_result.get("is_supplementary"):
+                original_paper_id = paper_id
+                stored_paper_id = f"supplementary_{original_paper_id}"
+                stored_path = os.path.join(target_dir, f"{stored_paper_id}.pdf")
+
+                if os.path.exists(stored_path) and is_valid_pdf(stored_path):
+                    # A valid supplementary copy already exists; discard the freshly downloaded one
+                    try:
+                        if filepath != stored_path:
+                            os.remove(filepath)
+                    except OSError:
+                        pass
+                    logger.info("Supplementary PDF already exists, reusing: %s", stored_path)
+                else:
+                    try:
+                        os.rename(filepath, stored_path)
+                        logger.info("Renamed supplementary PDF: %s -> %s", filepath, stored_path)
+                    except OSError as exc:
+                        logger.warning("Failed to rename supplementary PDF: %s", exc)
+                        stored_path = filepath  # fallback: keep original path
+                        stored_paper_id = original_paper_id
+
+                # Use a suffixed pseudo-DOI so DOI-based skip never conflates
+                # the supplementary record with the main article.
+                supp_doi_raw = doi or ""
+                stored_doi = f"{supp_doi_raw}#supp" if supp_doi_raw else "#supp"
+
+                try:
+                    from src.indexing.paper_metadata_store import paper_meta_store
+                    paper_meta_store.upsert(
+                        stored_paper_id,
+                        doi=stored_doi,
+                        title=title,
+                        authors=authors,
+                        year=year,
+                        source="download",
+                        extra={
+                            "is_supplementary": True,
+                            "supplementary_reason": supp_result.get("reason", ""),
+                            "primary_paper_id": original_paper_id,
+                            "primary_doi": supp_doi_raw,
+                        },
+                    )
+                except Exception:
+                    pass
+
+                return {
+                    "success": True,
+                    "paper_id": stored_paper_id,
+                    "filepath": stored_path,
+                    "message": "已保存 supplementary PDF，未标记为主文已下载",
+                    "route_diag": route_diag,
+                    "is_supplementary": True,
+                    "should_mark_downloaded": False,
+                    "should_auto_ingest": False,
+                    "primary_paper_id": original_paper_id,
+                    "supplementary_reason": supp_result.get("reason", ""),
+                }
+
+            # ── Normal (non-supplementary) path ─────────────────────────────
             try:
                 from src.indexing.paper_metadata_store import paper_meta_store
                 paper_meta_store.upsert(
@@ -713,6 +799,11 @@ class ScholarDownloaderAdapter:
                 "filepath": filepath,
                 "message": message,
                 "route_diag": route_diag,
+                "is_supplementary": False,
+                "should_mark_downloaded": True,
+                "should_auto_ingest": True,
+                "primary_paper_id": None,
+                "supplementary_reason": None,
             }
 
         try:
@@ -780,25 +871,30 @@ class ScholarDownloaderAdapter:
             logger.warning("Downloader cleanup during shutdown failed: %s", e)
 
 
-_adapter_instance: Optional[ScholarDownloaderAdapter] = None
+_adapter_cache: Dict[bool, ScholarDownloaderAdapter] = {}  # False = headless, True = headed
 _adapter_lock = threading.Lock()
 
 
-def get_adapter() -> ScholarDownloaderAdapter:
-    global _adapter_instance
-    if _adapter_instance is None:
-        with _adapter_lock:
-            if _adapter_instance is None:
-                _adapter_instance = ScholarDownloaderAdapter()
-    return _adapter_instance
+def get_adapter(show_browser: Optional[bool] = None) -> ScholarDownloaderAdapter:
+    """Return adapter for the given mode. None/False -> headless, True -> headed. Instances are cached per mode."""
+    global _adapter_cache
+    use_headed = show_browser is True
+    with _adapter_lock:
+        if use_headed not in _adapter_cache:
+            _adapter_cache[use_headed] = ScholarDownloaderAdapter(headed=use_headed)
+    return _adapter_cache[use_headed]
 
 
 def is_adapter_ready() -> bool:
-    return _adapter_instance is not None
+    return len(_adapter_cache) > 0
 
 
 def shutdown_adapter() -> None:
-    global _adapter_instance
-    if _adapter_instance:
-        _adapter_instance.shutdown()
-        _adapter_instance = None
+    global _adapter_cache
+    with _adapter_lock:
+        for adapter in _adapter_cache.values():
+            try:
+                adapter.shutdown()
+            except Exception as e:
+                logger.warning("Downloader shutdown failed: %s", e)
+        _adapter_cache.clear()

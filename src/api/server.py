@@ -94,6 +94,12 @@ async def lifespan(app: FastAPI):
     if dl.enabled:
         logger.info("[startup] debug mode: ON (log_dir=%s)", dl.log_dir)
 
+    # 3b. 清理 headed 浏览器 profile 残留锁（避免上一进程未退出导致的 SingletonLock 占位）
+    try:
+        SharedBrowserService.cleanup_headed_profile_locks_on_startup()
+    except Exception as e:
+        logger.warning("[startup] headed profile lock cleanup failed: %s", e)
+
     # 4. 启动共享浏览器：无头 + 有头两个常驻服务（双端口），失败则回退到本地 launch
     sb = getattr(settings, "shared_browser", None)
     if sb is None:
@@ -104,10 +110,21 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning("[startup] shared headless browser start failed, fallback to local launch: %s", e)
     if getattr(sb, "start_headed", True):
-        try:
-            await SharedBrowserService.start_headed(port=getattr(sb, "headed_port", 9223))
-        except Exception as e:
-            logger.warning("[startup] shared headed browser start failed, fallback to local launch: %s", e)
+        if SharedBrowserService.is_headed_profile_in_use():
+            logger.info(
+                "[startup] headed browser skipped: at least one profile is in use by a live process "
+                "(likely another worker still holds the Chromium profile). "
+                "Headed slots will be unavailable until that process exits."
+            )
+        else:
+            try:
+                ext_path = getattr(settings, "capsolver_extension_path", None)
+                await SharedBrowserService.start_headed(
+                    port=getattr(sb, "headed_port", 9223),
+                    extension_path=ext_path,
+                )
+            except Exception as e:
+                logger.warning("[startup] shared headed browser start failed, fallback to local launch: %s", e)
 
     # 4b. 初始化 resident context 池（headless + headed）
     try:

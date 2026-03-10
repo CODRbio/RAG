@@ -18,6 +18,10 @@ class ChatRequest(BaseModel):
         None,
         description="本地检索目标知识库（Milvus collection），None 表示使用默认库",
     )
+    collections: Optional[List[str]] = Field(
+        None,
+        description="本地检索目标知识库列表（多选），优先级高于 collection；LLM 自动按相关度分配检索配额",
+    )
     search_mode: str = Field("local", description="检索模式: local | web | hybrid | none")
     web_providers: Optional[List[str]] = Field(
         None,
@@ -43,9 +47,13 @@ class ChatRequest(BaseModel):
         None,
         description="本地检索返回的最大文档数，None 表示使用配置默认值",
     )
+    fused_pool_score_threshold: Optional[float] = Field(
+        None,
+        description="合并池分数阈值 (0-1)：仅在 local+web 融合后的最终池上过滤，低于此分数的结果丢弃。默认 0.35。",
+    )
     local_threshold: Optional[float] = Field(
         None,
-        description="本地检索的相似度阈值 (0-1)，低于此阈值的结果会被过滤，None 表示不过滤",
+        description="(已废弃，请用 fused_pool_score_threshold) 兼容用：会映射为合并池阈值。",
     )
     year_start: Optional[int] = Field(
         None,
@@ -173,7 +181,10 @@ class EvidenceSummary(BaseModel):
     coverage_score: Optional[float] = Field(None, description="0-1, from LLM sufficiency eval when run")
     sufficiency_reason: Optional[str] = Field(None, description="Short reason from LLM when evidence_scarce")
     # 检索诊断信息
-    diagnostics: Optional[Dict[str, Any]] = Field(None, description="检索诊断: stages/web_providers/content_fetcher")
+    diagnostics: Optional[Dict[str, Any]] = Field(
+        None,
+        description="检索诊断: stages/web_providers/content_fetcher/pool_fusion/final_fusion/agent_refusion",
+    )
 
 
 class ChatCitation(BaseModel):
@@ -185,6 +196,7 @@ class ChatCitation(BaseModel):
     year: Optional[int] = None
     doc_id: Optional[str] = None
     url: Optional[str] = None
+    pdf_url: Optional[str] = None
     doi: Optional[str] = None
     bbox: Optional[List[float]] = Field(None, description="Docling bbox 坐标 [x0,y0,x1,y1]")
     page_num: Optional[int] = Field(None, description="证据所在页码")
@@ -487,6 +499,22 @@ class IntentDetectResponse(BaseModel):
     suggested_search_mode: str = Field("hybrid", description="[兼容] 建议的检索模式")
 
 
+# ---- Chat input suggestions (history-based) ----
+
+class ChatSuggestionsRequest(BaseModel):
+    """Chat 输入建议请求：根据前缀与会话历史返回候选"""
+
+    session_id: Optional[str] = Field(None, description="会话 ID，有则从该会话历史取 user 轮次")
+    prefix: str = Field("", description="当前输入前缀，用于过滤")
+    limit: int = Field(5, ge=1, le=15, description="最多返回条数")
+
+
+class ChatSuggestionsResponse(BaseModel):
+    """Chat 输入建议响应"""
+
+    suggestions: List[str] = Field(default_factory=list, description="候选文本列表")
+
+
 # ---- Model Sync ----
 
 class ModelSyncRequest(BaseModel):
@@ -604,7 +632,11 @@ class DeepResearchRequest(BaseModel):
     web_source_configs: Optional[Dict[str, Dict[str, Any]]] = Field(None, description="每个搜索源配置")
     serpapi_ratio: Optional[float] = Field(None, description="SerpAPI 轮询比例 0-1")
     local_top_k: Optional[int] = Field(None, description="本地检索 top_k")
-    local_threshold: Optional[float] = Field(None, description="本地检索阈值")
+    fused_pool_score_threshold: Optional[float] = Field(
+        None,
+        description="合并池分数阈值 (0-1)，仅作用于融合后的最终池。默认 0.35。",
+    )
+    local_threshold: Optional[float] = Field(None, description="(已废弃) 兼容用")
     year_start: Optional[int] = Field(None, ge=1900, le=2100, description="年份窗口起始（硬过滤）")
     year_end: Optional[int] = Field(None, ge=1900, le=2100, description="年份窗口结束（硬过滤）")
     step_top_k: Optional[int] = Field(
@@ -656,7 +688,11 @@ class DeepResearchStartRequest(BaseModel):
     web_source_configs: Optional[Dict[str, Dict[str, Any]]] = Field(None, description="每个搜索源配置")
     serpapi_ratio: Optional[float] = Field(None, description="SerpAPI 轮询比例 0-1")
     local_top_k: Optional[int] = Field(None, description="本地检索 top_k")
-    local_threshold: Optional[float] = Field(None, description="本地检索阈值")
+    fused_pool_score_threshold: Optional[float] = Field(
+        None,
+        description="合并池分数阈值 (0-1)，仅作用于融合后的最终池。默认 0.35。",
+    )
+    local_threshold: Optional[float] = Field(None, description="(已废弃) 兼容用")
     year_start: Optional[int] = Field(None, ge=1900, le=2100, description="年份窗口起始（硬过滤）")
     year_end: Optional[int] = Field(None, ge=1900, le=2100, description="年份窗口结束（硬过滤）")
     step_top_k: Optional[int] = Field(
@@ -675,6 +711,10 @@ class DeepResearchStartRequest(BaseModel):
     ultra_lite_provider: Optional[str] = Field(None, description="超轻量级 LLM 提供商（长文本压缩等）")
     model_override: Optional[str] = Field(None, description="覆盖 provider 默认模型")
     collection: Optional[str] = Field(None, description="本地检索目标 collection")
+    collections: Optional[List[str]] = Field(
+        None,
+        description="本地检索目标知识库列表（多选），优先级高于 collection；LLM 自动按相关度分配检索配额",
+    )
     use_content_fetcher: Optional[str] = Field(None, description="全文抓取模式: auto | force | off")
     gap_query_intent: Optional[str] = Field(
         None,
@@ -756,7 +796,11 @@ class DeepResearchConfirmRequest(BaseModel):
     web_source_configs: Optional[Dict[str, Dict[str, Any]]] = Field(None, description="每个搜索源配置")
     serpapi_ratio: Optional[float] = Field(None, description="SerpAPI 轮询比例 0-1")
     local_top_k: Optional[int] = Field(None, description="本地检索 top_k")
-    local_threshold: Optional[float] = Field(None, description="本地检索阈值")
+    fused_pool_score_threshold: Optional[float] = Field(
+        None,
+        description="合并池分数阈值 (0-1)，仅作用于融合后的最终池。默认 0.35。",
+    )
+    local_threshold: Optional[float] = Field(None, description="(已废弃) 兼容用")
     year_start: Optional[int] = Field(None, ge=1900, le=2100, description="年份窗口起始（硬过滤）")
     year_end: Optional[int] = Field(None, ge=1900, le=2100, description="年份窗口结束（硬过滤）")
     step_top_k: Optional[int] = Field(
@@ -775,6 +819,10 @@ class DeepResearchConfirmRequest(BaseModel):
     ultra_lite_provider: Optional[str] = Field(None, description="超轻量级 LLM 提供商（长文本压缩等）")
     model_override: Optional[str] = Field(None, description="覆盖 provider 默认模型")
     collection: Optional[str] = Field(None, description="本地检索目标 collection")
+    collections: Optional[List[str]] = Field(
+        None,
+        description="本地检索目标知识库列表（多选），优先级高于 collection；LLM 自动按相关度分配检索配额",
+    )
     use_content_fetcher: Optional[str] = Field(None, description="全文抓取模式: auto | force | off")
     gap_query_intent: Optional[str] = Field(
         None,

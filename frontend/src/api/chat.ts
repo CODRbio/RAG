@@ -40,6 +40,22 @@ export async function detectIntent(data: IntentDetectRequest): Promise<IntentDet
 }
 
 /**
+ * Chat 输入建议：根据前缀与会话历史返回候选（可选后端）
+ */
+export async function getChatSuggestions(data: {
+  prefix: string;
+  session_id?: string;
+  limit?: number;
+}): Promise<{ suggestions: string[] }> {
+  const res = await client.post<{ suggestions: string[] }>('/chat/suggestions', {
+    prefix: data.prefix,
+    session_id: data.session_id ?? undefined,
+    limit: data.limit ?? 5,
+  });
+  return res.data;
+}
+
+/**
  * Deep Research 澄清问题生成
  */
 export async function clarifyForDeepResearch(data: {

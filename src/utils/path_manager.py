@@ -33,7 +33,8 @@ class PathManager:
 
     @classmethod
     def get_user_parsed_path(cls, user_id: str = DEFAULT_USER_ID) -> Path:
-        path = cls.get_user_dir(user_id) / "parsed"
+        # Legacy/non-library parsed storage (kept for backward compatibility).
+        path = cls.get_user_dir(user_id) / "library" / "parsed_raw"
         path.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -49,6 +50,26 @@ class PathManager:
         path = cls.get_user_library_path(user_id, library_name) / "pdfs"
         path.mkdir(parents=True, exist_ok=True)
         return path
+
+    @classmethod
+    def get_user_library_parsed_path(cls, user_id: str, library_name: str) -> Path:
+        path = cls.get_user_library_path(user_id, library_name) / "parsed_data"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    @classmethod
+    def get_user_all_library_parsed_paths(cls, user_id: str) -> list[Path]:
+        libraries_root = cls.get_user_dir(user_id) / "libraries"
+        if not libraries_root.exists():
+            return []
+        paths: list[Path] = []
+        for child in sorted(libraries_root.iterdir(), key=lambda p: p.name.lower()):
+            if not child.is_dir():
+                continue
+            parsed = child / "parsed_data"
+            if parsed.exists():
+                paths.append(parsed)
+        return paths
 
     @classmethod
     def get_shared_dir(cls) -> Path:

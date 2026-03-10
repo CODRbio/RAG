@@ -3,7 +3,9 @@ import { useTranslation } from 'react-i18next';
 import { Loader2, Clock, X, ListOrdered } from 'lucide-react';
 import { useChatStore } from '../../stores';
 import { getTaskQueue, cancelTask } from '../../api/chat';
+import { listIngestJobs } from '../../api/ingest';
 import type { TaskQueueResponse } from '../../types';
+import type { IngestJobInfo } from '../../api/ingest';
 
 interface TaskCenterProps {
   open: boolean;
@@ -14,15 +16,21 @@ interface TaskCenterProps {
 export function TaskCenter({ open, onClose, anchor }: TaskCenterProps) {
   const { t } = useTranslation();
   const [snap, setSnap] = useState<TaskQueueResponse | null>(null);
+  const [ingestJobs, setIngestJobs] = useState<IngestJobInfo[]>([]);
   const [loading, setLoading] = useState(false);
   const [cancellingId, setCancellingId] = useState<string | null>(null);
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
-      const data = await getTaskQueue();
+      const [data, runningIngest, pendingIngest] = await Promise.all([
+        getTaskQueue(),
+        listIngestJobs(10, 'running'),
+        listIngestJobs(10, 'pending'),
+      ]);
       setSnap(data);
+      setIngestJobs([...runningIngest, ...pendingIngest]);
     } catch (e) {
-      console.error('[TaskCenter] getTaskQueue failed:', e);
+      console.error('[TaskCenter] refresh failed:', e);
     } finally {
       setLoading(false);
     }
@@ -33,10 +41,13 @@ export function TaskCenter({ open, onClose, anchor }: TaskCenterProps) {
   }, [open, refresh]);
 
   useEffect(() => {
-    if (!open || !snap || (snap.active_count === 0 && snap.queued.length === 0)) return;
-    const t = setInterval(refresh, 4000);
-    return () => clearInterval(t);
-  }, [open, snap?.active_count, snap?.queued?.length, refresh]);
+    if (!open) return;
+    const hasQueueActivity = snap && (snap.active_count > 0 || snap.queued.length > 0);
+    const hasIngestActivity = ingestJobs.length > 0;
+    if (!hasQueueActivity && !hasIngestActivity) return;
+    const interval = setInterval(refresh, 4000);
+    return () => clearInterval(interval);
+  }, [open, snap?.active_count, snap?.queued?.length, ingestJobs.length, refresh]);
 
   const handleCancel = async (taskId: string) => {
     setCancellingId(taskId);
@@ -85,15 +96,54 @@ export function TaskCenter({ open, onClose, anchor }: TaskCenterProps) {
                   {t('taskCenter.active', '执行中')}
                 </div>
                 <ul className="space-y-1">
-                  {snap.active.map((a) => (
+                  {snap.active.map((a) => {
+                    const payload = (a.payload || {}) as {
+                      total?: number;
+                      completed?: number;
+                      failed?: number;
+                      stage?: string;
+                      type?: string;
+                    };
+                    const label =
+                      a.kind === 'scholar'
+                        ? payload.type === 'recommend'
+                          ? t('taskCenter.recommend', '推荐文献')
+                          : t('taskCenter.batchDownload', '批量下载') + `: ${payload.completed ?? 0}/${payload.total ?? 0}`
+                        : a.kind === 'dr'
+                          ? t('taskCenter.dr', 'Deep Research')
+                          : t('taskCenter.chat', 'Chat');
+                    return (
+                      <li
+                        key={a.task_id}
+                        className="flex items-center gap-2 rounded-lg bg-slate-800/80 px-2 py-1.5 text-sm"
+                      >
+                        <Loader2 size={14} className="shrink-0 animate-spin text-sky-400" />
+                        <span className="truncate text-slate-200">
+                          {label}
+                          {a.session_id && a.kind !== 'scholar' ? ` · ${a.session_id.slice(0, 8)}` : ''}
+                        </span>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </div>
+            )}
+            {ingestJobs.length > 0 && (
+              <div className="mb-3">
+                <div className="mb-1 text-xs font-medium uppercase text-slate-400">
+                  {t('taskCenter.ingest', '入库任务')}
+                </div>
+                <ul className="space-y-1">
+                  {ingestJobs.map((j) => (
                     <li
-                      key={a.task_id}
+                      key={j.job_id}
                       className="flex items-center gap-2 rounded-lg bg-slate-800/80 px-2 py-1.5 text-sm"
                     >
-                      <Loader2 size={14} className="shrink-0 animate-spin text-sky-400" />
-                      <span className="truncate text-slate-200">
-                        {a.kind === 'dr' ? t('taskCenter.dr', 'Deep Research') : t('taskCenter.chat', 'Chat')}
-                        {a.session_id ? ` · ${a.session_id.slice(0, 8)}` : ''}
+                      <Loader2 size={14} className="shrink-0 animate-spin text-emerald-400" />
+                      <span className="truncate text-slate-200" title={j.message}>
+                        {j.current_stage && j.current_file
+                          ? `${j.current_stage}: ${j.current_file}`
+                          : j.message || `${j.processed_files}/${j.total_files} 文件`}
                       </span>
                     </li>
                   ))}
@@ -134,7 +184,7 @@ export function TaskCenter({ open, onClose, anchor }: TaskCenterProps) {
                 </ul>
               </div>
             )}
-            {snap.active_count === 0 && snap.queued.length === 0 && (
+            {snap.active_count === 0 && snap.queued.length === 0 && ingestJobs.length === 0 && (
               <div className="py-4 text-center text-sm text-slate-500">
                 {t('taskCenter.empty', '暂无任务')}
               </div>

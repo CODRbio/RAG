@@ -40,6 +40,7 @@ export interface Source {
   year?: number | null;
   doc_id?: string | null;
   url?: string | null;
+  pdf_url?: string | null;
   doi?: string | null;
   score?: number;
   snippet?: string;
@@ -68,6 +69,21 @@ export interface RetrievalStageDiag {
   time_ms: number;
 }
 
+export interface PoolFusionDiag {
+  main_in?: number;
+  gap_in?: number;
+  agent_in?: number;
+  rank_pool_k?: number;
+  rank_pool_multiplier?: number;
+  gap_ratio?: number | null;
+  agent_ratio?: number | null;
+  gap_min_keep?: number;
+  gap_in_output?: number;
+  agent_min_keep?: number;
+  agent_in_output?: number;
+  output_count?: number;
+}
+
 export interface RetrievalDiagnostics {
   optimized_queries?: string[];
   stages?: Record<string, RetrievalStageDiag>;
@@ -75,6 +91,14 @@ export interface RetrievalDiagnostics {
   content_fetcher?: { enriched: number; total: number };
   cross_source_dedup?: { removed: number; remaining: number };
   cache_hit?: boolean;
+  pool_fusion?: PoolFusionDiag;
+  final_fusion?: PoolFusionDiag;
+  agent_refusion?: {
+    agent_extra_chunks?: number;
+    gap_candidates?: number;
+    main_candidates?: number;
+    output_count?: number;
+  };
 }
 
 export interface EvidenceSummary {
@@ -105,13 +129,17 @@ export interface ChatRequest {
   canvas_id?: string;
   message: string;
   collection?: string;
+  collections?: string[];
   search_mode: 'local' | 'web' | 'hybrid' | 'none';
   web_providers?: string[];
   web_source_configs?: Record<string, { topK: number; threshold: number; useSerpapi?: boolean }>;
   serpapi_ratio?: number;  // SerpAPI 轮询比例 0-1（仅当 google/scholar 启用 useSerpapi 时生效）
   use_query_expansion?: boolean;  // 兼容字段（已弃用）
   local_top_k?: number;  // 本地检索返回的最大文档数
-  local_threshold?: number;  // 本地检索的相似度阈值 (0-1)
+  /** 合并池分数阈值 (0-1)，仅作用于融合后的最终池。默认 0.35。 */
+  fused_pool_score_threshold?: number;
+  /** @deprecated 请用 fused_pool_score_threshold */
+  local_threshold?: number;
   year_start?: number;  // 年份窗口起始（硬过滤）
   year_end?: number;  // 年份窗口结束（硬过滤）
   step_top_k?: number;  // 每步检索保留的文档数（local + web 合并重排后）
@@ -306,6 +334,7 @@ export interface DeepResearchRequest {
   query_optimizer_max_queries?: number;
   gap_query_intent?: 'broad' | 'review_pref' | 'reviews_only';
   local_top_k?: number;
+  fused_pool_score_threshold?: number;
   local_threshold?: number;
   year_start?: number;
   year_end?: number;
@@ -323,6 +352,7 @@ export interface DeepResearchStartRequest {
   canvas_id?: string;
   user_id?: string;
   collection?: string;
+  collections?: string[];
   search_mode: 'local' | 'web' | 'hybrid';
   max_sections?: number;
   clarification_answers?: Record<string, string>;
@@ -337,6 +367,7 @@ export interface DeepResearchStartRequest {
   use_content_fetcher?: 'auto' | 'force' | 'off';
   gap_query_intent?: 'broad' | 'review_pref' | 'reviews_only';
   local_top_k?: number;
+  fused_pool_score_threshold?: number;
   local_threshold?: number;
   year_start?: number;
   year_end?: number;
@@ -387,6 +418,7 @@ export interface DeepResearchConfirmRequest {
   canvas_id?: string;
   user_id?: string;
   collection?: string;
+  collections?: string[];
   search_mode: 'local' | 'web' | 'hybrid';
   confirmed_outline: string[];
   confirmed_brief?: Record<string, unknown>;
@@ -401,6 +433,7 @@ export interface DeepResearchConfirmRequest {
   use_content_fetcher?: 'auto' | 'force' | 'off';
   gap_query_intent?: 'broad' | 'review_pref' | 'reviews_only';
   local_top_k?: number;
+  fused_pool_score_threshold?: number;
   local_threshold?: number;
   year_start?: number;
   year_end?: number;
@@ -656,7 +689,10 @@ export interface WebSource {
 export interface RagConfig {
   enabled: boolean;  // 是否启用本地 RAG 检索
   localTopK: number;
-  localThreshold: number;  // 相似度阈值 (0-1)
+  /** 合并池分数阈值 (0-1)，仅作用于 local+web 融合后的最终池。默认 0.35。 */
+  fusedPoolScoreThreshold: number;
+  /** @deprecated 已由 fusedPoolScoreThreshold 取代，保留仅作持久化兼容 */
+  localThreshold?: number;
   stepTopK: number;  // 每步检索保留的文档数（local + web 合并重排后）
   writeTopK: number;  // 最终撰写阶段证据保留数量（Deep Research）
   yearStart?: number | null; // 全局年份过滤起始
@@ -713,8 +749,7 @@ export type ScholarDownloadStrategyId =
 export interface ScholarDownloaderDefaults {
   includeAcademia: boolean;
   assistLlmEnabled: boolean;
-  llmProvider: string;
-  llmModel: string;
+  assistLlmMode: 'ultra-lite' | 'lite' | 'auto-upgrade';
   browserMode: 'headed' | 'headless';
   strategyOrder: ScholarDownloadStrategyId[];
 }

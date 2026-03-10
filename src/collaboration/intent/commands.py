@@ -5,7 +5,7 @@
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Iterable, List, Optional, Set
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 from .parser import ParsedIntent
 from src.utils.prompt_manager import PromptManager
@@ -27,6 +27,9 @@ class ContextAnalysis:
     context_status: str = "self_contained"  # self_contained / resolved / needs_clarification
     rewritten_query: str = ""
     clarification: str = ""
+    followup_mode: str = "fresh"  # fresh / reuse_only / reuse_and_search
+    topic_relevance: str = "low"  # low / medium / high
+    target_span: str = ""
 
 
 def analyze_chat_context(
@@ -85,11 +88,22 @@ def analyze_chat_context(
     if context_status not in ("self_contained", "resolved", "needs_clarification"):
         context_status = "self_contained"
 
+    followup_mode = (data.get("followup_mode") or "fresh").strip().lower()
+    if followup_mode not in ("fresh", "reuse_only", "reuse_and_search"):
+        followup_mode = "fresh"
+
+    topic_relevance = (data.get("topic_relevance") or "low").strip().lower()
+    if topic_relevance not in ("low", "medium", "high"):
+        topic_relevance = "low"
+
     return ContextAnalysis(
         action=action,
         context_status=context_status,
         rewritten_query=(data.get("rewritten_query") or "").strip(),
         clarification=(data.get("clarification") or "").strip(),
+        followup_mode=followup_mode,
+        topic_relevance=topic_relevance,
+        target_span=(data.get("target_span") or "").strip(),
     )
 
 
@@ -104,6 +118,80 @@ COLLECTION_SCOPE: dict = {
     "deepsea_ocean": "深海海洋、海洋环境",
     "deepsea_env": "深海环境、海洋环境",
 }
+
+
+def allocate_collection_quotas(
+    query: str,
+    collection_names: List[str],
+    llm_client: Any,
+) -> Dict[str, float]:
+    """
+    用 LLM 根据 query 在多个 collection 之间分配检索配额。
+    返回 {collection_name: ratio} 字典，所有 ratio 之和为 1.0。
+    若只有一个 collection，或 LLM 调用失败，则均等分配。
+    """
+    if not collection_names:
+        return {}
+    if len(collection_names) == 1:
+        return {collection_names[0]: 1.0}
+
+    equal = {name: round(1.0 / len(collection_names), 4) for name in collection_names}
+
+    if not (query and llm_client):
+        return equal
+
+    try:
+        from src.indexing.collection_scope import get_scope
+    except Exception:
+        get_scope = lambda _: None  # noqa: E731
+
+    lines = []
+    for name in collection_names:
+        try:
+            scope = get_scope(name.strip())
+        except Exception:
+            scope = None
+        if not scope:
+            scope = COLLECTION_SCOPE.get(name.strip(), f"主题：{name}")
+        lines.append(f"- {name}: {scope}")
+    collections_block = "\n".join(lines)
+
+    prompt = _pm.render(
+        "chat_collection_quota_allocate.txt",
+        query=query[:500],
+        collections_block=collections_block,
+    )
+    try:
+        resp = llm_client.chat(
+            messages=[
+                {"role": "system", "content": _pm.render("chat_collection_quota_allocate_system.txt")},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        raw = (resp.get("final_text") or "").strip()
+        # Strip markdown fences if present
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            return equal
+        # Validate keys match; fill missing with 0
+        result: Dict[str, float] = {}
+        for name in collection_names:
+            v = parsed.get(name, 0.0)
+            try:
+                result[name] = max(0.0, float(v))
+            except Exception:
+                result[name] = 0.0
+        total = sum(result.values())
+        if total <= 0:
+            return equal
+        # Normalize to sum=1.0
+        return {k: round(v / total, 4) for k, v in result.items()}
+    except Exception:
+        return equal
 
 
 def check_query_collection_scope(

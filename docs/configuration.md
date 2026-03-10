@@ -18,6 +18,14 @@
 2. 若存在 `rag_config.local.json`，深度合并覆盖
 3. 部分字段再由环境变量覆盖（如 API Key / 端口）
 
+**运行时取值优先级（生效顺序）：**
+
+- **UI/请求入参（若有）**：前端或 API 请求里显式传入的参数（如检索超时、全文抓取模式等）优先生效。
+- **Config 托底**：上述未提供时，使用本文件（及本地覆盖、环境变量）中的配置。
+- **代码默认值**：配置中未书写该项时，使用各模块代码中的默认值。
+
+即：**UI 输入（若有）> config > 代码默认**。新增或扩展配置项时，应保持该优先级，并在使用处合并请求级覆盖后再读 config。
+
 ## 二、关键配置块（`rag_config.json`）
 
 ### `database`
@@ -121,6 +129,40 @@ NCBI 文献搜索配置。
 
 - `enabled`：开关
 - 缓存与策略配置
+
+### `shared_browser`
+
+共享浏览器与 Playwright context 池配置。启动时根据此配置初始化常驻 CDP 浏览器和 context 池，供 Google/Scholar 搜索、网页全文抓取（content_fetcher）等模块复用。
+
+#### 浏览器进程
+
+- `start_headless`：是否启动无头 CDP 浏览器（默认 true）
+- `start_headed`：是否启动有头 CDP 浏览器（默认 true）
+- `headless_port`：无头浏览器 CDP 端口（默认 9222）
+- `headed_port`：有头浏览器 CDP 端口（默认 9223）
+
+#### Context 池大小
+
+- `headless_context_pool_size`：无头 context 总数（默认 4）
+  - 其中一部分为通用 slot，所有模块均可使用
+  - 另一部分为搜索预留 slot，仅 Google/Scholar 搜索可优先使用
+- `headless_search_reserved_slots`：搜索预留 slot 数量（默认 1）
+  - 通用 slot 数 = `headless_context_pool_size - headless_search_reserved_slots`
+  - 设为 0 则关闭预留，所有 slot 均为通用
+- `headed_context_pool_size`：有头 context 数量（默认 2，无预留）
+
+#### 超时与冷却
+
+- `context_acquire_timeout_seconds`：获取 context 的最大等待时间（默认 30s）
+  - 超时后调用方回退到临时浏览器
+- `context_cooldown_min_seconds` / `context_cooldown_max_seconds`：归还 context 后的随机冷却区间（默认 1~2s），防止同一 context 被过于频繁复用
+- `context_idle_ttl_seconds`：slot 元数据空闲 TTL（默认 300s，仅用于诊断标记，不触发驱逐——context 始终常驻）
+
+#### 调优建议
+
+- 如果并发用户较多（同时多人检索），可适当增大 `headless_context_pool_size`（如 6），并酌情增加 `headless_search_reserved_slots`（如 2）
+- 如果搜索功能很少使用，可将 `headless_search_reserved_slots` 设为 0 以释放该 slot 给其他模块
+- 有头 context 主要用于文献下载和需要 UI 交互的验证码场景，一般 2 个即可满足需求
 
 ### `api`
 

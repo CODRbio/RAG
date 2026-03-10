@@ -12,8 +12,7 @@ import type { CollectionInfo } from '../api/ingest';
 export const DEFAULT_SCHOLAR_DOWNLOADER_DEFAULTS: ScholarDownloaderDefaults = {
   includeAcademia: false,
   assistLlmEnabled: false,
-  llmProvider: '',
-  llmModel: '',
+  assistLlmMode: 'ultra-lite',
   browserMode: 'headed',
   strategyOrder: ['direct_download', 'playwright_download', 'browser_lookup', 'sci_hub', 'brightdata', 'anna'],
 };
@@ -31,6 +30,7 @@ interface ConfigState {
   dbAddress: string;
   dbStatus: 'disconnected' | 'connecting' | 'connected';
   currentCollection: string;
+  selectedCollections: string[];
   collections: string[];
   collectionInfos: CollectionInfo[];
 
@@ -54,6 +54,8 @@ interface ConfigState {
   setDbAddress: (addr: string) => void;
   setDbStatus: (status: 'disconnected' | 'connecting' | 'connected') => void;
   setCurrentCollection: (name: string) => void;
+  setSelectedCollections: (names: string[]) => void;
+  toggleCollection: (name: string) => void;
   setCollections: (list: string[]) => void;
   setCollectionInfos: (list: CollectionInfo[]) => void;
   addCollection: (name: string) => void;
@@ -103,6 +105,7 @@ export const useConfigStore = create<ConfigState>()(
       dbAddress: 'localhost:19530',
       dbStatus: 'disconnected',
       currentCollection: 'deepsea_research_v1',
+      selectedCollections: ['deepsea_research_v1'],
       collections: ['deepsea_research_v1', 'general_ocean_v2'],
       collectionInfos: [
         { name: 'deepsea_research_v1', count: -1, associated_library_id: null, associated_library_name: null, binding_ready: false },
@@ -111,8 +114,9 @@ export const useConfigStore = create<ConfigState>()(
 
       ragConfig: {
         enabled: true,  // 默认启用本地 RAG
-        localTopK: 5,
-        localThreshold: 0.5,  // 默认相似度阈值
+        localTopK: 45,  // hybrid chat 推荐更高本地召回预算，避免本地候选池过小
+        fusedPoolScoreThreshold: 0.35,  // 合并池分数阈值，仅作用于融合后的最终池
+        localThreshold: 0.5,  // 已废弃，兼容持久化
         stepTopK: 10,  // 默认每步保留10条
         writeTopK: 15,  // 默认撰写阶段 Top-K（>= stepTopK * 1.5）
         yearStart: null,
@@ -164,7 +168,30 @@ export const useConfigStore = create<ConfigState>()(
 
       setDbAddress: (addr) => set({ dbAddress: addr }),
       setDbStatus: (status) => set({ dbStatus: status }),
-      setCurrentCollection: (name) => set({ currentCollection: name }),
+      setCurrentCollection: (name) =>
+        set((state) => ({
+          currentCollection: name,
+          selectedCollections: state.selectedCollections.includes(name)
+            ? state.selectedCollections
+            : [name],
+        })),
+      setSelectedCollections: (names) =>
+        set({
+          selectedCollections: names,
+          currentCollection: names[0] ?? '',
+        }),
+      toggleCollection: (name) =>
+        set((state) => {
+          const current = state.selectedCollections;
+          const next = current.includes(name)
+            ? current.filter((n) => n !== name)
+            : [...current, name];
+          const final = next.length === 0 ? current : next;
+          return {
+            selectedCollections: final,
+            currentCollection: final[0] ?? state.currentCollection,
+          };
+        }),
       setCollections: (list) => set({ collections: list }),
       setCollectionInfos: (list) => set({ collectionInfos: list }),
       addCollection: (name) =>
@@ -174,6 +201,7 @@ export const useConfigStore = create<ConfigState>()(
             ? state.collectionInfos
             : [...state.collectionInfos, { name, count: -1, associated_library_id: null, associated_library_name: null, binding_ready: false }],
           currentCollection: name,
+          selectedCollections: [name],
         })),
 
       updateRagConfig: (update) =>
@@ -271,6 +299,7 @@ export const useConfigStore = create<ConfigState>()(
       partialize: (state) => ({
         dbAddress: state.dbAddress,
         currentCollection: state.currentCollection,
+        selectedCollections: state.selectedCollections,
         collections: state.collections,
         collectionInfos: state.collectionInfos,
         ragConfig: state.ragConfig,
@@ -291,6 +320,8 @@ export const useConfigStore = create<ConfigState>()(
             ...(persisted.ragConfig || {}),
             // 确保新字段有默认值
             enabled: persisted.ragConfig?.enabled ?? true,
+            localTopK: persisted.ragConfig?.localTopK ?? currentState.ragConfig.localTopK,
+            fusedPoolScoreThreshold: (persisted.ragConfig as any)?.fusedPoolScoreThreshold ?? 0.35,
             localThreshold: persisted.ragConfig?.localThreshold ?? 0.5,
             stepTopK: persisted.ragConfig?.stepTopK ?? (persisted.ragConfig as any)?.finalTopK ?? 10,
             writeTopK: persisted.ragConfig?.writeTopK
@@ -335,6 +366,13 @@ export const useConfigStore = create<ConfigState>()(
             })(),
           },
           collectionInfos: persisted.collectionInfos || currentState.collectionInfos,
+          selectedCollections: (() => {
+            const saved = (persisted as any).selectedCollections;
+            if (Array.isArray(saved) && saved.length > 0) return saved as string[];
+            // Migrate: if no selectedCollections, derive from currentCollection
+            const col = persisted.currentCollection || currentState.currentCollection;
+            return col ? [col] : currentState.selectedCollections;
+          })(),
           deepResearchDefaults: {
             ...currentState.deepResearchDefaults,
             ...(persisted.deepResearchDefaults || {}),
@@ -355,8 +393,11 @@ export const useConfigStore = create<ConfigState>()(
             ...(persisted.scholarDownloaderDefaults || {}),
             includeAcademia: persisted.scholarDownloaderDefaults?.includeAcademia ?? currentState.scholarDownloaderDefaults.includeAcademia,
             assistLlmEnabled: persisted.scholarDownloaderDefaults?.assistLlmEnabled ?? currentState.scholarDownloaderDefaults.assistLlmEnabled,
-            llmProvider: persisted.scholarDownloaderDefaults?.llmProvider ?? currentState.scholarDownloaderDefaults.llmProvider,
-            llmModel: persisted.scholarDownloaderDefaults?.llmModel ?? currentState.scholarDownloaderDefaults.llmModel,
+            assistLlmMode: (() => {
+              const saved = (persisted.scholarDownloaderDefaults as any)?.assistLlmMode;
+              if (saved === 'ultra-lite' || saved === 'lite' || saved === 'auto-upgrade') return saved;
+              return currentState.scholarDownloaderDefaults.assistLlmMode;
+            })(),
             browserMode: persisted.scholarDownloaderDefaults?.browserMode === 'headless' ? 'headless' : 'headed',
             strategyOrder: (() => {
               const saved = persisted.scholarDownloaderDefaults?.strategyOrder || [];
@@ -398,12 +439,16 @@ useConfigStore.persist.onFinishHydration?.(() => {
       .then((cols) => {
         const names = cols.map((c) => c.name);
         if (names.length > 0) {
-          const { currentCollection } = useConfigStore.getState();
+          const { currentCollection, selectedCollections } = useConfigStore.getState();
+          const validSelected = selectedCollections.filter((n) => names.includes(n));
+          const finalSelected = validSelected.length > 0 ? validSelected : [names[0]];
+          const finalCurrent = names.includes(currentCollection) ? currentCollection : names[0];
           useConfigStore.setState({
             collections: names,
-          collectionInfos: cols,
+            collectionInfos: cols,
             dbStatus: 'connected',
-            ...(names.includes(currentCollection) ? {} : { currentCollection: names[0] }),
+            currentCollection: finalCurrent,
+            selectedCollections: finalSelected,
           });
         }
       })

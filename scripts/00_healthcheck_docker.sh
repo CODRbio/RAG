@@ -7,12 +7,32 @@ set -euo pipefail
 echo "========== Docker 健康检查 =========="
 
 # 容器状态
-echo "[1/4] 检查容器状态..."
+echo "[1/6] 检查容器状态..."
 docker compose ps
+
+# PostgreSQL 健康
+echo ""
+echo "[2/6] 检查 PostgreSQL..."
+if docker compose exec -T postgres pg_isready -U "${POSTGRES_USER:-rag}" -d "${POSTGRES_DB:-rag}" >/dev/null 2>&1; then
+  echo "[OK] PostgreSQL ready"
+else
+  echo "[FAIL] PostgreSQL health failed"
+  echo "  尝试: docker logs --tail 50 deepsea-rag-postgres"
+fi
+
+# Redis 健康
+echo ""
+echo "[3/6] 检查 Redis..."
+if docker compose exec -T redis redis-cli ping >/dev/null 2>&1; then
+  echo "[OK] Redis ping OK"
+else
+  echo "[FAIL] Redis health failed"
+  echo "  尝试: docker logs --tail 50 deepsea-rag-redis"
+fi
 
 # Milvus 健康
 echo ""
-echo "[2/4] 检查 Milvus..."
+echo "[4/6] 检查 Milvus..."
 if curl -sf http://localhost:9091/healthz >/dev/null 2>&1; then
   echo "[OK] Milvus healthz OK"
 else
@@ -22,9 +42,9 @@ fi
 
 # MinIO 健康
 echo ""
-echo "[3/4] 检查 MinIO..."
-if curl -sf http://localhost:9000/minio/health/live >/dev/null 2>&1; then
-  echo "[OK] MinIO live OK"
+echo "[5/6] 检查 MinIO..."
+if [ "$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}unknown{{end}}' deepsea-minio 2>/dev/null || true)" = "healthy" ]; then
+  echo "[OK] MinIO health OK"
 else
   echo "[FAIL] MinIO health failed"
   echo "  尝试: docker logs --tail 50 deepsea-minio"
@@ -32,7 +52,7 @@ fi
 
 # etcd 健康
 echo ""
-echo "[4/4] 检查 etcd..."
+echo "[6/6] 检查 etcd..."
 if docker exec deepsea-etcd etcdctl endpoint health >/dev/null 2>&1; then
   echo "[OK] etcd endpoint health OK"
 else

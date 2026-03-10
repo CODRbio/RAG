@@ -16,13 +16,13 @@ Output ONLY a valid JSON object. No markdown.
 **Rules per engine (style + language):**
 - **ncbi** (PubMed-style): Boolean phrase with grouped concepts, e.g. `(A) AND (B)`; biomedical terminology; prefer MeSH-like terms or compact [tiab]-friendly phrases; 4-10 words total. ENGLISH ONLY — ncbi/PubMed index is English; do not output Chinese for this engine.
 - **semantic**: Strict technical concept phrases only (no question/sentence), 3-8 words, high-information nouns. ENGLISH ONLY — semantic indices are English; do not output Chinese for this engine.
-- **scholar**: Short academic keyword phrases (3-8 words), concept-dense; avoid generic suffixes like `review/survey/overview` unless user explicitly asks for reviews. ENGLISH ONLY — academic indices are predominantly English; do not output Chinese for this engine.
+- **scholar**: Short academic keyword phrases (3-8 words), concept-dense; avoid generic suffixes like `review/survey/overview` unless user explicitly asks for reviews. When input is Chinese, may provide both Chinese and English keyword queries (Scholar supports Chinese).
 - **google**: Plain web keywords, 6-12 words, core concepts + optional one anchor; no verbose natural-language sentence. When input is Chinese, may provide both Chinese and English keyword queries.
 - **tavily**: One concise natural-language question (<=15 words) that preserves the user intent chain; no boolean syntax. When input is Chinese, may provide both Chinese and English questions.
 {bilingual_instruction}
 
 **Output format:**
-- If input is Chinese: for **ncbi, semantic, scholar** — return a plain array of 1-{max_per} English query strings only. For **google, tavily** — return an object with keys **zh** and **en**, each an array of exactly {max_per} queries.
+- If input is Chinese: for **ncbi, semantic** — return a plain array of 1-{max_per} English query strings only. For **scholar, google, tavily** — return an object with keys **zh** and **en**, each an array of exactly {max_per} queries.
 - If input is English: each engine value is an array of 1-{max_per} query strings.
 - Only include keys for engines that are in the list above; omit others.
 

@@ -7,6 +7,7 @@ const BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api';
 export interface CollectionInfo {
   name: string;
   count: number;
+  scope_summary?: string | null;
   associated_library_id?: number | null;
   associated_library_name?: string | null;
   binding_ready?: boolean;
@@ -118,6 +119,18 @@ export interface PaperInfo {
   error_message: string;
   created_at: number;
   content_hash?: string;
+  /** Link to scholar library when this paper came from library import / download+ingest */
+  library_id?: number | null;
+  library_paper_id?: number | null;
+  source?: string;
+  doi?: string | null;
+  title?: string | null;
+  authors?: string[] | null;
+  year?: number | null;
+  venue?: string | null;
+  url?: string | null;
+  pdf_url?: string | null;
+  arxiv_id?: string | null;
 }
 
 export async function listPapers(collection: string): Promise<PaperInfo[]> {

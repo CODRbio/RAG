@@ -250,17 +250,8 @@ def lookup_by_venue(venue: str, ensure_current: bool = True) -> Optional[Dict[st
         ).first()
         if row is not None:
             return _row_to_dict(row)
-        # 3. conservative fallback: norm contained in normalized_journal_name or vice versa
-        all_rows = session.exec(select(ImpactFactorJournal)).all()
-        for r in all_rows:
-            if r.normalized_journal_name and norm in r.normalized_journal_name:
-                return _row_to_dict(r)
-            if r.normalized_journal_name and r.normalized_journal_name in norm:
-                return _row_to_dict(r)
-            if r.normalized_jcr_abbreviation and norm in r.normalized_jcr_abbreviation:
-                return _row_to_dict(r)
-            if r.normalized_jcr_abbreviation and r.normalized_jcr_abbreviation in norm:
-                return _row_to_dict(r)
+        # No fuzzy/substring fallback: unknown journals must not get another journal's IF.
+        # Callers should display "n.a." when lookup returns None.
     return None
 
 

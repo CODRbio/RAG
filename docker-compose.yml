@@ -1,11 +1,46 @@
 # ============================================================
-#  深海科研知识库 - Milvus 部署
+#  深海科研知识库 - 基础服务部署
 #  Mac: docker compose --profile dev up -d
 #  服务器: docker compose --profile prod up -d
 # ============================================================
 
 services:
   # ------------ 基础服务 ------------
+  postgres:
+    container_name: deepsea-rag-postgres
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-rag}
+      POSTGRES_USER: ${POSTGRES_USER:-rag}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rag} -d ${POSTGRES_DB:-rag}"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+    networks:
+      - deepsea-net
+
+  redis:
+    container_name: deepsea-rag-redis
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1000"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+    networks:
+      - deepsea-net
+
   etcd:
     container_name: deepsea-etcd
     image: quay.io/coreos/etcd:v3.5.5
@@ -95,3 +130,9 @@ services:
 networks:
   deepsea-net:
     name: deepsea-network
+
+volumes:
+  postgres-data:
+    name: deepsea-rag-postgres-data
+  redis-data:
+    name: deepsea-rag-redis-data

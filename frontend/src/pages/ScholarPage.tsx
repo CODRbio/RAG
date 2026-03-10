@@ -18,11 +18,13 @@ import {
   Trash2,
   FolderPlus,
   RefreshCw,
+  RefreshCcw,
   FileSearch,
   Upload,
   Settings2,
   PanelLeftOpen,
   PanelLeftClose,
+  Layers,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useScholarStore } from '../stores/useScholarStore';
@@ -30,18 +32,25 @@ import { useConfigStore } from '../stores/useConfigStore';
 import { useToastStore } from '../stores/useToastStore';
 import { PdfViewerModal } from '../components/ui/PdfViewerModal';
 import { ScholarAdvancedSettingsModal } from '../components/scholar/ScholarAdvancedSettingsModal';
+import { ScholarLibraryRecommendModal } from '../components/scholar/ScholarLibraryRecommendModal';
 import {
   getPdfViewUrl,
   getLibraryPdfViewUrl,
   fetchPdfAsBlobUrl,
   uploadLibraryPaperPdf,
   deleteLibraryPaperPdf,
+  importLibraryPdfs,
   getHeadedBrowserWindowState,
   showHeadedBrowserWindow,
   parkHeadedBrowserWindow,
 } from '../api/scholar';
 import type { ScholarSearchResult } from '../api/scholar';
-import type { ScholarSource, ScholarLibraryPaper, HeadedBrowserWindowState } from '../api/scholar';
+import type {
+  ScholarSource,
+  ScholarLibraryPaper,
+  HeadedBrowserWindowState,
+  LibraryImportPdfSummary,
+} from '../api/scholar';
 
 const SOURCE_OPTIONS: { value: ScholarSource; labelKey: string }[] = [
   { value: 'google_scholar', labelKey: 'scholar.sourceGoogleScholar' },
@@ -134,6 +143,9 @@ export function ScholarPage() {
     setSearchError,
     smartOptimize,
     setSmartOptimize,
+    batchAllSources,
+    setBatchAllSources,
+    batchSourceCounts,
     useSerpapi,
     serpapiRatio,
     setUseSerpapi,
@@ -157,6 +169,7 @@ export function ScholarPage() {
     downloadLibraryBatch,
     extractDoiAndDedup,
     pdfRenameDedup,
+    refreshMetadataFromCrossref,
     downloadLibraryPaperAndOpen,
     openPdfAfterDownload,
     clearOpenPdfAfterDownload,
@@ -164,6 +177,7 @@ export function ScholarPage() {
     downloadAndOpenFailures,
     clearDownloadAndOpenFailure,
     applyScholarDownloaderDefaults,
+    hydrateRunningDownloadTasks,
   } = useScholarStore();
 
   const [tasksPanelOpen, setTasksPanelOpen] = useState(true);
@@ -174,19 +188,24 @@ export function ScholarPage() {
   const [downloadingIndex, setDownloadingIndex] = useState<number | null>(null);
   const [downloadingBatch, setDownloadingBatch] = useState(false);
   const [extractDoiDedupLoading, setExtractDoiDedupLoading] = useState(false);
+  const [refreshMetadataLoading, setRefreshMetadataLoading] = useState(false);
   const [pdfRenameDedupLoading, setPdfRenameDedupLoading] = useState(false);
   const [showNewLibraryModal, setShowNewLibraryModal] = useState(false);
   const [showAdvancedSettings, setShowAdvancedSettings] = useState(false);
+  const [showRecommendModal, setShowRecommendModal] = useState(false);
   const [headedBrowserWindow, setHeadedBrowserWindow] = useState<HeadedBrowserWindowState | null>(null);
   const [headedBrowserWindowBusy, setHeadedBrowserWindowBusy] = useState(false);
   const [newLibraryName, setNewLibraryName] = useState('');
   const [newLibraryDesc, setNewLibraryDesc] = useState('');
+  const [importingLibraryPdfs, setImportingLibraryPdfs] = useState(false);
+  const [libraryImportSummary, setLibraryImportSummary] = useState<LibraryImportPdfSummary | null>(null);
   const [addingToLibrary, setAddingToLibrary] = useState(false);
   const [uploadingPapers, setUploadingPapers] = useState<Record<number, boolean>>({});
-  const [uploadFailures, setUploadFailures] = useState<Record<number, string>>({});
+  const [, setUploadFailures] = useState<Record<number, string>>({});
   const [deletingPdfId, setDeletingPdfId] = useState<number | null>(null);
   const [redownloadingId, setRedownloadingId] = useState<number | null>(null);
   const resultsLayoutRef = useRef<HTMLDivElement | null>(null);
+  const importLibraryInputRef = useRef<HTMLInputElement | null>(null);
 
   // Filter/sort state (shared for search results and library list)
   const [sortField, setSortField] = useState<'score' | 'year' | 'impact_factor'>('score');
@@ -209,6 +228,11 @@ export function ScholarPage() {
   useEffect(() => {
     setQueryHistory(loadScholarQueryHistory());
   }, []);
+
+  // Recover running batch-download tasks from backend after reload
+  useEffect(() => {
+    hydrateRunningDownloadTasks();
+  }, [hydrateRunningDownloadTasks]);
 
   const FILTER_STORAGE_KEY = 'scholar_filter_prefs';
   useEffect(() => {
@@ -514,12 +538,6 @@ export function ScholarPage() {
 
   const taskIds = Object.keys(downloadTasks);
   const activeTaskCount = taskIds.length;
-  const headedBrowserStatusLabel =
-    headedBrowserWindow?.mode === 'visible'
-      ? t('scholar.headedBrowserStatusVisible')
-      : headedBrowserWindow?.mode === 'parked'
-        ? t('scholar.headedBrowserStatusParked')
-        : t('scholar.headedBrowserStatusUnavailable');
 
   const handleSearch = useCallback(() => {
     const q = query.trim();
@@ -645,6 +663,53 @@ export function ScholarPage() {
     [activeLibraryId, addResultsToLibrary, addToast, t]
   );
 
+  const handlePickLibraryPdfFiles = useCallback(() => {
+    if (activeLibraryId == null || activeLibraryId < 0) {
+      addToast(t('scholar.libraryImportRequirePermanent'), 'info');
+      return;
+    }
+    importLibraryInputRef.current?.click();
+  }, [activeLibraryId, addToast, t]);
+
+  const handleLibraryPdfImportChange = useCallback(
+    async (e: React.ChangeEvent<HTMLInputElement>) => {
+      const picked = Array.from(e.target.files ?? []).filter((f) => f.name.toLowerCase().endsWith('.pdf'));
+      e.target.value = '';
+      if (picked.length === 0) {
+        addToast(t('scholar.libraryImportNoPdfFound'), 'info');
+        return;
+      }
+      if (activeLibraryId == null || activeLibraryId < 0) {
+        addToast(t('scholar.libraryImportRequirePermanent'), 'info');
+        return;
+      }
+      if (importingLibraryPdfs) return;
+      setImportingLibraryPdfs(true);
+      try {
+        const summary = await importLibraryPdfs(activeLibraryId, picked);
+        setLibraryImportSummary(summary);
+        await loadLibraryPapers(activeLibraryId);
+        await loadLibraries();
+        addToast(
+          t('scholar.libraryImportSuccessSummary', {
+            imported: summary.imported,
+            linked: summary.linked_existing,
+            skipped: summary.skipped_duplicates,
+          }),
+          'success',
+        );
+        if (summary.errors.length > 0) {
+          addToast(t('scholar.libraryImportPartialErrors', { count: summary.errors.length }), 'error');
+        }
+      } catch (err) {
+        addToast((err as Error)?.message || t('scholar.libraryImportFailed'), 'error');
+      } finally {
+        setImportingLibraryPdfs(false);
+      }
+    },
+    [activeLibraryId, importingLibraryPdfs, addToast, t, loadLibraryPapers, loadLibraries],
+  );
+
   const allSelected =
     filteredResults.length > 0 &&
     filteredResults.every(({ originalIndex }) => selectedIndices.includes(originalIndex));
@@ -668,14 +733,23 @@ export function ScholarPage() {
 
   return (
     <div className="flex flex-col h-full min-h-0">
-      <div className="flex-shrink-0 p-4 space-y-4">
-        {/* Search bar */}
-        <div className="rounded-xl border border-slate-700/60 bg-slate-800/30 p-4 space-y-4">
-          <div className="flex flex-wrap items-end gap-3">
-            <div className="flex-[2.2] min-w-[320px]">
-              <label className="block text-xs font-medium text-slate-400 mb-1">{t('scholar.queryLabel')}</label>
+      <input
+        ref={importLibraryInputRef}
+        type="file"
+        accept=".pdf"
+        multiple
+        className="hidden"
+        onChange={handleLibraryPdfImportChange}
+      />
+      <div className="flex-shrink-0 p-3 space-y-2">
+        {/* Search bar area with dynamic font sizing */}
+        <div className="rounded-xl border border-slate-700/60 bg-slate-800/30 p-3 space-y-3 text-[10px] sm:text-xs 2xl:text-sm">
+          {/* Row 1: Search Inputs */}
+          <div className="flex flex-wrap items-end gap-2 sm:gap-3">
+            <div className="flex-[3] min-w-[200px]">
+              <label className="block font-medium text-slate-400 mb-1">{t('scholar.queryLabel')}</label>
               <div className="flex rounded-lg border border-slate-600/80 bg-slate-800/60 focus-within:border-sky-500/50">
-                <Search className="text-slate-500 shrink-0 self-center ml-3" size={18} />
+                <Search className="text-slate-500 shrink-0 self-center ml-2 sm:ml-3" size={14} />
                 <input
                   type="text"
                   value={query}
@@ -683,7 +757,7 @@ export function ScholarPage() {
                   onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
                   list="scholar-query-history"
                   placeholder={t('scholar.queryPlaceholder')}
-                  className="flex-1 bg-transparent px-3 py-2.5 text-slate-200 placeholder:text-slate-500 focus:outline-none text-sm"
+                  className="flex-1 bg-transparent px-2 sm:px-3 py-1.5 sm:py-2 text-slate-200 placeholder:text-slate-500 focus:outline-none"
                 />
                 <datalist id="scholar-query-history">
                   {queryHistory.map((item) => (
@@ -692,12 +766,12 @@ export function ScholarPage() {
                 </datalist>
               </div>
             </div>
-            <div className="w-[180px]">
-              <label className="block text-xs font-medium text-slate-400 mb-1">{t('scholar.sourceLabel')}</label>
+            <div className="flex-1 min-w-[120px]">
+              <label className="block font-medium text-slate-400 mb-1">{t('scholar.sourceLabel')}</label>
               <select
                 value={source}
                 onChange={(e) => setSource(e.target.value as ScholarSource)}
-                className="w-full rounded-lg border border-slate-600/80 bg-slate-800/60 px-3 py-2.5 text-slate-200 text-sm focus:outline-none focus:ring-1 focus:ring-sky-500/50"
+                className="w-full rounded-lg border border-slate-600/80 bg-slate-800/60 px-2 sm:px-3 py-1.5 sm:py-2 text-slate-200 focus:outline-none focus:ring-1 focus:ring-sky-500/50"
               >
                 {SOURCE_OPTIONS.map((opt) => (
                   <option key={opt.value} value={opt.value}>
@@ -706,9 +780,9 @@ export function ScholarPage() {
                 ))}
               </select>
             </div>
-            <div className="flex gap-2">
-              <div className="w-24">
-                <label className="block text-xs font-medium text-slate-400 mb-1">{t('scholar.yearStart')}</label>
+            <div className="flex gap-1.5 sm:gap-2">
+              <div className="w-16 sm:w-20">
+                <label className="block font-medium text-slate-400 mb-1 truncate">{t('scholar.yearStart')}</label>
                 <input
                   type="number"
                   min={1900}
@@ -716,11 +790,11 @@ export function ScholarPage() {
                   value={yearStart ?? ''}
                   onChange={(e) => setYearStart(e.target.value === '' ? null : parseInt(e.target.value, 10) || null)}
                   placeholder="—"
-                  className="w-full rounded-lg border border-slate-600/80 bg-slate-800/60 px-3 py-2.5 text-slate-200 text-sm focus:outline-none"
+                  className="w-full rounded-lg border border-slate-600/80 bg-slate-800/60 px-2 py-1.5 sm:py-2 text-slate-200 focus:outline-none"
                 />
               </div>
-              <div className="w-24">
-                <label className="block text-xs font-medium text-slate-400 mb-1">{t('scholar.yearEnd')}</label>
+              <div className="w-16 sm:w-20">
+                <label className="block font-medium text-slate-400 mb-1 truncate">{t('scholar.yearEnd')}</label>
                 <input
                   type="number"
                   min={1900}
@@ -728,12 +802,12 @@ export function ScholarPage() {
                   value={yearEnd ?? ''}
                   onChange={(e) => setYearEnd(e.target.value === '' ? null : parseInt(e.target.value, 10) || null)}
                   placeholder="—"
-                  className="w-full rounded-lg border border-slate-600/80 bg-slate-800/60 px-3 py-2.5 text-slate-200 text-sm focus:outline-none"
+                  className="w-full rounded-lg border border-slate-600/80 bg-slate-800/60 px-2 py-1.5 sm:py-2 text-slate-200 focus:outline-none"
                 />
               </div>
             </div>
-            <div className="w-28">
-              <label className="block text-xs font-medium text-slate-400 mb-1">{t('scholar.limitLabel')}</label>
+            <div className="w-20 sm:w-24">
+              <label className="block font-medium text-slate-400 mb-1">{t('scholar.limitLabel')}</label>
               <div className="flex rounded-lg border border-slate-600/80 bg-slate-800/60 overflow-hidden">
                 <input
                   type="number"
@@ -741,26 +815,22 @@ export function ScholarPage() {
                   step={10}
                   value={limit}
                   onChange={(e) => setLimit(parseInt(e.target.value, 10) || 30)}
-                  className="w-14 flex-1 min-w-0 bg-transparent px-2 py-2.5 text-slate-200 text-sm focus:outline-none"
+                  className="flex-1 min-w-0 bg-transparent px-2 py-1.5 sm:py-2 text-slate-200 focus:outline-none"
                 />
                 <div className="flex flex-col border-l border-slate-600/80">
                   <button
                     type="button"
                     onClick={() => setLimit(limit + 10)}
                     className="flex items-center justify-center p-0.5 text-slate-400 hover:bg-slate-600/60 hover:text-slate-200 transition-colors"
-                    title={t('scholar.limitIncrease')}
-                    aria-label={t('scholar.limitIncrease')}
                   >
-                    <ChevronUp size={16} />
+                    <ChevronUp size={12} />
                   </button>
                   <button
                     type="button"
                     onClick={() => setLimit(Math.max(1, limit - 10))}
                     className="flex items-center justify-center p-0.5 text-slate-400 hover:bg-slate-600/60 hover:text-slate-200 transition-colors"
-                    title={t('scholar.limitDecrease')}
-                    aria-label={t('scholar.limitDecrease')}
                   >
-                    <ChevronDown size={16} />
+                    <ChevronDown size={12} />
                   </button>
                 </div>
               </div>
@@ -768,20 +838,21 @@ export function ScholarPage() {
             <button
               onClick={handleSearch}
               disabled={isSearching}
-              className="flex items-center gap-2 px-4 py-2.5 rounded-lg bg-sky-600 hover:bg-sky-500 disabled:opacity-60 disabled:cursor-not-allowed text-white font-medium text-sm transition-colors"
+              className="flex items-center gap-1.5 sm:gap-2 px-3 sm:px-4 py-1.5 sm:py-2 rounded-lg bg-sky-600 hover:bg-sky-500 disabled:opacity-60 disabled:cursor-not-allowed text-white font-medium transition-colors"
             >
-              {isSearching ? <Loader2 size={18} className="animate-spin" /> : <Search size={18} />}
-              {t('common.search')}
+              {isSearching ? <Loader2 size={16} className="animate-spin" /> : <Search size={16} />}
+              <span>{t('common.search')}</span>
             </button>
           </div>
 
-          <div className="flex flex-wrap items-end gap-3">
-            <div className="w-[160px]">
-              <label className="block text-xs font-medium text-slate-400 mb-1">{t('scholar.libraryLabel')}</label>
+          {/* Row 2: Library, Settings & Options */}
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+            <div className="flex items-center gap-2">
+              <label className="font-medium text-slate-400 whitespace-nowrap">{t('scholar.libraryLabel')}:</label>
               <select
                 value={activeLibraryId ?? ''}
                 onChange={(e) => setActiveLibrary(e.target.value === '' ? null : Number(e.target.value))}
-                className="w-full rounded-lg border border-slate-600/80 bg-slate-800/60 px-3 py-2.5 text-slate-200 text-sm focus:outline-none focus:ring-1 focus:ring-sky-500/50"
+                className="w-[140px] sm:w-[160px] rounded-lg border border-slate-600/80 bg-slate-800/60 px-2 py-1 sm:py-1.5 text-slate-200 focus:outline-none focus:ring-1 focus:ring-sky-500/50"
               >
                 <option value="">{t('scholar.libraryTemporary')}</option>
                 {libraries.map((lib) => (
@@ -792,94 +863,137 @@ export function ScholarPage() {
                 ))}
               </select>
             </div>
+            
             <button
               type="button"
               onClick={() => setShowAdvancedSettings(true)}
-              className="inline-flex items-center gap-2 rounded-lg border border-slate-600/80 bg-slate-800/60 px-3 py-2.5 text-sm font-medium text-slate-200 hover:border-slate-500 hover:bg-slate-800 transition-colors"
+              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-600/80 bg-slate-800/60 px-2 py-1 sm:py-1.5 font-medium text-slate-200 hover:border-slate-500 hover:bg-slate-800 transition-colors"
             >
-              <Settings2 size={16} className="text-sky-300" />
-              {t('scholar.advancedSettingsTitle')}
+              <Settings2 size={14} className="text-sky-300" />
+              <span>{t('scholar.advancedSettingsTitle')}</span>
             </button>
-            <div className="flex flex-wrap items-center gap-2 pt-6">
-              <span className="text-xs text-slate-400 whitespace-nowrap">
-                {t('scholar.headedBrowserToolsLabel')}: {headedBrowserStatusLabel}
-              </span>
+
+            <button
+              type="button"
+              onClick={() => setShowRecommendModal(true)}
+              disabled={!activeLibraryId || activeLibraryId < 0}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-600/80 bg-slate-800/60 px-2 py-1 sm:py-1.5 font-medium text-slate-200 hover:border-slate-500 hover:bg-slate-800 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              <FileSearch size={14} className="text-amber-300" />
+              <span>{t('scholar.recommendButton')}</span>
+            </button>
+
+            <div className="h-4 w-px bg-slate-700/60 mx-1 hidden sm:block"></div>
+
+            <div className="flex items-center gap-1">
               <button
                 type="button"
                 onClick={handleShowHeadedBrowser}
                 disabled={headedBrowserWindowBusy || !headedBrowserWindow?.available}
-                className="inline-flex items-center gap-2 rounded-lg border border-slate-600/80 bg-slate-800/60 px-3 py-2 text-xs font-medium text-slate-200 hover:border-slate-500 hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                className={
+                  headedBrowserWindow?.mode === 'parked'
+                    ? 'p-1 rounded border transition-colors text-slate-200 disabled:opacity-30 ring-2 ring-teal-400/60 bg-teal-900/30 border-teal-600/60'
+                    : 'p-1 rounded border transition-colors text-slate-200 disabled:opacity-30 bg-slate-700/50 border-slate-600/80 hover:bg-slate-600'
+                }
                 title={t('scholar.headedBrowserSummon')}
               >
-                {headedBrowserWindowBusy ? <Loader2 size={14} className="animate-spin" /> : <PanelLeftOpen size={14} className="text-teal-300" />}
-                {t('scholar.headedBrowserSummon')}
+                <PanelLeftOpen size={14} className="text-teal-300" />
               </button>
               <button
                 type="button"
                 onClick={handleParkHeadedBrowser}
                 disabled={headedBrowserWindowBusy || !headedBrowserWindow?.available}
-                className="inline-flex items-center gap-2 rounded-lg border border-slate-600/80 bg-slate-800/60 px-3 py-2 text-xs font-medium text-slate-200 hover:border-slate-500 hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                className={
+                  headedBrowserWindow?.mode === 'visible'
+                    ? 'p-1 rounded border transition-colors text-slate-200 disabled:opacity-30 ring-2 ring-slate-400/60 bg-slate-700/80 border-slate-500/60'
+                    : 'p-1 rounded border transition-colors text-slate-200 disabled:opacity-30 bg-slate-700/50 border-slate-600/80 hover:bg-slate-600'
+                }
                 title={t('scholar.headedBrowserPark')}
               >
-                {headedBrowserWindowBusy ? <Loader2 size={14} className="animate-spin" /> : <PanelLeftClose size={14} className="text-slate-300" />}
-                {t('scholar.headedBrowserPark')}
+                <PanelLeftClose size={14} className="text-slate-300" />
               </button>
             </div>
-            <label className="flex items-center gap-2 cursor-pointer select-none pt-6">
-              <input
-                type="checkbox"
-                checked={smartOptimize}
-                onChange={(e) => setSmartOptimize(e.target.checked)}
-                className="rounded border-slate-500 bg-slate-800 text-teal-500 focus:ring-teal-500/50"
-              />
-      <ScholarAdvancedSettingsModal
-        open={showAdvancedSettings}
-        onClose={() => setShowAdvancedSettings(false)}
-      />
-              <Sparkles size={16} className="text-teal-400 shrink-0" />
-              <span className="text-xs text-slate-400 whitespace-nowrap">{t('scholar.smartOptimize')}</span>
-            </label>
-            {(source === 'google_scholar' || source === 'google') && (
-              <>
-                <label className="flex items-center gap-2 cursor-pointer select-none pt-6" title={t('sidebar.useSerpapiHelp')}>
+
+            <div className="flex items-center gap-3">
+              <label className="flex items-center gap-1.5 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={smartOptimize}
+                  onChange={(e) => setSmartOptimize(e.target.checked)}
+                  className="rounded border-slate-500 bg-slate-800 text-teal-500 focus:ring-teal-500/50 w-3.5 h-3.5"
+                />
+                <Sparkles size={14} className="text-teal-400 shrink-0" />
+                <span className="text-slate-400 whitespace-nowrap">{t('scholar.smartOptimize')}</span>
+              </label>
+              
+              {smartOptimize && (
+                <label className="flex items-center gap-1.5 cursor-pointer select-none" title={t('scholar.batchAllSourcesHint')}>
                   <input
                     type="checkbox"
-                    checked={useSerpapi}
-                    onChange={(e) => setUseSerpapi(e.target.checked)}
-                    className="rounded border-slate-500 bg-slate-800 text-teal-500 focus:ring-teal-500/50"
+                    checked={batchAllSources}
+                    onChange={(e) => setBatchAllSources(e.target.checked)}
+                    className="rounded border-slate-500 bg-slate-800 text-purple-500 focus:ring-purple-500/50 w-3.5 h-3.5"
                   />
-                  <span className="text-xs text-slate-400 whitespace-nowrap">{t('sidebar.useSerpapi')}</span>
+                  <Layers size={14} className="text-purple-400 shrink-0" />
+                  <span className="text-slate-400 whitespace-nowrap">{t('scholar.batchAllSources')}</span>
                 </label>
-                {useSerpapi && (
-                  <div className="pt-6">
+              )}
+
+              {!(smartOptimize && batchAllSources) && (source === 'google_scholar' || source === 'google') && (
+                <div className="flex items-center gap-2">
+                  <label className="flex items-center gap-1.5 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={useSerpapi}
+                      onChange={(e) => setUseSerpapi(e.target.checked)}
+                      className="rounded border-slate-500 bg-slate-800 text-teal-500 focus:ring-teal-500/50 w-3.5 h-3.5"
+                    />
+                    <span className="text-slate-400 whitespace-nowrap">{t('sidebar.useSerpapi')}</span>
+                  </label>
+                  {useSerpapi && (
                     <select
                       value={serpapiRatio}
                       onChange={(e) => setSerpapiRatio(Number(e.target.value))}
-                      className="rounded-lg border border-slate-600/80 bg-slate-800/60 px-2.5 py-2 text-slate-200 text-xs focus:outline-none focus:ring-1 focus:ring-sky-500/50"
-                      title={t('sidebar.serpapiRatio')}
+                      className="rounded border border-slate-600/80 bg-slate-800/60 px-1.5 py-0.5 text-slate-200 focus:outline-none"
                     >
                       {[0, 25, 33, 50, 67, 75, 100].map((v) => (
-                        <option key={v} value={v}>{t('sidebar.serpapiRatio')} {v}%</option>
+                        <option key={v} value={v}>{v}%</option>
                       ))}
                     </select>
-                  </div>
-                )}
-              </>
-            )}
-            <div className="pt-6">
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div className="flex-1"></div>
+
+            <div className="flex items-center gap-2">
               <button
                 type="button"
                 onClick={() => setShowNewLibraryModal(true)}
-                className="flex items-center gap-2 px-3 py-2.5 rounded-lg border border-slate-600/80 bg-slate-800/60 text-slate-300 hover:bg-slate-700/60 hover:text-slate-200 text-sm"
+                className="flex items-center gap-1.5 px-2.5 py-1 sm:py-1.5 rounded-lg border border-slate-600/80 bg-slate-800/60 text-slate-300 hover:bg-slate-700 hover:text-slate-200 transition-colors"
               >
-                <FolderPlus size={18} />
-                {t('scholar.libraryNew')}
+                <FolderPlus size={14} />
+                <span>{t('scholar.libraryNew')}</span>
+              </button>
+              <button
+                type="button"
+                onClick={handlePickLibraryPdfFiles}
+                disabled={importingLibraryPdfs}
+                className="flex items-center gap-1.5 px-2.5 py-1 sm:py-1.5 rounded-lg border border-slate-600/80 bg-slate-800/60 text-slate-300 hover:bg-slate-700 hover:text-slate-200 disabled:opacity-50 transition-colors"
+              >
+                {importingLibraryPdfs ? <Loader2 size={14} className="animate-spin" /> : <Upload size={14} />}
+                <span>{t('scholar.libraryImportPdf')}</span>
               </button>
             </div>
           </div>
         </div>
+      <ScholarAdvancedSettingsModal
+        open={showAdvancedSettings}
+        onClose={() => setShowAdvancedSettings(false)}
+      />
 
-        {searchError && (
+      {searchError && (
           <div className="flex items-center gap-2 rounded-lg border border-red-500/40 bg-red-500/10 px-4 py-2 text-red-200 text-sm">
             <AlertCircle size={18} />
             {searchError}
@@ -889,6 +1003,19 @@ export function ScholarPage() {
           <div className="flex items-center gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-2 text-amber-200 text-sm">
             <AlertCircle size={18} />
             {libraryError}
+          </div>
+        )}
+        {libraryImportSummary && (
+          <div className="rounded-lg border border-slate-600/70 bg-slate-800/50 px-4 py-3 text-xs text-slate-300">
+            {t('scholar.libraryImportResultLine', {
+              total: libraryImportSummary.total_files,
+              imported: libraryImportSummary.imported,
+              linked: libraryImportSummary.linked_existing,
+              renamed: libraryImportSummary.renamed,
+              skipped: libraryImportSummary.skipped_duplicates,
+              invalid: libraryImportSummary.invalid_pdf,
+              noDoi: libraryImportSummary.no_doi,
+            })}
           </div>
         )}
       </div>
@@ -992,7 +1119,7 @@ export function ScholarPage() {
                       {t('scholar.filtersApplyToCatalog')}
                     </p>
                   )}
-                  <div className="flex items-center gap-2 p-2 border-b border-slate-700/60">
+                  <div className="flex items-center gap-1.5 p-1.5 border-b border-slate-700/60">
                     <button
                       type="button"
                       onClick={async () => {
@@ -1010,10 +1137,10 @@ export function ScholarPage() {
                         }
                       }}
                       disabled={libraryPapers.length === 0 || libraryLoading}
-                      className="flex-1 flex items-center justify-center gap-2 px-3 py-2 rounded-lg bg-sky-600 hover:bg-sky-500 disabled:opacity-60 text-white text-sm font-medium"
+                      className="flex-1 flex items-center justify-center gap-1 px-2 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 disabled:opacity-60 text-white text-xs font-medium"
                     >
-                      <Download size={16} />
-                      {t('scholar.libraryDownloadAll')}
+                      <Download size={14} />
+                      <span className="truncate">{t('scholar.libraryDownloadAll')}</span>
                     </button>
                     <button
                       type="button"
@@ -1037,16 +1164,51 @@ export function ScholarPage() {
                         }
                       }}
                       disabled={libraryPapers.length === 0 || libraryLoading || extractDoiDedupLoading}
-                      className="flex items-center justify-center gap-2 px-3 py-2 rounded-lg border border-slate-500/60 bg-slate-700/50 hover:bg-slate-600/50 disabled:opacity-60 text-slate-200 text-sm font-medium"
+                      className="flex items-center justify-center gap-1 px-2 py-1.5 rounded-lg border border-slate-500/60 bg-slate-700/50 hover:bg-slate-600/50 disabled:opacity-60 text-slate-200 text-xs font-medium"
                       title={t('scholar.libraryExtractDoiDedup')}
                     >
                       {extractDoiDedupLoading ? (
-                        <Loader2 size={16} className="animate-spin" />
+                        <Loader2 size={14} className="animate-spin" />
                       ) : (
-                        <FileSearch size={16} />
+                        <FileSearch size={14} />
                       )}
-                      <span className="hidden sm:inline">{t('scholar.libraryExtractDoiDedup')}</span>
+                      <span>{t('scholar.libraryExtractDoiDedup')}</span>
                     </button>
+                    {activeLibraryId != null && activeLibraryId >= 0 && (
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          setRefreshMetadataLoading(true);
+                          try {
+                            const stats = await refreshMetadataFromCrossref();
+                            if (stats != null) {
+                              addToast(
+                                t('scholar.libraryRefreshMetadataSuccess', {
+                                  updated: stats.updated,
+                                  skipped: stats.skipped_no_doi,
+                                  failed: stats.failed,
+                                }),
+                                'success',
+                              );
+                            } else {
+                              addToast(t('scholar.downloadFailed'), 'error');
+                            }
+                          } finally {
+                            setRefreshMetadataLoading(false);
+                          }
+                        }}
+                        disabled={libraryPapers.length === 0 || libraryLoading || refreshMetadataLoading}
+                        className="flex items-center justify-center gap-1 px-2 py-1.5 rounded-lg border border-slate-500/60 bg-slate-700/50 hover:bg-slate-600/50 disabled:opacity-60 text-slate-200 text-xs font-medium"
+                        title={t('scholar.libraryRefreshMetadata')}
+                      >
+                        {refreshMetadataLoading ? (
+                          <Loader2 size={14} className="animate-spin" />
+                        ) : (
+                          <RefreshCcw size={14} />
+                        )}
+                        <span>{t('scholar.libraryRefreshMetadata')}</span>
+                      </button>
+                    )}
                     {activeLibraryId != null && activeLibraryId >= 0 && (
                       <button
                         type="button"
@@ -1072,15 +1234,15 @@ export function ScholarPage() {
                           }
                         }}
                         disabled={libraryLoading || pdfRenameDedupLoading}
-                        className="flex items-center justify-center gap-2 px-3 py-2 rounded-lg border border-slate-500/60 bg-slate-700/50 hover:bg-slate-600/50 disabled:opacity-60 text-slate-200 text-sm font-medium"
+                        className="flex items-center justify-center gap-1 px-2 py-1.5 rounded-lg border border-slate-500/60 bg-slate-700/50 hover:bg-slate-600/50 disabled:opacity-60 text-slate-200 text-xs font-medium"
                         title={t('scholar.pdfRenameDedup')}
                       >
                         {pdfRenameDedupLoading ? (
-                          <Loader2 size={16} className="animate-spin" />
+                          <Loader2 size={14} className="animate-spin" />
                         ) : (
-                          <RefreshCw size={16} />
+                          <RefreshCw size={14} />
                         )}
-                        <span className="hidden sm:inline">{t('scholar.pdfRenameDedup')}</span>
+                        <span>{t('scholar.pdfRenameDedup')}</span>
                       </button>
                     )}
                     <button
@@ -1097,14 +1259,14 @@ export function ScholarPage() {
                           }
                         }
                       }}
-                      className="p-2 rounded-lg text-slate-400 hover:bg-red-500/20 hover:text-red-400"
+                      className="p-1.5 rounded-lg text-slate-400 hover:bg-red-500/20 hover:text-red-400"
                       title={
                         libraries.find((l) => l.id === activeLibraryId)?.is_temporary
                           ? t('scholar.libraryClear')
                           : t('scholar.libraryDelete')
                       }
                     >
-                      <Trash2 size={16} />
+                      <Trash2 size={14} />
                     </button>
                   </div>
                   {/* 文献目录内排序与筛选栏 */}
@@ -1247,10 +1409,17 @@ export function ScholarPage() {
                               {(p.venue || p.impact_factor != null) && (
                                 <p className="text-xs text-slate-400 mt-0.5">
                                   {p.venue ?? ''}
-                                  {p.impact_factor != null && ` · IF ${p.impact_factor}${p.jif_quartile ? ` ${p.jif_quartile}` : ''}`}
+                                  {p.impact_factor != null
+                                    ? ` · IF ${p.impact_factor}${p.jif_quartile ? ` ${p.jif_quartile}` : ''}`
+                                    : (p.venue ? ` · IF ${t('scholar.impactFactorNA')}` : '')}
                                 </p>
                               )}
                               <div className="flex flex-wrap items-center gap-1.5 mt-1">
+                                {p.in_collection && (
+                                  <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-emerald-600/50 text-emerald-200" title={p.collection_paper_id ?? undefined}>
+                                    {t('scholar.inCurrentCollection')}
+                                  </span>
+                                )}
                                 {p.source && (
                                   <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-600/60 text-slate-300">
                                     {p.source.replace(/_/g, ' ')}
@@ -1622,6 +1791,15 @@ export function ScholarPage() {
                     {filteredResults.length !== results.length && ` / ${results.length}`}{' '}
                     {t('scholar.resultsCount')}
                   </span>
+                  {batchSourceCounts && (
+                    <span className="flex items-center gap-1 text-xs text-purple-400" title={t('scholar.batchSourceCountsHint')}>
+                      <Layers size={12} />
+                      {Object.entries(batchSourceCounts)
+                        .filter(([, n]) => n > 0)
+                        .map(([src, n]) => `${src.replace('_', ' ')}: ${n}`)
+                        .join(' · ')}
+                    </span>
+                  )}
                   {activeFilterCount > 0 && (
                     <span className="text-xs text-sky-400" title={t('scholar.filtersActive')}>
                       ({activeFilterCount})
@@ -1723,7 +1901,7 @@ export function ScholarPage() {
                                   {m.jif_quartile ? ` ${m.jif_quartile}` : ''}
                                 </span>
                               ) : (
-                                '—'
+                                t('scholar.impactFactorNA')
                               )}
                             </td>
                             <td className="py-2 px-3 text-slate-500 text-xs">{m.source}</td>
@@ -1795,7 +1973,9 @@ export function ScholarPage() {
                               {(m.venue || m.impact_factor != null) && (
                                 <p className="text-xs text-slate-400 mt-0.5">
                                   {m.venue ?? ''}
-                                  {m.impact_factor != null && ` · IF ${m.impact_factor}${m.jif_quartile ? ` ${m.jif_quartile}` : ''}`}
+                                  {m.impact_factor != null
+                                    ? ` · IF ${m.impact_factor}${m.jif_quartile ? ` ${m.jif_quartile}` : ''}`
+                                    : (m.venue ? ` · IF ${t('scholar.impactFactorNA')}` : '')}
                                 </p>
                               )}
                               {m.doi && (
@@ -1911,11 +2091,16 @@ export function ScholarPage() {
                 {taskIds.map((taskId) => {
                   const task = downloadTasks[taskId];
                   if (!task) return null;
-                  const payload = task.payload as { total?: number; completed?: number; failed?: number };
+                  const payload = task.payload as { total?: number; completed?: number; failed?: number; stage?: string; paper_id?: string };
                   const total = payload?.total ?? 1;
                   const completed = payload?.completed ?? 0;
                   const isDone = task.status === 'completed' || task.status === 'error';
-                  const paperId = (task.payload as { paper_id?: string })?.paper_id;
+                  const paperId = payload?.paper_id;
+                  const stage = payload?.stage;
+                  const runningLabel =
+                    task.status === 'running' && (stage === 'INGEST_QUEUED' || stage === 'INGESTING')
+                      ? t('scholar.taskStage.ingesting')
+                      : t(`scholar.taskStatus.${task.status}`);
                   return (
                     <div
                       key={taskId}
@@ -1927,7 +2112,7 @@ export function ScholarPage() {
                             {taskId}
                           </p>
                           <p className="text-slate-200 mt-0.5">
-                            {t(`scholar.taskStatus.${task.status}`)}
+                            {runningLabel}
                             {total > 1 && ` · ${completed}/${total}`}
                           </p>
                           {task.error_message && (
@@ -1971,6 +2156,17 @@ export function ScholarPage() {
           }}
           pdfUrl={'pdfUrl' in pdfView && pdfView.pdfUrl ? pdfView.pdfUrl : getPdfViewUrl(pdfView.paperId)}
           title={pdfView.title}
+        />
+      )}
+
+      {showRecommendModal && activeLibraryId && activeLibraryId > 0 && (
+        <ScholarLibraryRecommendModal
+          open={showRecommendModal}
+          onClose={() => setShowRecommendModal(false)}
+          libraryId={activeLibraryId}
+          collection={currentCollection ?? ''}
+          libraryPapers={libraryPapers}
+          filteredPaperIds={filteredLibraryPapers.map((p) => p.id)}
         />
       )}
 

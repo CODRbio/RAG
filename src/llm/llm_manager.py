@@ -48,7 +48,7 @@ except Exception:
 # ============================================================
 
 ANTHROPIC_VERSION = "2023-06-01"
-DEFAULT_TIMEOUT = 120  # seconds
+DEFAULT_TIMEOUT = 180  # seconds; 与 config performance.llm.timeout_seconds 一致，无 config 时使用
 LOG_DIR_NAME = "llm_raw"
 LOG_MAX_AGE_DAYS = 10
 LOG_MAX_TOTAL_MB = 100
@@ -175,6 +175,238 @@ def messages_digest(messages: List[Dict[str, Any]], max_len: int = MESSAGE_DIGES
             truncated = content[:max_len] + ("..." if len(content) > max_len else "")
             parts.append(f"[{role}] {truncated}")
     return "\n".join(parts)
+
+
+def _is_openai_api(base_url: str) -> bool:
+    return "api.openai.com" in (base_url or "")
+
+
+def _is_gemini_api(base_url: str) -> bool:
+    return "generativelanguage.googleapis.com" in (base_url or "")
+
+
+def _gemini_native_base_url(base_url: str) -> str:
+    root = (base_url or "").rstrip("/")
+    if root.endswith("/openai"):
+        root = root[: -len("/openai")]
+    return root
+
+
+def _is_qwen_api(base_url: str) -> bool:
+    return "dashscope.aliyuncs.com" in (base_url or "") or "dashscope-intl.aliyuncs.com" in (base_url or "")
+
+
+def _is_perplexity_api(base_url: str) -> bool:
+    return "api.perplexity.ai" in (base_url or "")
+
+
+def _qwen_responses_url(base_url: str) -> str:
+    root = (base_url or "").rstrip("/")
+    if root.endswith("/compatible-mode/v1"):
+        prefix = root[: -len("/compatible-mode/v1")]
+        return f"{prefix}/api/v2/apps/protocols/compatible-mode/v1/responses"
+    return f"{root}/responses"
+
+
+def _is_openai_reasoning_model(model: Optional[str]) -> bool:
+    m = (model or "").lower()
+    return (
+        m.startswith("gpt-5")
+        or m.startswith("o1")
+        or m.startswith("o3")
+        or m.startswith("o4")
+    )
+
+
+def _apply_openai_compat_best_practices(
+    payload: Dict[str, Any],
+    *,
+    base_url: str,
+    provider_name: str,
+    model: str,
+    has_tools: bool,
+) -> Dict[str, Any]:
+    """
+    Normalize OpenAI-compatible payloads according to provider/model capabilities.
+
+    Current policy:
+    - OpenAI GPT reasoning models: when using /chat/completions with tools, drop
+      reasoning_effort because OpenAI requires Responses API for that combo.
+    - OpenAI non-reasoning models: drop reasoning_effort entirely.
+    - Gemini OpenAI-compatible API: normalize `minimal` -> `low` for
+      reasoning_effort to avoid known compatibility quirks.
+    """
+    out = dict(payload)
+
+    if _is_perplexity_api(base_url):
+        allowed_keys = {
+            "model",
+            "messages",
+            "max_tokens",
+            "stream",
+            "stop",
+            "temperature",
+            "top_p",
+            "response_format",
+            "web_search_options",
+            "search_mode",
+            "return_images",
+            "return_related_questions",
+            "enable_search_classifier",
+            "disable_search",
+            "search_domain_filter",
+            "search_language_filter",
+            "search_recency_filter",
+            "search_after_date_filter",
+            "search_before_date_filter",
+            "last_updated_before_filter",
+            "last_updated_after_filter",
+            "image_format_filter",
+            "image_domain_filter",
+            "stream_mode",
+            "reasoning_effort",
+        }
+        dropped_keys = sorted(k for k in out.keys() if k not in allowed_keys)
+        if dropped_keys:
+            _log.info(
+                "Perplexity compat: dropped unsupported fields provider=%s model=%s keys=%s",
+                provider_name,
+                model,
+                dropped_keys,
+            )
+        out = {k: v for k, v in out.items() if k in allowed_keys}
+
+        messages = []
+        for msg in out.get("messages") or []:
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role") or "user")
+            if role not in {"system", "user", "assistant", "tool"}:
+                role = "user"
+            messages.append({"role": role, "content": msg.get("content")})
+        out["messages"] = messages
+
+        response_format = out.get("response_format")
+        if isinstance(response_format, dict) and response_format.get("type") == "json_object":
+            out["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "schema": {"type": "object"},
+                },
+            }
+            _log.info(
+                "Perplexity compat: upgraded response_format json_object -> json_schema for provider=%s model=%s",
+                provider_name,
+                model,
+            )
+
+        max_tokens = out.get("max_tokens")
+        try:
+            if max_tokens is not None:
+                out["max_tokens"] = min(int(max_tokens), 128_000)
+        except Exception:
+            out.pop("max_tokens", None)
+
+        return out
+
+    reasoning_effort = out.get("reasoning_effort")
+    if not reasoning_effort:
+        return out
+
+    if _is_openai_api(base_url):
+        if not _is_openai_reasoning_model(model):
+            out.pop("reasoning_effort", None)
+            _log.info(
+                "OpenAI compat: dropped reasoning_effort for non-reasoning model=%s provider=%s",
+                model,
+                provider_name,
+            )
+            return out
+        if has_tools:
+            out.pop("reasoning_effort", None)
+            _log.info(
+                "OpenAI compat: dropped reasoning_effort for model=%s provider=%s because /chat/completions + tools is incompatible; Responses API is preferred",
+                model,
+                provider_name,
+            )
+            return out
+
+    if _is_gemini_api(base_url):
+        eff = str(reasoning_effort).strip().lower()
+        if eff == "minimal":
+            out["reasoning_effort"] = "low"
+            _log.info(
+                "Gemini compat: normalized reasoning_effort minimal -> low for model=%s provider=%s",
+                model,
+                provider_name,
+            )
+
+    return out
+
+
+def _should_use_openai_responses_api(
+    *,
+    base_url: str,
+    model: str,
+    has_tools: bool,
+    params: Dict[str, Any],
+    response_model: Optional[Any],
+) -> bool:
+    if not _is_openai_api(base_url):
+        return False
+    if response_model is not None:
+        return False
+    if not _is_openai_reasoning_model(model):
+        return False
+    return bool(has_tools or params.get("reasoning_effort"))
+
+
+def _should_use_qwen_responses_api(
+    *,
+    base_url: str,
+    has_tools: bool,
+    params: Dict[str, Any],
+    response_model: Optional[Any],
+) -> bool:
+    if not _is_qwen_api(base_url):
+        return False
+    if response_model is not None:
+        return False
+    return bool(has_tools or params.get("enable_thinking") is True)
+
+
+def _can_use_gemini_native_api(
+    *,
+    base_url: str,
+    messages: List[Dict[str, Any]],
+    response_model: Optional[Any],
+) -> bool:
+    if not _is_gemini_api(base_url):
+        return False
+    if response_model is not None:
+        return False
+    for msg in messages:
+        content = msg.get("content")
+        if content is None or isinstance(content, str):
+            continue
+        return False
+    return True
+
+
+def _is_claude_opus_46(model: Optional[str]) -> bool:
+    return "claude-opus-4-6" in (model or "").lower()
+
+
+def _infer_anthropic_adaptive_effort(budget_tokens: Optional[int]) -> str:
+    try:
+        budget = int(budget_tokens or 0)
+    except Exception:
+        budget = 0
+    if budget <= 8000:
+        return "low"
+    if budget <= 16000:
+        return "medium"
+    return "high"
 
 
 # ============================================================
@@ -345,7 +577,14 @@ class OpenAICompatProvider(Provider):
         self._session = requests.Session()
 
     def request(self, payload: Dict[str, Any], timeout: Optional[int] = None) -> Dict[str, Any]:
-        url = f"{self.config.base_url.rstrip('/')}/chat/completions"
+        api_mode = str(payload.pop("_api_mode", "chat_completions"))
+        if api_mode == "responses":
+            if _is_qwen_api(self.config.base_url):
+                url = _qwen_responses_url(self.config.base_url)
+            else:
+                url = f"{self.config.base_url.rstrip('/')}/responses"
+        else:
+            url = f"{self.config.base_url.rstrip('/')}/chat/completions"
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.config.api_key}",
@@ -355,7 +594,10 @@ class OpenAICompatProvider(Provider):
             self._session, "POST", url, timeout,
             headers=headers, json=payload,
         )
-        return resp.json()
+        data = resp.json()
+        if isinstance(data, dict):
+            data["_api_mode"] = api_mode
+        return data
 
 
 class AnthropicProvider(Provider):
@@ -382,6 +624,100 @@ class AnthropicProvider(Provider):
             headers=headers, json=payload,
         )
         return resp.json()
+
+
+class GeminiNativeProvider(Provider):
+    """
+    Gemini native API provider with automatic fallback to OpenAI-compatible mode.
+    """
+
+    def __init__(self, config: ProviderConfig):
+        super().__init__(config)
+        self._session = requests.Session()
+        self._fallback = OpenAICompatProvider(config)
+
+    @staticmethod
+    def _adapt_native_response(raw: Dict[str, Any]) -> Dict[str, Any]:
+        candidates = raw.get("candidates") or []
+        usage_meta = raw.get("usageMetadata") or raw.get("usage_metadata") or {}
+        content_text_parts: List[str] = []
+        tool_calls: List[Dict[str, Any]] = []
+        finish_reason = ""
+        if candidates:
+            cand = candidates[0] or {}
+            finish_reason = str(cand.get("finishReason") or cand.get("finish_reason") or "").lower()
+            content = cand.get("content") or {}
+            for part in content.get("parts") or []:
+                if not isinstance(part, dict):
+                    continue
+                if isinstance(part.get("text"), str):
+                    content_text_parts.append(part.get("text", ""))
+                if isinstance(part.get("functionCall"), dict):
+                    fc = part.get("functionCall") or {}
+                    tool_calls.append(
+                        {
+                            "id": fc.get("id") or fc.get("callId") or f"gemini_call_{len(tool_calls)}",
+                            "type": "function",
+                            "function": {
+                                "name": fc.get("name", ""),
+                                "arguments": json.dumps(fc.get("args") or {}, ensure_ascii=False),
+                            },
+                        }
+                    )
+        return {
+            "_api_mode": "gemini_native",
+            "usage": {
+                "prompt_tokens": usage_meta.get("promptTokenCount") or usage_meta.get("prompt_token_count"),
+                "completion_tokens": usage_meta.get("candidatesTokenCount") or usage_meta.get("candidates_token_count"),
+                "total_tokens": usage_meta.get("totalTokenCount") or usage_meta.get("total_token_count"),
+                "reasoning_tokens": usage_meta.get("thoughtsTokenCount") or usage_meta.get("thoughts_token_count"),
+            },
+            "choices": [
+                {
+                    "finish_reason": "tool_calls" if tool_calls else finish_reason,
+                    "message": {
+                        "role": "assistant",
+                        "content": "".join(content_text_parts),
+                        "tool_calls": tool_calls,
+                    },
+                }
+            ],
+            "candidates": candidates,
+            "raw_native": raw,
+        }
+
+    def request(self, payload: Dict[str, Any], timeout: Optional[int] = None) -> Dict[str, Any]:
+        if str(payload.get("_api_mode") or "") != "gemini_native":
+            return self._fallback.request(payload, timeout=timeout)
+
+        fallback_payload = payload.pop("_fallback_payload", None)
+        api_mode = payload.pop("_api_mode", None)
+        model = str(payload.pop("_model_id", payload.get("model") or ""))
+        payload.pop("model", None)
+        url = f"{_gemini_native_base_url(self.config.base_url)}/models/{model}:generateContent"
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": self.config.api_key,
+        }
+        timeout = int(timeout or _llm_perf_timeout())
+        try:
+            resp = _request_with_retry(
+                self._session,
+                "POST",
+                url,
+                timeout,
+                headers=headers,
+                json=payload,
+            )
+            data = resp.json()
+            adapted = self._adapt_native_response(data)
+            adapted["_api_mode"] = api_mode or "gemini_native"
+            return adapted
+        except Exception as e:
+            if fallback_payload:
+                _log.warning("Gemini native request failed, falling back to compat mode: %s", e)
+                return self._fallback.request(fallback_payload, timeout=timeout)
+            raise
 
 
 # ============================================================
@@ -457,6 +793,28 @@ def _normalize_openai_compat(raw: Dict[str, Any]) -> Dict[str, Any]:
     search_results = raw.get("search_results")
     if search_results is not None and isinstance(search_results, list):
         result["search_results"] = search_results
+
+    if (raw.get("_api_mode") or "") == "responses" or raw.get("output"):
+        text_parts = []
+        reasoning_parts = []
+        for item in raw.get("output") or []:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if item_type == "message":
+                for block in item.get("content") or []:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") in ("output_text", "text"):
+                        text_parts.append(block.get("text", ""))
+            elif item_type == "reasoning":
+                for block in item.get("summary") or []:
+                    if isinstance(block, dict) and block.get("type") == "summary_text":
+                        reasoning_parts.append(block.get("text", ""))
+        result["final_text"] = "".join(text_parts) if text_parts else (raw.get("output_text") or None)
+        if reasoning_parts:
+            result["reasoning_text"] = "".join(reasoning_parts)
+        return result
 
     choices = raw.get("choices") or []
     if not choices:
@@ -699,7 +1057,13 @@ class HTTPChatClient(BaseChatClient):
         if is_anthropic:
             payload = self._build_anthropic_payload(messages, resolved_model, merged_params, tools=tools)
         else:
-            payload = self._build_openai_payload(messages, resolved_model, merged_params, tools=tools)
+            payload = self._build_openai_payload(
+                messages,
+                resolved_model,
+                merged_params,
+                tools=tools,
+                response_model=response_model,
+            )
 
         # 发送请求（可选并发限流）
         start_time = time.time()
@@ -803,7 +1167,13 @@ class HTTPChatClient(BaseChatClient):
                 retry_payload = (
                     self._build_anthropic_payload(retry_msgs, resolved_model, merged_params, tools=tools)
                     if is_anthropic
-                    else self._build_openai_payload(retry_msgs, resolved_model, merged_params, tools=tools)
+                    else self._build_openai_payload(
+                        retry_msgs,
+                        resolved_model,
+                        merged_params,
+                        tools=tools,
+                        response_model=response_model,
+                    )
                 )
                 try:
                     if self._semaphore:
@@ -833,18 +1203,274 @@ class HTTPChatClient(BaseChatClient):
         default = self.config.default_model
         return self.config.models.get(default, default)
 
-    def _build_openai_payload(
+    def _build_openai_responses_payload(
         self,
         messages: List[Dict[str, Any]],
         model: str,
         params: Dict[str, Any],
         tools: Optional[List] = None,
     ) -> Dict[str, Any]:
-        """构建 OpenAI-compatible 请求 payload"""
-        # Sanitize messages for stricter OpenAI-compatible providers (e.g. Moonshot/Kimi):
-        # - Never send content=null
-        # - Ensure assistant.tool_calls[*].id/function.arguments are valid
-        # - Ensure tool messages carry a valid tool_call_id
+        def _to_text(v: Any) -> str:
+            if v is None:
+                return ""
+            if isinstance(v, str):
+                return v
+            try:
+                return json.dumps(v, ensure_ascii=False, default=str)
+            except Exception:
+                return str(v)
+
+        instructions_parts: List[str] = []
+        input_items: List[Dict[str, Any]] = []
+        pending_tool_ids: List[str] = []
+        auto_idx = 0
+        for msg in messages:
+            role = str(msg.get("role") or "")
+            content = _to_text(msg.get("content"))
+            if role == "system":
+                if content:
+                    instructions_parts.append(content)
+                continue
+            if role == "assistant" and isinstance(msg.get("tool_calls"), list):
+                if content:
+                    input_items.append({"role": "assistant", "content": content})
+                for tc in msg.get("tool_calls") or []:
+                    if not isinstance(tc, dict):
+                        continue
+                    fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                    tc_id = str(tc.get("id") or "") or f"call_auto_{auto_idx}"
+                    if not tc.get("id"):
+                        auto_idx += 1
+                    fn_name = str(fn.get("name") or tc.get("name") or "")
+                    fn_args = fn.get("arguments", {})
+                    if not isinstance(fn_args, str):
+                        fn_args = _to_text(fn_args)
+                    input_items.append(
+                        {
+                            "type": "function_call",
+                            "call_id": tc_id,
+                            "name": fn_name,
+                            "arguments": fn_args,
+                        }
+                    )
+                    pending_tool_ids.append(tc_id)
+                continue
+            if role == "tool":
+                tc_id = str(msg.get("tool_call_id") or "")
+                if not tc_id:
+                    tc_id = pending_tool_ids.pop(0) if pending_tool_ids else f"call_auto_{auto_idx}"
+                    auto_idx += 1
+                input_items.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": tc_id,
+                        "output": content,
+                    }
+                )
+                continue
+            input_items.append({"role": role, "content": content})
+
+        payload: Dict[str, Any] = {
+            "_api_mode": "responses",
+            "model": model,
+            "input": input_items,
+        }
+        if instructions_parts:
+            payload["instructions"] = "\n\n".join(p for p in instructions_parts if p.strip())
+
+        if tools:
+            from src.llm.tools import ToolDef
+            resp_tools = []
+            for t in tools:
+                if isinstance(t, ToolDef):
+                    resp_tools.append(
+                        {
+                            "type": "function",
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.parameters,
+                        }
+                    )
+                elif isinstance(t, dict):
+                    if t.get("type") == "function" and isinstance(t.get("function"), dict):
+                        fn = t.get("function") or {}
+                        resp_tools.append(
+                            {
+                                "type": "function",
+                                "name": fn.get("name"),
+                                "description": fn.get("description", ""),
+                                "parameters": fn.get("parameters", {}),
+                            }
+                        )
+                    else:
+                        resp_tools.append(t)
+            payload["tools"] = resp_tools
+
+        for key, value in params.items():
+            if key == "reasoning_effort":
+                payload["reasoning"] = {"effort": value}
+            elif key == "max_completion_tokens":
+                payload["max_output_tokens"] = value
+            elif key == "max_tokens":
+                payload["max_output_tokens"] = value
+            elif key == "response_format":
+                # Keep structured-output on chat.completions for now.
+                continue
+            else:
+                payload[key] = value
+
+        if "max_output_tokens" not in payload and "max_tokens" in params:
+            payload["max_output_tokens"] = params["max_tokens"]
+
+        if payload.get("enable_thinking") is True and "thinking_budget" not in payload:
+            cap = int(payload.get("max_output_tokens") or 65_536)
+            payload["thinking_budget"] = max(25_000, cap - 8_000)
+
+        return payload
+
+    def _build_gemini_native_payload(
+        self,
+        messages: List[Dict[str, Any]],
+        model: str,
+        params: Dict[str, Any],
+        tools: Optional[List] = None,
+        *,
+        fallback_payload: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        def _to_text(v: Any) -> str:
+            if v is None:
+                return ""
+            if isinstance(v, str):
+                return v
+            try:
+                return json.dumps(v, ensure_ascii=False, default=str)
+            except Exception:
+                return str(v)
+
+        system_parts: List[Dict[str, Any]] = []
+        contents: List[Dict[str, Any]] = []
+        tool_id_to_name: Dict[str, str] = {}
+        auto_idx = 0
+        for msg in messages:
+            role = str(msg.get("role") or "")
+            content = _to_text(msg.get("content"))
+            if role == "system":
+                if content:
+                    system_parts.append({"text": content})
+                continue
+            if role == "assistant" and isinstance(msg.get("tool_calls"), list):
+                parts: List[Dict[str, Any]] = []
+                if content:
+                    parts.append({"text": content})
+                for tc in msg.get("tool_calls") or []:
+                    if not isinstance(tc, dict):
+                        continue
+                    fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                    tc_id = str(tc.get("id") or "") or f"gemini_call_{auto_idx}"
+                    if not tc.get("id"):
+                        auto_idx += 1
+                    fn_name = str(fn.get("name") or tc.get("name") or "")
+                    fn_args = fn.get("arguments", {})
+                    if isinstance(fn_args, str):
+                        try:
+                            fn_args = json.loads(fn_args)
+                        except Exception:
+                            fn_args = {"_raw": fn_args}
+                    tool_id_to_name[tc_id] = fn_name
+                    parts.append({"functionCall": {"id": tc_id, "name": fn_name, "args": fn_args or {}}})
+                if parts:
+                    contents.append({"role": "model", "parts": parts})
+                continue
+            if role == "tool":
+                tc_id = str(msg.get("tool_call_id") or "")
+                fn_name = str(msg.get("name") or tool_id_to_name.get(tc_id) or "tool")
+                response_payload: Any = content
+                try:
+                    response_payload = json.loads(content) if content else {}
+                except Exception:
+                    response_payload = {"content": content}
+                contents.append(
+                    {
+                        "role": "user",
+                        "parts": [
+                            {
+                                "functionResponse": {
+                                    "name": fn_name,
+                                    "response": response_payload if isinstance(response_payload, dict) else {"content": content},
+                                }
+                            }
+                        ],
+                    }
+                )
+                continue
+            contents.append({"role": "model" if role == "assistant" else "user", "parts": [{"text": content}]})
+
+        payload: Dict[str, Any] = {
+            "_api_mode": "gemini_native",
+            "_model_id": model,
+            "model": model,
+            "contents": contents,
+        }
+        if fallback_payload is not None:
+            payload["_fallback_payload"] = fallback_payload
+        if system_parts:
+            payload["systemInstruction"] = {"parts": system_parts}
+
+        generation_config: Dict[str, Any] = {}
+        if params.get("temperature") is not None:
+            generation_config["temperature"] = params["temperature"]
+        if params.get("top_p") is not None:
+            generation_config["topP"] = params["top_p"]
+        stop = params.get("stop")
+        if stop:
+            generation_config["stopSequences"] = stop if isinstance(stop, list) else [stop]
+        max_out = params.get("max_completion_tokens") or params.get("max_tokens")
+        if max_out is not None:
+            generation_config["maxOutputTokens"] = max_out
+        reasoning_effort = params.get("reasoning_effort")
+        if reasoning_effort:
+            effort = str(reasoning_effort).strip().lower()
+            if effort == "minimal":
+                effort = "low"
+            generation_config["thinkingConfig"] = {"thinkingLevel": effort}
+        if generation_config:
+            payload["generationConfig"] = generation_config
+
+        if tools:
+            from src.llm.tools import ToolDef
+            function_declarations = []
+            for t in tools:
+                if isinstance(t, ToolDef):
+                    function_declarations.append(
+                        {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.parameters,
+                        }
+                    )
+                elif isinstance(t, dict):
+                    if t.get("type") == "function" and isinstance(t.get("function"), dict):
+                        fn = t.get("function") or {}
+                        function_declarations.append(
+                            {
+                                "name": fn.get("name"),
+                                "description": fn.get("description", ""),
+                                "parameters": fn.get("parameters", {}),
+                            }
+                        )
+            if function_declarations:
+                payload["tools"] = [{"functionDeclarations": function_declarations}]
+
+        return payload
+
+    def _build_openai_compat_chat_payload(
+        self,
+        messages: List[Dict[str, Any]],
+        model: str,
+        params: Dict[str, Any],
+        tools: Optional[List] = None,
+    ) -> Dict[str, Any]:
+        """Build OpenAI-compatible chat/completions payload."""
         def _to_text(v: Any) -> str:
             if v is None:
                 return ""
@@ -897,7 +1523,6 @@ class HTTPChatClient(BaseChatClient):
                     tc_id = pending_tool_ids.pop(0) if pending_tool_ids else f"call_auto_{auto_idx}"
                     auto_idx += 1
                 normalized["tool_call_id"] = tc_id
-                # Some providers are stricter and expect name on tool messages.
                 if normalized.get("name") is None:
                     normalized["name"] = "tool"
 
@@ -907,20 +1532,17 @@ class HTTPChatClient(BaseChatClient):
             "messages": sanitized,
         }
 
-        # ── Function Calling: 注入 tools ──
         if tools:
             from src.llm.tools import ToolDef
             openai_tools = [t.to_openai() if isinstance(t, ToolDef) else t for t in tools]
             payload["tools"] = openai_tools
 
-        # 标准参数直接放入 payload
         standard_params = {
             "max_tokens", "max_completion_tokens", "temperature", "top_p",
             "frequency_penalty", "presence_penalty", "stop",
             "stream", "n", "response_format",
         }
 
-        # Gemini OpenAI-compatible endpoint does not accept some params
         is_gemini = "generativelanguage.googleapis.com" in (self.config.base_url or "")
         for key, value in params.items():
             if is_gemini and key == "media_resolution":
@@ -928,37 +1550,40 @@ class HTTPChatClient(BaseChatClient):
             if key in standard_params:
                 payload[key] = value
             else:
-                # 非标准参数也放入（某些平台支持）
                 payload[key] = value
 
-        # Remove None-valued token fields — None means "let the API decide"
+        payload = _apply_openai_compat_best_practices(
+            payload,
+            base_url=self.config.base_url,
+            provider_name=self.config.name,
+            model=model,
+            has_tools=bool(tools),
+        )
+
         if payload.get("max_tokens") is None:
             payload.pop("max_tokens", None)
         if payload.get("max_completion_tokens") is None:
             payload.pop("max_completion_tokens", None)
 
-        # Provider-specific default max_tokens when missing (per-platform limits).
-        # Prevents truncation or API errors when the caller does not set a value.
         provider_name = (self.config.name or "").lower()
         if "max_tokens" not in payload and "max_completion_tokens" not in payload:
             if "kimi" in provider_name:
-                payload["max_tokens"] = 32_768  # Moonshot cap
+                payload["max_tokens"] = 32_768
             elif "deepseek" in provider_name:
-                payload["max_tokens"] = 8_192   # deepseek-chat / reasoner cap
+                payload["max_tokens"] = 8_192
             elif "gemini" in provider_name:
-                payload["max_tokens"] = 65_536 # 64K output
+                payload["max_tokens"] = 65_536
             elif "openai" in provider_name:
-                payload["max_tokens"] = 128_000 # GPT-5.2 128K
+                payload["max_tokens"] = 128_000
             elif "qwen" in provider_name:
                 model_lower = (model or "").lower()
                 if "plus" in model_lower or "max" in model_lower:
-                    payload["max_tokens"] = 65_536  # qwen3.5-plus / qwen3-max
+                    payload["max_tokens"] = 65_536
                 else:
-                    payload["max_tokens"] = 32_768  # qwen-plus, qwen-flash, etc.
+                    payload["max_tokens"] = 32_768
+            elif "perplexity" in provider_name or "sonar" in provider_name:
+                payload["max_tokens"] = 16_384
 
-        # Reasoning/thinking models: avoid restricting chain-of-thought with a small limit.
-        # Covers: OpenAI reasoning_effort, DeepSeek thinking.type, Kimi thinking.type,
-        #         Qwen enable_thinking
         _is_thinking_openai_compat = (
             payload.get("reasoning_effort")
             or (payload.get("thinking") or {}).get("type") in ("enabled",)
@@ -970,26 +1595,55 @@ class HTTPChatClient(BaseChatClient):
                 if val is not None and val < 8000:
                     payload.pop(key, None)
 
-        # Qwen enable_thinking: inject thinking_budget if not explicitly set.
-        #
-        # Without thinking_budget, the model can spend its ENTIRE token quota on
-        # reasoning_content (chain-of-thought) and output an empty content field,
-        # producing response_len=0.  thinking_budget caps the reasoning phase and
-        # forces the model to start generating the actual answer afterwards.
-        #
-        # Derive from max_tokens minus 8000 so the model always has ≥8K tokens for
-        # the final content. Override via provider params: { "enable_thinking": true, "thinking_budget": N }
         _MIN_RESPONSE_TOKENS = 8_000
         if payload.get("enable_thinking") is True and "thinking_budget" not in payload:
             cap = payload.get("max_tokens") or 65_536
             payload["thinking_budget"] = max(25_000, cap - _MIN_RESPONSE_TOKENS)
 
-        # OpenAI 新 API: 使用 max_completion_tokens
         is_openai = "api.openai.com" in (self.config.base_url or "")
         if is_openai and "max_tokens" in payload and "max_completion_tokens" not in payload:
             payload["max_completion_tokens"] = payload.pop("max_tokens")
 
         return payload
+
+    def _build_openai_payload(
+        self,
+        messages: List[Dict[str, Any]],
+        model: str,
+        params: Dict[str, Any],
+        tools: Optional[List] = None,
+        response_model: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """构建 OpenAI-compatible 请求 payload"""
+        if _can_use_gemini_native_api(
+            base_url=self.config.base_url,
+            messages=messages,
+            response_model=response_model,
+        ):
+            fallback_payload = self._build_openai_compat_chat_payload(messages, model, params, tools=tools)
+            return self._build_gemini_native_payload(
+                messages,
+                model,
+                params,
+                tools=tools,
+                fallback_payload=fallback_payload,
+            )
+        if _should_use_openai_responses_api(
+            base_url=self.config.base_url,
+            model=model,
+            has_tools=bool(tools),
+            params=params,
+            response_model=response_model,
+        ):
+            return self._build_openai_responses_payload(messages, model, params, tools=tools)
+        if _should_use_qwen_responses_api(
+            base_url=self.config.base_url,
+            has_tools=bool(tools),
+            params=params,
+            response_model=response_model,
+        ):
+            return self._build_openai_responses_payload(messages, model, params, tools=tools)
+        return self._build_openai_compat_chat_payload(messages, model, params, tools=tools)
 
     def _build_anthropic_payload(
         self,
@@ -1021,16 +1675,36 @@ class HTTPChatClient(BaseChatClient):
         for key, value in params.items():
             payload[key] = value
 
-        # Anthropic API 必须提供大于 0 的整型 max_tokens。
-        # Claude 4.5 / Sonnet 4.5 / Opus 4.5 最大输出 64K；Opus 4.6+ 才到 128K。
         thinking_cfg = payload.get("thinking") or {}
-        thinking_type = thinking_cfg.get("type")
+        thinking_type = str(thinking_cfg.get("type") or "").strip().lower()
+        is_opus_46 = _is_claude_opus_46(model)
+        if is_opus_46 and thinking_type == "enabled":
+            # Anthropic recommends adaptive thinking for Opus 4.6.
+            effort = _infer_anthropic_adaptive_effort(thinking_cfg.get("budget_tokens"))
+            payload["thinking"] = {"type": "adaptive", "effort": effort}
+            thinking_cfg = payload["thinking"]
+            thinking_type = "adaptive"
+            _log.info(
+                "Anthropic compat: upgraded thinking mode to adaptive for model=%s with effort=%s",
+                model,
+                effort,
+            )
+        elif thinking_type == "adaptive" and not thinking_cfg.get("effort"):
+            thinking_cfg = dict(thinking_cfg)
+            thinking_cfg["effort"] = "medium"
+            payload["thinking"] = thinking_cfg
+            thinking_type = "adaptive"
+
+        # Anthropic API 必须提供大于 0 的整型 max_tokens。
+        # Claude Sonnet/Haiku 4.5/4.6 最大输出 64K；Opus 4.6 最大输出 128K。
         is_thinking = thinking_type in ("enabled", "adaptive")
         _CLAUDE_45_MAX_OUTPUT = 64_000
+        _CLAUDE_OPUS_46_MAX_OUTPUT = 128_000
         _MIN_VISIBLE_TOKENS = 8_000
+        max_model_output = _CLAUDE_OPUS_46_MAX_OUTPUT if is_opus_46 else _CLAUDE_45_MAX_OUTPUT
 
         if payload.get("max_tokens") is None:
-            payload["max_tokens"] = _CLAUDE_45_MAX_OUTPUT if is_thinking else 16384
+            payload["max_tokens"] = max_model_output if is_thinking else 16384
 
         # Extended thinking: max_tokens 必须 > budget_tokens，否则 API 报错。
         # Cap budget so that (budget + visible response) stays within max_tokens.
@@ -1040,12 +1714,15 @@ class HTTPChatClient(BaseChatClient):
             if max_out <= budget:
                 payload["max_tokens"] = budget + _MIN_VISIBLE_TOKENS
             # Ensure we do not exceed platform cap and that budget leaves room for answer
-            payload["max_tokens"] = min(payload["max_tokens"], _CLAUDE_45_MAX_OUTPUT)
+            payload["max_tokens"] = min(payload["max_tokens"], max_model_output)
             max_budget = payload["max_tokens"] - _MIN_VISIBLE_TOKENS
             if budget > max_budget:
                 thinking_cfg = dict(thinking_cfg)
                 thinking_cfg["budget_tokens"] = max_budget
                 payload["thinking"] = thinking_cfg
+
+        if is_thinking and thinking_type == "adaptive":
+            payload["max_tokens"] = min(int(payload["max_tokens"]), max_model_output)
 
         # ── Function Calling: 注入 tools ──
         if tools:
@@ -1193,6 +1870,8 @@ class LLMManager:
         # 创建实际 Provider
         if pcfg.is_anthropic():
             http_provider = AnthropicProvider(pcfg)
+        elif pcfg.platform == "gemini" or _is_gemini_api(pcfg.base_url):
+            http_provider = GeminiNativeProvider(pcfg)
         else:
             http_provider = OpenAICompatProvider(pcfg)
 

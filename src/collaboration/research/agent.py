@@ -414,6 +414,8 @@ def _extract_zh_keywords(text: str, max_terms: int = 8) -> str:
 
 _ACADEMIC_ENGINES = frozenset({"ncbi", "semantic", "scholar"})
 _GENERAL_KEYWORD_ENGINES = frozenset({"google"})
+# Only these engines lack meaningful Chinese support; scholar and google support zh+en.
+_ENGLISH_ONLY_ENGINES = frozenset({"ncbi", "semantic"})
 
 
 def _build_write_queries(
@@ -424,9 +426,10 @@ def _build_write_queries(
     """Build per-provider queries for write / claims / verification stages.
 
     Engine-aware language routing:
-    - Academic engines (ncbi, semantic, scholar): English-only keyword phrases.
-      These indices are almost exclusively English; Chinese queries return near-zero results.
-    - General keyword engines (google): English-only keyword phrases.
+    - English-only engines (ncbi, semantic): English-only keyword phrases; indices are
+      almost exclusively English; Chinese queries return near-zero results.
+    - Bilingual keyword engines (scholar, google): For Chinese topics, both zh and en
+      keyword phrases; for English topics, English only.
     - NL engines (tavily): For Chinese topics, both Chinese and English NL questions.
 
     No LLM call — pure extraction.
@@ -441,6 +444,9 @@ def _build_write_queries(
     if not en_kw:
         en_kw = (section_title or topic or "research")[:80]
 
+    # ── Chinese keyword query (for scholar/google when topic is Chinese) ──
+    zh_kw = _extract_zh_keywords(src, max_terms=8) if is_zh else ""
+
     # ── NL queries ──
     if is_zh:
         short_title = section_title[:40] if len(section_title) > 40 else section_title
@@ -454,9 +460,12 @@ def _build_write_queries(
         ]
 
     result: Dict[str, List[str]] = {}
-    # Academic + general keyword engines: English only
-    for engine in (_ACADEMIC_ENGINES | _GENERAL_KEYWORD_ENGINES):
+    # English-only engines (ncbi, semantic): English only
+    for engine in _ENGLISH_ONLY_ENGINES:
         result[engine] = [en_kw]
+    # Bilingual keyword engines (scholar, google): zh+en when Chinese topic
+    for engine in (_ACADEMIC_ENGINES | _GENERAL_KEYWORD_ENGINES) - _ENGLISH_ONLY_ENGINES:
+        result[engine] = ([zh_kw, en_kw] if is_zh and zh_kw else [en_kw])
     # NL engines: bilingual for Chinese topics, English-only otherwise
     for engine in _NL_ENGINES:
         result[engine] = list(nl_queries)
@@ -979,10 +988,30 @@ def _tick_cost_monitor(state: DeepResearchState, node_name: str) -> None:
 
 
 def _get_retrieval_svc(state: DeepResearchState):
-    """Extract collection from filters and get the correct RetrievalService."""
-    from src.retrieval.service import get_retrieval_service
+    """
+    Extract collection(s) from filters and return the appropriate retrieval service.
+    If filters["collections"] contains multiple entries, returns a MultiCollectionRetrievalService
+    using pre-computed quotas stored in state["_collection_quotas"], or equal split as fallback.
+    """
+    from src.retrieval.service import get_retrieval_service, get_multi_collection_retrieval_service
 
-    collection = ((state.get("filters") or {}).get("collection") or "").strip() or None
+    filters = state.get("filters") or {}
+    collections = filters.get("collections") or []
+    if isinstance(collections, list):
+        collections = [c.strip() for c in collections if (c or "").strip()]
+
+    if len(collections) > 1:
+        # Use pre-computed quotas (stored by _ensure_collection_quotas) or equal split
+        precomputed = state.get("_collection_quotas") or {}
+        if precomputed and set(precomputed.keys()) == set(collections):
+            quotas = precomputed
+        else:
+            equal = 1.0 / len(collections)
+            quotas = {col: equal for col in collections}
+        return get_multi_collection_retrieval_service(collection_quotas=quotas)
+
+    # Single collection path (original behavior)
+    collection = (filters.get("collection") or "").strip() or None
     return get_retrieval_service(collection=collection)
 
 
@@ -1394,6 +1423,7 @@ def _accumulate_section_pool(
 # pool_source values that represent gap-targeted evidence; these candidates get
 # a relevance score boost and guaranteed quota in the final top-k selection.
 _DR_GAP_POOL_SOURCES: frozenset = frozenset({"eval_supplement"})
+_DR_AGENT_POOL_SOURCES: frozenset = frozenset({"agent_supplement"})
 
 
 def _rerank_section_pool_chunks(
@@ -1403,6 +1433,7 @@ def _rerank_section_pool_chunks(
     *,
     reranker_mode: Optional[str] = None,
     trace_ctx: Optional[Dict[str, Any]] = None,
+    fused_pool_score_threshold: Optional[float] = None,
 ) -> List[Any]:
     """Rerank section pool chunks with gap-pool protection.
 
@@ -1419,9 +1450,10 @@ def _rerank_section_pool_chunks(
 
     # Lazy imports — avoids circular dependencies at module load time
     try:
-        from src.retrieval.service import fuse_pools_with_gap_protection
+        from src.retrieval.service import fuse_pools_with_gap_protection, _filter_fused_by_score_threshold
         _has_fusion = True
     except Exception:
+        _filter_fused_by_score_threshold = None
         _has_fusion = False
     try:
         from src.retrieval.hybrid_retriever import _rerank_candidates
@@ -1434,6 +1466,7 @@ def _rerank_section_pool_chunks(
 
     main_candidates: List[Dict[str, Any]] = []
     gap_candidates: List[Dict[str, Any]] = []
+    agent_candidates: List[Dict[str, Any]] = []
     by_chunk_id: Dict[str, Any] = {}
 
     for idx, chunk in enumerate(pool_chunks):
@@ -1483,11 +1516,13 @@ def _rerank_section_pool_chunks(
         }
         if pool_source in _DR_GAP_POOL_SOURCES:
             gap_candidates.append(cand)
+        elif pool_source in _DR_AGENT_POOL_SOURCES:
+            agent_candidates.append(cand)
         else:
             main_candidates.append(cand)
         by_chunk_id[chunk_id] = chunk
 
-    all_candidates = main_candidates + gap_candidates
+    all_candidates = main_candidates + gap_candidates + agent_candidates
     if not all_candidates:
         return list(pool_chunks[:top_k])
 
@@ -1500,7 +1535,9 @@ def _rerank_section_pool_chunks(
                 main_candidates=main_candidates,
                 gap_candidates=gap_candidates,
                 top_k=min(max(top_k, 1), len(all_candidates)),
-                gap_ratio=float(getattr(settings.search, "research_gap_ratio", 0.25)),
+                agent_candidates=agent_candidates,
+                gap_ratio=float(getattr(settings.search, "research_gap_ratio", 0.2)),
+                agent_ratio=float(getattr(settings.search, "research_agent_ratio", 0.1)),
                 rank_pool_multiplier=float(getattr(settings.search, "research_rank_pool_multiplier", 3.0)),
                 trace_ctx=trace_ctx,
                 reranker_mode=reranker_mode,
@@ -1527,6 +1564,9 @@ def _rerank_section_pool_chunks(
                 )
         else:
             fused = all_candidates
+
+    if _filter_fused_by_score_threshold is not None and fused:
+        fused = _filter_fused_by_score_threshold(fused, fused_pool_score_threshold)
 
     # Map fused raw dicts back to original chunk objects
     out: List[Any] = []
@@ -1626,8 +1666,12 @@ def _build_gap_evidence_summary(
 
     cfg = getattr(settings, "content_fetcher", None)
     enable_compress = bool(getattr(cfg, "compress_long_fulltext", True))
-    word_threshold = int(getattr(cfg, "compress_word_threshold", 300))
-    max_output_words = int(getattr(cfg, "compress_max_output_words", 400))
+    word_threshold = int(getattr(cfg, "compress_word_threshold", 900))
+    char_threshold = int(getattr(cfg, "compress_char_threshold", 5500))
+    max_output_words = int(getattr(cfg, "compress_max_output_words", 280))
+    fallback_chars = int(getattr(cfg, "compress_fallback_chars", per_chunk_max_chars))
+    input_max_chars = int(getattr(cfg, "compress_input_max_chars", 12000))
+    llm_max_tokens = int(getattr(cfg, "compress_llm_max_tokens", 800))
     compress_client = None
     if enable_compress:
         try:
@@ -1654,7 +1698,7 @@ def _build_gap_evidence_summary(
         if (
             compress_client is not None
             and len(text) > per_chunk_max_chars
-            and len(text.split()) > word_threshold
+            and (len(text.split()) > word_threshold or len(text) > char_threshold)
         ):
             text = compress_evidence_text_sync(
                 text,
@@ -1663,7 +1707,9 @@ def _build_gap_evidence_summary(
                 title=title,
                 url=getattr(c, "url", "") or "",
                 max_output_words=max_output_words,
-                fallback_chars=per_chunk_max_chars,
+                fallback_chars=fallback_chars,
+                max_input_chars=input_max_chars,
+                llm_max_tokens=llm_max_tokens,
             )
             compressed_chunks += 1
         elif len(text) > per_chunk_max_chars:
@@ -1752,8 +1798,8 @@ def _generate_refined_queries(
         )
 
     gaps_block = "\n".join(f"- {g}" for g in section.gaps) if section.gaps else "(none)"
-    # T3 targets scholar + google — always English academic keywords even for Chinese topics
-    english_only_instruction = _BILINGUAL_HINT_ACADEMIC if _topic_is_chinese(topic) else ""
+    # T3 targets scholar + google; both support Chinese — allow zh+en when topic is Chinese
+    english_only_instruction = "" if _topic_is_chinese(topic) else ""
 
     try:
         prompt = _pm.render(
@@ -2354,6 +2400,23 @@ def plan_node(state: DeepResearchState) -> DeepResearchState:
     dashboard = state["dashboard"]
     trajectory = state["trajectory"]
     max_sections = _normalize_max_sections(state.get("max_sections"), default=4)
+
+    # ── Pre-compute multi-collection quotas once per DR run ──
+    _dr_collections = ((state.get("filters") or {}).get("collections") or [])
+    if isinstance(_dr_collections, list):
+        _dr_collections = [c.strip() for c in _dr_collections if (c or "").strip()]
+    if len(_dr_collections) > 1 and not state.get("_collection_quotas"):
+        try:
+            from src.collaboration.intent.commands import allocate_collection_quotas as _alloc_quotas
+            _ultra_lite_client, _ = _resolve_step_client_and_model(state, "evaluate")
+            _topic_query = (dashboard.brief.topic or "").strip() or (state.get("topic") or "")
+            _quotas = _alloc_quotas(_topic_query, _dr_collections, _ultra_lite_client)
+            state["_collection_quotas"] = _quotas
+            logger.info("[plan_node] 多库配额分配 | collections=%s quotas=%s", _dr_collections, _quotas)
+        except Exception as _qe:
+            logger.warning("[plan_node] 多库配额分配失败（均等分配）: %s", _qe)
+            _equal = 1.0 / len(_dr_collections)
+            state["_collection_quotas"] = {c: _equal for c in _dr_collections}
 
     # Initial retrieval for background context: 1+1+1 structured queries (topic + preliminary_knowledge)
     # Plan phase does not use Sonar; strip it so only tavily/scholar/etc. get 1+1+1 queries.
@@ -3014,50 +3077,145 @@ def research_node(state: DeepResearchState) -> DeepResearchState:
         section.research_rounds, section.title,
     )
 
-    # Build queries (recall + precision + gap + discovery)
-    recall_q = int(preset.get("recall_queries_per_section", 2))
-    precision_q = int(preset.get("precision_queries_per_section", 2))
-    max_q = recall_q + precision_q + 4 + 2  # +4 gap buffer (kw + nl), +2 discovery
-    queries = _generate_section_queries(state, section, max_queries=max_q)
+    # Build section 1+1+1 queries and execute one hybrid retrieval step.
+    from src.retrieval.structured_queries import (
+        generate_structured_queries_1plus1plus1,
+        web_queries_per_provider_from_1plus1plus1,
+    )
 
-    temp_hits = _retrieve_temp_snippets(state, f"{dashboard.brief.topic} {section.title}", top_k=4)
-    branch_id = f"sec_{dashboard.sections.index(section) + 1}"
-    for hit in temp_hits:
-        trajectory.add_finding(branch_id, f"[temp:{hit['name']}] {hit['text'][:180]}")
-
-    # ── Determine tier ceiling for this round ──
-    max_rounds = int(preset.get("max_section_research_rounds", 3))
-    is_first_round = section.research_rounds <= 1
-    is_last_round = section.research_rounds >= max_rounds
-    if is_last_round:
-        max_tier = int(preset.get("last_round_max_tier", 3))
-    elif is_first_round:
-        max_tier = int(preset.get("round1_max_tier", 2))
-    else:
-        max_tier = int(preset.get("gapfill_max_tier", 2))
-
-    # ── Extract UI settings from state filters ──
+    section_query = f"{dashboard.brief.topic} {section.title}".strip()
+    section_pool = list((state.get("section_evidence_pool") or {}).get(section.title) or [])
+    seed_findings = ""
+    if section_pool:
+        try:
+            seed_pack = _build_pack_from_chunks(section_query, section_pool[:12])
+            seed_findings = seed_pack.to_context_string(max_chunks=8) or ""
+        except Exception:
+            seed_findings = ""
+    structured = generate_structured_queries_1plus1plus1(
+        section_query,
+        seed_findings,
+        client,
+        model_override=state.get("model_override"),
+    )
     ui_filters = state.get("filters") or {}
     ui_providers = ui_filters.get("web_providers")
     ui_allowed = set(ui_providers) if ui_providers else None
     ui_fetcher = ui_filters.get("use_content_fetcher", "auto")
     ui_source_configs = ui_filters.get("web_source_configs")
+    qpp = {}
+    dr_filters = dict(base_dr_filters)
+    dr_filters["reranker_mode"] = "bge_only"
+    _inject_trace_filters(dr_filters, state, phase="research_main_1p1p1", section=section.title)
+    if ui_fetcher is not None and ui_fetcher != "":
+        dr_filters["use_content_fetcher"] = ui_fetcher
+    if ui_source_configs:
+        dr_filters["web_source_configs"] = ui_source_configs
+    if ui_providers:
+        providers_no_sonar = [p for p in ui_providers if str(p).strip().lower() != "sonar"]
+        dr_filters["web_providers"] = providers_no_sonar
+    else:
+        providers_no_sonar = []
 
-    _emit_progress(state, "research_tier_plan", {
+    search_query = section_query
+    if structured and providers_no_sonar:
+        qpp = web_queries_per_provider_from_1plus1plus1(structured, providers_no_sonar)
+        if qpp:
+            dr_filters["web_queries_per_provider"] = qpp
+            search_query = structured.get("recall") or section_query
+
+    step_top_k = int((state.get("filters") or {}).get("step_top_k") or preset.get("search_top_k", 20))
+    pack = svc.search(
+        query=search_query,
+        mode=state.get("search_mode", "hybrid"),
+        top_k=step_top_k,
+        filters=dr_filters,
+    )
+    all_chunks = list(pack.chunks)
+    all_sources = set(pack.sources_used or [])
+    queries = (
+        [("recall", structured.get("recall", "")), ("precision", structured.get("precision", ""),), ("discovery", structured.get("discovery", ""))]
+        if structured
+        else [("recall", section_query)]
+    )
+
+    temp_hits = _retrieve_temp_snippets(state, section_query, top_k=4)
+    branch_id = f"sec_{dashboard.sections.index(section) + 1}"
+    for hit in temp_hits:
+        trajectory.add_finding(branch_id, f"[temp:{hit['name']}] {hit['text'][:180]}")
+
+    _emit_progress(state, "research_main_1p1p1", {
         "section": section.title,
         "round": section.research_rounds,
-        "max_tier": max_tier,
-        "is_first_round": is_first_round,
-        "is_last_round": is_last_round,
+        "search_query": search_query,
+        "providers": list((qpp or {}).keys()) if qpp else (providers_no_sonar or []),
+        "chunks_found": len(all_chunks),
     })
 
-    all_chunks, all_sources = _execute_tiered_search(
-        state, section, queries, svc, base_dr_filters, preset,
-        max_tier=max_tier,
-        ui_allowed_providers=ui_allowed,
-        ui_content_fetcher=ui_fetcher,
-        ui_source_configs=ui_source_configs,
-    )
+    # Optional section-level agent supplement (always enabled for DR runtime).
+    agent_supplement_chunks: List[Any] = []
+    try:
+        from src.llm.react_loop import react_loop
+        from src.llm.tools import (
+            get_routed_skills,
+            start_agent_chunk_collector,
+            drain_agent_chunks,
+            set_tool_collection,
+            set_tool_step_top_k,
+            set_agent_sonar_model,
+        )
+
+        start_agent_chunk_collector()
+        _agent_filters = state.get("filters") or {}
+        _agent_cols = [c.strip() for c in (_agent_filters.get("collections") or []) if (c or "").strip()]
+        set_tool_collection(
+            _agent_filters.get("collection"),
+            collections=_agent_cols if len(_agent_cols) > 1 else None,
+        )
+        set_tool_step_top_k(step_top_k)
+        set_agent_sonar_model(_agent_filters.get("agent_sonar_model") or "sonar-pro")
+        routed_tools = get_routed_skills(
+            message=section_query,
+            current_stage="research",
+            search_mode=state.get("search_mode", "hybrid"),
+            allowed_web_providers=ui_providers,
+        )
+        if routed_tools:
+            supplement_prompt = (
+                f"Topic: {dashboard.brief.topic}\n"
+                f"Section: {section.title}\n"
+                f"Known gaps: {', '.join((section.gaps or [])[:4]) or '(none)'}\n"
+                "Use tools to find additional high-value evidence for this section. "
+                "Prioritize missing evidence and contradictory findings."
+            )
+            react_loop(
+                messages=[
+                    {"role": "system", "content": "You are a focused research retrieval assistant. Use tools when needed."},
+                    {"role": "user", "content": supplement_prompt},
+                ],
+                tools=routed_tools,
+                llm_client=client,
+                max_iterations=2,
+                model=state.get("model_override"),
+            )
+            agent_supplement_chunks = list(drain_agent_chunks() or [])
+            if agent_supplement_chunks:
+                _accumulate_section_pool(
+                    state, section.title, agent_supplement_chunks, pool_source="agent_supplement"
+                )
+                _accumulate_evidence_chunks(state, agent_supplement_chunks)
+                all_chunks.extend(agent_supplement_chunks)
+                all_sources.update(
+                    (getattr(c, "provider", None) or ("local" if getattr(c, "source_type", "") in ("dense", "graph") else "web"))
+                    for c in agent_supplement_chunks
+                )
+                _emit_progress(state, "section_agent_supplement", {
+                    "section": section.title,
+                    "chunks": len(agent_supplement_chunks),
+                    "tools": [t.name for t in routed_tools],
+                })
+    except Exception as e:
+        logger.debug("section agent supplement skipped: %s", e)
 
     _finalise_research_round(state, section, all_chunks, all_sources, queries_repr=queries, client=client)
     _save_phase_checkpoint(state, "research", section.title)
@@ -3149,6 +3307,7 @@ def evaluate_node(state: DeepResearchState) -> DeepResearchState:
             top_k=eval_top_k,
             reranker_mode=eval_filters.get("reranker_mode"),
             trace_ctx=_make_trace_ctx(state, phase="evaluate_pool_rerank", section=section.title),
+            fused_pool_score_threshold=eval_filters.get("fused_pool_score_threshold"),
         )
         pool_pack = _build_pack_from_chunks(query_text, reranked_pool)
         findings = cap_and_log(
@@ -3330,6 +3489,7 @@ def generate_claims_node(state: DeepResearchState) -> DeepResearchState:
             top_k=write_top_k,
             reranker_mode=dr_filters.get("reranker_mode"),
             trace_ctx=_make_trace_ctx(state, phase="generate_claims_pool_rerank", section=section.title),
+            fused_pool_score_threshold=dr_filters.get("fused_pool_score_threshold"),
         )
         pack = _build_pack_from_chunks(query_text, selected_chunks)
     else:
@@ -3416,6 +3576,7 @@ def write_node(state: DeepResearchState) -> DeepResearchState:
             top_k=write_top_k,
             reranker_mode=dr_filters.get("reranker_mode"),
             trace_ctx=_make_trace_ctx(state, phase="write_pool_rerank", section=section.title),
+            fused_pool_score_threshold=dr_filters.get("fused_pool_score_threshold"),
         )
         verify_chunks = _rerank_section_pool_chunks(
             query=verify_query,
@@ -3423,6 +3584,7 @@ def write_node(state: DeepResearchState) -> DeepResearchState:
             top_k=verification_k,
             reranker_mode=dr_filters.get("reranker_mode"),
             trace_ctx=_make_trace_ctx(state, phase="write_verify_pool_rerank", section=section.title),
+            fused_pool_score_threshold=dr_filters.get("fused_pool_score_threshold"),
         )
         pack = _build_pack_from_chunks(base_query, write_chunks)
         verify_pack = _build_pack_from_chunks(verify_query, verify_chunks)
@@ -4292,8 +4454,75 @@ def synthesize_node(state: DeepResearchState) -> DeepResearchState:
         aggregated_conflict_notes.extend(getattr(dashboard, "conflict_notes", []) or [])
     aggregated_conflict_notes = _dedupe_keep_order(aggregated_conflict_notes)
 
+    # Optional final agent supplement: gather missing evidence from section outputs/open gaps.
+    final_agent_supplement_chunks: List[Any] = []
+    final_agent_notes = ""
+    try:
+        from src.llm.react_loop import react_loop
+        from src.llm.tools import (
+            get_routed_skills,
+            start_agent_chunk_collector,
+            drain_agent_chunks,
+            set_tool_collection,
+            set_tool_step_top_k,
+            set_agent_sonar_model,
+        )
+
+        step_top_k = int((state.get("filters") or {}).get("step_top_k") or 20)
+        final_query = f"{state.get('topic', '')} final synthesis evidence supplement".strip()
+        start_agent_chunk_collector()
+        _synth_filters = state.get("filters") or {}
+        _synth_cols = [c.strip() for c in (_synth_filters.get("collections") or []) if (c or "").strip()]
+        set_tool_collection(
+            _synth_filters.get("collection"),
+            collections=_synth_cols if len(_synth_cols) > 1 else None,
+        )
+        set_tool_step_top_k(step_top_k)
+        set_agent_sonar_model(_synth_filters.get("agent_sonar_model") or "sonar-pro")
+        routed_tools = get_routed_skills(
+            message=final_query,
+            current_stage="synthesize",
+            search_mode=state.get("search_mode", "hybrid"),
+            allowed_web_providers=(state.get("filters") or {}).get("web_providers"),
+        )
+        if routed_tools:
+            supplement_prompt = (
+                f"Topic: {state.get('topic', '')}\n"
+                f"Open gaps: {', '.join(aggregated_open_gaps[:8]) or '(none)'}\n"
+                f"Conflict notes: {', '.join(aggregated_conflict_notes[:6]) or '(none)'}\n"
+                "Use tools to fetch only missing high-value evidence for final synthesis. "
+                "Do not repeat already-covered points."
+            )
+            rr = react_loop(
+                messages=[
+                    {"role": "system", "content": "You are a synthesis-stage evidence collector. Prefer concise tool calls."},
+                    {"role": "user", "content": supplement_prompt},
+                ],
+                tools=routed_tools,
+                llm_client=client,
+                max_iterations=2,
+                model=model_override,
+            )
+            final_agent_notes = (rr.final_text or "").strip()
+            final_agent_supplement_chunks = list(drain_agent_chunks() or [])
+            if final_agent_supplement_chunks:
+                _accumulate_evidence_chunks(state, final_agent_supplement_chunks)
+                _emit_progress(
+                    state,
+                    "final_agent_supplement_done",
+                    {
+                        "chunks": len(final_agent_supplement_chunks),
+                        "step_top_k": step_top_k,
+                        "tools": [t.name for t in routed_tools],
+                    },
+                )
+    except Exception:
+        logger.debug("final synthesize agent supplement skipped", exc_info=True)
+
     # 生成摘要
     full_md = "\n".join(state.get("markdown_parts", []))
+    if final_agent_notes:
+        full_md = full_md + "\n\n" + ("补充研究笔记:\n" if is_zh else "Supplementary research notes:\n") + final_agent_notes[:1200]
     prompt = _pm.render(
         "generate_abstract.txt",
         language_instruction=_language_instruction(state),

@@ -53,6 +53,7 @@ def _regenerate_cite_keys(
             year=c.year,
             doc_id=c.doc_id,
             url=c.url,
+            pdf_url=getattr(c, "pdf_url", None),
             doi=c.doi,
             bibtex=c.bibtex,
             cite_key=new_key,

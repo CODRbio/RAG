@@ -35,9 +35,13 @@ interface ChatState {
   // 按任务/会话的流式状态（taskId -> { sessionId, status, queuePosition? }）
   streamingTasks: Record<string, { sessionId: string | null; status: string; queuePosition?: number }>;
 
+  /** 当前流式步骤（Thinking 式），step 结束时清空 */
+  streamingStep: { step: string; label: string } | null;
+
   // Actions
   setStreamingTask: (taskId: string, sessionId: string | null, status: string, queuePosition?: number) => void;
   clearStreamingTask: (taskId: string) => void;
+  setStreamingStep: (step: { step: string; label: string } | null) => void;
   setSessionId: (id: string | null) => void;
   setCanvasId: (id: string | null) => void;
   addMessage: (msg: Message) => void;
@@ -97,6 +101,7 @@ export const useChatStore = create<ChatState>((set) => ({
   localDbChoiceHandler: null,
   localDbChoiceTimeoutId: null,
   streamingTasks: {},
+  streamingStep: null,
 
   setStreamingTask: (taskId, sessionId, status, queuePosition) =>
     set((state) => ({
@@ -111,6 +116,7 @@ export const useChatStore = create<ChatState>((set) => ({
       delete next[taskId];
       return { streamingTasks: next };
     }),
+  setStreamingStep: (step) => set({ streamingStep: step }),
 
   setSessionId: (id) => set({ sessionId: id }),
   setCanvasId: (id) => set({ canvasId: id }),
@@ -210,6 +216,7 @@ export const useChatStore = create<ChatState>((set) => ({
       messages: [],
       workflowStep: 'idle',
       lastEvidenceSummary: null,
+      streamingStep: null,
       // 新对话 = 全新页面；旧 Deep Research 任务仍在后台运行，
       // 加载旧会话时会重新恢复 dashboard。
       deepResearchActive: false,
