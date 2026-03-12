@@ -264,13 +264,109 @@ class TaskQueue:
     def cancel_running(self, task_id: str) -> bool:
         """Mark running task as cancelled; dispatcher must check state and stop. Returns True if was running."""
         state = self.get_state(task_id)
-        if not state or state.status != TaskStatus.running:
+        if not state or state.status not in (TaskStatus.running, TaskStatus.pausing, TaskStatus.paused):
             return False
         state.status = TaskStatus.cancelled
         state.finished_at = time.time()
+        state.pause_started_at = None
         self.set_state(state)
         self.push_event(task_id, "cancelled", {})
         return True
+
+    def pause_running(self, task_id: str) -> bool:
+        """Request cooperative pause for a running task."""
+        state = self.get_state(task_id)
+        if not state or state.status != TaskStatus.running:
+            return False
+        state.status = TaskStatus.pausing
+        self.set_state(state)
+        self.push_event(task_id, "pause_requested", {"status": TaskStatus.pausing.value})
+        return True
+
+    def resume_paused(self, task_id: str) -> bool:
+        """Resume a paused or pausing task."""
+        state = self.get_state(task_id)
+        if not state or state.status not in (TaskStatus.paused, TaskStatus.pausing):
+            return False
+        now = time.time()
+        if state.pause_started_at is not None:
+            state.paused_total_seconds = float(state.paused_total_seconds or 0.0) + max(
+                0.0,
+                now - float(state.pause_started_at),
+            )
+        state.pause_started_at = None
+        state.status = TaskStatus.running
+        self.set_state(state)
+        self.push_event(task_id, "resumed", {"status": TaskStatus.running.value})
+        return True
+
+    def repair_stale_scholar_tasks(self, max_age_seconds: int = 300) -> int:
+        """Mark Scholar tasks stuck in 'running' longer than max_age_seconds as error (e.g. after restart). Returns count repaired."""
+        self._ensure_client()
+        repaired = 0
+        now = time.time()
+        try:
+            for key in self._client.scan_iter(match=f"{KEY_TASK_PREFIX}*", count=100):
+                task_id = key[len(KEY_TASK_PREFIX):] if key.startswith(KEY_TASK_PREFIX) else None
+                if not task_id:
+                    continue
+                state = self.get_state(task_id)
+                if not state or state.kind != TaskKind.scholar or state.status != TaskStatus.running:
+                    continue
+                started = state.started_at or state.created_at or 0
+                if (now - started) < max_age_seconds:
+                    continue
+                state.status = TaskStatus.error
+                state.finished_at = now
+                state.error_message = "服务重启，任务中断"
+                self.set_state(state)
+                self.push_event(task_id, "error", {"message": state.error_message})
+                repaired += 1
+                logger.info("[TaskQueue] repaired stale scholar task_id=%s (was running >%ds)", task_id, max_age_seconds)
+        except Exception as e:
+            logger.warning("[TaskQueue] repair_stale_scholar_tasks failed: %s", e)
+        return repaired
+
+    def repair_stale_chat_tasks(self, max_age_seconds: int = 60) -> int:
+        """Mark Chat tasks stuck in active states as error after restart.
+
+        Chat tasks are short-lived (seconds to minutes); any task still 'running' after a restart
+        will never complete because its coroutine died with the process. Marking them as error
+        releases the active slot in rag:active_tasks / rag:active_sessions so new tasks
+        for the same session are not blocked.
+
+        Returns count repaired.
+        """
+        self._ensure_client()
+        repaired = 0
+        now = time.time()
+        try:
+            for key in self._client.scan_iter(match=f"{KEY_TASK_PREFIX}*", count=100):
+                task_id = key[len(KEY_TASK_PREFIX):] if key.startswith(KEY_TASK_PREFIX) else None
+                if not task_id:
+                    continue
+                state = self.get_state(task_id)
+                if not state or state.kind != TaskKind.chat or state.status not in (
+                    TaskStatus.running,
+                    TaskStatus.pausing,
+                    TaskStatus.paused,
+                ):
+                    continue
+                started = state.started_at or state.created_at or 0
+                if (now - started) < max_age_seconds:
+                    continue
+                state.status = TaskStatus.error
+                state.finished_at = now
+                state.error_message = "服务重启，任务中断"
+                self.set_state(state)
+                self.push_event(task_id, "error", {"message": state.error_message})
+                # Release the active slot so new tasks for the same session are not blocked
+                self.release_slot(task_id, str(state.session_id or ""))
+                repaired += 1
+                logger.info("[TaskQueue] repaired stale chat task_id=%s (was active >%ds)", task_id, max_age_seconds)
+        except Exception as e:
+            logger.warning("[TaskQueue] repair_stale_chat_tasks failed: %s", e)
+        return repaired
 
 
 # Singleton for app lifecycle

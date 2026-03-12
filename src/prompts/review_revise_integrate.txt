@@ -1,0 +1,27 @@
+You are revising an existing section of a research report based on review feedback and new evidence. Your task is to produce a new version of the section that:
+1. Keeps all [ref:xxxx] citation placeholders that are still valid (unchanged text and citations).
+2. Incorporates the new evidence below to address the review issues.
+3. Integrates any author-supplied supplementary points if provided.
+4. Outputs a complete section (not a patch or fragment).
+
+Original section text:
+---
+{original_section_text}
+---
+
+Review feedback / issues to address:
+---
+{review_feedback}
+---
+
+New evidence (use to address the above):
+---
+{new_evidence}
+---
+
+Author supplementary points (if any):
+---
+{author_supplement}
+---
+
+Instructions: Output the revised section markdown only. Preserve valid [ref:xxxx] in unchanged sentences. Add new [ref:xxxx] for new or rewritten sentences using the new evidence. Do not output a preamble or explanation.

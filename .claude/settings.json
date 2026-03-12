@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//Users/wangminxiao/Desktop/RAG/**)",
+      "Read(//^def synthesize_node/,/^def [a-z_]/**)",
+      "Bash(/tmp/audit_summary.txt:*)",
+      "Read(//tmp/**)"
+    ]
+  }
+}

@@ -1,4 +1,5 @@
 import client, { getWithRetry, streamChat } from './client';
+import { streamSSEResumable, DR_TERMINAL_EVENTS } from './sse';
 import type {
   ChatRequest,
   ChatResponse,
@@ -216,6 +217,20 @@ export async function cancelTask(taskId: string): Promise<{ success: boolean; me
   return res.data;
 }
 
+export async function pauseTask(taskId: string): Promise<{ success: boolean; message: string }> {
+  const res = await client.post<{ success: boolean; message: string }>(
+    `/tasks/${encodeURIComponent(taskId)}/pause`
+  );
+  return res.data;
+}
+
+export async function resumeTask(taskId: string): Promise<{ success: boolean; message: string }> {
+  const res = await client.post<{ success: boolean; message: string }>(
+    `/tasks/${encodeURIComponent(taskId)}/resume`
+  );
+  return res.data;
+}
+
 /** Submit the start phase job; returns a job_id immediately (non-blocking). */
 export async function deepResearchStart(
   data: DeepResearchStartRequest
@@ -283,12 +298,15 @@ export async function listDeepResearchJobEvents(
 }
 
 /**
- * SSE stream for Deep Research job progress.
+ * SSE stream for Deep Research job progress, with automatic reconnect and resume.
  *
- * Replaces the setInterval polling of /events + /jobs/{id}.
- * Yields all job progress events in real-time. The backend also emits
- * periodic `heartbeat` events (with job status) and a final `job_status`
- * event when the job reaches a terminal state.
+ * Uses the shared streamSSEResumable adapter so that on connection drop the stream
+ * reconnects with ?after_id=<last_event_id>, receiving only events after the last
+ * persisted checkpoint. The backend now emits `id: <event_id>` on every real
+ * (DB-persisted) event; heartbeat and job_status events omit the id line intentionally
+ * so that lastEventId only advances on durable events.
+ *
+ * Terminal events: `job_status` (normal completion) or `error` (job not found).
  */
 export async function* streamDeepResearchEvents(
   jobId: string,
@@ -296,44 +314,25 @@ export async function* streamDeepResearchEvents(
   afterId = 0,
 ): AsyncGenerator<{ event: string; data: Record<string, unknown> }> {
   const token = localStorage.getItem('token');
-  const url = `${BASE_URL}/deep-research/jobs/${encodeURIComponent(jobId)}/stream?after_id=${afterId}`;
-  const response = await fetch(url, {
-    method: 'GET',
-    headers: {
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+  // Capture initialAfterId once; after the first reconnect the adapter uses the SSE id: field.
+  const initialAfterId = afterId ? String(afterId) : '';
+
+  for await (const evt of streamSSEResumable({
+    getUrl: (lastEventId) => {
+      const id = lastEventId || initialAfterId;
+      const base = `${BASE_URL}/deep-research/jobs/${encodeURIComponent(jobId)}/stream`;
+      return id ? `${base}?after_id=${encodeURIComponent(id)}` : base;
     },
+    getHeaders: () => ({
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    }),
+    terminalEvents: DR_TERMINAL_EVENTS as unknown as string[],
     signal,
-  });
-  if (!response.ok) {
-    const errBody = await response.text().catch(() => '');
-    throw new Error(`HTTP ${response.status}: ${response.statusText} - ${errBody}`);
-  }
-  const reader = response.body?.getReader();
-  if (!reader) throw new Error('No response body');
-
-  const decoder = new TextDecoder();
-  let buffer = '';
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = lines.pop() || '';
-
-    let currentEvent = '';
-    for (const line of lines) {
-      if (line.startsWith('event: ')) {
-        currentEvent = line.slice(7).trim();
-      } else if (line.startsWith('data: ')) {
-        const dataStr = line.slice(6);
-        try {
-          const data = JSON.parse(dataStr) as Record<string, unknown>;
-          yield { event: currentEvent, data };
-        } catch {
-          yield { event: currentEvent, data: { raw: dataStr } };
-        }
-      }
-    }
+    maxRetries: 5,
+    baseMs: 2000,
+    maxMs: 30000,
+  })) {
+    yield { event: evt.event, data: evt.data as Record<string, unknown> };
   }
 }
 
@@ -345,6 +344,24 @@ export async function cancelDeepResearchJob(
     `/deep-research/jobs/${encodeURIComponent(jobId)}/cancel`,
     undefined,
     force ? { params: { force: true } } : undefined,
+  );
+  return res.data;
+}
+
+export async function pauseDeepResearchJob(
+  jobId: string,
+): Promise<{ ok: boolean; job_id: string; status: string; message?: string }> {
+  const res = await client.post<{ ok: boolean; job_id: string; status: string; message?: string }>(
+    `/deep-research/jobs/${encodeURIComponent(jobId)}/pause`,
+  );
+  return res.data;
+}
+
+export async function resumeDeepResearchJob(
+  jobId: string,
+): Promise<{ ok: boolean; job_id: string; status: string; message?: string }> {
+  const res = await client.post<{ ok: boolean; job_id: string; status: string; message?: string }>(
+    `/deep-research/jobs/${encodeURIComponent(jobId)}/resume`,
   );
   return res.data;
 }

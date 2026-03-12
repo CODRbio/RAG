@@ -114,6 +114,8 @@ export function Sidebar({ onStartResize }: SidebarProps) {
     setAgentMode,
   } = useConfigStore();
 
+  const effectiveSelectedCount = selectedCollections.filter((c) => collections.includes(c)).length;
+
   const {
     sidebarWidth,
     isSidebarOpen,
@@ -184,7 +186,7 @@ export function Sidebar({ onStartResize }: SidebarProps) {
     setIsLoadingJobs(true);
     try {
       const jobs = await listDeepResearchJobs(20);
-      const active = ['planning', 'pending', 'running', 'cancelling', 'waiting_review'];
+      const active = ['planning', 'pending', 'running', 'pausing', 'paused', 'cancelling', 'waiting_review'];
       const sorted = jobs.sort((a, b) => {
         const aActive = active.includes(a.status);
         const bActive = active.includes(b.status);
@@ -206,7 +208,7 @@ export function Sidebar({ onStartResize }: SidebarProps) {
 
   // 有活跃任务时定期刷新状态
   const hasRunningJob = backgroundJobs.some((j) =>
-    ['planning', 'pending', 'running', 'cancelling', 'waiting_review'].includes(j.status),
+    ['planning', 'pending', 'running', 'pausing', 'paused', 'cancelling', 'waiting_review'].includes(j.status),
   );
   useEffect(() => {
     if (!hasRunningJob || dbStatus !== 'connected') return;
@@ -284,7 +286,7 @@ export function Sidebar({ onStartResize }: SidebarProps) {
   };
 
   const handleRestoreBackgroundJob = async (job: DeepResearchJobInfo) => {
-    const runnable = ['planning', 'pending', 'running', 'cancelling', 'waiting_review'];
+    const runnable = ['planning', 'pending', 'running', 'pausing', 'paused', 'cancelling', 'waiting_review'];
     try {
       setActiveTab('chat'); // 恢复任务时切换到对话页，确保会话内容在对话窗显示
       localStorage.setItem(DEEP_RESEARCH_JOB_KEY, job.job_id);
@@ -539,8 +541,8 @@ export function Sidebar({ onStartResize }: SidebarProps) {
               <div>
                 <div className="flex items-center justify-between text-[10px] text-slate-500 mb-1">
                   <span>{t('sidebar.queryCollection')}</span>
-                  {selectedCollections.length > 1 && (
-                    <span className="text-sky-500 font-medium">{selectedCollections.length} selected</span>
+                  {effectiveSelectedCount > 1 && (
+                    <span className="text-sky-500 font-medium">{effectiveSelectedCount} selected</span>
                   )}
                 </div>
                 {collections.length === 0 ? (
@@ -640,12 +642,12 @@ export function Sidebar({ onStartResize }: SidebarProps) {
                       id="step-topk-num"
                       name="step-topk-num"
                       type="number"
-                      min="1"
-                      max="200"
+                      min="10"
+                      max="150"
                       step="1"
                       value={ragConfig.stepTopK ?? 10}
                       onChange={(e) =>
-                        updateRagConfig({ stepTopK: Math.max(1, Number(e.target.value)) })
+                        updateRagConfig({ stepTopK: Math.min(150, Math.max(10, Number(e.target.value))) })
                       }
                       className="w-16 text-[10px] bg-slate-950 border border-slate-700 text-slate-300 rounded px-1 py-0.5 focus:border-sky-500 focus:outline-none"
                       title={t('sidebar.stepTopKDesc')}
@@ -656,10 +658,10 @@ export function Sidebar({ onStartResize }: SidebarProps) {
                   id="step-topk-range"
                   name="step-topk-range"
                   type="range"
-                  min="1"
-                  max="60"
+                  min="10"
+                  max="150"
                   step="1"
-                  value={Math.min(ragConfig.stepTopK ?? 10, 60)}
+                  value={Math.min(Math.max(ragConfig.stepTopK ?? 10, 10), 150)}
                   onChange={(e) =>
                     updateRagConfig({ stepTopK: Number(e.target.value) })
                   }
@@ -682,15 +684,18 @@ export function Sidebar({ onStartResize }: SidebarProps) {
                       id="write-topk-num"
                       name="write-topk-num"
                       type="number"
-                      min={Math.ceil((ragConfig.stepTopK ?? 10) * 1.5)}
-                      max="300"
+                      min={Math.ceil((ragConfig.stepTopK ?? 10) * 1.2)}
+                      max={Math.ceil((ragConfig.stepTopK ?? 10) * 2.5)}
                       step="1"
                       value={ragConfig.writeTopK ?? 15}
                       onChange={(e) =>
                         updateRagConfig({
-                          writeTopK: Math.max(
-                            Math.ceil((ragConfig.stepTopK ?? 10) * 1.5),
-                            Number(e.target.value),
+                          writeTopK: Math.min(
+                            Math.ceil((ragConfig.stepTopK ?? 10) * 2.5),
+                            Math.max(
+                              Math.ceil((ragConfig.stepTopK ?? 10) * 1.2),
+                              Number(e.target.value),
+                            ),
                           ),
                         })
                       }
@@ -703,18 +708,21 @@ export function Sidebar({ onStartResize }: SidebarProps) {
                   id="write-topk-range"
                   name="write-topk-range"
                   type="range"
-                  min={Math.ceil((ragConfig.stepTopK ?? 10) * 1.5)}
-                  max="120"
+                  min={Math.ceil((ragConfig.stepTopK ?? 10) * 1.2)}
+                  max={Math.ceil((ragConfig.stepTopK ?? 10) * 2.5)}
                   step="1"
                   value={Math.min(
-                    Math.max(ragConfig.writeTopK ?? 15, Math.ceil((ragConfig.stepTopK ?? 10) * 1.5)),
-                    120,
+                    Math.max(ragConfig.writeTopK ?? 15, Math.ceil((ragConfig.stepTopK ?? 10) * 1.2)),
+                    Math.ceil((ragConfig.stepTopK ?? 10) * 2.5),
                   )}
                   onChange={(e) =>
                     updateRagConfig({
-                      writeTopK: Math.max(
-                        Math.ceil((ragConfig.stepTopK ?? 10) * 1.5),
-                        Number(e.target.value),
+                      writeTopK: Math.min(
+                        Math.ceil((ragConfig.stepTopK ?? 10) * 2.5),
+                        Math.max(
+                          Math.ceil((ragConfig.stepTopK ?? 10) * 1.2),
+                          Number(e.target.value),
+                        ),
                       ),
                     })
                   }
@@ -757,44 +765,76 @@ export function Sidebar({ onStartResize }: SidebarProps) {
               </div>
 
               {/* 合并池分数阈值 */}
-              <div>
-                <div className="flex items-center justify-between text-[10px] text-slate-500 mb-1">
+              <div className="bg-slate-900/30 rounded-lg p-2 border border-slate-700/50">
+                <div className="flex items-center justify-between text-[10px] text-slate-500 mb-2">
                   <span>{t('sidebar.fusedPoolScoreThreshold')}</span>
-                  <div className="flex items-center gap-2">
-                    <span className="font-mono bg-slate-950 px-1.5 py-0.5 rounded border border-slate-700 text-sky-400">
-                      {(ragConfig.fusedPoolScoreThreshold ?? 0.35).toFixed(2)}
-                    </span>
-                    <input
-                      id="fused-threshold-num"
-                      name="fused-threshold-num"
-                      type="number"
-                      min="0"
-                      max="1"
-                      step="0.05"
-                      value={ragConfig.fusedPoolScoreThreshold ?? 0.35}
-                      onChange={(e) =>
-                        updateRagConfig({ fusedPoolScoreThreshold: Math.min(1, Math.max(0, Number(e.target.value) || 0.35)) })
-                      }
-                      className="w-16 text-[10px] bg-slate-950 border border-slate-700 text-slate-300 rounded px-1 py-0.5 focus:border-sky-500 focus:outline-none"
-                    />
+                  <div className="flex gap-1">
+                    <button
+                      type="button"
+                      onClick={() => updateRagConfig({
+                        poolScoreThresholds: {
+                          chat: { main: 0.3, gap: 0, agent: 0.1 },
+                          research: ragConfig.poolScoreThresholds?.research || { main: 0.35, gap: 0.05, agent: 0.15 }
+                        }
+                      })}
+                      className="px-1.5 py-0.5 bg-slate-800 hover:bg-slate-700 rounded text-sky-400 border border-slate-600 transition-colors"
+                      title="重置 Chat 预设"
+                    >
+                      Chat 预设
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => updateRagConfig({
+                        poolScoreThresholds: {
+                          chat: ragConfig.poolScoreThresholds?.chat || { main: 0.3, gap: 0, agent: 0.1 },
+                          research: { main: 0.35, gap: 0.05, agent: 0.15 }
+                        }
+                      })}
+                      className="px-1.5 py-0.5 bg-slate-800 hover:bg-slate-700 rounded text-emerald-400 border border-slate-600 transition-colors"
+                      title="重置 Research 预设"
+                    >
+                      DR 预设
+                    </button>
                   </div>
                 </div>
-                <input
-                  id="fused-threshold-range"
-                  name="fused-threshold-range"
-                  type="range"
-                  min="0"
-                  max="1"
-                  step="0.05"
-                  value={ragConfig.fusedPoolScoreThreshold ?? 0.35}
-                  onChange={(e) =>
-                    updateRagConfig({ fusedPoolScoreThreshold: Number(e.target.value) })
-                  }
-                  className="w-full accent-emerald-500 h-1.5 bg-slate-700 rounded-lg appearance-none cursor-pointer"
-                />
-                <div className="text-[9px] text-slate-600 mt-0.5">
-                  {t('sidebar.fusedPoolScoreThresholdDesc')}
-                </div>
+
+                {(['chat', 'research'] as const).map((mode) => {
+                  const thresholds = ragConfig.poolScoreThresholds?.[mode] || { main: 0, gap: 0, agent: 0 };
+                  return (
+                    <div key={mode} className="mb-2 last:mb-0">
+                      <div className="text-[9px] text-slate-400 mb-1 capitalize">{mode} 候选池</div>
+                      <div className="grid grid-cols-3 gap-2">
+                        {(['main', 'gap', 'agent'] as const).map((source) => (
+                          <div key={source} className="flex flex-col gap-0.5">
+                            <div className="flex justify-between items-center">
+                              <span className="text-[8px] text-slate-500 capitalize">{source}</span>
+                              <span className="text-[8px] text-slate-400 font-mono">{thresholds[source]}</span>
+                            </div>
+                            <input
+                              type="range"
+                              min="0" max="1" step="0.05"
+                              value={thresholds[source]}
+                              onChange={(e) => {
+                                const val = Number(e.target.value) || 0;
+                                updateRagConfig({
+                                  poolScoreThresholds: {
+                                    chat: ragConfig.poolScoreThresholds?.chat || { main: 0.3, gap: 0, agent: 0.1 },
+                                    research: ragConfig.poolScoreThresholds?.research || { main: 0.35, gap: 0.05, agent: 0.15 },
+                                    [mode]: {
+                                      ...thresholds,
+                                      [source]: val
+                                    }
+                                  }
+                                });
+                              }}
+                              className="w-full accent-emerald-500 h-1 bg-slate-700 rounded-lg appearance-none cursor-pointer"
+                            />
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
 
               {/* 年份过滤 */}
@@ -1350,7 +1390,7 @@ export function Sidebar({ onStartResize }: SidebarProps) {
                 <div className="text-xs text-slate-600 text-center py-3">{t('sidebar.noBackgroundJobs')}</div>
               )}
               {backgroundJobs.map((job) => {
-                const active = ['planning', 'pending', 'running', 'cancelling', 'waiting_review'].includes(job.status);
+                const active = ['planning', 'pending', 'running', 'pausing', 'paused', 'cancelling', 'waiting_review'].includes(job.status);
                 const running = active;
                 const terminal = ['done', 'error', 'cancelled'].includes(job.status);
                 const isStopping = stoppingJobId === job.job_id;
@@ -1390,6 +1430,8 @@ export function Sidebar({ onStartResize }: SidebarProps) {
                       <span className="ml-2 text-slate-700">|</span>
                       <span className={`ml-1 ${
                         job.status === 'planning' ? 'text-amber-400' :
+                        job.status === 'pausing' ? 'text-amber-300' :
+                        job.status === 'paused' ? 'text-yellow-300' :
                         job.status === 'running' ? 'text-emerald-400' :
                         job.status === 'done' ? 'text-sky-400' :
                         job.status === 'error' ? 'text-red-400' :
@@ -1398,6 +1440,8 @@ export function Sidebar({ onStartResize }: SidebarProps) {
                       }`}>
                         {job.status === 'planning' ? t('sidebar.statusPlanning') :
                          job.status === 'pending' ? t('sidebar.statusPending') :
+                         job.status === 'pausing' ? t('sidebar.statusPausing') :
+                         job.status === 'paused' ? t('sidebar.statusPaused') :
                          job.status === 'running' ? t('sidebar.statusRunning') :
                          job.status === 'waiting_review' ? t('sidebar.statusReview') :
                          job.status === 'done' ? t('sidebar.statusDone') :

@@ -1,237 +1,342 @@
 # DeepSea RAG
 
-面向科研场景（尤其深海相关文献）的全栈 RAG 系统：支持 PDF 解析与入库、混合检索（向量 + 图谱 + 网络）、多轮对话、Deep Research、画布协作、引用管理、多文档对比，以及可观测性与 MCP 工具化接入。
-
-**使用方式**：所有功能与选项以 **UI 前端为主**；命令行与脚本为默认/辅助手段（配置检查、单点测试等），正式使用请通过前端界面。
-
-## 你可以用它做什么
-
-- 把本地 PDF 批量解析为结构化数据并向量入库
-- 在聊天中做 `local / web / hybrid` 检索并给出可追溯引用
-- 启用 Agent 模式让模型自动调用检索/画布/图谱/对比工具
-- 对 2-5 篇论文做结构化比较（对话引文候选 + 本地文库候选）
-- 在 Canvas 中持续编辑综述草稿并导出 Markdown
-- 通过 Deep Research 完成从选题到综述终稿的全自动化研究流程
-- 通过 `/metrics`、`/health/detailed` 监控运行状态
-- 多语言支持（中/英）
-
-## 当前技术栈
-
-| 层 | 技术 |
-|---|---|
-| 后端框架 | FastAPI + Pydantic + SQLModel/Alembic + SQLite(`data/rag.db`) + Milvus + NetworkX |
-| 检索引擎 | Dense/Sparse + RRF + BGE-M3/ColBERT + HippoRAG + Web Search 聚合 |
-| LLM 调度 | 统一 `LLMManager`（OpenAI / DeepSeek / Gemini / Claude / Kimi / Sonar） |
-| Agent 框架 | ReAct 循环 + 统一 Tool 抽象 + LangGraph Deep Research |
-| 前端 | React 19 + TypeScript + Zustand + Vite 7 + Tailwind CSS |
-| 国际化 | i18next（中/英） |
-| 可观测性 | OpenTelemetry + Prometheus + LangSmith |
-| 工具化 | MCP Server（对外暴露工具/资源） |
-
-## 快速开始
-
-### 1) 安装依赖
-
-```bash
-conda create -n deepsea-rag python=3.10 -y
-conda activate deepsea-rag
-conda install -c pytorch -c conda-forge "pytorch>=2.6.0" "torchvision>=0.21.0" timm -y
-pip install -r requirements.txt --no-cache-dir
-cd frontend && npm install && cd ..
-playwright install chromium
-```
-
-详细安装与依赖核对见 `install.md`。
-
-### 2) 准备配置
-
-```bash
-cp config/rag_config.example.json config/rag_config.json
-cp config/rag_config.local.example.json config/rag_config.local.json
-cp .env.example .env
-bash scripts/verify_dependencies.sh
-```
-
-- 敏感字段（API Key）建议放在 `config/rag_config.local.json`
-- 或使用环境变量覆盖：`RAG_LLM__{PROVIDER}__API_KEY`
-- 数据库默认使用 `database.url = sqlite:///data/rag.db`（推荐用 `RAG_DATABASE_URL` 切到 Docker PostgreSQL）
-- 队列推荐使用 `REDIS_URL=redis://127.0.0.1:6379/0`
-
-### 3) 启动基础服务（PostgreSQL / Redis / Milvus 等）
-
-```bash
-bash scripts/00_preflight_check.sh
-# 开发环境（Mac CPU）
-docker compose --profile dev up -d
-# 生产环境（Linux GPU）
-# docker compose --profile prod up -d
-bash scripts/00_healthcheck_docker.sh
-```
-
-### 4) 执行离线入库流水线
-
-```bash
-python scripts/01_init_env.py
-python scripts/02_parse_papers.py
-python scripts/03_index_papers.py
-python scripts/03b_build_graph.py
-```
-
-### 5) 启动全栈
-
-```bash
-bash scripts/start.sh
-```
-
-- 前端：`http://localhost:5173`
-- 后端 Swagger：`http://127.0.0.1:9999/docs`
-
-## 关键接口速览
-
-| 功能域 | 接口 |
-|---|---|
-| 聊天 | `POST /chat`、`POST /chat/stream` |
-| Deep Research | `/deep-research/start\|submit\|jobs/*\|jobs/*/stream\|review\|gap-supplement\|insights` |
-| 画布 | `/canvas/*`（CRUD + 大纲 + 草稿 + 快照 + AI 编辑 + 引用管理） |
-| 导出 | `POST /export` |
-| 对比 | `POST /compare`、`GET /compare/candidates`、`GET /compare/papers` |
-| 图谱 | `/graph/*`（统计 + 实体 + 邻居 + chunk 详情） |
-| 在线入库 | `/ingest/*`（上传 + Collections + 任务管理） |
-| 认证与项目 | `/auth/*`、`/admin/*`、`/projects/*` |
-| 模型管理 | `GET /models/status`、`POST /models/sync`、`GET /llm/providers` |
-| 自动补全 | `POST /auto-complete` |
-| 可观测 | `GET /metrics`、`GET /health`、`GET /health/detailed`、`GET /storage/stats` |
-
-完整接口见 `docs/api_reference.md`。
-
-## Deep Research 核心能力
-
-- **启动前 `⚙` 设置**：深度（lite / comprehensive）、输出语言、分步骤模型、strict step model
-- **后台任务模式**：提交后前端可关闭/刷新，任务在后端持续运行
-- **进度实时流**：前端通过 `/deep-research/jobs/{job_id}/stream`（SSE）低延迟接收进度与状态心跳
-- **Drafting 人工审核**：通过 / 修改 / 重新确认 + 一键"全部通过并触发整合"
-- **章节缺口补充**：支持"材料线索"与"直接观点"
-- **人工介入**：上传临时材料（pdf/md/txt）或文本补充，仅用于本次任务
-- **最终整合**：自动生成 Abstract + Limitations + Open Gaps 研究议程 + 全篇连贯性整合
-- **引用保护**：若整合后引用/证据标签显著丢失，自动回退安全版本
-- **成本监控**：心跳上报 + 预警阈值 + 强制摘要模式
-- **循环防护**：动态迭代预算 + 收益曲线早停 + 3 级验证分流
-
-## 目录结构
-
-```text
-.
-├── README.md                 # 项目入口
-├── install.md                # 安装与依赖核对
-├── requirements.txt          # Python 依赖
-├── docker-compose.yml        # Docker 服务（PostgreSQL/Redis/Milvus/etcd/MinIO）
-├── .env.example              # 环境变量模板
-│
-├── config/                   # 配置中心
-│   ├── rag_config.json       #   主配置（结构 + 默认值）
-│   ├── rag_config.local.json #   本地覆盖（敏感信息，gitignored）
-│   ├── rag_config.example.json
-│   ├── rag_config.local.example.json
-│   └── settings.py           #   Python 配置加载器
-│
-├── src/                      # 后端源码
-│   ├── api/                  #   FastAPI 路由层
-│   ├── llm/                  #   LLMManager + tools + react_loop
-│   ├── db/                   #   SQLModel 模型 / 连接引擎 / 历史库迁移
-│   ├── retrieval/            #   混合检索 + web 聚合 + 重排
-│   ├── collaboration/        #   协作核心
-│   │   ├── canvas/           #     画布管理
-│   │   ├── memory/           #     会话/工作/持久记忆
-│   │   ├── intent/           #     意图解析与命令
-│   │   ├── research/         #     Deep Research（LangGraph Agent）
-│   │   ├── workflow/         #     状态机
-│   │   ├── citation/         #     引用管理与格式化
-│   │   └── export/           #     导出格式化
-│   ├── indexing/             #   embed + Milvus + paper 管理
-│   ├── parser/               #   PDF 解析 + 声明提取
-│   ├── chunking/             #   结构化切块
-│   ├── generation/           #   证据综合 + 上下文打包 + LLM 兼容层
-│   ├── graph/                #   HippoRAG 图检索
-│   ├── graphs/               #   LangGraph 流水线（入库图）
-│   ├── mcp/                  #   MCP Server
-│   ├── observability/        #   metrics + tracing + middleware
-│   ├── evaluation/           #   评测执行与指标
-│   ├── auth/                 #   认证（session + password）
-│   ├── utils/                #   缓存/限流/清理/提示词管理/任务运行器
-│   ├── log/                  #   日志管理
-│   └── prompts/              #   LLM 提示词模板
-│
-├── frontend/                 # React 前端
-│   ├── src/pages/            #   ChatPage / IngestPage / LoginPage / AdminPage
-│   ├── src/components/       #   chat / canvas / compare / graph / workflow / research / settings / layout / ui
-│   │   └── workflow/deep-research/
-│   │       #   Deep Research 拆分模块：
-│   │       #   useDeepResearchTask + ClarifyPhase + ConfirmPhase + ProgressMonitor + types
-│   ├── src/stores/           #   Zustand 状态管理
-│   ├── src/api/              #   后端接口封装
-│   ├── src/types/            #   TypeScript 类型
-│   └── src/i18n/             #   国际化（en/zh）
-│
-├── scripts/                  # 运行与测试脚本
-├── tests/                    # pytest 测试
-├── docs/                     # 文档中心
-├── data/                     # 数据存储（raw/parsed/metadata/graph）
-├── volumes/                  # Docker 持久卷（Milvus/etcd/MinIO；PostgreSQL/Redis 使用 named volumes）
-└── logs/                     # 应用日志（含 LLM 原始响应日志）
-```
-
-## 文档导航
-
-| 文档 | 说明 |
-|---|---|
-| `docs/README.md` | 文档总览与角色阅读路径 |
-| `docs/developer_guide.md` | 开发总指南（模块职责、约定、扩展路径） |
-| `docs/architecture.md` | 系统架构与关键数据流 |
-| `docs/api_reference.md` | 按前缀分组的完整 API 参考 |
-| `docs/configuration.md` | 配置项与环境变量说明 |
-| `docs/scripts_guide.md` | 脚本用途、参数、推荐执行顺序 |
-| `docs/operations_and_troubleshooting.md` | 启动、监控、运维、故障处理 |
-| `docs/release_migration_ubuntu.md` | Ubuntu 发布与迁移全流程（systemd + Nginx） |
-| `docs/testing_and_evaluation.md` | pytest 与评测体系 |
-| `docs/dependency_matrix.md` | Python / 前端依赖矩阵与运行时要求 |
-
-## LLM 调用约定（必须遵守）
-
-统一走 `src/llm/llm_manager.py`：
-
-```python
-from src.llm import LLMManager
-
-manager = LLMManager.from_json("config/rag_config.json")
-client = manager.get_client("deepseek")
-resp = client.chat(messages=[{"role": "user", "content": "你好"}])
-text = resp["final_text"]
-```
-
-禁止直接在业务代码里实例化各家 SDK 客户端或硬编码密钥。
-
-## Prompt 管理约定（必须遵守）
-
-- 所有业务 prompt 模板统一放在 `src/prompts/`
-- 业务代码通过 `src/utils/prompt_manager.py` 读取，不在 Python 逻辑中硬编码多行提示词
-- 常规模板使用 `PromptManager.render(template, **kwargs)`，延迟格式化场景使用 `PromptManager.load(template)`
-
-示例：
-
-```python
-from src.utils.prompt_manager import PromptManager
-
-_pm = PromptManager()
-system_prompt = _pm.render("chat_route_system.txt")
-user_prompt = _pm.render("chat_route_classify.txt", history=history, message=message)
-```
-
-对于包含 JSON 示例的模板，字面量花括号需使用 `{{` / `}}`，以兼容 `str.format`。
+A full-stack Retrieval-Augmented Generation (RAG) platform built for deep-sea science research — and general academic literature workflows. It combines hybrid local+web retrieval, multi-provider LLM support, and a stateful deep research agent to accelerate literature review and knowledge synthesis.
 
 ---
 
-*最后更新：2026-03-02*
+## Features
+
+- **Hybrid Retrieval** — dense (BGE-M3) + sparse (BM25) local search fused via RRF, with web aggregation across Tavily, Google Scholar, Semantic Scholar, and PubMed
+- **Deep Research Agent** — LangGraph-powered, stateful, resumable literature review pipeline: clarify → outline → per-section research loop → write → verify → human review gate → synthesize
+- **Evidence Quota Protection** — `fuse_pools_with_gap_protection()` guarantees that gap-fill and agent-supplemented evidence is not squeezed out by volume, even when the main pool dominates
+- **Multi-Provider LLM** — unified dispatch across OpenAI, DeepSeek, Gemini, Claude, Kimi, Perplexity Sonar, and Qwen; thinking-model variants supported
+- **Scholar Downloader** — automated PDF acquisition with strategy chain (direct → Playwright browser → Sci-Hub → BrightData → Anna's Archive) and captcha solving (2Captcha, CapSolver)
+- **Canvas Editor** — live collaborative document editing with AI expand/condense/refine and inline citation insertion
+- **Multi-Document Comparison** — structured analysis across 2–5 papers on configurable dimensions
+- **Streaming Everything** — all long-running tasks (ingest, chat, deep research, scholar download) stream progress via SSE with `id:` lines for reconnect/resume
+- **Graceful Reliability** — per-task checkpointing, task-level heartbeats, concurrent-slot management, and clean SIGTERM shutdown
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|-------|-----------|
+| Backend | Python 3.10, FastAPI, Uvicorn, SQLModel, Alembic |
+| Frontend | React 19, TypeScript, Vite 7, Zustand, Tailwind CSS |
+| Vector DB | Milvus 2.5 (dense + sparse, BGE-M3 embedding) |
+| Reranker | BGE Reranker, optional ColBERT (jina-colbert-v2) |
+| Graph DB | NetworkX (entity/relation extraction) |
+| Task Queue | Redis |
+| Relational DB | PostgreSQL |
+| Agent Framework | LangGraph |
+| Browser Automation | Playwright (shared context pool) |
+| Observability | OpenTelemetry, Prometheus, LangSmith (optional) |
+
+---
+
+## Architecture Overview
+
+```
+┌─────────────────────────────────────────────┐
+│         Frontend  (React + Vite)             │
+│  Chat | Scholar | Research | Canvas | Compare│
+└──────────────────┬──────────────────────────┘
+                   │ HTTP / SSE
+┌──────────────────▼──────────────────────────┐
+│         Backend  (FastAPI)                   │
+│  routes_chat  routes_ingest  routes_scholar  │
+└────┬──────────────┬──────────────┬───────────┘
+     │              │              │
+  Chat/DR        Ingest         Scholar
+  Worker         Worker         Worker
+     │              │              │
+┌────▼──────────────▼──────────────▼──────────┐
+│  RetrievalService  │  LLMManager  │  DR Agent│
+│  (hybrid search,   │  (multi-LLM  │  (LangGraph│
+│   gap protection)  │   dispatch)  │   stateful)│
+└────────────────────┴──────────────┴──────────┘
+     │                                         │
+ Milvus  Redis  PostgreSQL  Playwright  BGE Models
+```
+
+---
+
+## Quick Start
+
+### Prerequisites
+
+| Requirement | Version |
+|-------------|---------|
+| Python | 3.10+ (3.10 recommended) |
+| Conda / Miniconda | any recent |
+| Node.js | `^20.19.0` or `>=22.12.0` |
+| Docker + Compose Plugin | 24.0+ / 2.20+ |
+
+> **Important**: PyTorch, Torchvision, and timm **must** be installed via Conda. Do not include them in `requirements.txt` — doing so causes C++ operator conflicts.
+
+### 1. Clone & set up Python environment
+
+```bash
+git clone <repo-url> DeepSeaRAG
+cd DeepSeaRAG
+
+conda create -n deepsea-rag python=3.10 -y
+conda activate deepsea-rag
+
+# Install PyTorch via Conda (macOS CPU)
+conda install -c pytorch -c conda-forge "pytorch>=2.6.0" "torchvision>=0.21.0" timm -y
+
+# Install remaining Python dependencies
+pip install -r requirements.txt --no-cache-dir
+
+# Install browser for Scholar/download features
+playwright install chromium
+```
+
+### 2. Start infrastructure
+
+```bash
+# macOS dev (CPU Milvus)
+docker compose --profile dev up -d
+
+# Ubuntu production (GPU Milvus)
+docker compose --profile prod up -d
+```
+
+Waits for all services to reach `healthy`: PostgreSQL (5433), Milvus (19530), Redis (6379), etcd, MinIO.
+
+### 3. Configure
+
+```bash
+cp config/rag_config.example.json config/rag_config.json
+cp config/rag_config.example.json config/rag_config.local.json
+```
+
+Edit `config/rag_config.local.json` — at minimum, add one LLM API key:
+
+```json
+{
+  "database": {
+    "url": "postgresql+psycopg://rag:change-me@localhost:5433/rag"
+  },
+  "llm": {
+    "platforms": {
+      "claude": { "api_key": "sk-ant-xxx" }
+    }
+  }
+}
+```
+
+The local file is git-ignored and takes priority over `rag_config.json`. See [docs/configuration.md](docs/configuration.md) for all options.
+
+### 4. Initialize database
+
+```bash
+alembic upgrade head
+```
+
+### 5. Start the application
+
+```bash
+# Terminal 1 — backend
+uvicorn src.api.server:app --host 0.0.0.0 --port 9999 --reload
+
+# Terminal 2 — frontend
+cd frontend && npm ci && npm run dev
+```
+
+Open **http://localhost:5173**.
+
+---
+
+## Configuration
+
+Configuration is loaded in this priority order (highest wins):
+
+```
+UI / API request params
+  > config/rag_config.local.json   (local overrides, git-ignored)
+  > environment variables
+  > config/rag_config.json         (main config)
+  > code defaults
+```
+
+### API Keys
+
+| Config path | Purpose | Required |
+|-------------|---------|----------|
+| `llm.platforms.<provider>.api_key` | LLM calls | At least one |
+| `web_search.api_key` | Tavily web search | Recommended |
+| `semantic_scholar.api_key` | S2 API (rate-limited without) | Optional |
+| `ncbi.api_key` + `ncbi.email` | PubMed API | Optional |
+| `content_fetcher.brightdata_api_key` | Full-text fetching proxy | Optional |
+| `scholar_downloader.twocaptcha_api_key` | Captcha solving | Optional |
+| `auth.secret_key` | JWT signing (**change in production**) | Required in prod |
+
+---
+
+## Supported LLM Providers
+
+| Provider ID | Platform | Notes |
+|-------------|---------|-------|
+| `openai` / `openai-thinking` / `openai-mini` | OpenAI | GPT series; thinking injects `reasoning_effort` |
+| `deepseek` / `deepseek-thinking` | DeepSeek | Chat + Reasoner |
+| `gemini` / `gemini-thinking` / `gemini-vision` / `gemini-flash` | Google | Vision variants for figure parsing |
+| `claude` / `claude-thinking` / `claude-haiku` | Anthropic | Thinking injects `budget_tokens` |
+| `kimi` / `kimi-thinking` / `kimi-vision` | Moonshot | K2 series |
+| `sonar` | Perplexity | Web-augmented; used for preliminary knowledge |
+| `qwen` / `qwen-thinking` / `qwen-vision` | Alibaba | Qwen3 series |
+
+The frontend model selector fetches available models from each platform's API at runtime — no static list to maintain.
+
+---
+
+## Deep Research Workflow
+
+```
+User topic
+  → Clarify (AI questions + optional Sonar prelim knowledge)
+  → User answers
+  → Scope (ResearchBrief: scope, criteria, key questions, exclusions, time range)
+  → Plan (background search + outline generation)
+  → User confirms outline
+  → Per-section loop:
+       research_node (1+1+1 structured queries + agent supplement)
+       evaluate_node (coverage check → gap-fill search if needed)
+       generate_claims_node (comprehensive only)
+       write_node (three-pool fuse: main 80% + gap 20% + agent 25% quota)
+       verify_node (light / medium / severe → rewrite if severe)
+  → review_gate_node (human approve / revise / skip)
+       revise → targeted agent supplement + integrate rewrite → back to gate
+  → synthesize_node (abstract + limitations + coherence refine + citation resolve)
+```
+
+### Depth presets
+
+| Parameter | `lite` | `comprehensive` |
+|-----------|-------:|----------------:|
+| Max research rounds / section | 3 | 5 |
+| Max verify rewrites / section | 1 | 2 |
+| Coverage threshold | 0.60 | 0.80 |
+| write_top_k baseline | 10 | 12 |
+| write_top_k cap | 40 | 60 |
+| verify severe threshold | 0.45 | 0.35 |
+
+---
+
+## Evidence Retrieval Design
+
+The retrieval system uses a three-pool fusion model with quota protection to prevent gap-fill evidence from being drowned out:
+
+```
+main_pool  (main search results)
+gap_pool   (eval_supplement — automatic coverage gap fill, 20% quota)
+agent_pool (agent_supplement / revise_supplement — agent tool results, 25% quota)
+
+fuse_pools_with_gap_protection(top_k, gap_ratio=0.2, agent_ratio=0.25, multiplier=3.0):
+  1. Deduplicate by chunk_id (priority: agent > gap > main)
+  2. BGE rerank all candidates together (rerank_k = top_k × 3.0)
+  3. Take top_k slice
+  4. Soft quota backfill: if gap count < ceil(top_k × 0.2), pull from reranked tail
+  5. Return top_k results
+```
+
+`effective_write_top_k` derivation:
+1. Explicit UI `write_top_k` → `max(preset_baseline, write_top_k)`
+2. Explicit UI `step_top_k` → `max(preset_baseline, floor(step_top_k × 1.5))`
+3. Neither → `preset_baseline` (lite=10, comprehensive=12)
+4. Capped by `search_top_k_write_max`
+
+---
+
+## Project Structure
+
+```
+src/
+├── api/            FastAPI routes (chat, ingest, scholar, canvas, compare)
+├── llm/            LLM manager + agent tools + ReAct loop
+├── retrieval/      RetrievalService, hybrid retriever, web search, dedup
+├── collaboration/
+│   ├── research/   LangGraph Deep Research agent + job store
+│   ├── canvas/     Canvas document model
+│   ├── memory/     Session / working / persistent memory
+│   └── citation/   Citation resolution
+├── indexing/       PDF ingest pipeline + embedder
+└── tasks/          Redis queue, task state, dispatcher
+config/
+├── rag_config.json          Main configuration
+└── rag_config.example.json  Template (copy to rag_config.local.json)
+frontend/src/
+├── api/            Axios + SSE clients
+├── components/     React components
+├── stores/         Zustand state
+├── pages/          Page routes
+└── i18n/           Chinese / English localization
+docs/               Full documentation (see below)
+```
+
+---
+
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [docs/architecture.md](docs/architecture.md) | System architecture, module responsibilities, Chat/DR flow, design constraints |
+| [docs/developer_guide.md](docs/developer_guide.md) | Dev setup, module conventions, evidence flow, extending tools/providers |
+| [docs/api_reference.md](docs/api_reference.md) | All HTTP/SSE endpoints with request/response schemas |
+| [docs/installation_and_migration.md](docs/installation_and_migration.md) | Full install guide (Mac + Ubuntu), systemd, Nginx, upgrades, rollback |
+| [docs/operations_and_troubleshooting.md](docs/operations_and_troubleshooting.md) | Service management, monitoring, fault diagnosis, emergency checklist |
+| [docs/configuration.md](docs/configuration.md) | All config options and environment variables |
+| [docs/chat_research_workflow_contract.md](docs/chat_research_workflow_contract.md) | Authoritative spec for current Chat + Deep Research implementation |
+| [docs/evidence_retention.md](docs/evidence_retention.md) | Evidence pool mechanics, step_top_k / write_top_k semantics, fuse algorithm |
+| [docs/task_management.md](docs/task_management.md) | Long-task contract: slots, heartbeat, checkpoint, SSE resume |
+| [install.md](install.md) | Quick install reference + dependency checklist |
+
+---
+
+## Development
+
+```bash
+# Run all tests
+pytest
+
+# Run specific test
+pytest tests/test_chat_agent_refusion.py -v -s
+
+# Enable mock LLM (no API calls)
+# Set llm.dry_run: true in rag_config.local.json
+```
+
+### Key design constraints (do not break)
+
+| Constraint | Reason |
+|-----------|--------|
+| `eval_supplement` **must** enter gap pool | Otherwise gap-fill evidence competes equally with main results and gets squeezed out |
+| `agent_supplement` **must** enter agent pool | Same reason — agent evidence needs its own quota |
+| `revise_supplement` **must** be written to section pool | Guarantees citation traceability in synthesize phase |
+| `write_stage` **must not** be recycled back into the pool | Prevents write-phase evidence from polluting rerank weights |
+| All pool-bound searches use `pool_only=True` | Prevents premature truncation before global rerank |
+| No score-threshold filter after fuse | Breaks gap/agent quota protection |
+| Chat BGE rerank: max 2 passes | §5¾ (main+gap) + optional agent append — no intermediate rerankings |
+| `search_scholar` tool must close aiohttp session in `finally` | Prevents `RuntimeError: Event loop is closed` on agent teardown |
+
+---
+
+## Production Deployment
+
+For Ubuntu production deployment (systemd + Nginx + HTTPS), see [docs/installation_and_migration.md](docs/installation_and_migration.md).
+
+Quick checklist:
+- [ ] Replace `auth.secret_key` with a randomly generated 64-character key
+- [ ] Use `docker compose --profile prod` (GPU Milvus)
+- [ ] Build frontend: `cd frontend && npm ci && npm run build`
+- [ ] Configure Nginx with `proxy_buffering off` and `proxy_read_timeout 3600s` for SSE
+- [ ] Set up HTTPS (SSE connections may be interrupted by proxies on plain HTTP)
+- [ ] Run `alembic upgrade head` before starting the service
+
+---
 
 ## License
 
-MIT
+This project is for internal/research use. Contact the maintainers for licensing questions.

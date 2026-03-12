@@ -9,8 +9,11 @@ from contextlib import asynccontextmanager
 from src.utils.aiohttp_tls_patch import apply_aiohttp_tls_in_tls_patch
 apply_aiohttp_tls_in_tls_patch()
 
+from pathlib import Path
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from config.settings import settings
 from src.api.routes_auth import router as auth_router, admin_router
@@ -38,19 +41,14 @@ logger = get_logger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """应用生命周期：DB初始化 → 历史迁移 → 清理残留任务 → 存储清理 → 启动后台 Worker"""
+    """应用生命周期：DB初始化 → 清理残留任务 → 存储清理 → 启动后台 Worker"""
 
-    # 0. 确保 rag.db 表结构存在，自动迁移旧 .db 文件（仅首次启动时执行）
+    # 0. 确保表结构存在（Alembic 已运行时为 no-op）
     from src.db.engine import init_db
-    from src.db.migrate_legacy import migrate_if_needed
     try:
         init_db()
     except Exception as e:
         logger.warning("[startup] init_db failed (may be OK if alembic already ran): %s", e)
-    try:
-        migrate_if_needed()
-    except Exception as e:
-        logger.warning("[startup] migrate_if_needed failed: %s", e)
 
     # 0a. JWT secret key safety check
     _DEFAULT_SECRET = "change-me-in-local"
@@ -138,7 +136,13 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Shutdown: 取消 Worker + 关闭 Scholar 适配器
+    # Shutdown: wait for Scholar background tasks, then cancel worker and close adapter
+    try:
+        from src.api.routes_scholar import wait_scholar_background_tasks_or_timeout
+        timeout = getattr(settings.tasks, "graceful_shutdown_timeout_seconds", 30)
+        await wait_scholar_background_tasks_or_timeout(timeout)
+    except Exception as e:
+        logger.warning("scholar shutdown wait failed: %s", e)
     worker_task.cancel()
     try:
         await worker_task
@@ -190,6 +194,11 @@ app.include_router(graph_router)
 app.include_router(compare_router)
 app.include_router(debug_router)
 app.include_router(scholar_router)
+
+# Static files: Graphic Abstract 生成的图片
+_GA_IMAGES_DIR = Path("data/ga_images")
+_GA_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/ga_images", StaticFiles(directory=str(_GA_IMAGES_DIR)), name="ga_images")
 
 # Observability: 中间件 + /metrics + /health/detailed
 setup_observability(app)

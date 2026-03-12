@@ -105,11 +105,22 @@ def generate_working_memory_summary(canvas_id: str, config_path=None) -> str:
     canvas = get_canvas(canvas_id)
     if canvas is None:
         return ""
+        
+    # 获取旧的 facts，用于冲突解决和继承
+    old_wm = get_working_memory(canvas_id)
+    old_facts = old_wm.get("summary", "") if old_wm else "无历史事实"
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
     context = _canvas_to_context_string(canvas)
-    prompt = _pm.render("working_memory_progress.txt", context=context)
+    prompt = _pm.render(
+        "working_memory_progress.txt", 
+        context=context,
+        old_facts=old_facts,
+        current_time=current_time
+    )
     try:
         manager = get_manager(str(config_path) if config_path else None)
-        client = manager.get_client()
+        client = manager.get_lite_client()  # canvas摘要无需推理能力，lite 客户端即可
         resp = client.chat(
             [
                 {"role": "system", "content": _pm.render("working_memory_progress_system.txt")},
@@ -118,7 +129,7 @@ def generate_working_memory_summary(canvas_id: str, config_path=None) -> str:
 
         )
         summary = (resp.get("final_text") or "").strip()
-    except Exception:
+    except Exception as e:
         summary = f"主题: {canvas.topic}，阶段: {canvas.stage}，共 {len(canvas.outline)} 个大纲章节，{len(canvas.drafts)} 个草稿。"
     meta: Dict[str, Any] = {
         "stage": canvas.stage,

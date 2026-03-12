@@ -1,12 +1,23 @@
 import { useState, useRef, useCallback, useEffect, useMemo, type KeyboardEvent } from 'react';
 import { useTranslation } from 'react-i18next';
-import { ArrowRight, Loader2, Telescope, Settings } from 'lucide-react';
+import { ArrowRight, Loader2, Telescope, Settings, Image as ImageIcon, Pause, Play, Square } from 'lucide-react';
 import { useChatStore, useConfigStore, useToastStore, useCanvasStore, useUIStore } from '../../stores';
-import { submitChat, streamChatByTaskId, clarifyForDeepResearch, getChatSuggestions } from '../../api/chat';
+import {
+  submitChat,
+  streamChatByTaskId,
+  clarifyForDeepResearch,
+  getChatSuggestions,
+  cancelTask,
+  pauseTask,
+  resumeTask,
+  cancelDeepResearchJob,
+  pauseDeepResearchJob,
+  resumeDeepResearchJob,
+} from '../../api/chat';
 import { exportCanvas, getCanvas } from '../../api/canvas';
-import { CommandPalette, DeepResearchSettingsPopover } from '../workflow';
+import { CommandPalette, DeepResearchSettingsPopover, GraphicAbstractPopover } from '../workflow';
 import { COMMAND_LIST } from '../../types';
-import type { ChatRequest, Source, EvidenceSummary, IntentInfo, CommandDefinition } from '../../types';
+import type { ChatRequest, Source, EvidenceSummary, IntentInfo, CommandDefinition, WorkflowStep } from '../../types';
 
 /** 1 分钟未选择时默认「本会话不用本地库」的间隔（毫秒） */
 const LOCAL_DB_CHOICE_TIMEOUT_MS = 60_000;
@@ -48,6 +59,7 @@ function saveChatInputHistory(message: string) {
 export function ChatInput() {
   const [inputValue, setInputValue] = useState('');
   const [showDRSettings, setShowDRSettings] = useState(false);
+  const [showGASettings, setShowGASettings] = useState(false);
   const [suggestionIndex, setSuggestionIndex] = useState(-1);
   const [dismissedSuggestions, setDismissedSuggestions] = useState(false);
   const [backendSuggestions, setBackendSuggestions] = useState<string[]>([]);
@@ -59,6 +71,8 @@ export function ChatInput() {
   const localDbChoiceTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const toggleDRSettings = useCallback(() => setShowDRSettings((v) => !v), []);
   const closeDRSettings = useCallback(() => setShowDRSettings(false), []);
+  const toggleGASettings = useCallback(() => setShowGASettings((v) => !v), []);
+  const closeGASettings = useCallback(() => setShowGASettings(false), []);
 
   useEffect(() => {
     return () => {
@@ -85,6 +99,9 @@ export function ChatInput() {
     setStreamingTask,
     clearStreamingTask,
     setStreamingStep,
+    setActiveResponse,
+    patchActiveResponse,
+    activeResponse,
     streamingTasks,
     setMessageAgentDebugById,
     updateMessageTimestampById,
@@ -100,6 +117,7 @@ export function ChatInput() {
     selectedModel,
     currentCollection,
     selectedCollections,
+    collections: validCollectionNames,
     deepResearchDefaults,
   } = useConfigStore();
   const addToast = useToastStore((s) => s.addToast);
@@ -109,9 +127,83 @@ export function ChatInput() {
   const isCurrentSessionBusy = Boolean(
     sessionId &&
       Object.values(streamingTasks).some(
-        (task) => task.sessionId === sessionId && (task.status === 'queued' || task.status === 'running')
+        (task) => task.sessionId === sessionId && ['queued', 'running', 'pausing', 'paused'].includes(task.status)
       )
   );
+  const controlTaskId = activeResponse?.taskOrJobId?.trim() || '';
+  const isResearchControl = activeResponse?.kind === 'research';
+  const isPaused = activeResponse?.streamPhase === 'paused';
+  const isPauseTransitioning = activeResponse?.stepKey === 'pausing';
+  const hasControllableTask = Boolean(controlTaskId);
+
+  const applyControlState = useCallback((status: 'pausing' | 'paused' | 'running', label?: string) => {
+    if (!activeResponse) return;
+    const nextPhase = status === 'paused' ? 'paused' : 'thinking';
+    patchActiveResponse({
+      streamPhase: nextPhase,
+      stepKey: status,
+      stepLabel:
+        label
+        || (status === 'paused'
+          ? t('chat.taskPaused', 'Paused')
+          : status === 'pausing'
+            ? t('chat.taskPausing', 'Pausing...')
+            : t('chat.taskResumed', 'Resumed')),
+    });
+    if (controlTaskId && !isResearchControl) {
+      const currentSessionId = useChatStore.getState().sessionId;
+      setStreamingTask(controlTaskId, currentSessionId ?? null, status);
+    }
+    if (status === 'paused') {
+      setStreamingStep(null);
+    }
+  }, [activeResponse, controlTaskId, isResearchControl, patchActiveResponse, setStreamingStep, setStreamingTask, t]);
+
+  const handleStopActiveTask = useCallback(async () => {
+    if (!controlTaskId) return;
+    try {
+      if (isResearchControl) {
+        await cancelDeepResearchJob(controlTaskId);
+      } else {
+        await cancelTask(controlTaskId);
+      }
+      patchActiveResponse({
+        stepKey: 'cancelling',
+        stepLabel: t('chat.taskStopping', 'Stopping...'),
+        streamPhase: 'thinking',
+      });
+      addToast(t('chat.stopRequested', 'Stop request sent, task is terminating'), 'info');
+    } catch (err) {
+      console.error('[ChatInput] stop task failed:', err);
+      addToast(t('chat.stopFailed', 'Stop failed'), 'error');
+    }
+  }, [addToast, controlTaskId, isResearchControl, patchActiveResponse, t]);
+
+  const handleTogglePauseActiveTask = useCallback(async () => {
+    if (!controlTaskId || isPauseTransitioning) return;
+    try {
+      if (isPaused) {
+        if (isResearchControl) {
+          await resumeDeepResearchJob(controlTaskId);
+        } else {
+          await resumeTask(controlTaskId);
+        }
+        applyControlState('running');
+        addToast(t('chat.taskResumed', 'Resumed'), 'info');
+      } else {
+        if (isResearchControl) {
+          await pauseDeepResearchJob(controlTaskId);
+        } else {
+          await pauseTask(controlTaskId);
+        }
+        applyControlState('pausing');
+        addToast(t('chat.taskPauseRequested', 'Pause requested'), 'info');
+      }
+    } catch (err) {
+      console.error('[ChatInput] toggle pause failed:', err);
+      addToast(t('chat.taskControlFailed', 'Task control failed'), 'error');
+    }
+  }, [addToast, applyControlState, controlTaskId, isPauseTransitioning, isPaused, isResearchControl, t]);
 
   const prefix = inputValue.trim();
   const prefixLower = prefix.toLowerCase();
@@ -213,6 +305,36 @@ export function ChatInput() {
     },
     [],
   );
+
+  const handleTaskControlEvent = useCallback((event: string, data: unknown) => {
+    const message = typeof data === 'object' && data && 'message' in data ? String((data as { message?: unknown }).message || '') : '';
+    if (event === 'pause_requested') {
+      applyControlState('pausing', message || t('chat.taskPausing', 'Pausing...'));
+      return true;
+    }
+    if (event === 'paused') {
+      applyControlState('paused', message || t('chat.taskPaused', 'Paused'));
+      return true;
+    }
+    if (event === 'resumed') {
+      applyControlState('running', message || t('chat.taskResumed', 'Resumed'));
+      return true;
+    }
+    return false;
+  }, [applyControlState, t]);
+
+  const toWorkflowStep = (step?: string | null): WorkflowStep => {
+    switch (step) {
+      case 'idle':
+      case 'explore':
+      case 'outline':
+      case 'drafting':
+      case 'refine':
+        return step;
+      default:
+        return 'explore';
+    }
+  };
 
   /**
    * 触发 Deep Research 流程（打开澄清对话框）
@@ -318,6 +440,16 @@ export function ChatInput() {
 
     addMessage({ role: 'user', content: userMessage });
     addMessage({ id: assistantMessageId, role: 'assistant', content: '' });
+    setActiveResponse({
+      kind: 'chat',
+      taskOrJobId: '',
+      surface: 'chat',
+      stepKey: 'queued',
+      stepLabel: t('chat.thinking', 'Thinking'),
+      streamPhase: 'thinking',
+      targetMessageId: assistantMessageId,
+      hasVisibleOutput: false,
+    });
     setWorkflowStep('explore');
 
     try {
@@ -359,7 +491,10 @@ export function ChatInput() {
       canvas_id: canvasId || undefined,
       message: userMessage,
       collection: currentCollection || undefined,
-      collections: selectedCollections.length > 0 ? selectedCollections : undefined,
+      collections: (() => {
+        const valid = selectedCollections.filter((c) => validCollectionNames.includes(c));
+        return valid.length > 1 ? valid : undefined;
+      })(),
       search_mode: searchMode,
       mode,
       llm_provider: selectedProvider || undefined,
@@ -369,6 +504,7 @@ export function ChatInput() {
       web_source_configs: (searchMode !== 'none' && webEnabled && Object.keys(webSourceConfigs).length > 0) ? webSourceConfigs : undefined,
       serpapi_ratio: (searchMode !== 'none' && webEnabled && hasAnySerpapi) ? (webSearchConfig.serpapiRatio ?? 50) / 100 : undefined,
       local_top_k: (searchMode !== 'none' && localEnabled) ? ragConfig.localTopK : undefined,
+      pool_score_thresholds: (searchMode !== 'none' && ragConfig.poolScoreThresholds?.chat) ? (ragConfig.poolScoreThresholds.chat as unknown as Record<string, number>) : undefined,
       fused_pool_score_threshold: (searchMode !== 'none') ? (ragConfig.fusedPoolScoreThreshold ?? 0.35) : undefined,
       year_start: ragConfig.yearStart ?? undefined,
       year_end: ragConfig.yearEnd ?? undefined,
@@ -391,6 +527,8 @@ export function ChatInput() {
           : 'bge_only')
         : undefined,
       agent_debug_mode: ragConfig.agentDebugMode ?? false,
+      enable_graphic_abstract: ragConfig.enableGraphicAbstract ?? false,
+      graphic_abstract_model: ragConfig.graphicAbstractModel ?? 'gemini',
     };
 
     if (import.meta.env.DEV) {
@@ -443,12 +581,16 @@ export function ChatInput() {
           };
           const { task_id: tid1 } = await submitChat(preq);
           setStreamingTask(tid1, latestSessionId ?? null, 'running');
+          patchActiveResponse({ kind: 'chat', taskOrJobId: tid1, surface: 'chat', targetMessageId: assistantMessageId });
           const s1 = streamChatByTaskId(tid1);
           for await (const { event: ev, data: d } of s1) {
+            if (handleTaskControlEvent(ev, d)) continue;
             if (ev === 'meta' && (d as { session_id?: string }).session_id)
               setSessionId((d as { session_id: string }).session_id);
-            if (ev === 'delta')
+            if (ev === 'delta') {
               appendToMessageById(assistantMessageId, (d as { delta: string }).delta);
+              patchActiveResponse({ hasVisibleOutput: true, streamPhase: 'streaming' });
+            }
           }
           clearStreamingTask(tid1);
 
@@ -456,8 +598,17 @@ export function ChatInput() {
           clearPendingLocalDbChoice();
           setLocalDbChoiceHandler(null);
           const newAssistantId = `assistant-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-          addMessage({ role: 'user', content: userMessage });
           addMessage({ id: newAssistantId, role: 'assistant', content: '' });
+          setActiveResponse({
+            kind: 'chat',
+            taskOrJobId: '',
+            surface: 'chat',
+            stepKey: 'queued',
+            stepLabel: t('chat.thinking', 'Thinking'),
+            streamPhase: 'thinking',
+            targetMessageId: newAssistantId,
+            hasVisibleOutput: false,
+          });
 
           // 再次读取最新 session_id（偏好任务可能返回了新的 session_id）
           const sessionIdForReq2 = useChatStore.getState().sessionId;
@@ -470,14 +621,16 @@ export function ChatInput() {
           const { task_id: tid2 } = await submitChat(req2);
           secondTaskId = tid2;
           setStreamingTask(tid2, sessionIdForReq2 ?? null, 'queued');
+          patchActiveResponse({ taskOrJobId: tid2, targetMessageId: newAssistantId });
           requestSessionListRefresh();
 
           const s2 = streamChatByTaskId(tid2);
           for await (const { event: ev, data: d } of s2) {
+            if (handleTaskControlEvent(ev, d)) continue;
             if (ev === 'meta') {
               const m = d as { session_id?: string; canvas_id?: string; citations?: CitationData[]; evidence_summary?: EvidenceSummary | null; current_stage?: string };
               if (m.session_id) setSessionId(m.session_id);
-              if (m.current_stage) setWorkflowStep(m.current_stage as any);
+              if (m.current_stage) setWorkflowStep(toWorkflowStep(m.current_stage));
               if (m.evidence_summary) setLastEvidenceSummary(m.evidence_summary);
               if (m.citations?.length) {
                 const srcs: Source[] = m.citations.map((c, i) => ({
@@ -491,16 +644,39 @@ export function ChatInput() {
             if (ev === 'step') {
               const stepPayload = d as { step?: string | null; label?: string };
               setStreamingStep(stepPayload?.step ? { step: stepPayload.step, label: stepPayload.label ?? stepPayload.step } : null);
+              patchActiveResponse({
+                stepKey: stepPayload?.step ?? null,
+                stepLabel: stepPayload?.label ?? stepPayload?.step ?? t('chat.thinking', 'Thinking'),
+                streamPhase: 'thinking',
+              });
             }
-            if (ev === 'delta') appendToMessageById(newAssistantId, (d as { delta: string }).delta);
-            if (ev === 'done') { setStreamingStep(null); updateMessageTimestampById(newAssistantId); setWorkflowStep('idle'); }
-            if (ev === 'error' || ev === 'cancelled' || ev === 'timeout') { setStreamingStep(null); updateMessageTimestampById(newAssistantId); break; }
+            if (ev === 'delta') {
+              appendToMessageById(newAssistantId, (d as { delta: string }).delta);
+              patchActiveResponse({ hasVisibleOutput: true, streamPhase: 'streaming' });
+            }
+            if (ev === 'done') {
+              const donePayload = d as { final_text?: string };
+              if (donePayload?.final_text) {
+                useChatStore.getState().updateMessageById(newAssistantId, donePayload.final_text);
+              }
+              setStreamingStep(null);
+              setActiveResponse(null);
+              updateMessageTimestampById(newAssistantId);
+              setWorkflowStep('idle');
+            }
+            if (ev === 'error' || ev === 'cancelled' || ev === 'timeout') {
+              setStreamingStep(null);
+              setActiveResponse(null);
+              updateMessageTimestampById(newAssistantId);
+              break;
+            }
           }
         } catch (e) {
           console.error('[ChatInput] localDbChoice follow-up error:', e);
           addToast(t('chat.sendFailed'), 'error');
         } finally {
           setStreamingStep(null);
+          setActiveResponse(null);
           if (secondTaskId) clearStreamingTask(secondTaskId);
         }
       };
@@ -521,11 +697,13 @@ export function ChatInput() {
       const { task_id } = await submitChat(request);
       taskId = task_id;
       setStreamingTask(task_id, sessionId ?? null, 'queued');
+      patchActiveResponse({ taskOrJobId: task_id });
       requestSessionListRefresh();
       const stream = streamChatByTaskId(task_id);
 
       for await (const { event, data } of stream) {
         console.log('[ChatInput] SSE event:', event, typeof data === 'object' ? JSON.stringify(data).slice(0, 200) : data);
+        if (handleTaskControlEvent(event, data)) continue;
 
         if (event === 'meta') {
           const meta = data as {
@@ -542,7 +720,7 @@ export function ChatInput() {
             setSessionId(meta.session_id);
             if (taskId) setStreamingTask(taskId, meta.session_id, 'running');
           }
-          if (meta.current_stage) setWorkflowStep(meta.current_stage as any);
+          if (meta.current_stage) setWorkflowStep(toWorkflowStep(meta.current_stage));
           if (meta.evidence_summary) {
             setLastEvidenceSummary(meta.evidence_summary);
             if (!meta.current_stage) setWorkflowStep('outline');
@@ -588,10 +766,16 @@ export function ChatInput() {
               ? { step: stepPayload.step, label: stepPayload.label ?? stepPayload.step }
               : null
           );
+          patchActiveResponse({
+            stepKey: stepPayload?.step ?? null,
+            stepLabel: stepPayload?.label ?? stepPayload?.step ?? t('chat.thinking', 'Thinking'),
+            streamPhase: 'thinking',
+          });
 
         } else if (event === 'delta') {
           const delta = (data as { delta: string }).delta;
           appendToMessageById(assistantMessageId, delta);
+          patchActiveResponse({ hasVisibleOutput: true, streamPhase: 'streaming' });
           setWorkflowStep('drafting');
           // 兜底：若 meta / local_db_choice 事件均未触发，根据消息内容识别范围不符关键词
           if (!useChatStore.getState().pendingLocalDbChoice) {
@@ -603,13 +787,19 @@ export function ChatInput() {
           }
 
         } else if (event === 'done') {
+          const donePayload = data as { final_text?: string };
+          if (donePayload?.final_text) {
+            useChatStore.getState().updateMessageById(assistantMessageId, donePayload.final_text);
+          }
           setStreamingStep(null);
+          setActiveResponse(null);
           updateMessageTimestampById(assistantMessageId);
           setWorkflowStep('refine');
           setTimeout(() => setWorkflowStep('idle'), 1000);
           saveChatInputHistory(userMessage);
         } else if (event === 'error' || event === 'cancelled' || event === 'timeout') {
           setStreamingStep(null);
+          setActiveResponse(null);
           updateMessageTimestampById(assistantMessageId);
           if (event === 'error') {
             appendToMessageById(assistantMessageId, '\n\n' + (t('chat.requestError') || 'Error'));
@@ -634,6 +824,7 @@ export function ChatInput() {
       appendToMessageById(assistantMessageId, '\n\n' + (t('chat.requestError') || '请求失败'));
     } finally {
       setStreamingStep(null);
+      setActiveResponse(null);
       if (taskId) clearStreamingTask(taskId);
     }
     } catch (err) {
@@ -716,59 +907,81 @@ export function ChatInput() {
           onSelectCommand={handleSelectCommand}
         />
 
-        {/* 输入区域 */}
-        <div className="flex items-center gap-2">
-          {/* 输出语言：常用选项，与搜索栏并列 */}
-          <select
-            value={deepResearchDefaults.outputLanguage ?? 'auto'}
-            onChange={(e) => useConfigStore.getState().updateDeepResearchDefaults({ outputLanguage: e.target.value as 'auto' | 'en' | 'zh' })}
-            title={t('sidebar.outputLanguage')}
-            className="flex-shrink-0 h-[42px] px-2.5 rounded-lg border border-slate-700 bg-slate-800/60 text-slate-200 text-sm focus:ring-1 focus:ring-sky-500 focus:border-sky-500 outline-none cursor-pointer"
-          >
-            <option value="auto">{t('chatInput.langAuto', 'Auto')}</option>
-            <option value="en">EN</option>
-            <option value="zh">中文</option>
-          </select>
-
-          {/* Deep Research 按钮组：⚙ 设置 + 🔭 启动 */}
-          <div className="relative flex items-center">
-            <button
-              onClick={toggleDRSettings}
-              className={`
-                flex items-center px-2 py-2.5 rounded-l-lg border border-r-0 text-sm
-                transition-all cursor-pointer
-                ${showDRSettings
-                  ? 'bg-indigo-900/30 text-indigo-400 border-indigo-500/30'
-                  : 'bg-slate-800/60 text-slate-400 border-slate-700/60 hover:bg-slate-700 hover:text-slate-300'
-                }
-              `}
-              title={t('chatInput.drSettingsTitle')}
+        {/* 顶部控制栏 (语言, 图文摘要, Deep Research) 与 输入区域分两行显示，让输入框占满宽度 */}
+        <div className="flex flex-col gap-2">
+          {/* 顶部控制栏 */}
+          <div className="flex items-center justify-end gap-2">
+            {/* 输出语言 */}
+            <select
+              value={deepResearchDefaults.outputLanguage ?? 'auto'}
+              onChange={(e) => useConfigStore.getState().updateDeepResearchDefaults({ outputLanguage: e.target.value as 'auto' | 'en' | 'zh' })}
+              title={t('sidebar.outputLanguage')}
+              className="flex-shrink-0 h-[36px] px-2.5 rounded-lg border border-slate-700 bg-slate-800/60 text-slate-200 text-sm focus:ring-1 focus:ring-sky-500 focus:border-sky-500 outline-none cursor-pointer"
             >
-              <Settings size={14} />
-            </button>
-            <button
-              onClick={() => handleDeepResearch(inputValue)}
-              disabled={!inputValue.trim()}
-              className={`
-                flex items-center gap-1.5 px-3 py-2.5 rounded-r-lg border text-sm font-medium
-                transition-all cursor-pointer whitespace-nowrap
-                ${!inputValue.trim()
-                  ? 'bg-slate-800/60 text-slate-500 border-slate-700/60 cursor-not-allowed'
-                  : 'bg-gradient-to-r from-indigo-900/30 to-purple-900/30 text-indigo-400 border-indigo-500/30 hover:border-indigo-400 hover:shadow-sm'
-                }
-              `}
-              title="Deep Research - 多步深度研究"
-            >
-              <Telescope size={16} />
-              <span className="hidden sm:inline">Deep Research</span>
-            </button>
+              <option value="auto">{t('chatInput.langAuto', 'Auto')}</option>
+              <option value="en">EN</option>
+              <option value="zh">中文</option>
+            </select>
 
-            {/* Settings popover (positioned above the button group) */}
-            <DeepResearchSettingsPopover open={showDRSettings} onClose={closeDRSettings} />
+            {/* Graphic Abstract 设置按钮 */}
+            <div className="relative flex items-center">
+              <button
+                onClick={toggleGASettings}
+                className={`
+                  flex items-center px-2 py-2 rounded-lg border text-sm
+                  transition-all cursor-pointer
+                  ${showGASettings
+                    ? 'bg-pink-900/30 text-pink-400 border-pink-500/30'
+                    : 'bg-slate-800/60 text-slate-400 border-slate-700/60 hover:bg-slate-700 hover:text-slate-300'
+                  }
+                `}
+                title="Graphic Abstract 设置"
+              >
+                <ImageIcon size={16} />
+              </button>
+              <GraphicAbstractPopover open={showGASettings} onClose={closeGASettings} />
+            </div>
+
+            {/* Deep Research 按钮组：⚙ 设置 + 🔭 启动 */}
+            <div className="relative flex items-center">
+              <button
+                onClick={toggleDRSettings}
+                className={`
+                  flex items-center px-2 py-2 rounded-l-lg border border-r-0 text-sm
+                  transition-all cursor-pointer
+                  ${showDRSettings
+                    ? 'bg-indigo-900/30 text-indigo-400 border-indigo-500/30'
+                    : 'bg-slate-800/60 text-slate-400 border-slate-700/60 hover:bg-slate-700 hover:text-slate-300'
+                  }
+                `}
+                title={t('chatInput.drSettingsTitle')}
+              >
+                <Settings size={14} />
+              </button>
+              <button
+                onClick={() => handleDeepResearch(inputValue)}
+                disabled={!inputValue.trim()}
+                className={`
+                  flex items-center gap-1.5 px-3 py-2 rounded-r-lg border text-sm font-medium
+                  transition-all cursor-pointer whitespace-nowrap
+                  ${!inputValue.trim()
+                    ? 'bg-slate-800/60 text-slate-500 border-slate-700/60 cursor-not-allowed'
+                    : 'bg-gradient-to-r from-indigo-900/30 to-purple-900/30 text-indigo-400 border-indigo-500/30 hover:border-indigo-400 hover:shadow-sm'
+                  }
+                `}
+                title="Deep Research - 多步深度研究"
+              >
+                <Telescope size={16} />
+                <span className="hidden sm:inline">Deep Research</span>
+              </button>
+
+              {/* Settings popover (positioned above the button group) */}
+              <DeepResearchSettingsPopover open={showDRSettings} onClose={closeDRSettings} />
+            </div>
           </div>
 
           {/* 输入框 + 历史建议下拉 */}
-          <div ref={suggestionsDropdownRef} className="flex-1 relative">
+          <div ref={suggestionsDropdownRef} className="w-full relative">
             <input
               ref={inputRef}
               type="text"
@@ -779,7 +992,7 @@ export function ChatInput() {
               }}
               onKeyDown={handleKeyDown}
               placeholder={t('chatInput.placeholder')}
-              className="w-full bg-slate-900/60 border border-slate-700 text-slate-200 rounded-xl py-3 pl-4 pr-12 shadow-sm focus:ring-1 focus:ring-sky-500 focus:border-sky-500 placeholder-slate-500 outline-none transition-all"
+              className="w-full bg-slate-900/60 border border-slate-700 text-slate-200 rounded-xl py-3 pl-4 pr-32 shadow-sm focus:ring-1 focus:ring-sky-500 focus:border-sky-500 placeholder-slate-500 outline-none transition-all"
               aria-autocomplete="list"
               aria-controls="chat-suggestions-listbox"
               aria-expanded={showSuggestionsDropdown}
@@ -812,17 +1025,35 @@ export function ChatInput() {
                 ))}
               </ul>
             )}
-            <button
-              onClick={() => handleSend()}
-              disabled={!inputValue.trim()}
-              className="absolute right-2 top-1/2 -translate-y-1/2 w-8 h-8 bg-sky-600 text-white rounded-lg flex items-center justify-center hover:bg-sky-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
-            >
-              {isCurrentSessionBusy ? (
-                <Loader2 size={18} className="animate-spin" />
-              ) : (
-                <ArrowRight size={18} />
-              )}
-            </button>
+            <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1">
+              <button
+                onClick={() => void handleTogglePauseActiveTask()}
+                disabled={!hasControllableTask || isPauseTransitioning}
+                title={isPaused ? t('chat.resumeTask', 'Resume task') : t('chat.pauseTask', 'Pause task')}
+                className="w-8 h-8 bg-slate-800/90 text-slate-200 rounded-lg flex items-center justify-center hover:bg-slate-700 transition-colors disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+              >
+                {isPaused ? <Play size={16} /> : <Pause size={16} />}
+              </button>
+              <button
+                onClick={() => void handleStopActiveTask()}
+                disabled={!hasControllableTask}
+                title={t('chat.stopTask', 'Stop task')}
+                className="w-8 h-8 bg-rose-900/80 text-rose-100 rounded-lg flex items-center justify-center hover:bg-rose-800 transition-colors disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+              >
+                <Square size={14} />
+              </button>
+              <button
+                onClick={() => handleSend()}
+                disabled={isCurrentSessionBusy || !inputValue.trim()}
+                className="w-8 h-8 bg-sky-600 text-white rounded-lg flex items-center justify-center hover:bg-sky-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+              >
+                {isCurrentSessionBusy ? (
+                  <Loader2 size={18} className={isPaused ? '' : 'animate-spin'} />
+                ) : (
+                  <ArrowRight size={18} />
+                )}
+              </button>
+            </div>
           </div>
         </div>
 

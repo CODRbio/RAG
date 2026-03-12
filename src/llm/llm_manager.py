@@ -33,7 +33,7 @@ from src.observability.tracing import traceable
 from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, Iterator, List, Optional
 from abc import ABC, abstractmethod
 
 import requests
@@ -518,6 +518,10 @@ class Provider(ABC):
         """
         raise NotImplementedError
 
+    def request_stream(self, payload: Dict[str, Any], timeout: Optional[int] = None) -> Iterator[Dict[str, Any]]:
+        """Best-effort streaming API. Providers may raise NotImplementedError."""
+        raise NotImplementedError
+
 
 def _llm_perf_timeout() -> int:
     if settings and hasattr(settings, "perf_llm"):
@@ -565,6 +569,68 @@ def _request_with_retry(
     raise RuntimeError("request_with_retry failed")
 
 
+def _request_stream_no_retry(
+    session: requests.Session,
+    method: str,
+    url: str,
+    timeout: int,
+    **kwargs: Any,
+) -> requests.Response:
+    resp = session.request(method, url, timeout=timeout, stream=True, **kwargs)
+    resp.raise_for_status()
+    return resp
+
+
+def _iter_sse_events(resp: requests.Response) -> Iterator[Dict[str, Any]]:
+    event_name = "message"
+    data_lines: List[str] = []
+    event_id = ""
+
+    for raw_line in resp.iter_lines(decode_unicode=True):
+        line = raw_line if isinstance(raw_line, str) else raw_line.decode("utf-8", errors="ignore")
+        if line == "":
+            if data_lines:
+                data_str = "\n".join(data_lines)
+                payload: Any = data_str
+                if data_str != "[DONE]":
+                    try:
+                        payload = json.loads(data_str)
+                    except Exception:
+                        payload = data_str
+                yield {"event": event_name or "message", "data": payload, "id": event_id}
+            event_name = "message"
+            data_lines = []
+            event_id = ""
+            continue
+        if line.startswith(":"):
+            continue
+        if line.startswith("event:"):
+            event_name = line[6:].strip()
+            continue
+        if line.startswith("data:"):
+            data_lines.append(line[5:].strip())
+            continue
+        if line.startswith("id:"):
+            event_id = line[3:].strip()
+
+    if data_lines:
+        data_str = "\n".join(data_lines)
+        payload = data_str
+        if data_str != "[DONE]":
+            try:
+                payload = json.loads(data_str)
+            except Exception:
+                payload = data_str
+        yield {"event": event_name or "message", "data": payload, "id": event_id}
+
+
+def _chunk_text_for_stream(text: str, chunk_size: int = 80) -> Iterator[str]:
+    if not text:
+        return
+    for idx in range(0, len(text), chunk_size):
+        yield text[idx : idx + chunk_size]
+
+
 class OpenAICompatProvider(Provider):
     """
     OpenAI 兼容协议 Provider。
@@ -599,6 +665,38 @@ class OpenAICompatProvider(Provider):
             data["_api_mode"] = api_mode
         return data
 
+    def request_stream(self, payload: Dict[str, Any], timeout: Optional[int] = None) -> Iterator[Dict[str, Any]]:
+        stream_payload = dict(payload)
+        api_mode = str(stream_payload.pop("_api_mode", "chat_completions"))
+        if api_mode == "responses":
+            if _is_qwen_api(self.config.base_url):
+                url = _qwen_responses_url(self.config.base_url)
+            else:
+                url = f"{self.config.base_url.rstrip('/')}/responses"
+        else:
+            url = f"{self.config.base_url.rstrip('/')}/chat/completions"
+            stream_options = stream_payload.get("stream_options")
+            if not isinstance(stream_options, dict):
+                stream_options = {}
+            stream_options.setdefault("include_usage", True)
+            stream_payload["stream_options"] = stream_options
+        stream_payload["stream"] = True
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.config.api_key}",
+        }
+        timeout = int(timeout or _llm_perf_timeout())
+        with _request_stream_no_retry(
+            self._session,
+            "POST",
+            url,
+            timeout,
+            headers=headers,
+            json=stream_payload,
+        ) as resp:
+            for item in _iter_sse_events(resp):
+                yield {**item, "api_mode": api_mode}
+
 
 class AnthropicProvider(Provider):
     """
@@ -618,12 +716,37 @@ class AnthropicProvider(Provider):
             "x-api-key": self.config.api_key,
             "anthropic-version": ANTHROPIC_VERSION,
         }
+        if self.config.params.get("enable_prompt_cache"):
+            headers["anthropic-beta"] = "prompt-caching-2024-07-31"
         timeout = int(timeout or _llm_perf_timeout())
         resp = _request_with_retry(
             self._session, "POST", url, timeout,
             headers=headers, json=payload,
         )
         return resp.json()
+
+    def request_stream(self, payload: Dict[str, Any], timeout: Optional[int] = None) -> Iterator[Dict[str, Any]]:
+        stream_payload = dict(payload)
+        stream_payload["stream"] = True
+        url = f"{self.config.base_url.rstrip('/')}/v1/messages"
+        headers = {
+            "Content-Type": "application/json",
+            "x-api-key": self.config.api_key,
+            "anthropic-version": ANTHROPIC_VERSION,
+        }
+        if self.config.params.get("enable_prompt_cache"):
+            headers["anthropic-beta"] = "prompt-caching-2024-07-31"
+        timeout = int(timeout or _llm_perf_timeout())
+        with _request_stream_no_retry(
+            self._session,
+            "POST",
+            url,
+            timeout,
+            headers=headers,
+            json=stream_payload,
+        ) as resp:
+            for item in _iter_sse_events(resp):
+                yield item
 
 
 class GeminiNativeProvider(Provider):
@@ -713,11 +836,31 @@ class GeminiNativeProvider(Provider):
             adapted = self._adapt_native_response(data)
             adapted["_api_mode"] = api_mode or "gemini_native"
             return adapted
+        except requests.exceptions.HTTPError as e:
+            status = getattr(e.response, "status_code", None)
+            if status is not None and 400 <= status < 500 and status != 429:
+                msg = (
+                    f"Gemini native API error (no fallback): {status} for url={url!r} "
+                    f"provider={self.config.name!r} model={model!r}. "
+                    "4xx client errors are not retried via OpenAI-compat endpoint."
+                )
+                _log.warning("%s", msg)
+                raise RuntimeError(msg) from e
+            if fallback_payload:
+                _log.warning("Gemini native request failed, falling back to compat mode: %s", e)
+                return self._fallback.request(fallback_payload, timeout=timeout)
+            raise
         except Exception as e:
             if fallback_payload:
                 _log.warning("Gemini native request failed, falling back to compat mode: %s", e)
                 return self._fallback.request(fallback_payload, timeout=timeout)
             raise
+
+    def request_stream(self, payload: Dict[str, Any], timeout: Optional[int] = None) -> Iterator[Dict[str, Any]]:
+        if str(payload.get("_api_mode") or "") != "gemini_native":
+            yield from self._fallback.request_stream(payload, timeout=timeout)
+            return
+        raise NotImplementedError("Gemini native streaming is not implemented")
 
 
 # ============================================================
@@ -936,6 +1079,18 @@ class BaseChatClient(ABC):
         """
         raise NotImplementedError
 
+    @abstractmethod
+    def stream_chat(
+        self,
+        messages: List[Dict[str, Any]],
+        model: Optional[str] = None,
+        return_reasoning: bool = False,
+        response_model: Optional[Any] = None,
+        **overrides
+    ) -> Iterator[Dict[str, Any]]:
+        """Stream normalized chat events: `text_delta` and terminal `completed`."""
+        raise NotImplementedError
+
 
 class DryRunChatClient(BaseChatClient):
     """
@@ -994,6 +1149,26 @@ class DryRunChatClient(BaseChatClient):
             })
 
         return result
+
+    def stream_chat(
+        self,
+        messages: List[Dict[str, Any]],
+        model: Optional[str] = None,
+        return_reasoning: bool = False,
+        response_model: Optional[Any] = None,
+        **overrides
+    ) -> Iterator[Dict[str, Any]]:
+        result = self.chat(
+            messages,
+            model=model,
+            return_reasoning=return_reasoning,
+            response_model=response_model,
+            **overrides,
+        )
+        final_text = result.get("final_text") or ""
+        for chunk in _chunk_text_for_stream(final_text):
+            yield {"type": "text_delta", "delta": chunk}
+        yield {"type": "completed", "response": result}
 
     def _resolve_model(self, model: Optional[str]) -> str:
         if model:
@@ -1196,6 +1371,272 @@ class HTTPChatClient(BaseChatClient):
                     result["parsed_object"] = None
 
         return result
+
+    @traceable(run_type="llm", name="llm.stream_chat")
+    def stream_chat(
+        self,
+        messages: List[Dict[str, Any]],
+        model: Optional[str] = None,
+        return_reasoning: bool = False,
+        tools: Optional[List] = None,
+        response_model: Optional[Any] = None,
+        **overrides
+    ) -> Iterator[Dict[str, Any]]:
+        resolved_model = self._resolve_model(model)
+        timeout_override = overrides.pop("timeout_seconds", None) or overrides.pop("timeout", None)
+        if timeout_override is not None:
+            try:
+                timeout_override = int(timeout_override)
+                if timeout_override <= 0:
+                    timeout_override = None
+            except Exception:
+                timeout_override = None
+        merged_params = deep_merge(self.config.params, overrides)
+        is_anthropic = self.config.is_anthropic()
+
+        if response_model is not None:
+            final_result = self.chat(
+                messages,
+                model=model,
+                return_reasoning=return_reasoning,
+                tools=tools,
+                response_model=response_model,
+                **overrides,
+            )
+            for chunk in _chunk_text_for_stream(final_result.get("final_text") or ""):
+                yield {"type": "text_delta", "delta": chunk}
+            yield {"type": "completed", "response": final_result}
+            return
+
+        if is_anthropic:
+            payload = self._build_anthropic_payload(messages, resolved_model, merged_params, tools=tools)
+        else:
+            payload = self._build_openai_payload(
+                messages,
+                resolved_model,
+                merged_params,
+                tools=tools,
+                response_model=response_model,
+            )
+
+        start_time = time.time()
+        text_parts: List[str] = []
+        reasoning_parts: List[str] = []
+        final_raw: Dict[str, Any] = {}
+        usage: Dict[str, Any] | None = None
+        refusal: Optional[bool] = None
+        error: Optional[str] = None
+
+        try:
+            stream_iter = self.provider.request_stream(payload, timeout=timeout_override)
+            if self._semaphore:
+                with self._semaphore:
+                    for event in self._normalize_stream_events(stream_iter, payload, is_anthropic):
+                        if event["type"] == "text_delta":
+                            delta = str(event.get("delta") or "")
+                            if delta:
+                                text_parts.append(delta)
+                        elif event["type"] == "reasoning_delta" and return_reasoning:
+                            reasoning_parts.append(str(event.get("delta") or ""))
+                        elif event["type"] == "completed":
+                            final_raw = dict(event.get("raw") or {})
+                            usage = event.get("usage") or usage
+                            refusal = event.get("refusal")
+                            continue
+                        yield event
+            else:
+                for event in self._normalize_stream_events(stream_iter, payload, is_anthropic):
+                    if event["type"] == "text_delta":
+                        delta = str(event.get("delta") or "")
+                        if delta:
+                            text_parts.append(delta)
+                    elif event["type"] == "reasoning_delta" and return_reasoning:
+                        reasoning_parts.append(str(event.get("delta") or ""))
+                    elif event["type"] == "completed":
+                        final_raw = dict(event.get("raw") or {})
+                        usage = event.get("usage") or usage
+                        refusal = event.get("refusal")
+                        continue
+                    yield event
+        except Exception as exc:
+            error = str(exc)
+            _log.info("LLM native stream unavailable for provider=%s model=%s, falling back: %s", self.config.name, resolved_model, exc)
+            fallback_result = self.chat(
+                messages,
+                model=model,
+                return_reasoning=return_reasoning,
+                tools=tools,
+                response_model=response_model,
+                **overrides,
+            )
+            for chunk in _chunk_text_for_stream(fallback_result.get("final_text") or ""):
+                yield {"type": "text_delta", "delta": chunk}
+            error = None
+            yield {"type": "completed", "response": fallback_result}
+            return
+        finally:
+            latency_ms = int((time.time() - start_time) * 1000)
+            if _obs_metrics:
+                _prov = self.config.name
+                _mod = resolved_model
+                _obs_metrics.llm_requests_total.labels(provider=_prov, model=_mod).inc()
+                _obs_metrics.llm_duration_seconds.labels(provider=_prov, model=_mod).observe(latency_ms / 1000.0)
+                if error:
+                    _obs_metrics.llm_errors_total.labels(provider=_prov, model=_mod).inc()
+                if usage and usage.get("prompt_tokens"):
+                    _obs_metrics.llm_tokens_used.labels(provider=_prov, model=_mod, direction="input").inc(usage["prompt_tokens"])
+                if usage and usage.get("completion_tokens"):
+                    _obs_metrics.llm_tokens_used.labels(provider=_prov, model=_mod, direction="output").inc(usage["completion_tokens"])
+            if self.log_store:
+                self.log_store.write({
+                    "timestamp": now_iso(),
+                    "provider": self.config.name,
+                    "model": resolved_model,
+                    "params": merged_params,
+                    "messages_digest": messages_digest(messages),
+                    "final_text": "".join(text_parts),
+                    "reasoning_text": "".join(reasoning_parts) if reasoning_parts else None,
+                    "raw_response": final_raw,
+                    "meta": {
+                        "usage": usage,
+                        "latency_ms": latency_ms,
+                        "refusal": refusal,
+                    },
+                    "error": error,
+                })
+        yield {
+            "type": "completed",
+            "response": {
+                "provider": self.config.name,
+                "model": resolved_model,
+                "final_text": "".join(text_parts),
+                "reasoning_text": "".join(reasoning_parts) if reasoning_parts and return_reasoning else None,
+                "raw": final_raw,
+                "params": merged_params,
+                "meta": {
+                    "usage": usage,
+                    "latency_ms": int((time.time() - start_time) * 1000),
+                    "refusal": refusal,
+                },
+            },
+        }
+
+    def _normalize_stream_events(
+        self,
+        stream_iter: Iterator[Dict[str, Any]],
+        payload: Dict[str, Any],
+        is_anthropic: bool,
+    ) -> Iterator[Dict[str, Any]]:
+        if is_anthropic:
+            yield from self._normalize_anthropic_stream(stream_iter)
+            return
+        yield from self._normalize_openai_stream(stream_iter, payload)
+
+    def _normalize_openai_stream(
+        self,
+        stream_iter: Iterator[Dict[str, Any]],
+        payload: Dict[str, Any],
+    ) -> Iterator[Dict[str, Any]]:
+        api_mode = str(payload.get("_api_mode") or "chat_completions")
+        usage: Dict[str, Any] | None = None
+        final_raw: Dict[str, Any] = {}
+        refusal: Optional[bool] = None
+        saw_completed = False
+
+        for event in stream_iter:
+            name = str(event.get("event") or "message")
+            data = event.get("data")
+            if data == "[DONE]":
+                saw_completed = True
+                yield {"type": "completed", "raw": final_raw, "usage": usage, "refusal": refusal}
+                continue
+            if not isinstance(data, dict):
+                continue
+
+            if api_mode == "responses":
+                if name == "response.output_text.delta":
+                    delta = str(data.get("delta") or "")
+                    if delta:
+                        yield {"type": "text_delta", "delta": delta}
+                elif name == "response.completed":
+                    final_raw = dict(data.get("response") or data)
+                    normalized = normalize_response(self.config.name, final_raw, False)
+                    usage = normalized.get("usage") or usage
+                    refusal = normalized.get("refusal")
+                    saw_completed = True
+                    yield {"type": "completed", "raw": final_raw, "usage": usage, "refusal": refusal}
+                elif name == "error":
+                    raise RuntimeError(str((data.get("error") or {}).get("message") or data.get("message") or "stream error"))
+                continue
+
+            choices = data.get("choices") or []
+            if data.get("usage"):
+                usage = data.get("usage")
+            for choice in choices:
+                delta = choice.get("delta") or {}
+                content = delta.get("content")
+                if isinstance(content, str) and content:
+                    yield {"type": "text_delta", "delta": content}
+                elif isinstance(content, list):
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        block_type = block.get("type")
+                        text = str(block.get("text") or "")
+                        if block_type == "text" and text:
+                            yield {"type": "text_delta", "delta": text}
+                        elif block_type in ("reasoning", "thinking") and text:
+                            yield {"type": "reasoning_delta", "delta": text}
+                refusal = bool(delta.get("refusal")) or refusal
+                if choice.get("finish_reason") and not saw_completed:
+                    saw_completed = True
+                    yield {"type": "completed", "raw": final_raw, "usage": usage, "refusal": refusal}
+
+        if not saw_completed:
+            yield {"type": "completed", "raw": final_raw, "usage": usage, "refusal": refusal}
+
+    def _normalize_anthropic_stream(self, stream_iter: Iterator[Dict[str, Any]]) -> Iterator[Dict[str, Any]]:
+        usage: Dict[str, Any] | None = None
+        final_raw: Dict[str, Any] = {}
+        refusal: Optional[bool] = None
+        completed = False
+
+        for event in stream_iter:
+            name = str(event.get("event") or "message")
+            data = event.get("data")
+            if not isinstance(data, dict):
+                continue
+            if name == "content_block_delta":
+                delta = data.get("delta") or {}
+                delta_type = str(delta.get("type") or "")
+                if delta_type == "text_delta":
+                    text = str(delta.get("text") or "")
+                    if text:
+                        yield {"type": "text_delta", "delta": text}
+                elif delta_type == "thinking_delta":
+                    text = str(delta.get("thinking") or "")
+                    if text:
+                        yield {"type": "reasoning_delta", "delta": text}
+            elif name == "message_start":
+                message = data.get("message") or {}
+                if isinstance(message, dict):
+                    usage = message.get("usage") or usage
+                    final_raw = dict(message)
+            elif name == "message_delta":
+                if isinstance(data.get("usage"), dict):
+                    usage = data.get("usage")
+            elif name == "message_stop":
+                completed = True
+                normalized = normalize_response(self.config.name, final_raw, True) if final_raw else {}
+                usage = normalized.get("usage") or usage
+                refusal = normalized.get("refusal")
+                yield {"type": "completed", "raw": final_raw, "usage": usage, "refusal": refusal}
+            elif name == "error":
+                err = data.get("error") or {}
+                raise RuntimeError(str(err.get("message") or data.get("message") or "stream error"))
+
+        if not completed:
+            yield {"type": "completed", "raw": final_raw, "usage": usage, "refusal": refusal}
 
     def _resolve_model(self, model: Optional[str]) -> str:
         if model:
@@ -1669,11 +2110,17 @@ class HTTPChatClient(BaseChatClient):
         }
 
         if system_content:
-            payload["system"] = system_content
+            if params.get("enable_prompt_cache"):
+                # Anthropic prompt caching: system 作为带 cache_control 的 content 数组
+                payload["system"] = [{"type": "text", "text": system_content, "cache_control": {"type": "ephemeral"}}]
+            else:
+                payload["system"] = system_content
 
-        # 合并参数
+        # 合并参数（注意排除非 API 参数）
+        _NON_API_PARAMS = {"enable_prompt_cache"}
         for key, value in params.items():
-            payload[key] = value
+            if key not in _NON_API_PARAMS:
+                payload[key] = value
 
         thinking_cfg = payload.get("thinking") or {}
         thinking_type = str(thinking_cfg.get("type") or "").strip().lower()
@@ -2026,3 +2473,14 @@ def chat(
     manager = get_manager()
     client = manager.get_client(provider)
     return client.chat(messages, model=model, **kwargs)
+
+
+def stream_chat(
+    messages: List[Dict[str, Any]],
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    **kwargs
+) -> Iterator[Dict[str, Any]]:
+    manager = get_manager()
+    client = manager.get_client(provider)
+    yield from client.stream_chat(messages, model=model, **kwargs)

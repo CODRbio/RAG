@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { Message, WorkflowStep, EvidenceSummary, Source, ClarifyQuestion, ResearchDashboardData, ToolTraceItem, AgentDebugData } from '../types';
+import type { ActiveResponseState, Message, WorkflowStep, EvidenceSummary, Source, ClarifyQuestion, ResearchDashboardData, ToolTraceItem, AgentDebugData } from '../types';
 import { getSession } from '../api/chat';
 
 interface ChatState {
@@ -37,11 +37,14 @@ interface ChatState {
 
   /** 当前流式步骤（Thinking 式），step 结束时清空 */
   streamingStep: { step: string; label: string } | null;
+  activeResponse: ActiveResponseState | null;
 
   // Actions
   setStreamingTask: (taskId: string, sessionId: string | null, status: string, queuePosition?: number) => void;
   clearStreamingTask: (taskId: string) => void;
   setStreamingStep: (step: { step: string; label: string } | null) => void;
+  setActiveResponse: (active: ActiveResponseState | null) => void;
+  patchActiveResponse: (patch: Partial<ActiveResponseState>) => void;
   setSessionId: (id: string | null) => void;
   setCanvasId: (id: string | null) => void;
   addMessage: (msg: Message) => void;
@@ -102,6 +105,7 @@ export const useChatStore = create<ChatState>((set) => ({
   localDbChoiceTimeoutId: null,
   streamingTasks: {},
   streamingStep: null,
+  activeResponse: null,
 
   setStreamingTask: (taskId, sessionId, status, queuePosition) =>
     set((state) => ({
@@ -117,6 +121,11 @@ export const useChatStore = create<ChatState>((set) => ({
       return { streamingTasks: next };
     }),
   setStreamingStep: (step) => set({ streamingStep: step }),
+  setActiveResponse: (active) => set({ activeResponse: active }),
+  patchActiveResponse: (patch) =>
+    set((state) => ({
+      activeResponse: state.activeResponse ? { ...state.activeResponse, ...patch } : state.activeResponse,
+    })),
 
   setSessionId: (id) => set({ sessionId: id }),
   setCanvasId: (id) => set({ canvasId: id }),
@@ -217,6 +226,7 @@ export const useChatStore = create<ChatState>((set) => ({
       workflowStep: 'idle',
       lastEvidenceSummary: null,
       streamingStep: null,
+      activeResponse: null,
       // 新对话 = 全新页面；旧 Deep Research 任务仍在后台运行，
       // 加载旧会话时会重新恢复 dashboard。
       deepResearchActive: false,
@@ -313,6 +323,7 @@ export const useChatStore = create<ChatState>((set) => ({
         showDeepResearchDialog: false,
         researchDashboard: sessionInfo.research_dashboard || null,
         showCommandPalette: false,
+        activeResponse: null,
         isLoadingSession: false,
       });
     } catch (error) {

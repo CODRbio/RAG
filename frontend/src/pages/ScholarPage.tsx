@@ -30,6 +30,9 @@ import { useTranslation } from 'react-i18next';
 import { useScholarStore } from '../stores/useScholarStore';
 import { useConfigStore } from '../stores/useConfigStore';
 import { useToastStore } from '../stores/useToastStore';
+import { useAuthStore } from '../stores/useAuthStore';
+import { login as apiLogin } from '../api/auth';
+import { Modal } from '../components/ui/Modal';
 import { PdfViewerModal } from '../components/ui/PdfViewerModal';
 import { ScholarAdvancedSettingsModal } from '../components/scholar/ScholarAdvancedSettingsModal';
 import { ScholarLibraryRecommendModal } from '../components/scholar/ScholarLibraryRecommendModal';
@@ -116,6 +119,7 @@ export function ScholarPage() {
   const collectionInfos = useConfigStore((s) => s.collectionInfos);
   const scholarDownloaderDefaults = useConfigStore((s) => s.scholarDownloaderDefaults);
   const addToast = useToastStore((s) => s.addToast);
+  const user = useAuthStore((s) => s.user);
 
   const {
     query,
@@ -193,6 +197,9 @@ export function ScholarPage() {
   const [showNewLibraryModal, setShowNewLibraryModal] = useState(false);
   const [showAdvancedSettings, setShowAdvancedSettings] = useState(false);
   const [showRecommendModal, setShowRecommendModal] = useState(false);
+  const [deleteLibraryModal, setDeleteLibraryModal] = useState<{ libId: number; name: string } | null>(null);
+  const [deleteLibraryPassword, setDeleteLibraryPassword] = useState('');
+  const [deleteLibraryVerifying, setDeleteLibraryVerifying] = useState(false);
   const [headedBrowserWindow, setHeadedBrowserWindow] = useState<HeadedBrowserWindowState | null>(null);
   const [headedBrowserWindowBusy, setHeadedBrowserWindowBusy] = useState(false);
   const [newLibraryName, setNewLibraryName] = useState('');
@@ -213,7 +220,7 @@ export function ScholarPage() {
   const [filterJournal, setFilterJournal] = useState('');
   const [filterYearMin, setFilterYearMin] = useState<number | null>(null);
   const [filterYearMax, setFilterYearMax] = useState<number | null>(null);
-  const [filterStatus, setFilterStatus] = useState<'all' | 'downloaded' | 'not_downloaded'>('all');
+  const [filterStatus, setFilterStatus] = useState<'all' | 'downloaded' | 'not_downloaded' | 'not_in_collection'>('all');
   const [filterIfMin, setFilterIfMin] = useState<number | null>(null);
   const [filterSource, setFilterSource] = useState<ScholarSource | 'all'>('all');
   const [filterDownloadableOnly, setFilterDownloadableOnly] = useState(false);
@@ -243,7 +250,7 @@ export function ScholarPage() {
       if (p.filterJournal != null) setFilterJournal(String(p.filterJournal));
       if (typeof p.filterYearMin === 'number') setFilterYearMin(p.filterYearMin);
       if (typeof p.filterYearMax === 'number') setFilterYearMax(p.filterYearMax);
-      if (p.filterStatus === 'downloaded' || p.filterStatus === 'not_downloaded') setFilterStatus(p.filterStatus);
+      if (p.filterStatus === 'downloaded' || p.filterStatus === 'not_downloaded' || p.filterStatus === 'not_in_collection') setFilterStatus(p.filterStatus);
       if (typeof p.filterIfMin === 'number') setFilterIfMin(p.filterIfMin);
       if (p.filterSource && p.filterSource !== 'all') setFilterSource(p.filterSource as ScholarSource);
       if (p.filterDownloadableOnly === true) setFilterDownloadableOnly(true);
@@ -414,6 +421,8 @@ export function ScholarPage() {
       list = list.filter((p) => p.is_downloaded ?? !!p.downloaded_at);
     } else if (filterStatus === 'not_downloaded') {
       list = list.filter((p) => !(p.is_downloaded ?? p.downloaded_at));
+    } else if (filterStatus === 'not_in_collection') {
+      list = list.filter((p) => !p.in_collection);
     }
     if (filterIfMin != null) {
       list = list.filter((p) => (p.impact_factor ?? 0) >= filterIfMin);
@@ -713,6 +722,24 @@ export function ScholarPage() {
   const allSelected =
     filteredResults.length > 0 &&
     filteredResults.every(({ originalIndex }) => selectedIndices.includes(originalIndex));
+
+  const handleConfirmDeleteLibraryWithPassword = async () => {
+    if (!deleteLibraryModal || !deleteLibraryPassword.trim() || !user) return;
+    setDeleteLibraryVerifying(true);
+    try {
+      await apiLogin({ user_id: user.user_id, password: deleteLibraryPassword });
+      const { libId, name } = deleteLibraryModal;
+      await deleteLibrary(libId);
+      addToast(`已删除文献库「${name}」`, 'success');
+      setDeleteLibraryModal(null);
+      setDeleteLibraryPassword('');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      addToast(`删除失败: ${msg}`, 'error');
+    } finally {
+      setDeleteLibraryVerifying(false);
+    }
+  };
 
   if (scholarHealth && !scholarHealth.enabled) {
     return (
@@ -1249,14 +1276,14 @@ export function ScholarPage() {
                       type="button"
                       onClick={() => {
                         const activeLib = libraries.find((l) => l.id === activeLibraryId);
-                        const isTemp = activeLib?.is_temporary ?? false;
-                        const confirmKey = isTemp ? 'scholar.libraryClearConfirm' : 'scholar.libraryDeleteConfirm';
-                        if (window.confirm(t(confirmKey))) {
-                          if (isTemp) {
+                        if (!activeLib) return;
+                        if (activeLib.is_temporary) {
+                          if (window.confirm(t('scholar.libraryClearConfirm'))) {
                             clearTemporaryLibrary(activeLibraryId);
-                          } else {
-                            deleteLibrary(activeLibraryId);
                           }
+                        } else {
+                          setDeleteLibraryModal({ libId: activeLib.id, name: activeLib.name });
+                          setDeleteLibraryPassword('');
                         }
                       }}
                       className="p-1.5 rounded-lg text-slate-400 hover:bg-red-500/20 hover:text-red-400"
@@ -1329,12 +1356,13 @@ export function ScholarPage() {
                           </select>
                           <select
                             value={filterStatus}
-                            onChange={(e) => setFilterStatus(e.target.value as 'all' | 'downloaded' | 'not_downloaded')}
+                            onChange={(e) => setFilterStatus(e.target.value as 'all' | 'downloaded' | 'not_downloaded' | 'not_in_collection')}
                             className="rounded border border-slate-600/80 bg-slate-800/60 px-2 py-1 text-slate-200 text-xs"
                           >
                             <option value="all">{t('scholar.statusAll')}</option>
                             <option value="downloaded">{t('scholar.statusDownloaded')}</option>
                             <option value="not_downloaded">{t('scholar.statusNotDownloaded')}</option>
+                            <option value="not_in_collection">{t('scholar.statusNotInCollection')}</option>
                           </select>
                           <select
                             value={sortField}
@@ -1467,9 +1495,14 @@ export function ScholarPage() {
                                             if (activeLibraryId == null) return;
                                             setDeletingPdfId(p.id);
                                             try {
-                                              await deleteLibraryPaperPdf(activeLibraryId, p.id);
+                                              const r = await deleteLibraryPaperPdf(activeLibraryId, p.id);
                                               await loadLibraryPapers(activeLibraryId);
-                                              addToast(t('scholar.pdfDeleted'), 'success');
+                                              addToast(
+                                                r.removed_from_collection
+                                                  ? `${t('scholar.pdfDeleted')}（已同步移除向量）`
+                                                  : t('scholar.pdfDeleted'),
+                                                'success',
+                                              );
                                             } catch (err) {
                                               addToast((err as Error)?.message || t('scholar.downloadFailed'), 'error');
                                             } finally {
@@ -1716,12 +1749,13 @@ export function ScholarPage() {
                           <label className="block text-xs text-slate-500 mb-0.5">{t('scholar.filterStatus')}</label>
                           <select
                             value={filterStatus}
-                            onChange={(e) => setFilterStatus(e.target.value as 'all' | 'downloaded' | 'not_downloaded')}
+                            onChange={(e) => setFilterStatus(e.target.value as 'all' | 'downloaded' | 'not_downloaded' | 'not_in_collection')}
                             className="w-full rounded border border-slate-600/80 bg-slate-800/60 px-2 py-1.5 text-slate-200 text-sm"
                           >
                             <option value="all">{t('scholar.statusAll')}</option>
                             <option value="downloaded">{t('scholar.statusDownloaded')}</option>
                             <option value="not_downloaded">{t('scholar.statusNotDownloaded')}</option>
+                            <option value="not_in_collection">{t('scholar.statusNotInCollection')}</option>
                           </select>
                         </div>
                       )}
@@ -2169,6 +2203,49 @@ export function ScholarPage() {
           filteredPaperIds={filteredLibraryPapers.map((p) => p.id)}
         />
       )}
+
+      {/* 删除文献库：密码确认 Modal */}
+      <Modal
+        open={deleteLibraryModal !== null}
+        onClose={() => { setDeleteLibraryModal(null); setDeleteLibraryPassword(''); }}
+        title="删除文献库（危险操作）"
+        maxWidth="max-w-md"
+      >
+        {deleteLibraryModal && (
+          <div className="space-y-4">
+            <p className="text-sm text-gray-700">
+              将永久删除文献库「<strong>{deleteLibraryModal.name}</strong>」及其所有文献记录与本地 PDF 目录，此操作不可恢复。
+            </p>
+            <p className="text-sm text-amber-700">
+              请输入当前登录账号密码以确认：
+            </p>
+            <input
+              type="password"
+              value={deleteLibraryPassword}
+              onChange={(e) => setDeleteLibraryPassword(e.target.value)}
+              placeholder="密码"
+              className="w-full border rounded-md p-2 text-sm focus:ring-2 focus:ring-red-500 outline-none"
+              onKeyDown={(e) => e.key === 'Enter' && handleConfirmDeleteLibraryWithPassword()}
+            />
+            <div className="flex justify-end gap-2 pt-2">
+              <button
+                onClick={() => { setDeleteLibraryModal(null); setDeleteLibraryPassword(''); }}
+                className="px-4 py-2 text-gray-600 hover:bg-gray-100 rounded-lg text-sm"
+              >
+                取消
+              </button>
+              <button
+                onClick={handleConfirmDeleteLibraryWithPassword}
+                disabled={!deleteLibraryPassword.trim() || deleteLibraryVerifying}
+                className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50 text-sm flex items-center gap-2"
+              >
+                {deleteLibraryVerifying ? <Loader2 size={14} className="animate-spin" /> : null}
+                确认删除
+              </button>
+            </div>
+          </div>
+        )}
+      </Modal>
 
     </div>
   );

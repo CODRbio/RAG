@@ -1,339 +1,650 @@
-# API 参考
+# API 参考文档
 
-本文档基于 `src/api/routes_*.py` 与 `src/api/server.py` 的实际路由整理。
+本文档描述 DeepSea RAG 后端所有 HTTP/SSE 接口，按功能模块分组。
 
-更新时间：2026-02-19
+完整的交互式 API 文档（Swagger UI）可访问：`http://localhost:9999/docs`
 
-## 基础信息
+---
 
-- 默认服务地址：`http://127.0.0.1:9999`
-- Swagger：`/docs`
-- OpenAPI：`/openapi.json`
+## 通用说明
 
-## 全局与健康
+### 认证
 
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| `GET` | `/health` | 基础健康检查 |
-| `GET` | `/health/detailed` | 组件级健康状态（检索/LLM/图谱等） |
-| `GET` | `/storage/stats` | 存储统计 |
-| `GET` | `/metrics` | Prometheus 指标导出 |
+所有接口（除 `/auth/login` 外）均需 JWT 认证：
 
-## 认证与用户（`/auth`、`/admin`）
+```
+Authorization: Bearer <token>
+```
 
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| `POST` | `/auth/login` | 用户登录，返回 token |
-| `POST` | `/admin/users` | 管理员创建用户（需 admin token） |
-| `GET` | `/admin/users` | 管理员查看用户列表（需 admin token） |
-
-### 鉴权说明
-
-- 需要鉴权的接口使用 Header：`Authorization: Bearer <token>`
-- 普通用户与管理员权限由路由层依赖项判断
-- 登录返回的 `token` 为 JWT（`HS256`），默认有效期由 `auth.token_expire_hours` 控制
-- token 为无状态设计，支持多进程/多副本；被撤销 token 会通过 `revoked_tokens` 表进行拦截
-
-## 项目管理（`/projects`）
-
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| `GET` | `/projects` | 项目列表（可选 `include_archived`） |
-| `POST` | `/projects/{canvas_id}/archive` | 存档 |
-| `POST` | `/projects/{canvas_id}/unarchive` | 取消存档 |
-| `DELETE` | `/projects/{canvas_id}` | 删除项目 |
-
-## 聊天与会话
-
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| `POST` | `/chat` | 同步对话 |
-| `POST` | `/chat/stream` | SSE 流式对话 |
-| `POST` | `/intent/detect` | 意图检测（Chat vs Deep Research） |
-| `GET` | `/sessions` | 会话列表 |
-| `GET` | `/sessions/{session_id}` | 会话详情 |
-| `DELETE` | `/sessions/{session_id}` | 删除会话 |
-
-### `chat/stream` SSE 事件
-
-- `meta`：元信息（session_id 等）
-- `dashboard`：仪表盘数据
-- `tool_trace`：工具调用轨迹
-- `delta`：流式文本增量
-- `done`：完成
-
-## Deep Research
-
-### 推荐后台任务模式
-
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| `POST` | `/deep-research/clarify` | 生成澄清问题（1-6 个关键问题） |
-| `POST` | `/deep-research/context-files` | 上传临时上下文文件（pdf/md/txt），仅本次使用 |
-| `POST` | `/deep-research/start` | Phase-1（Scope + Plan），返回可编辑 brief + outline |
-| `POST` | `/deep-research/submit` | Phase-2 后台提交，返回 `job_id`（推荐） |
-| `GET` | `/deep-research/jobs` | 列出后台任务（支持 `limit`、`status` 筛选） |
-| `GET` | `/deep-research/jobs/{job_id}` | 查询单个任务状态与结果 |
-| `GET` | `/deep-research/jobs/{job_id}/stream` | SSE 进度流（推荐，支持 `after_id` 断点续传） |
-| `GET` | `/deep-research/jobs/{job_id}/events` | 增量事件流（支持 `after_id`） |
-| `POST` | `/deep-research/jobs/{job_id}/cancel` | 停止任务（前端关闭不会自动终止） |
-| `POST` | `/deep-research/jobs/{job_id}/review` | 提交章节审核（approve / revise） |
-| `GET` | `/deep-research/jobs/{job_id}/reviews` | 查看章节审核记录 |
-| `POST` | `/deep-research/jobs/{job_id}/gap-supplement` | 提交章节缺口补充 |
-| `GET` | `/deep-research/jobs/{job_id}/gap-supplements` | 查看补充记录（pending / consumed） |
-| `GET` | `/deep-research/jobs/{job_id}/insights` | 查看研究洞察 |
-| `POST` | `/deep-research/jobs/{job_id}/insights/{insight_id}/status` | 更新洞察状态 |
-
-### Resume Queue 运维
-
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| `GET` | `/deep-research/resume-queue` | 查看 resume 队列（支持 status/owner/job 过滤） |
-| `POST` | `/deep-research/resume-queue/cleanup` | 清理终态记录 |
-| `POST` | `/deep-research/resume-queue/{resume_id}/retry` | 重试指定 resume 请求 |
-
-### 兼容流式模式
-
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| `POST` | `/deep-research/confirm` | SSE 直连执行（旧模式，仍可用） |
-
-### Phase-2 关键请求字段
-
-`POST /deep-research/submit` 与 `/deep-research/confirm` 共用 `DeepResearchConfirmRequest`：
-
-**基础字段：**
-- `topic`、`session_id`、`canvas_id`、`search_mode`
-- `confirmed_outline`、`confirmed_brief`
-- `output_language`、`step_models`、`step_model_strict`
-- `skip_draft_review`、`skip_refine_review`
-- 检索参数（`web_providers`、`local_top_k`、`step_top_k`、`write_top_k` 等）
-
-**研究深度（`depth`）：**
-- `lite`：快速探索（~5-15 min）
-- `comprehensive`：全面学术综述（~20-60 min，默认）
-
-**人工介入字段：**
-- `user_context`：用户补充观点/约束文本
-- `user_context_mode`：`supporting`（补充上下文）| `direct_injection`（强提示直接注入）
-- `user_documents`：`[{name, content}]` 临时材料（来自 `/deep-research/context-files`）
-
-**`step_model_strict` 行为：**
-- `false`（默认）：步骤模型解析失败时自动回退默认模型
-- `true`：步骤模型解析失败时立即终止任务
-
-### 人工审核字段
-
-`POST /deep-research/jobs/{job_id}/review`：
+### 通用响应格式
 
 ```json
 {
-  "section_id": "string",
-  "action": "approve | revise",
-  "feedback": "optional string"
+  "success": true,
+  "data": { ... },
+  "message": "操作成功"
 }
 ```
 
-### 缺口补充字段
+错误响应：
+```json
+{
+  "detail": "错误描述",
+  "code": "ERROR_CODE"
+}
+```
 
-`POST /deep-research/jobs/{job_id}/gap-supplement`：
+### SSE 响应格式
+
+流式接口返回 Server-Sent Events：
+
+```
+id: 42
+event: chunk
+data: {"type": "text", "content": "生成内容..."}
+
+id: 43
+event: done
+data: {"status": "completed"}
+```
+
+客户端重连时传 `?after_id=42` 或 `Last-Event-ID: 42` 实现断点续传。
+
+---
+
+## 1. 认证（`/auth`）
+
+### POST /auth/login
+
+登录并获取 JWT Token。
+
+**请求体**：
+```json
+{
+  "username": "admin",
+  "password": "password"
+}
+```
+
+**响应**：
+```json
+{
+  "access_token": "eyJ...",
+  "token_type": "bearer",
+  "expires_in": 86400
+}
+```
+
+### POST /auth/logout
+
+撤销当前 Token（写入 `revoked_tokens` 表）。
+
+---
+
+## 2. 对话（`/chat`）
+
+### POST /chat/stream
+
+提交 Chat 流式请求，返回任务 ID。
+
+**请求体（ChatRequest）**：
 
 ```json
 {
-  "section_id": "string",
-  "gap_text": "string",
-  "supplement_type": "material | direct_info",
-  "content": {"text": "用户补充内容"}
+  "session_id": "uuid",
+  "message": "深海热液喷口的生物多样性",
+  "history": [],
+  "llm_provider": "claude",
+  "llm_model": null,
+  "mode": "hybrid",
+  "filters": {
+    "local_top_k": 45,
+    "step_top_k": 10,
+    "write_top_k": 15,
+    "reranker_mode": "bge_only"
+  },
+  "agent_mode": "assist",
+  "project_id": null
 }
 ```
 
-### Resume Queue 运维字段
+**字段说明**：
 
-`POST /deep-research/resume-queue/cleanup`：
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `mode` | string | 检索模式：`local` / `web` / `hybrid` |
+| `filters.local_top_k` | int | 本地召回上限（推荐 45） |
+| `filters.step_top_k` | int | 单次检索输出上限（推荐 10） |
+| `filters.write_top_k` | int | 进 LLM 的证据上限（推荐 15） |
+| `filters.reranker_mode` | string | `bge_only` / `colbert` / `cascade` |
+| `agent_mode` | string | `disabled` / `assist` / `autonomous` |
+
+**响应**：
+```json
+{
+  "task_id": "uuid",
+  "status": "queued"
+}
+```
+
+### GET /chat/stream/{task_id}
+
+订阅 Chat 流式响应（SSE）。
+
+**查询参数**：
+- `after_id`（可选）：从指定事件 ID 后重放
+
+**SSE 事件类型**：
+
+| event | data 格式 | 说明 |
+|-------|----------|------|
+| `chunk` | `{"type": "text", "content": "..."}` | 生成的文本片段 |
+| `citations` | `[{"id": "...", "title": "...", "authors": [...], ...}]` | 引文列表 |
+| `evidence` | `[{"chunk_id": "...", "text": "...", "score": 0.9, ...}]` | 检索证据 |
+| `diag` | `{"phase": "...", "pool_fusion": {...}, ...}` | 诊断信息 |
+| `done` | `{"status": "completed"}` | 任务完成 |
+| `error` | `{"message": "...", "code": "..."}` | 错误信息 |
+
+### GET /chat/sessions
+
+获取当前用户的 Chat 会话列表。
+
+### DELETE /chat/sessions/{session_id}
+
+删除指定会话。
+
+### POST /tasks/{task_id}/cancel
+
+取消 Chat 任务（与 Scholar 共用）。
+
+---
+
+## 3. Deep Research（`/deep-research`）
+
+### POST /deep-research/clarify
+
+提交研究主题，获取澄清问题。
+
+**请求体**：
+```json
+{
+  "topic": "深海热液喷口生物群落的演化机制",
+  "history": [],
+  "llm_provider": "claude",
+  "use_preliminary_knowledge": true
+}
+```
+
+**响应**：
+```json
+{
+  "clarification_questions": [
+    "您希望重点关注哪个时间尺度（地质年代还是近现代）？",
+    "是否需要包括冷泉生态系统的对比？"
+  ],
+  "preliminary_knowledge": "热液喷口生态系统..."
+}
+```
+
+### POST /deep-research/submit
+
+提交 Deep Research 任务（用户已回答澄清问题并确认大纲后调用）。
+
+**请求体（DeepResearchRequest）**：
+```json
+{
+  "topic": "深海热液喷口生物群落的演化机制",
+  "clarification_answers": ["关注近现代（百年尺度）", "是，需要冷泉对比"],
+  "confirmed_brief": { ... },
+  "confirmed_outline": ["引言", "热液喷口理化环境", "微生物群落", "宏生物群落", "结论"],
+  "depth": "comprehensive",
+  "llm_provider": "claude",
+  "filters": {
+    "step_top_k": 20,
+    "write_top_k": null
+  },
+  "skip_draft_review": false,
+  "canvas_id": null
+}
+```
+
+**字段说明**：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `depth` | string | `lite` / `comprehensive`（控制研究深度预算） |
+| `filters.step_top_k` | int | 每轮检索上限；影响 write_top_k 推导 |
+| `filters.write_top_k` | int | 显式覆盖写作证据上限；null 则由 step_top_k 推导 |
+| `skip_draft_review` | bool | 跳过章节审核门控 |
+
+**响应**：
+```json
+{
+  "job_id": "uuid",
+  "status": "pending"
+}
+```
+
+### GET /deep-research/jobs/{job_id}/stream
+
+订阅 Deep Research 进度流（SSE）。
+
+**SSE 事件类型**：
+
+| event | data 格式 | 说明 |
+|-------|----------|------|
+| `status` | `{"status": "planning", "phase": "scoping", ...}` | 阶段状态更新 |
+| `section_start` | `{"section": "引言", "round": 1}` | 章节开始 |
+| `section_done` | `{"section": "引言", "text": "..."}` | 章节完成 |
+| `review_gate` | `{"sections": [...], "job_id": "..."}` | 等待用户审核 |
+| `heartbeat` | `{"ts": 1710000000}` | 心跳（约 10s 间隔） |
+| `done` | `{"job_id": "...", "canvas_id": "..."}` | 全文完成 |
+| `error` | `{"message": "...", "code": "..."}` | 错误 |
+
+### GET /deep-research/jobs/{job_id}
+
+查询任务状态与进度。
+
+**响应**：
+```json
+{
+  "job_id": "uuid",
+  "status": "running",
+  "phase": "research",
+  "current_section": "微生物群落",
+  "sections_done": 2,
+  "sections_total": 5,
+  "canvas_id": "uuid",
+  "created_at": "2026-03-11T10:00:00Z",
+  "updated_at": "2026-03-11T10:15:00Z"
+}
+```
+
+### POST /deep-research/jobs/{job_id}/review
+
+提交章节审核结果。
+
+**请求体**：
+```json
+{
+  "action": "revise",
+  "section": "微生物群落",
+  "feedback": "需要补充更多关于嗜热古菌的内容",
+  "author_notes": "请重点参考 2020 年后的文献"
+}
+```
+
+`action` 可选值：`approve` / `revise` / `skip`
+
+### POST /deep-research/jobs/{job_id}/cancel
+
+取消 Deep Research 任务。
+
+### GET /deep-research/jobs
+
+列出当前用户的 Deep Research 任务。
+
+---
+
+## 4. 文档入库（`/ingest`）
+
+### POST /ingest/upload
+
+上传 PDF 文件（multipart form-data）。
+
+**请求**：
+```
+Content-Type: multipart/form-data
+file: [binary PDF data]
+project_id: uuid（可选）
+```
+
+**响应**：
+```json
+{
+  "file_id": "uuid",
+  "filename": "paper.pdf",
+  "size": 1024000
+}
+```
+
+### POST /ingest/process
+
+提交 Ingest 任务（处理已上传的文件）。
+
+**请求体**：
+```json
+{
+  "file_ids": ["uuid1", "uuid2"],
+  "project_id": "uuid",
+  "options": {
+    "ocr": false,
+    "enrich_tables": true,
+    "enrich_figures": true
+  }
+}
+```
+
+**响应**：
+```json
+{
+  "job_id": "uuid",
+  "status": "pending",
+  "file_count": 2
+}
+```
+
+### GET /ingest/jobs/{job_id}/events
+
+订阅 Ingest 任务进度（SSE）。
+
+**SSE 事件类型**：
+
+| event | data 格式 | 说明 |
+|-------|----------|------|
+| `progress` | `{"file": "paper.pdf", "stage": "parsing", "percent": 45}` | 进度更新 |
+| `file_done` | `{"file": "paper.pdf", "chunks": 42, "status": "done"}` | 单文件完成 |
+| `heartbeat` | `{"ts": 1710000000}` | 心跳（约 5s） |
+| `done` | `{"job_id": "...", "total_chunks": 84}` | 全部完成 |
+| `error` | `{"file": "paper.pdf", "message": "..."}` | 错误 |
+
+### GET /ingest/jobs/{job_id}
+
+查询 Ingest 任务状态。
+
+### POST /ingest/jobs/{job_id}/cancel
+
+取消 Ingest 任务。
+
+### GET /ingest/documents
+
+列出已入库的文档。
+
+**查询参数**：
+- `project_id`：按项目过滤
+- `page` / `page_size`：分页
+
+### DELETE /ingest/documents/{doc_id}
+
+删除已入库文档（同时从 Milvus 删除向量）。
+
+---
+
+## 5. 学术搜索（`/scholar`）
+
+### POST /scholar/search
+
+搜索学术文献。
+
+**请求体**：
+```json
+{
+  "query": "deep sea hydrothermal vent microbial community",
+  "providers": ["semantic_scholar", "google_scholar"],
+  "max_results": 20,
+  "year_from": 2015,
+  "year_to": 2026
+}
+```
+
+**响应**：
+```json
+{
+  "results": [
+    {
+      "title": "...",
+      "authors": ["Author A", "Author B"],
+      "year": 2023,
+      "doi": "10.xxxx/xxx",
+      "abstract": "...",
+      "pdf_url": "...",
+      "source": "semantic_scholar"
+    }
+  ],
+  "total": 47
+}
+```
+
+### POST /scholar/download
+
+下载单篇论文 PDF。
+
+**请求体**：
+```json
+{
+  "doi": "10.xxxx/xxx",
+  "pdf_url": "https://...",
+  "title": "Paper Title",
+  "ingest_after_download": true,
+  "project_id": "uuid"
+}
+```
+
+**响应**：
+```json
+{
+  "task_id": "uuid",
+  "status": "queued"
+}
+```
+
+### POST /scholar/download/batch
+
+批量下载论文 PDF。
+
+**请求体**：
+```json
+{
+  "papers": [
+    {"doi": "10.xxx/1", "title": "..."},
+    {"doi": "10.xxx/2", "title": "..."}
+  ],
+  "ingest_after_download": true,
+  "project_id": "uuid",
+  "max_concurrent": 3
+}
+```
+
+### GET /scholar/task/{task_id}/stream
+
+订阅下载/推荐任务进度（SSE，同 Chat 取消共用 `/tasks/{task_id}/cancel`）。
+
+**SSE 事件类型**：
+
+| event | 说明 |
+|-------|------|
+| `progress` | 下载进度 |
+| `paper_done` | 单篇完成 |
+| `captcha` | 需要验证码解决（自动处理，仅信息事件） |
+| `done` | 全部完成 |
+| `error` | 错误 |
+
+### GET /scholar/libraries
+
+获取当前用户的学术文献库列表。
+
+### POST /scholar/libraries
+
+创建学术文献库。
+
+### POST /scholar/libraries/{lib_id}/recommend/start
+
+启动文献推荐任务（基于已有文献推荐相关论文）。
+
+**请求体**：
+```json
+{
+  "max_recommendations": 20,
+  "year_from": 2020
+}
+```
+
+### POST /scholar/libraries/{lib_id}/ingest
+
+将文献库中的 PDF 批量入库。
+
+---
+
+## 6. Canvas（`/canvas`）
+
+### GET /canvas
+
+列出所有 Canvas 文档。
+
+### POST /canvas
+
+创建 Canvas 文档。
+
+**请求体**：
+```json
+{
+  "title": "研究综述草稿",
+  "content": "# 引言\n...",
+  "project_id": "uuid"
+}
+```
+
+### GET /canvas/{canvas_id}
+
+获取 Canvas 文档内容。
+
+### PUT /canvas/{canvas_id}
+
+更新 Canvas 文档。
+
+### DELETE /canvas/{canvas_id}
+
+删除 Canvas 文档。
+
+### POST /canvas/{canvas_id}/ai-edit
+
+AI 辅助编辑（扩写/缩写/润色/引文插入）。
+
+**请求体**：
+```json
+{
+  "action": "expand",
+  "selection": "热液喷口的理化环境极端。",
+  "instruction": "请扩写这段内容，补充具体的温度、压力、化学成分数据",
+  "llm_provider": "claude"
+}
+```
+
+`action` 可选值：`expand` / `condense` / `refine` / `insert_citations`
+
+---
+
+## 7. 多文档比较（`/compare`）
+
+### POST /compare/start
+
+启动多文档比较任务（支持 2-5 篇）。
+
+**请求体**：
+```json
+{
+  "doc_ids": ["uuid1", "uuid2", "uuid3"],
+  "dimensions": ["方法论", "结论", "局限性"],
+  "llm_provider": "claude"
+}
+```
+
+**响应**：
+```json
+{
+  "task_id": "uuid",
+  "status": "queued"
+}
+```
+
+### GET /compare/results/{task_id}
+
+获取比较结果。
+
+---
+
+## 8. 项目管理（`/projects`）
+
+### GET /projects
+
+列出所有项目/集合。
+
+### POST /projects
+
+创建项目。
+
+### DELETE /projects/{project_id}
+
+删除项目（不删除文档本身）。
+
+---
+
+## 9. 系统管理（`/admin`）
+
+### GET /admin/users
+
+列出用户（管理员权限）。
+
+### POST /admin/users
+
+创建用户。
+
+### GET /admin/models
+
+获取所有 provider 的可用模型列表（实时从平台 API 拉取）。
+
+### GET /health
+
+基础健康检查。
+
+```json
+{"status": "ok", "version": "8.0.0"}
+```
+
+### GET /health/detailed
+
+详细健康检查（含各组件状态）。
 
 ```json
 {
-  "statuses": ["done", "error", "cancelled"],
-  "before_hours": 72,
-  "owner_instance": "optional",
-  "job_id": "optional"
+  "status": "ok",
+  "components": {
+    "database": "ok",
+    "milvus": "ok",
+    "redis": "ok",
+    "llm_default": "ok"
+  }
 }
 ```
 
-`POST /deep-research/resume-queue/{resume_id}/retry`：
+### GET /metrics
 
-```json
-{
-  "message": "optional retry note"
-}
-```
+Prometheus Metrics 端点（OpenTelemetry 格式）。
 
-### Deep Research 事件类型
+---
 
-`GET /deep-research/jobs/{job_id}/events` 返回的事件（`/stream` 也会推送同类事件）：
+## 10. 错误码参考
 
-| 事件 | 说明 |
-|---|---|
-| `start` | 任务启动 |
-| `progress` | 阶段进展（含 section/type/message） |
-| `warning` | 风险或覆盖不足提醒 |
-| `section_review` | 用户提交章节审核 |
-| `gap_supplement` | 用户提交缺口补充 |
-| `cancel_requested` | 收到停止请求 |
-| `done` | 任务完成 |
-| `cancelled` | 任务取消完成 |
-| `error` | 任务失败 |
+| HTTP 状态 | 错误码 | 说明 |
+|-----------|--------|------|
+| 400 | `INVALID_PARAMS` | 请求参数无效 |
+| 401 | `UNAUTHORIZED` | 未认证或 Token 已过期 |
+| 403 | `FORBIDDEN` | 无权限访问该资源 |
+| 404 | `NOT_FOUND` | 资源不存在 |
+| 409 | `CONFLICT` | 资源状态冲突（如任务已在运行） |
+| 429 | `RATE_LIMITED` | 请求过于频繁 |
+| 500 | `INTERNAL_ERROR` | 服务内部错误 |
+| 503 | `SERVICE_UNAVAILABLE` | 依赖服务不可用（如 Milvus 未就绪） |
 
-`GET /deep-research/jobs/{job_id}/stream` 额外事件：
+---
 
-| 事件 | 说明 |
-|---|---|
-| `heartbeat` | 空闲心跳，附带任务 `status/message/current_stage/canvas_id/result_dashboard` |
-| `job_status` | 终态快照（`done/error/cancelled`）后关闭连接 |
+## 11. 前端 API 客户端对应关系
 
-> `/stream` 推送的业务事件数据中包含 `_event_id`，用于前端重连时更新 `after_id` 游标。
-
-**`progress` 子类型（`type` 字段）：**
-
-| type | 说明 |
-|---|---|
-| `evidence_insufficient` | 章节证据不足 |
-| `section_degraded` | 章节降级写作 |
-| `search_self_correction` | 补缺阶段自校正 |
-| `coverage_plateau_early_stop` | 覆盖收益趋平，提前停止 |
-| `section_evaluate_done` | 章节评估结果（含 coverage/gain/round/steps） |
-| `write_verification_context` | 写作阶段二次取证 |
-| `all_reviews_approved` | 所有章节审核通过 |
-| `global_refine_done` | 全文连贯性整合完成 |
-| `citation_guard_fallback` | 引用保护回退 |
-| `step_model_resolved` | 步骤模型解析成功 |
-| `step_model_fallback` | 步骤模型回退默认 |
-| `cost_monitor_tick` | 成本监控心跳 |
-| `cost_monitor_warn` | 成本预警 |
-| `cost_monitor_force_summary` | 强制摘要模式 |
-
-### Research Depth Presets
-
-#### Iteration & Coverage
-
-| 参数 | lite | comprehensive | 说明 |
-|---|---|---|---|
-| `max_iterations_per_section` | 3 | 6 | 每章迭代预算 |
-| `max_section_research_rounds` | 3 | 5 | 每章最大研究轮次 |
-| `coverage_threshold` | 0.60 | 0.80 | 覆盖度达标阈值 |
-
-#### Query Strategy
-
-| 参数 | lite | comprehensive | 说明 |
-|---|---|---|---|
-| `recall_queries_per_section` | 2 | 4 | 广撒网查询 |
-| `precision_queries_per_section` | 2 | 4 | 定向深钻查询 |
-
-#### Tiered search_top_k
-
-| 参数 | lite | comprehensive | 说明 |
-|---|---|---|---|
-| `search_top_k_first` | 18 | 30 | 首轮广撒网 |
-| `search_top_k_gap` | 10 | 15 | 补缺定点搜索 |
-| `search_top_k_write` | 8 | 10 | 写作前精选 |
-
-#### 3-tier Verification
-
-| 参数 | lite | comprehensive | 说明 |
-|---|---|---|---|
-| `verify_light_threshold` | 0.20 | 0.15 | 轻微：仅标记 |
-| `verify_medium_threshold` | 0.40 | 0.30 | 中等：记录 gaps |
-| `verify_severe_threshold` | 0.45 | 0.35 | 严重：回到 research |
-
-#### Review Gate
-
-| 参数 | lite | comprehensive | 说明 |
-|---|---|---|---|
-| `review_gate_max_rounds` | 80 | 200 | 最大轮询轮数 |
-| `review_gate_base_sleep` | 2s | 2s | 初始等待 |
-| `review_gate_max_sleep` | 15s | 20s | 单轮等待上限 |
-| `review_gate_early_stop_unchanged` | 8 | 12 | 无变化 N 轮后放行 |
-
-#### LangGraph & Cost
-
-| 参数 | lite | comprehensive | 说明 |
-|---|---|---|---|
-| `recursion_limit` | 200 | 500 | 递归上限 |
-| `cost_warn_steps` | 120 | 300 | 成本预警步数 |
-| `cost_force_summary_steps` | 180 | 420 | 强制摘要步数 |
-
-> 阈值可在 `config/rag_config.json` → `deep_research.depth_presets` 自定义覆盖。
-
-## Canvas（`/canvas`）
-
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| `POST` | `/canvas` | 创建画布 |
-| `GET` | `/canvas/{canvas_id}` | 获取画布 |
-| `PATCH` | `/canvas/{canvas_id}` | 更新画布基础字段 |
-| `DELETE` | `/canvas/{canvas_id}` | 删除画布 |
-| `POST` | `/canvas/{canvas_id}/outline` | 更新大纲 |
-| `POST` | `/canvas/{canvas_id}/drafts` | 更新草稿 |
-| `POST` | `/canvas/{canvas_id}/snapshot` | 创建快照 |
-| `POST` | `/canvas/{canvas_id}/restore/{version_number}` | 恢复快照 |
-| `GET` | `/canvas/{canvas_id}/snapshots` | 获取快照列表 |
-| `GET` | `/canvas/{canvas_id}/export` | 按画布导出 |
-| `POST` | `/canvas/{canvas_id}/refine-full` | 全文精炼 |
-| `GET` | `/canvas/{canvas_id}/citations` | 引用列表 |
-| `POST` | `/canvas/{canvas_id}/citations/filter` | 引用过滤 |
-| `DELETE` | `/canvas/{canvas_id}/citations/{cite_key}` | 删除引用 |
-| `POST` | `/canvas/{canvas_id}/ai-edit` | AI 段落编辑 |
-
-## 导出（`/export`）
-
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| `POST` | `/export` | 导出入口（支持 `canvas_id` 或 `session_id`，当前仅 Markdown） |
-
-## Auto Complete
-
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| `POST` | `/auto-complete` | 一键综述 |
-
-## Compare 多文档对比（`/compare`）
-
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| `POST` | `/compare` | 对比 2-5 篇论文 |
-| `GET` | `/compare/candidates` | 会话引文候选 |
-| `GET` | `/compare/papers` | 本地文库分页/搜索 |
-
-## Graph 图谱（`/graph`）
-
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| `GET` | `/graph/stats` | 图谱统计 |
-| `GET` | `/graph/entities` | 实体查询 |
-| `GET` | `/graph/neighbors/{entity_name}` | 实体邻居 |
-| `GET` | `/graph/chunk/{chunk_id}` | chunk 详情 |
-| `GET` | `/graph/pdf/{paper_id}` | PDF 原文访问 |
-
-## Ingest 在线入库（`/ingest`）
-
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| `GET` | `/ingest/collections` | 集合列表 |
-| `POST` | `/ingest/collections` | 创建集合 |
-| `DELETE` | `/ingest/collections/{name}` | 删除集合 |
-| `GET` | `/ingest/collections/{name}/papers` | 集合内论文列表 |
-| `DELETE` | `/ingest/collections/{name}/papers/{paper_id}` | 删除论文 |
-| `POST` | `/ingest/upload` | 上传文件 |
-| `POST` | `/ingest/process` | 触发处理 |
-| `GET` | `/ingest/jobs` | 任务列表 |
-| `GET` | `/ingest/jobs/{job_id}` | 任务详情 |
-| `POST` | `/ingest/jobs/{job_id}/cancel` | 取消任务 |
-| `GET` | `/ingest/jobs/{job_id}/events` | 任务事件流 |
-
-## Models 模型管理
-
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| `GET` | `/models/status` | 模型加载状态 |
-| `POST` | `/models/sync` | 同步模型 |
-| `GET` | `/llm/providers` | 可用 LLM provider 列表 |
+| 后端模块 | 前端文件 | 说明 |
+|---------|---------|------|
+| `/chat` | `frontend/src/api/chat.ts` | Chat + Deep Research |
+| `/ingest` | `frontend/src/api/ingest.ts` | 入库任务 |
+| `/scholar` | `frontend/src/api/scholar.ts` | 学术搜索下载 |
+| `/canvas` | `frontend/src/api/canvas.ts` | Canvas 操作 |
+| SSE 公共 | `frontend/src/api/sse.ts` | `streamSSEResumable()` |
+| 模型列表 | `frontend/src/api/models.ts` | LLM 模型选择 |

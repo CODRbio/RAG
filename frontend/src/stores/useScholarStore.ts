@@ -26,14 +26,52 @@ import {
   extractDoiAndDedupPapers,
   pdfRenameDedup as pdfRenameDedupApi,
   refreshLibraryMetadata as refreshLibraryMetadataApi,
+  streamScholarTaskEvents,
 } from '../api/scholar';
 import { getTaskQueue } from '../api/chat';
 import type { ScholarDownloaderDefaults, ScholarDownloadStrategyId } from '../types';
 import { useConfigStore } from './useConfigStore';
 
 const POLL_INTERVAL_MS = 2000;
-const TERMINAL_STATUSES = new Set(['completed', 'error', 'cancelled']);
+const TERMINAL_STATUSES = new Set(['completed', 'error', 'cancelled', 'timeout']);
 const initialScholarDownloaderDefaults = useConfigStore.getState().scholarDownloaderDefaults;
+
+const _sseAbortByTaskId = new Map<string, AbortController>();
+
+function _applyTerminalTaskCleanup(
+  set: (u: Partial<ScholarState> | ((s: ScholarState) => Partial<ScholarState>)) => void,
+  get: () => ScholarState,
+  taskId: string,
+  status: string,
+) {
+  get().stopPolling(taskId);
+  _sseAbortByTaskId.get(taskId)?.abort();
+  _sseAbortByTaskId.delete(taskId);
+  const { pendingDownloadAndOpen, activeLibraryId } = get();
+  if (activeLibraryId != null) {
+    get().loadLibraryPapers(activeLibraryId);
+  }
+  if (pendingDownloadAndOpen && pendingDownloadAndOpen.taskId === taskId) {
+    if (status === 'completed') {
+      set({
+        openPdfAfterDownload: {
+          libId: pendingDownloadAndOpen.libId,
+          paperId: pendingDownloadAndOpen.paperId,
+          title: pendingDownloadAndOpen.title,
+        },
+        pendingDownloadAndOpen: null,
+      });
+    } else {
+      set((s) => ({
+        pendingDownloadAndOpen: null,
+        downloadAndOpenFailures: {
+          ...s.downloadAndOpenFailures,
+          [pendingDownloadAndOpen.paperId]: true,
+        },
+      }));
+    }
+  }
+}
 
 function buildScholarDownloadOptions(state: Pick<
   ScholarState,
@@ -250,6 +288,7 @@ interface ScholarState {
   downloadSelected: (collection?: string) => Promise<string | null>;
   pollTask: (taskId: string) => Promise<void>;
   startPolling: (taskId: string) => void;
+  startSSE: (taskId: string) => void;
   stopPolling: (taskId: string) => void;
   removeTask: (taskId: string) => void;
 
@@ -435,7 +474,7 @@ export const useScholarStore = create<ScholarState>()((set, get) => ({
         set((s) => ({
           downloadTasks: { ...s.downloadTasks, [res.task_id]: { task_id: res.task_id, status: 'queued', payload: {} } },
         }));
-        get().startPolling(res.task_id);
+        get().startSSE(res.task_id);
         return res.task_id;
       }
       return null;
@@ -474,7 +513,7 @@ export const useScholarStore = create<ScholarState>()((set, get) => ({
         },
         selectedIndices: [],
       }));
-      get().startPolling(res.task_id);
+      get().startSSE(res.task_id);
       return res.task_id;
     } catch {
       return null;
@@ -528,6 +567,8 @@ export const useScholarStore = create<ScholarState>()((set, get) => ({
   },
 
   stopPolling: (taskId) => {
+    _sseAbortByTaskId.get(taskId)?.abort();
+    _sseAbortByTaskId.delete(taskId);
     const { pollIntervals } = get();
     const id = pollIntervals[taskId];
     if (id) clearInterval(id);
@@ -536,6 +577,58 @@ export const useScholarStore = create<ScholarState>()((set, get) => ({
       delete next[taskId];
       return { pollIntervals: next };
     });
+  },
+
+  startSSE: (taskId) => {
+    if (_sseAbortByTaskId.has(taskId)) return;
+    const ac = new AbortController();
+    _sseAbortByTaskId.set(taskId, ac);
+    (async () => {
+      try {
+        for await (const { event, data } of streamScholarTaskEvents(taskId, ac.signal, '-')) {
+          const payload = (data && typeof data === 'object' && !Array.isArray(data) ? data as Record<string, unknown> : {}) as Record<string, unknown>;
+          if (event === 'progress' || event === 'heartbeat') {
+            set((s) => ({
+              downloadTasks: {
+                ...s.downloadTasks,
+                [taskId]: {
+                  task_id: taskId,
+                  status: 'running',
+                  payload: { ...(s.downloadTasks[taskId]?.payload as Record<string, unknown> || {}), ...payload },
+                },
+              },
+            }));
+            continue;
+          }
+          const status =
+            event === 'done' ? 'completed'
+              : event === 'error' ? 'error'
+              : event === 'cancelled' ? 'cancelled'
+              : event === 'timeout' ? 'timeout'
+              : 'running';
+          set((s) => ({
+            downloadTasks: {
+              ...s.downloadTasks,
+              [taskId]: {
+                task_id: taskId,
+                status,
+                error_message: payload?.message as string | undefined,
+                payload: { ...(s.downloadTasks[taskId]?.payload as Record<string, unknown> || {}), ...payload },
+              },
+            },
+          }));
+          if (TERMINAL_STATUSES.has(status)) {
+            _applyTerminalTaskCleanup(set, get, taskId, status);
+            return;
+          }
+        }
+      } catch {
+        set((s) => ({ downloadTasks: { ...s.downloadTasks, [taskId]: { ...s.downloadTasks[taskId], status: s.downloadTasks[taskId]?.status ?? 'running' } } }));
+        get().startPolling(taskId);
+      } finally {
+        _sseAbortByTaskId.delete(taskId);
+      }
+    })();
   },
 
   removeTask: (taskId) => {
@@ -571,7 +664,7 @@ export const useScholarStore = create<ScholarState>()((set, get) => ({
       }));
       for (const taskId of Object.keys(updates)) {
         if (!TERMINAL_STATUSES.has(updates[taskId].status)) {
-          get().startPolling(taskId);
+          get().startSSE(taskId);
         }
       }
     } catch {
@@ -963,7 +1056,7 @@ export const useScholarStore = create<ScholarState>()((set, get) => ({
           title: paper.title,
         },
       }));
-      get().startPolling(res.task_id);
+      get().startSSE(res.task_id);
       return res.task_id;
     } catch {
       return null;
@@ -1016,7 +1109,7 @@ export const useScholarStore = create<ScholarState>()((set, get) => ({
           },
         },
       }));
-      get().startPolling(res.task_id);
+      get().startSSE(res.task_id);
       return { taskId: res.task_id, submittedCount: notDownloaded.length };
     } catch {
       return null;

@@ -19,6 +19,7 @@ from src.collaboration.research import agent as research_agent
 from src.collaboration.research.dashboard import ResearchBrief, ResearchDashboard
 from src.collaboration.research.trajectory import ResearchTrajectory
 from src.collaboration.research.verifier import verify_claims
+from config.settings import settings
 
 
 class _SequentialLLM:
@@ -99,6 +100,7 @@ def test_effective_write_k_respects_floor_scaling_and_cap():
 
 
 def test_write_node_uses_run_code_path_when_structured_numeric_data_present(monkeypatch):
+    monkeypatch.setattr(settings.tool_execution, "run_code_enabled", True)
     dashboard = ResearchDashboard(brief=ResearchBrief(topic="DeepSea microbiome"))
     dashboard.add_section("Quantitative Comparison")
     trajectory = ResearchTrajectory(topic="DeepSea microbiome")
@@ -152,7 +154,8 @@ def test_write_node_uses_run_code_path_when_structured_numeric_data_present(monk
 
     out = research_agent.write_node(state)
     assert captured["called"], "Expected write_node to enter the react_loop path"
-    assert captured["tool_names"] == ["run_code"], "Expected run_code-only toolset in quantitative mode"
+    assert "run_code" in captured["tool_names"], "Expected quantitative mode to expose run_code"
+    assert "summarize_quantitative" in captured["tool_names"], "Expected quantitative mode to expose summarize_quantitative"
     assert any("Computed differences via run_code." in part for part in out.get("markdown_parts", []))
 
 

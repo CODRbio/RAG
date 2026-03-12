@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
 import copy
@@ -75,7 +76,7 @@ def _resolve_runtime_llm_client(state: "DeepResearchState") -> Any:
 
 
 # ── Runtime callback registry (checkpoint-safe) ───────────────────────────────
-# progress_callback / cancel_check / review_waiter are Python callables that
+# progress_callback / cancel_check / pause_waiter / review_waiter are Python callables that
 # cannot be serialized by msgpack (LangGraph MemorySaver).  We keep them OUT of
 # the LangGraph state and resolve them from this in-process registry instead.
 _RUNTIME_CALLBACKS: Dict[str, Dict[str, Any]] = {}
@@ -686,6 +687,7 @@ class DeepResearchState(TypedDict, total=False):
     step_model_strict: bool
     progress_callback: Optional[Callable[[str, Dict[str, Any]], None]]
     cancel_check: Optional[Callable[[], bool]]
+    pause_waiter: Optional[Callable[[], None]]
     review_waiter: Optional[Callable[[str], Optional[Dict[str, Any]]]]
     skip_draft_review: bool
     skip_refine_review: bool
@@ -854,6 +856,7 @@ def reconstruct_state_from_checkpoint(
     llm_client: Any,
     progress_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
+    pause_waiter: Optional[Callable[[], None]] = None,
     review_waiter: Optional[Callable[[str], Optional[Dict[str, Any]]]] = None,
     model_override: Optional[str] = None,
 ) -> DeepResearchState:
@@ -899,6 +902,7 @@ def reconstruct_state_from_checkpoint(
         "step_model_strict": bool(state_data.get("step_model_strict")),
         "progress_callback": progress_callback,
         "cancel_check": cancel_check,
+        "pause_waiter": pause_waiter,
         "review_waiter": review_waiter,
         "skip_draft_review": bool(state_data.get("skip_draft_review")),
         "skip_refine_review": bool(state_data.get("skip_refine_review")),
@@ -925,7 +929,10 @@ def reconstruct_state_from_checkpoint(
 
 
 def _ensure_not_cancelled(state: DeepResearchState) -> None:
-    """Cooperative cancellation checkpoint."""
+    """Cooperative runtime-control checkpoint."""
+    pause_waiter = _resolve_runtime_callback(state, "pause_waiter")
+    if pause_waiter:
+        pause_waiter()
     checker = _resolve_runtime_callback(state, "cancel_check")
     if checker and checker():
         raise RuntimeError("Deep Research cancelled by user")
@@ -1285,8 +1292,8 @@ def _compute_effective_write_k(preset: Dict[str, Any], filters: Optional[Dict[st
     """Compute per-section write evidence window.
 
     write_top_k = per-output-unit evidence cap (one DR section = one unit).
-    If explicitly provided, use it directly (no backend cap). Otherwise derive
-    from step_top_k * 1.5 or preset.
+    If explicitly provided, use it (capped by search_top_k_write_max when set).
+    Otherwise derive from step_top_k * 1.5 or preset.
     """
     preset_write_k = int(preset.get("search_top_k_write", 12))
 
@@ -1297,15 +1304,19 @@ def _compute_effective_write_k(preset: Dict[str, Any], filters: Optional[Dict[st
         ui_write_k = 0
 
     if ui_write_k > 0:
-        return max(preset_write_k, ui_write_k)
-
-    ui_step_k = 0
-    try:
-        ui_step_k = int((filters or {}).get("step_top_k") or 0)
-    except (TypeError, ValueError):
+        result = max(preset_write_k, ui_write_k)
+    else:
         ui_step_k = 0
+        try:
+            ui_step_k = int((filters or {}).get("step_top_k") or 0)
+        except (TypeError, ValueError):
+            ui_step_k = 0
+        result = max(preset_write_k, int(ui_step_k * 1.5)) if ui_step_k > 0 else preset_write_k
 
-    return max(preset_write_k, int(ui_step_k * 1.5)) if ui_step_k > 0 else preset_write_k
+    cap = int(preset.get("search_top_k_write_max", 0))
+    if cap > 0:
+        result = min(result, max(cap, preset_write_k))
+    return result
 
 
 def _tokenize_for_overlap(text: str) -> List[str]:
@@ -1431,10 +1442,12 @@ def _rerank_section_pool_chunks(
     pool_chunks: List[Any],
     top_k: int,
     *,
+    secondary_top_k: Optional[int] = None,
     reranker_mode: Optional[str] = None,
     trace_ctx: Optional[Dict[str, Any]] = None,
+    pool_score_thresholds: Optional[Dict[str, float]] = None,
     fused_pool_score_threshold: Optional[float] = None,
-) -> List[Any]:
+) -> "Union[List[Any], tuple[List[Any], List[Any]]]":
     """Rerank section pool chunks with gap-pool protection.
 
     Chunks whose pool_source is in _DR_GAP_POOL_SOURCES (currently
@@ -1462,7 +1475,10 @@ def _rerank_section_pool_chunks(
         _has_reranker = False
 
     if not _has_fusion and not _has_reranker:
-        return list(pool_chunks[:top_k])
+        primary = list(pool_chunks[:top_k])
+        if secondary_top_k is not None:
+            return primary, list(pool_chunks[:secondary_top_k])
+        return primary
 
     main_candidates: List[Dict[str, Any]] = []
     gap_candidates: List[Dict[str, Any]] = []
@@ -1526,22 +1542,31 @@ def _rerank_section_pool_chunks(
     if not all_candidates:
         return list(pool_chunks[:top_k])
 
-    # Global fusion with gap protection
+    # Global fusion with gap protection — BGE runs once; secondary_top_k reuses the
+    # same ranked pool via _apply_quota_selection without a second cross-encoder call.
     fused: List[Dict[str, Any]] = []
+    fused_secondary: Optional[List[Dict[str, Any]]] = None
+    n_cands = min(max(top_k, 1), len(all_candidates))
     if _has_fusion:
         try:
-            fused = fuse_pools_with_gap_protection(
+            result = fuse_pools_with_gap_protection(
                 query=query,
                 main_candidates=main_candidates,
                 gap_candidates=gap_candidates,
-                top_k=min(max(top_k, 1), len(all_candidates)),
+                top_k=n_cands,
                 agent_candidates=agent_candidates,
                 gap_ratio=float(getattr(settings.search, "research_gap_ratio", 0.2)),
-                agent_ratio=float(getattr(settings.search, "research_agent_ratio", 0.1)),
+                agent_ratio=float(getattr(settings.search, "research_agent_ratio", 0.25)),
                 rank_pool_multiplier=float(getattr(settings.search, "research_rank_pool_multiplier", 3.0)),
+                pool_score_thresholds=pool_score_thresholds,
                 trace_ctx=trace_ctx,
                 reranker_mode=reranker_mode,
+                secondary_top_k=secondary_top_k,
             )
+            if secondary_top_k is not None:
+                fused, fused_secondary = result
+            else:
+                fused = result
         except Exception as e:
             logger.warning(
                 "_rerank_section_pool_chunks fusion failed (%s); falling back to plain rerank", e
@@ -1554,7 +1579,7 @@ def _rerank_section_pool_chunks(
                 fused = _rerank_candidates(
                     query=query,
                     candidates=all_candidates,
-                    top_k=min(max(top_k, 1), len(all_candidates)),
+                    top_k=n_cands,
                     reranker_mode=reranker_mode,
                     trace_ctx=trace_ctx,
                 )
@@ -1568,15 +1593,21 @@ def _rerank_section_pool_chunks(
     if _filter_fused_by_score_threshold is not None and fused:
         fused = _filter_fused_by_score_threshold(fused, fused_pool_score_threshold)
 
-    # Map fused raw dicts back to original chunk objects
-    out: List[Any] = []
-    for item in fused:
-        meta = item.get("metadata") or {}
-        cid = str(item.get("chunk_id") or meta.get("chunk_id") or "")
-        chunk = by_chunk_id.get(cid)
-        if chunk is not None:
-            out.append(chunk)
-    return out[:top_k] if out else list(pool_chunks[:top_k])
+    def _map_back(items: List[Dict[str, Any]], k: int) -> List[Any]:
+        out: List[Any] = []
+        for item in items:
+            meta = item.get("metadata") or {}
+            cid = str(item.get("chunk_id") or meta.get("chunk_id") or "")
+            chunk = by_chunk_id.get(cid)
+            if chunk is not None:
+                out.append(chunk)
+        return out[:k] if out else list(pool_chunks[:k])
+
+    primary_out = _map_back(fused, top_k)
+    if secondary_top_k is not None:
+        secondary_out = _map_back(fused_secondary or [], secondary_top_k) if fused_secondary else primary_out[:secondary_top_k]
+        return primary_out, secondary_out
+    return primary_out
 
 
 def _build_pack_from_chunks(query: str, chunks: List[Any]) -> Any:
@@ -3106,6 +3137,7 @@ def research_node(state: DeepResearchState) -> DeepResearchState:
     qpp = {}
     dr_filters = dict(base_dr_filters)
     dr_filters["reranker_mode"] = "bge_only"
+    dr_filters["pool_only"] = True
     _inject_trace_filters(dr_filters, state, phase="research_main_1p1p1", section=section.title)
     if ui_fetcher is not None and ui_fetcher != "":
         dr_filters["use_content_fetcher"] = ui_fetcher
@@ -3301,18 +3333,25 @@ def evaluate_node(state: DeepResearchState) -> DeepResearchState:
     _inject_trace_filters(eval_filters, state, phase="evaluate", section=section.title)
     pool_chunks = list((state.get("section_evidence_pool") or {}).get(section.title) or [])
     if pool_chunks:
+        # Use full section pool for evaluation (no hard truncation); compress if too long.
         reranked_pool = _rerank_section_pool_chunks(
             query=query_text,
             pool_chunks=pool_chunks,
-            top_k=eval_top_k,
+            top_k=len(pool_chunks),
             reranker_mode=eval_filters.get("reranker_mode"),
             trace_ctx=_make_trace_ctx(state, phase="evaluate_pool_rerank", section=section.title),
+            pool_score_thresholds=eval_filters.get("pool_score_thresholds"),
             fused_pool_score_threshold=eval_filters.get("fused_pool_score_threshold"),
         )
         pool_pack = _build_pack_from_chunks(query_text, reranked_pool)
-        findings = cap_and_log(
-            pool_pack.to_context_string(max_chunks=eval_top_k) or "", purpose="evaluate_findings"
-        )
+        findings = pool_pack.to_context_string(max_chunks=len(reranked_pool)) or ""
+        if len(findings) > DR_SECTION_EVIDENCE_MAX_CHARS:
+            findings = summarize_if_needed(
+                findings,
+                DR_SECTION_EVIDENCE_MAX_CHARS,
+                llm_client=client,
+                purpose="evaluate_findings",
+            )
     if not findings.strip():
         try:
             svc = _get_retrieval_svc(state)
@@ -3389,8 +3428,12 @@ def evaluate_node(state: DeepResearchState) -> DeepResearchState:
             svc = _get_retrieval_svc(state)
             supplement_filters = dict(eval_filters)
             supplement_filters["reranker_mode"] = "bge_only"
+            supplement_filters["pool_only"] = True
             _inject_trace_filters(supplement_filters, state, phase="evaluate_supplement", section=section.title)
-            supplement_top_k = max(5, int(eval_top_k * 0.2))
+            supplement_top_k = int(
+                (state.get("filters") or {}).get("step_top_k")
+                or preset.get("search_top_k_eval", 20)
+            )
             for gap in (section.gaps or [])[:3]:
                 gap_q = f"{dashboard.brief.topic} {section.title} {str(gap).strip()}"
                 gap_pack = svc.search(
@@ -3489,6 +3532,7 @@ def generate_claims_node(state: DeepResearchState) -> DeepResearchState:
             top_k=write_top_k,
             reranker_mode=dr_filters.get("reranker_mode"),
             trace_ctx=_make_trace_ctx(state, phase="generate_claims_pool_rerank", section=section.title),
+            pool_score_thresholds=dr_filters.get("pool_score_thresholds"),
             fused_pool_score_threshold=dr_filters.get("fused_pool_score_threshold"),
         )
         pack = _build_pack_from_chunks(query_text, selected_chunks)
@@ -3565,29 +3609,25 @@ def write_node(state: DeepResearchState) -> DeepResearchState:
     preset = state.get("depth_preset") or get_depth_preset(state.get("depth", DEFAULT_DEPTH))
     dr_filters = dict(state.get("filters") or {})
     write_top_k = _compute_effective_write_k(preset, dr_filters)
-    verification_k = int(preset.get("verification_k", max(10, write_top_k)))
+    verification_k = max(15, math.ceil(write_top_k * 0.25))
     base_query = f"{dashboard.brief.topic} {section.title}"
-    verify_query = f"{dashboard.brief.topic} {section.title} data evidence citation verification"
+    verify_query = f"{base_query} evidence data"
     pool_chunks = list((state.get("section_evidence_pool") or {}).get(section.title) or [])
     if pool_chunks:
-        write_chunks = _rerank_section_pool_chunks(
+        # BGE 只跑一次；secondary_top_k=verification_k 复用已排序的 reranked pool
+        # 重新做配额提取，不重跑 cross-encoder。
+        write_chunks, verify_chunks = _rerank_section_pool_chunks(
             query=base_query,
             pool_chunks=pool_chunks,
             top_k=write_top_k,
+            secondary_top_k=verification_k,
             reranker_mode=dr_filters.get("reranker_mode"),
             trace_ctx=_make_trace_ctx(state, phase="write_pool_rerank", section=section.title),
-            fused_pool_score_threshold=dr_filters.get("fused_pool_score_threshold"),
-        )
-        verify_chunks = _rerank_section_pool_chunks(
-            query=verify_query,
-            pool_chunks=pool_chunks,
-            top_k=verification_k,
-            reranker_mode=dr_filters.get("reranker_mode"),
-            trace_ctx=_make_trace_ctx(state, phase="write_verify_pool_rerank", section=section.title),
+            pool_score_thresholds=dr_filters.get("pool_score_thresholds"),
             fused_pool_score_threshold=dr_filters.get("fused_pool_score_threshold"),
         )
         pack = _build_pack_from_chunks(base_query, write_chunks)
-        verify_pack = _build_pack_from_chunks(verify_query, verify_chunks)
+        verify_pack = _build_pack_from_chunks(base_query, verify_chunks)
     else:
         svc = _get_retrieval_svc(state)
         write_filters = dict(dr_filters)
@@ -3786,9 +3826,11 @@ def write_node(state: DeepResearchState) -> DeepResearchState:
         section_text = _strip_redundant_heading(section_text, [section.title])
 
     # 仅累积 evidence chunks；[ref:xxxx] 占位符在 synthesize_node 合并时统一解析为 cite_key
-    section_chunks = list(pack.chunks) + list(verify_pack.chunks)
-    _accumulate_section_pool(state, section.title, section_chunks, pool_source="write_stage")
-    _accumulate_evidence_chunks(state, section_chunks)
+    # 严禁将从已有章节池取出的证据回灌进池，仅当 fallback 检索时才入池
+    if not pool_chunks:
+        section_chunks = list(pack.chunks) + list(verify_pack.chunks)
+        _accumulate_section_pool(state, section.title, section_chunks, pool_source="write_stage")
+        _accumulate_evidence_chunks(state, section_chunks)
 
     # 添加到 markdown（保留 [ref:xxxx]，合并时再做文献管理）
     level = "##"
@@ -4090,11 +4132,8 @@ def review_gate_node(state: DeepResearchState) -> DeepResearchState:
         pending_sections.append(sec.title)
 
     if revise_target:
-        section = dashboard.get_section(revise_target)
-        if section:
-            section.status = "researching"
         state["current_section"] = revise_target
-        # ── Record revise feedback as a limitation insight ──
+        state["review_revise_feedback"] = revise_feedback
         if revise_feedback:
             _record_insight(
                 state,
@@ -4108,11 +4147,11 @@ def review_gate_node(state: DeepResearchState) -> DeepResearchState:
             "review_requeue",
             {
                 "section": revise_target,
-                "message": "根据审核意见回到该章节重写。",
+                "message": "根据审核意见进行定向补证与整合重写。",
                 "feedback": revise_feedback,
             },
         )
-        state["review_gate_next"] = "research"
+        state["review_gate_next"] = "review_revise_agent_supplement"
         return state
 
     total = len(dashboard.sections)
@@ -4267,6 +4306,145 @@ def _build_document_blueprint(
             lines.append(f"{num}. {display_heading}{snippet_part}")
 
     return "\n".join(lines)
+
+
+def review_revise_agent_supplement_node(state: DeepResearchState) -> DeepResearchState:
+    """One round of targeted agent GAP search for the section under review (review-revise path only)."""
+    logger.info("[work=research] 阶段=review_revise_agent_supplement")
+    _ensure_not_cancelled(state)
+    _tick_cost_monitor(state, "review_revise_agent_supplement")
+    dashboard = state.get("dashboard")
+    if dashboard is None:
+        state["review_gate_next"] = "review_gate"
+        return state
+    section_title = state.get("current_section") or ""
+    section = dashboard.get_section(section_title) if section_title else None
+    if section is None:
+        state["review_gate_next"] = "review_gate"
+        return state
+    revise_feedback = str(state.get("review_revise_feedback") or "").strip()
+    if not revise_feedback:
+        state["review_gate_next"] = "review_gate"
+        return state
+
+    preset = state.get("depth_preset") or get_depth_preset(state.get("depth", DEFAULT_DEPTH))
+    step_k = int((state.get("filters") or {}).get("step_top_k") or preset.get("search_top_k_eval", 20))
+    review_revise_supplement_k = max(1, math.ceil(step_k * 0.5))
+    query = f"{dashboard.brief.topic} {section.title} {revise_feedback}"
+
+    try:
+        svc = _get_retrieval_svc(state)
+        supp_filters = dict(state.get("filters") or {})
+        supp_filters["pool_only"] = True
+        _inject_trace_filters(supp_filters, state, phase="review_revise_supplement", section=section.title)
+        pack = svc.search(
+            query=query,
+            mode=state.get("search_mode", "hybrid"),
+            top_k=review_revise_supplement_k,
+            filters=supp_filters,
+        )
+        chunks = list(pack.chunks) if pack else []
+        state["review_revise_supplement_chunks"] = chunks
+        if chunks:
+            _accumulate_section_pool(state, section.title, chunks, pool_source="revise_supplement")
+            _accumulate_evidence_chunks(state, chunks)
+        _emit_progress(
+            state,
+            "review_revise_supplement_done",
+            {"section": section.title, "chunks": len(chunks)},
+        )
+    except Exception as e:
+        logger.debug("review_revise_agent_supplement search failed: %s", e)
+        state["review_revise_supplement_chunks"] = []
+    state["review_gate_next"] = "review_revise_integrate"
+    return state
+
+
+def review_revise_integrate_node(state: DeepResearchState) -> DeepResearchState:
+    """Integrate review feedback + new evidence into the section; output revised section and return to review_gate."""
+    logger.info("[work=research] 阶段=review_revise_integrate")
+    _ensure_not_cancelled(state)
+    _tick_cost_monitor(state, "review_revise_integrate")
+    dashboard = state.get("dashboard")
+    client, model_override = _resolve_step_client_and_model(state, "write")
+    section_title = state.get("current_section") or ""
+    section = dashboard.get_section(section_title) if (dashboard and section_title) else None
+    if section is None:
+        state["review_gate_next"] = "review_gate"
+        state.pop("review_revise_supplement_chunks", None)
+        return state
+
+    original_section_text = ""
+    for part in state.get("markdown_parts", []):
+        if section.title in part:
+            original_section_text = part
+            break
+    if not original_section_text.strip():
+        state["review_gate_next"] = "review_gate"
+        state.pop("review_revise_supplement_chunks", None)
+        return state
+
+    review_feedback = str(state.get("review_revise_feedback") or "").strip()
+    supplement_chunks = list(state.get("review_revise_supplement_chunks") or [])
+    def _chunk_text(c: Any) -> str:
+        if hasattr(c, "text") and c.text:
+            return (c.text or "")[:2000]
+        if isinstance(c, dict):
+            return (c.get("content") or c.get("text") or str(c))[:2000]
+        return str(c)[:2000]
+    new_evidence = "\n\n".join(_chunk_text(c) for c in supplement_chunks[:20]).strip() if supplement_chunks else "(no new evidence)"
+    author_supplement = _load_section_supplements(state, section.title) or "(none)"
+
+    prompt = _pm.render(
+        "review_revise_integrate.txt",
+        original_section_text=original_section_text,
+        review_feedback=review_feedback or "(no specific feedback)",
+        new_evidence=new_evidence,
+        author_supplement=author_supplement,
+    )
+    try:
+        resp = client.chat(
+            messages=[
+                {"role": "system", "content": "You output only the revised section markdown. No preamble, no explanation."},
+                {"role": "user", "content": prompt},
+            ],
+            model=model_override,
+        )
+        revised = (resp.get("final_text") or "").strip()
+        if revised:
+            revised = _strip_redundant_heading(revised, [section.title])
+            parts = list(state.get("markdown_parts") or [])
+            new_parts = []
+            for p in parts:
+                if section.title in p:
+                    new_parts.append(f"\n## **{section.title}**\n\n{revised}\n")
+                else:
+                    new_parts.append(p)
+            state["markdown_parts"] = new_parts
+            if state.get("canvas_id"):
+                try:
+                    from src.collaboration.canvas.canvas_manager import get_canvas, upsert_draft, update_canvas
+                    from src.collaboration.canvas.models import DraftBlock
+                    canvas = get_canvas(state["canvas_id"])
+                    section_id = section.title
+                    if canvas:
+                        for s in canvas.outline:
+                            if s.title == section.title:
+                                section_id = s.id
+                                break
+                    upsert_draft(
+                        state["canvas_id"],
+                        DraftBlock(section_id=section_id, content_md=revised, version=1, used_fragment_ids=[], used_citation_ids=[]),
+                    )
+                    update_canvas(state["canvas_id"], stage="drafting")
+                except Exception as e:
+                    logger.warning("Failed to write revised section draft to canvas: %s", e)
+            _emit_progress(state, "review_revise_integrate_done", {"section": section.title})
+    except Exception as e:
+        logger.warning("review_revise_integrate LLM failed: %s", e)
+    state.pop("review_revise_supplement_chunks", None)
+    state["review_gate_next"] = "review_gate"
+    return state
 
 
 def synthesize_node(state: DeepResearchState) -> DeepResearchState:
@@ -4965,6 +5143,43 @@ def synthesize_node(state: DeepResearchState) -> DeepResearchState:
             if ref_text:
                 final_markdown = body_md.rstrip() + f"\n\n## **{ref_title}**\n\n{ref_text}\n"
 
+    # ── Graphic Abstract ──
+    dr_filters = state.get("filters") or {}
+    if dr_filters.get("enable_graphic_abstract") and final_markdown.strip():
+        ga_model = dr_filters.get("graphic_abstract_model") or "nanobanana 2"
+        ga_provider = "gemini"
+        if ga_model.startswith("gpt"):
+            ga_provider = "openai"
+        elif ga_model.startswith("kimi"):
+            ga_provider = "kimi"
+            
+        _emit_progress(state, "synthesize_graphic_abstract", {"message": f"正在生成 Graphic Abstract ({ga_model})..."})
+        try:
+            from src.llm.llm_manager import get_manager
+            from pathlib import Path
+            _config_path = Path(__file__).resolve().parents[3] / "config" / "rag_config.json"
+            ga_client = get_manager(str(_config_path)).get_client(ga_provider)
+            ga_prompt = (
+                "Please extract the core concepts and logical flow from the following report, "
+                "and generate a clear, structured Mermaid diagram (e.g. flowchart, mindmap, or sequence diagram) "
+                "to serve as a Graphic Abstract. "
+                "ONLY output the mermaid code block wrapped in ```mermaid ... ```, no other text or explanation.\n\n"
+                f"Report:\n{final_markdown[:40000]}"  # truncate to avoid context limit just in case
+            )
+            ga_resp = ga_client.chat([{"role": "user", "content": ga_prompt}], model=ga_model, max_tokens=None)
+            ga_text = (ga_resp.get("final_text") or "").strip()
+            
+            if ga_text and not ga_text.startswith("```mermaid"):
+                if ga_text.startswith("```"):
+                    pass
+                else:
+                    ga_text = f"```mermaid\n{ga_text}\n```"
+            
+            if ga_text:
+                final_markdown += f"\n\n## **Graphic Abstract**\n\n{ga_text}\n"
+        except Exception as e:
+            logger.error(f"[research] Graphic Abstract 生成失败: {e}", exc_info=True)
+
     state["markdown_parts"] = [final_markdown]
 
     # ── Mark consumed insights as addressed ──
@@ -5169,6 +5384,8 @@ def build_research_graph(include_scope_plan: bool = True, start_node: Optional[s
     graph.add_node("write", write_node)
     graph.add_node("verify", verify_node)
     graph.add_node("review_gate", review_gate_node)
+    graph.add_node("review_revise_agent_supplement", review_revise_agent_supplement_node)
+    graph.add_node("review_revise_integrate", review_revise_integrate_node)
     graph.add_node("synthesize", synthesize_node)
 
     # 添加边
@@ -5195,9 +5412,12 @@ def build_research_graph(include_scope_plan: bool = True, start_node: Optional[s
     })
     graph.add_conditional_edges("review_gate", _after_review_gate, {
         "review_gate": "review_gate",
-        "research": "research",
+        "review_revise_agent_supplement": "review_revise_agent_supplement",
+        "review_revise_integrate": "review_revise_integrate",
         "synthesize": "synthesize",
     })
+    graph.add_edge("review_revise_agent_supplement", "review_revise_integrate")
+    graph.add_edge("review_revise_integrate", "review_gate")
     graph.add_edge("synthesize", END)
 
     return graph
@@ -5224,6 +5444,7 @@ def _build_initial_state(
     step_model_strict: bool = False,
     progress_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
+    pause_waiter: Optional[Callable[[], None]] = None,
     review_waiter: Optional[Callable[[str], Optional[Dict[str, Any]]]] = None,
     skip_draft_review: bool = False,
     skip_refine_review: bool = False,
@@ -5238,6 +5459,11 @@ def _build_initial_state(
     normalized_filters = _ensure_research_rank_pool_multiplier(filters)
     if job_id:
         normalized_filters = {**normalized_filters, "job_id": job_id}
+        # 自动加入基于 job_id 的临时检索库，方便补充临时文档
+        temp_collection = f"job_{job_id.replace('-', '_')}"
+        collections = normalized_filters.get("collections") or []
+        if isinstance(collections, list) and temp_collection not in collections:
+            normalized_filters["collections"] = collections + [temp_collection]
     # max_iterations is set as a placeholder here; the real value is computed
     # dynamically in execute_deep_research() after num_sections is known:
     #   max_iterations = (max_section_research_rounds + max_verify_rewrite_cycles) × num_sections
@@ -5275,6 +5501,7 @@ def _build_initial_state(
         "step_model_strict": bool(step_model_strict),
         "progress_callback": None,
         "cancel_check": None,
+        "pause_waiter": None,
         "review_waiter": None,
         "skip_draft_review": bool(skip_draft_review),
         "skip_refine_review": bool(skip_refine_review),
@@ -5316,6 +5543,8 @@ def start_deep_research(
     max_iterations: int = 30,
     max_sections: int = 4,
     progress_callback: Optional[Callable[[str, str, int], None]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
+    pause_waiter: Optional[Callable[[], None]] = None,
 ) -> Dict[str, Any]:
     """Phase 1 only: scope + plan. Return outline and brief for confirmation."""
     def _emit(stage: str, message: str, percent: int) -> None:
@@ -5324,6 +5553,12 @@ def start_deep_research(
                 progress_callback(stage, message, percent)
             except Exception:
                 pass
+
+    def _cooperate() -> None:
+        if pause_waiter:
+            pause_waiter()
+        if cancel_check and cancel_check():
+            raise RuntimeError("Deep Research cancelled by user")
 
     t_start_phase1 = time.perf_counter()
     _f = filters or {}
@@ -5363,16 +5598,20 @@ def start_deep_research(
     _register_runtime_llm_client(rid, llm_client)
 
     try:
+        _cooperate()
         _emit("scoping", "正在分析研究范围和主题...", 10)
         t_scope = time.perf_counter()
         state = scoping_node(state)
         logger.info("[DR start] scope phase finished | elapsed_ms=%.0f", (time.perf_counter() - t_scope) * 1000.0)
+        _cooperate()
         _emit("retrieval", "正在检索相关文献和资源...", 35)
         t_plan = time.perf_counter()
         state = plan_node(state)
         logger.info("[DR start] plan phase finished | elapsed_ms=%.0f", (time.perf_counter() - t_plan) * 1000.0)
+        _cooperate()
         _emit("planning", "正在生成研究大纲框架...", 65)
         dashboard = state["dashboard"]
+        _cooperate()
         _emit("finalizing", "正在完善研究规划...", 90)
         logger.info("[DR start] phase-1 finished | elapsed_ms=%.0f", (time.perf_counter() - t_start_phase1) * 1000.0)
         return {
@@ -5477,6 +5716,7 @@ def prepare_deep_research_runtime(
     user_documents: Optional[List[Dict[str, str]]] = None,
     progress_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
+    pause_waiter: Optional[Callable[[], None]] = None,
     review_waiter: Optional[Callable[[str], Optional[Dict[str, Any]]]] = None,
     skip_draft_review: bool = False,
     skip_refine_review: bool = False,
@@ -5514,6 +5754,7 @@ def prepare_deep_research_runtime(
         step_model_strict=step_model_strict,
         progress_callback=progress_callback,
         cancel_check=cancel_check,
+        pause_waiter=pause_waiter,
         review_waiter=review_waiter,
         skip_draft_review=skip_draft_review,
         skip_refine_review=skip_refine_review,
@@ -5539,6 +5780,7 @@ def prepare_deep_research_runtime(
         # Runtime callbacks should always use the current process context.
         merged["progress_callback"] = progress_callback
         merged["cancel_check"] = cancel_check
+        merged["pause_waiter"] = pause_waiter
         merged["review_waiter"] = review_waiter
         merged["job_id"] = job_id
         if model_override is not None:
@@ -5619,6 +5861,7 @@ def prepare_deep_research_runtime(
     _register_runtime_callbacks(thread_id, {
         "progress_callback": progress_callback,
         "cancel_check": cancel_check,
+        "pause_waiter": pause_waiter,
         "review_waiter": review_waiter,
     })
     config = {"configurable": {"thread_id": thread_id}}

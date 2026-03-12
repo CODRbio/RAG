@@ -64,6 +64,17 @@ export interface Message {
   agentDebug?: AgentDebugData | null;
 }
 
+export interface ActiveResponseState {
+  kind: 'chat' | 'research';
+  taskOrJobId: string;
+  surface: 'chat' | 'research';
+  stepKey: string | null;
+  stepLabel: string;
+  streamPhase: 'thinking' | 'streaming' | 'paused';
+  targetMessageId?: string | null;
+  hasVisibleOutput: boolean;
+}
+
 export interface RetrievalStageDiag {
   count: number;
   time_ms: number;
@@ -136,6 +147,7 @@ export interface ChatRequest {
   serpapi_ratio?: number;  // SerpAPI 轮询比例 0-1（仅当 google/scholar 启用 useSerpapi 时生效）
   use_query_expansion?: boolean;  // 兼容字段（已弃用）
   local_top_k?: number;  // 本地检索返回的最大文档数
+  pool_score_thresholds?: Record<string, number>;
   /** 合并池分数阈值 (0-1)，仅作用于融合后的最终池。默认 0.35。 */
   fused_pool_score_threshold?: number;
   /** @deprecated 请用 fused_pool_score_threshold */
@@ -143,6 +155,8 @@ export interface ChatRequest {
   year_start?: number;  // 年份窗口起始（硬过滤）
   year_end?: number;  // 年份窗口结束（硬过滤）
   step_top_k?: number;  // 每步检索保留的文档数（local + web 合并重排后）
+  write_top_k?: number;
+  graph_top_k?: number;
   llm_provider?: string;  // LLM 提供商: deepseek | openai | gemini | claude | kimi 等
   ultra_lite_provider?: string;  // 长文本压缩等超轻量任务用的 provider（如 openai-mini, gemini-flash）
   model_override?: string;  // 覆盖默认模型，如 claude-opus-4-6
@@ -167,6 +181,8 @@ export interface ChatRequest {
   session_preference_local_db?: 'no_local' | 'use';
   /** 前端调试面板开启时传 true，本请求期间后端临时开启 DEBUG 级别日志 */
   agent_debug_mode?: boolean;
+  enable_graphic_abstract?: boolean;
+  graphic_abstract_model?: string;
 }
 
 export interface ChatCitation {
@@ -199,7 +215,7 @@ export interface ChatSubmitResponse {
 }
 
 /** 任务状态（排队区） */
-export type TaskStatus = 'queued' | 'running' | 'completed' | 'error' | 'cancelled' | 'timeout';
+export type TaskStatus = 'queued' | 'running' | 'pausing' | 'paused' | 'completed' | 'error' | 'cancelled' | 'timeout';
 
 export interface TaskStateItem {
   task_id: string;
@@ -211,6 +227,8 @@ export interface TaskStateItem {
   created_at?: number;
   started_at?: number;
   finished_at?: number;
+  pause_started_at?: number;
+  paused_total_seconds?: number;
   error_message?: string;
   payload?: Record<string, unknown>;
 }
@@ -334,6 +352,7 @@ export interface DeepResearchRequest {
   query_optimizer_max_queries?: number;
   gap_query_intent?: 'broad' | 'review_pref' | 'reviews_only';
   local_top_k?: number;
+  pool_score_thresholds?: Record<string, number>;
   fused_pool_score_threshold?: number;
   local_threshold?: number;
   year_start?: number;
@@ -367,17 +386,21 @@ export interface DeepResearchStartRequest {
   use_content_fetcher?: 'auto' | 'force' | 'off';
   gap_query_intent?: 'broad' | 'review_pref' | 'reviews_only';
   local_top_k?: number;
+  pool_score_thresholds?: Record<string, number>;
   fused_pool_score_threshold?: number;
   local_threshold?: number;
   year_start?: number;
   year_end?: number;
   step_top_k?: number;
   write_top_k?: number;
+  graph_top_k?: number;
   llm_provider?: string;
   ultra_lite_provider?: string;
   model_override?: string;
   reranker_mode?: 'bge_only' | 'colbert_only' | 'cascade';
   agent_sonar_model?: string;
+  enable_graphic_abstract?: boolean;
+  graphic_abstract_model?: string;
 }
 
 /** Returned immediately from POST /deep-research/start – poll status endpoint for result. */
@@ -433,12 +456,14 @@ export interface DeepResearchConfirmRequest {
   use_content_fetcher?: 'auto' | 'force' | 'off';
   gap_query_intent?: 'broad' | 'review_pref' | 'reviews_only';
   local_top_k?: number;
+  pool_score_thresholds?: Record<string, number>;
   fused_pool_score_threshold?: number;
   local_threshold?: number;
   year_start?: number;
   year_end?: number;
   step_top_k?: number;
   write_top_k?: number;
+  graph_top_k?: number;
   llm_provider?: string;
   ultra_lite_provider?: string;
   model_override?: string;
@@ -455,6 +480,8 @@ export interface DeepResearchConfirmRequest {
   skip_claim_generation?: boolean;
   // 大纲章节数
   max_sections?: number;
+  enable_graphic_abstract?: boolean;
+  graphic_abstract_model?: string;
 }
 
 export interface DeepResearchSubmitResponse {
@@ -488,7 +515,7 @@ export interface DeepResearchJobInfo {
   topic: string;
   session_id: string;
   canvas_id: string;
-  status: 'planning' | 'pending' | 'running' | 'cancelling' | 'waiting_review' | 'done' | 'error' | 'cancelled' | string;
+  status: 'planning' | 'pending' | 'running' | 'pausing' | 'paused' | 'cancelling' | 'waiting_review' | 'done' | 'error' | 'cancelled' | string;
   current_stage: string;
   message: string;
   error_message: string;
@@ -686,9 +713,19 @@ export interface WebSource {
   useSerpapi?: boolean;
 }
 
+export interface PoolScoreThresholds {
+  main: number;
+  gap: number;
+  agent: number;
+}
+
 export interface RagConfig {
   enabled: boolean;  // 是否启用本地 RAG 检索
   localTopK: number;
+  poolScoreThresholds?: {
+    chat: PoolScoreThresholds;
+    research: PoolScoreThresholds;
+  };
   /** 合并池分数阈值 (0-1)，仅作用于 local+web 融合后的最终池。默认 0.35。 */
   fusedPoolScoreThreshold: number;
   /** @deprecated 已由 fusedPoolScoreThreshold 取代，保留仅作持久化兼容 */
@@ -707,6 +744,8 @@ export interface RagConfig {
   agentSonarModel?: string;
   maxIterations: number;  // Agent ReAct 最大迭代轮数，默认 2
   agentDebugMode: boolean;  // 是否显示 Agent 详细调试面板
+  enableGraphicAbstract?: boolean; // 是否在末尾生成 Graphic Abstract
+  graphicAbstractModel?: string; // 生成 Graphic Abstract 所用的模型提供商（gemini, openai, kimi）
 }
 
 export interface WebSearchConfig {

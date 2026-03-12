@@ -38,9 +38,10 @@
 | `agent_supplement` | 章节 agent 补搜结果 | 章节池 `pool_source` | `research_node()` 内部 agent 工具补搜结果；章节 fuse 的 agent pool | `section_agent_search` |
 | `gap_supplement` | 用户补充材料 | API / DB / 事件名 | `/deep-research/jobs/{job_id}/gap-supplement` 提交；写作阶段读入，不参与章节 fuse pool | `user_gap_material` |
 | `research_round` | 主研究证据 | 章节池 `pool_source` | `research_node()` 主检索得到的常规章节证据 | `main_research_round` |
-| `write_stage` | 写作阶段证据 | 章节池 `pool_source` | `write_node()` 用过的写作/验证证据回灌 | `write_context_round` |
+| `write_stage` | 写作阶段兜底补搜 | 章节池 `pool_source` | `write_node()` 阶段因章节池证据不足或异常触发的兜底补充检索结果（严禁将已用过的写作/验证证据回灌） | `write_fallback_round` |
 | `final_agent_supplement` | 最终综合 agent 补搜 | 运行期行为 | `synthesize_node()` 内部的最终综合 agent 补搜；不进入章节 fuse | `synthesis_agent_search` |
 | `review_gate_node() -> research_node()` | 审核返修整章重跑 | 当前路径 | 当前代码里 `revise` 会让目标章节重新进入整章 research 循环 | `review_revise_agent_supplement -> review_revise_integrate` |
+| `revise_supplement` | 返修补证证据 | 章节池 `pool_source` | `review_revise_agent_supplement` 获取的新证据入池标签；必须追加写入 Section Evidence Pool，保证 synthesize 阶段引文可精准溯源 | 保持不变 |
 | `review_revise_agent_supplement` | 章节确认定向补证 | 目标节点 | 目标态下仅针对 review/revise 暴露的问题，做 1 轮 agent GAP 补证 | 保持不变 |
 | `review_revise_integrate` | 章节确认整合重写 | 目标节点 | 目标态下将“现有章节文本 + 新证据 + 作者补充观点”直接整合成新版章节，并保留原有有效 `[ref:xxxx]` 占位 | `section_revise_merge` |
 | `pre-research` | 前置研究 | 概念术语 | 确认前 prelim / clarify / scope / plan 的统称 | 保持不变 |
@@ -83,7 +84,7 @@
 - Chat 中，`step_top_k` 约束主检索与 gap 补搜的单次输出上限。
 - Research 中，`step_top_k` 约束每轮 `research_node()` 主检索输出上限。
 - Research agent 工具检索会继承当前请求级 `step_top_k`。
-- Research `evaluate_node()` 的取证窗口当前实际也是 `step_top_k` 优先；未传时回退到 `20`。
+- Research `evaluate_node()` 的取证窗口当前实际也是 `step_top_k` 优先；未传时回退到 preset `search_top_k_eval`（lite=20, comprehensive=40）。
 - 当前主流程并没有按 depth preset 区分 `search_top_k_first` / `search_top_k_gap`。
 
 ### 3.2 write_top_k
@@ -101,8 +102,18 @@
 ### 4.1 Chat
 
 - Chat 最终融合使用主检索、gap 补搜、agent 补搜三类候选共同组成的池。
-- Chat gap 保护比例当前为 `20%`。
-- Chat agent 保护比例当前为 `10%`。
+- Chat 采用“候选池优先”语义：
+  - local / web / gap / agent 各自先提供源内有序候选池
+  - 只有在 `main + gap` 或 `main + gap + agent` 这种跨池边界，才执行权威 rerank
+  - Chat 路径不再对 fused pool 追加绝对分数阈值过滤，避免配额保护后的候选再次被批量删除
+- Chat 目标保护比例（软配额，候选不足时按全局排序补齐）：
+  - **gap**：`chat_gap_ratio = 0.2`（20%），用于 gap 补搜融合与最终 main+gap+agent 融合。
+  - **agent**：`chat_agent_ratio = 0.1`（10%），用于最终融合时 agent 池最低保留比例。
+- 使用位置：
+  - `src/api/routes_chat.py` 中 `_fuse_chat_main_gap_agent_candidates()`、gap 补搜后的 `fuse_pools_with_gap_protection()` 调用时传入 `gap_ratio=chat_gap_ratio`、`agent_ratio=chat_agent_ratio`（及 `gap_min_keep` / `agent_min_keep` 由同比例计算）。
+- 配置：
+  - `config` 的 `search.chat_gap_ratio`（默认 `0.2`）；`chat_agent_ratio` 若未在 `settings.search` 中配置，则代码 fallback 为 `0.1`。
+- Chat fuse 放大倍率：`chat_rank_pool_multiplier = 3.0`（与 Research 的 `research_rank_pool_multiplier` 独立，均在对应路径的 `fuse_pools_with_gap_protection` 中传入）。
 
 ### 4.2 Deep Research（目标约束）
 
@@ -111,13 +122,18 @@
   - `eval_supplement`
   - `agent_supplement`
   - `write_stage`
+- 其中凡是“结果会继续进入章节池、并在后续 `_rerank_section_pool_chunks()` 统一裁决”的检索，统一采用 `pool_only=True`：
+  - `research_round`
+  - `eval_supplement`
+  - `review_revise_supplement`
+- 例外：确认前背景检索 / 章节规划、evaluate fallback、write/verify fallback 这类“当前节点直接消费、不会先入章节池再统一 fuse”的检索，可保持 `pool_only=False`。
 - 章节最终重排使用三池融合：
   - main pool：普通章节证据
   - gap pool：仅 `eval_supplement`
   - agent pool：仅 `agent_supplement`
 - Research 目标保护比例：
-  - `gap 35%`
-  - `agent 10%`
+  - `gap 20%`
+  - `agent 25%`
 - 保护是软配额，不是硬保底；候选不足时按全局排序补齐。
 - Research 中“类似 Chat gap 概念”的只有 `eval_supplement`。
 - Research 中的 `agent fuse` 确实存在，但范围要精确定义：
@@ -146,9 +162,11 @@ Chat 当前行为：
 
 - 可选 pre-research / preliminary knowledge 预处理。
 - 主检索使用 `1+1+1` 结构化查询。
-- 证据不足时最多生成 `1-3` 组 gap query，并行补搜，为了适应不同的search engine，每一组的搜索词要针对我们的引擎来生成字典。
-- Agent （可选）补搜结果会回流进入最终融合。
-- Chat 内部仍可对 `step_top_k` 做 `1.2x` 候选放大，但最终可见证据由 `write_top_k` 决定。
+- **Local 主检索**（`mode=local`）：dense + sparse 各自召回 → 应用层加权 RRF 融合 → 返回原始 RRF 候选池（**无 BGE rerank**）。web 模式各 provider 同样以 `pool_only=True` 形式返回原始候选，BGE rerank 统一延迟至最终融合步骤。
+- 证据不足时最多生成 `1-3` 组 gap query，并行补搜；gap 子查询以 `pool_only=True` 返回原始候选池，**不在子查询内部做任何 rerank**，结果暂存为 `chat_gap_candidates_hits`。
+- **单次最终 BGE rerank**（§5¾ 步骤，Phase `chat_pre_agent_fusion`）：在系统提示组装前，将 main pool（RRF 原始）+ gap pool（raw hits）送入 `_fuse_chat_main_gap_agent_candidates`，执行**全流程唯一一次**联合 BGE rerank，输出 `write_top_k` 条作为 `pack.chunks` 与 `context_str`。gap 保护比例 `chat_gap_ratio=0.2` 在此生效。
+- Agent （可选）补搜结果：agent 在 §5¾ `context_str` 的基础上调用 LLM，LLM 通过工具检索产生 `agent_extra_chunks`（§5¾ 时不存在的新 chunks）。若 `agent_extra_chunks` 非空，再做**一次** agent 追加融合（`_fuse_chat_main_gap_agent_candidates`，`gap_candidate_hits=[]`，agent 受 `chat_agent_ratio=0.1` 保护）。两次 rerank 池组成不同，不冗余；`pack.chunks` 已含 gap，gap 不得重传。若 agent 未触发或工具无新 chunk，整条路径仅 1 次 BGE rerank。
+- Chat 主检索在调用前会对 `step_top_k` 进行 1.2 倍软放大：`chat_effective_step_top_k = max(step_k, ceil(step_k * 1.2))`，目的是为 Main/Gap/Agent 三池融合提供充足的高质量候选缓冲。融合重排后再由 `write_top_k` 或原始 `step_top_k` 严格截断进入 LLM。
 
 ## 6. Deep Research 当前真实流程
 
@@ -240,7 +258,7 @@ flowchart TD
   - `coverage_score < coverage_threshold`
   - 当前章节 pool chunk 数量 `< 5`
   - 存在 `section.gaps`
-- 目标态下，`evaluate_node()` 应优先消费当前章节池的已累积证据；若上下文过长，只允许压缩/摘要，不应再对章节池做小窗硬截断。
+- 目标态下，`evaluate_node()` 优先消费当前章节池的已累积证据；若上下文过长，只允许压缩/摘要，不再对章节池做小窗硬截断。（已落地）
 - 目标态下，只有章节池不足或为空时，`evaluate_node()` 才回退到 retrieval fallback。
 - `eval_supplement search` 的目标规则是：
   - 最多取前 `3` 个 gaps
@@ -266,7 +284,7 @@ flowchart TD
 - `review_revise_agent_supplement` 目标规则：
   - 只跑 `1` 轮 agent GAP 补证
   - 只针对当前 review 暴露的问题与缺口
-  - 新补证窗口 `review_revise_supplement_k = ceil((step_top_k or search_top_k_eval) * 0.5)`
+  - 新补证窗口 `review_revise_supplement_k = max(1, ceil((step_top_k or search_top_k_eval) * 0.5))`
 - `review_revise_integrate` 目标规则：
   - 不重跑整章 `research -> evaluate -> claims -> write`
   - 直接把“当前章节文本 + 新补证 + 作者补充观点 + review 问题”整合成新版章节
@@ -281,7 +299,7 @@ flowchart TD
 
 从本节开始，以下数量规则以“后续代码改造目标”为准；若与当前实现不一致，应以后述规则为准进行代码调整。
 
-### 6.3 目标：每一步保留数量与 UI 参数关系
+### 6.3 目标：Research中每一步保留数量与 UI 参数关系
 
 | 阶段 | 目标数量规则 | 与 UI `step_top_k` 的关系 | 与 UI `write_top_k` 的关系 |
 |---|---|---|---|
@@ -294,7 +312,7 @@ flowchart TD
 | `generate_claims_node()` 取证 | `effective_write_top_k` | 若没传 `write_top_k`，会间接受 `step_top_k` 影响 | 直接参与计算 |
 | `write_node()` 主写作证据 | `effective_write_top_k`；但初稿写作与章节验证的 prompt packing 不能占满窗口，必须为后续章节确认补证与问题整合预留上下文余量 | 若没传 `write_top_k`，会间接受 `step_top_k` 影响；`step_top_k` 越大，后续应预留的 revise 补证余量也随之增大 | 直接参与计算 |
 | `write_node()` verification context | `verification_k = max(15, ceil(write_top_k * 0.25))` | 无直接关系 | 直接参与计算 |
-| `review_revise_agent_supplement` | `review_revise_supplement_k = ceil((step_top_k or preset.search_top_k_eval) * 0.5)`；每次 review / confirm 只允许 `1` 轮定向 agent GAP 补证 | 直接继承 `0.5 x step_top_k`；未传时回退到 `0.5 x preset.search_top_k_eval` | 无 |
+| `review_revise_agent_supplement` | `review_revise_supplement_k = max(1, ceil((step_top_k or preset.search_top_k_eval) * 0.5))`；每次 review / confirm 只允许 `1` 轮定向 agent GAP 补证 | 直接继承 `0.5 x step_top_k`；未传时回退到 `0.5 x preset.search_top_k_eval` | 无 |
 | `review_revise_integrate` | 不重新跑 full research fuse；直接消费“旧章节文本 + review 问题 + 作者补充观点 + 新补证”生成新版章节，并保留原有有效 `[ref:xxxx]`；输出后必须再次回到 `review_gate_node()` 供用户确认 | 新补证部分间接受 `step_top_k` 影响，因为其输入来自 `review_revise_supplement_k` | 无直接关系；原则上不重新展开一次完整 `write_top_k` 取证 |
 | `synthesize_node()` final agent tools | 综合主体直接使用章节写作结果、章节级摘要、聚合后的 `open_gaps` / `conflict_notes`，并保留可反查的 `[ref:xxxx]` 占位；不再统一导入所有原始材料；仅 final agent supplement 做少量补搜 | 只有触发 final agent supplement 时才继承 `step_top_k` | 无 |
 
@@ -313,7 +331,7 @@ flowchart TD
 
 `review_revise_supplement_k` 目标公式：
 
-- `review_revise_supplement_k = ceil((step_top_k or preset.search_top_k_eval) * 0.5)`
+- `review_revise_supplement_k = max(1, ceil((step_top_k or preset.search_top_k_eval) * 0.5))`
 
 补充说明：
 
@@ -332,9 +350,9 @@ flowchart TD
 | 全局 `max_iterations` | `4 x N_sections` | `7 x N_sections` | `(research_rounds + rewrite_cycles) x num_sections` |
 | `write_top_k` 基线 | 10 | 12 | `search_top_k_write` |
 | `verification_k` | 默认 `15`，随 `write_top_k` 上升 | 默认 `15`，随 `write_top_k` 上升 | `max(15, ceil(write_top_k * 0.25))` |
-| `review_revise_supplement_k` | 默认 `10`，随 `step_top_k` 上升 | 默认 `20`，随 `step_top_k` 上升 | `ceil((step_top_k or search_top_k_eval) * 0.5)` |
-| 章节 fuse gap 比例 | 35% | 35% | 仅 `eval_supplement` 参与 |
-| 章节 fuse agent 比例 | 10% | 10% | 仅 `agent_supplement` 参与 |
+| `review_revise_supplement_k` | 默认 `10`，随 `step_top_k` 上升 | 默认 `20`，随 `step_top_k` 上升 | `max(1, ceil((step_top_k or search_top_k_eval) * 0.5))` |
+| 章节 fuse gap 比例 | 20% | 20% | 仅 `eval_supplement` 参与 |
+| 章节 fuse agent 比例 | 25% | 25% | 仅 `agent_supplement` 参与 |
 | 章节 fuse 放大倍率 | 3.0 | 3.0 | `research_rank_pool_multiplier` |
 
 补充说明：
@@ -462,7 +480,8 @@ flowchart TD
 - `review_revise_agent_supplement` 目标规则：
   - 仅跑 `1` 轮 agent GAP 补证
   - 仅补当前 review 指出的缺口
-  - `review_revise_supplement_k = ceil((step_top_k or search_top_k_eval) * 0.5)`
+  - `review_revise_supplement_k = max(1, ceil((step_top_k or search_top_k_eval) * 0.5))`
+  - **架构铁律**：获取的新证据除参与当前整合重写外，必须追加写入当前章节的 Section Evidence Pool（使用 `pool_source="revise_supplement"` 标签），以保证最终全文合成阶段引文可精准溯源
 - `review_revise_integrate` 目标规则：
   - 直接消费旧章节文本、新补证、review 问题、作者补充观点
   - 输出新的章节版本
@@ -504,8 +523,8 @@ flowchart TD
 ### 7.9 章节 fuse 的目标保护参数
 
 - 章节写作前的 pool rerank 目标使用：
-  - `research_gap_ratio = 0.35`
-  - `agent_ratio = 0.10`
+  - `research_gap_ratio = 0.2`（章节 fuse gap 比例 20%）
+  - `research_agent_ratio = 0.25`（章节 fuse agent 比例 25%）
   - `research_rank_pool_multiplier = 3.0`
 - 其中：
   - 只有 `eval_supplement` 进入 gap pool
@@ -514,11 +533,10 @@ flowchart TD
 - fuse 放大池目标明确写为：
   - `rerank_k = min(max(ceil(write_top_k * research_rank_pool_multiplier), write_top_k + n_gap + n_agent), n_total)`
   - 默认 `research_rank_pool_multiplier = 3.0`
-- 因而默认情况下：
-  - `lite write_top_k = 10` 时，目标是约 `gap 4`、`agent 1`
-  - `comprehensive write_top_k = 12` 时，目标是约 `gap 5`、`agent 2`
-- 这是软目标，不是硬保底。
-- 当前代码若仍保留 `research_gap_ratio = 0.25`，则后续实现应按本文档目标同步改为 `0.35`。
+- 因而默认情况下（软目标，非硬保底）：
+  - `lite write_top_k = 10` 时，目标约 `gap 2`、`agent 2～3`
+  - `comprehensive write_top_k = 12` 时，目标约 `gap 2`、`agent 3`
+- 当前实现与本文档一致：`research_gap_ratio = 0.2`、`research_agent_ratio = 0.25`。
 
 ### 7.10 当前真正生效的成本与收敛参数
 
@@ -531,7 +549,7 @@ flowchart TD
 
 ## 8. 当前未接线或仅部分接线的 preset 字段
 
-以下字段目前在配置或文档中出现，但不驱动当前 Research 主路径：
+以下字段目前在配置或文档中出现，但不驱动当前 Research 主路径（如果确认这些参数不使用，建议后续清除）：
 
 - `max_iterations_per_section`
 - `search_top_k_first`
@@ -572,20 +590,27 @@ flowchart TD
   - 全文 coherence refine
   - 最终 citation resolve
 
-## 10. 当前现状总结
+## 10. 设计约束（勿随意修改）
 
-- Chat 路径相对接近文档原先描述。
-- Research 路径当前真实形态是“`1+1+1` 主检索 + `agent_supplement` + 条件性 `eval_supplement` + claims 可选 + 章节池重排写作 + verify severe 可打回 research + `final_agent_supplement`”。
-- `lite` / `comprehensive` 当前真正生效的差异，主要体现在：
-  - 研究轮次
-  - verify 打回次数
-  - coverage threshold
-  - `write_top_k` 基线
-  - `verification_k`
-  - verify light / severe 阈值
-  - recursion / cost 收敛参数
-  - 是否跳过 `generate_claims`
-- 许多文档里写的 `search_top_k_first` / `search_top_k_gap` / tiered 数量差异，当前并不是主流程的真实行为。
+1. **eval_supplement 必须进 gap pool**：`_DR_GAP_POOL_SOURCES` 必须包含 `"eval_supplement"`，否则 gap 评估阶段补充的证据在写作时会与普通证据平等竞争，可能全部被挤出 top-k。
+2. **agent_supplement 必须进 agent pool**：`research_node()` 内部 agent 工具补搜的结果以 `pool_source="agent_supplement"` 入池，章节 fuse 时作为独立 agent pool 参与三池融合，受 `research_agent_ratio=0.25` 保护。
+3. **revise_supplement 必须入池**：`review_revise_agent_supplement` 获取的新证据必须追加写入当前章节的 Section Evidence Pool（`pool_source="revise_supplement"`），以保证最终全文合成阶段引文可精准溯源。
+4. **write_stage 严禁回灌**：`write_stage` 仅限 `write_node()` 因章节池不足或异常触发的兜底补充检索结果。严禁将已用过的写作/验证证据回灌进章节池，否则会导致重排权重污染和数据冗余。
+5. **gap_supplement 上下文溢出防护**：用户手动提交的 `gap_supplement` 虽绕过 `fuse_pools`，但在拼接进入 LLM 写作上下文前，必须动态扣减其对应的 `write_top_k` 额度或执行严格的 Token 截断防范机制，严防上下文溢出。
+6. **review_revise_supplement_k 下限防御**：`review_revise_supplement_k = max(1, ceil((step_top_k or search_top_k_eval) * 0.5))`，外层 `max(1, ...)` 不可省略，防止极限小参数下算出"检索 0 条"导致节点崩溃。
+7. **BGE rerank 次数约束（Chat vs Deep Research）**：两条路径设计不同，均有合理原因。
+   - **Chat（最多 2 次）**：
+     - §5¾ `chat_pre_agent_fusion`（必须）：main（RRF 原始池）+ gap（raw hits）→ BGE rerank → `pack.chunks` + `context_str`。
+     - ⑧b Agent 追加融合（仅当 `agent_extra_chunks` 非空）：agent 工具在 §5¾ 之后产生新 chunks，这些 chunks 在第一次 rerank 时不存在，必须事后补排。传 `gap_candidate_hits=[]`（gap 已在 pack.chunks 中，不得重传）。若 agent 无新 chunk，第二次跳过，整条路径 1 次。
+     - 禁止的中间 rerank：local main pool 单独排序、gap 补搜后立即做中间 fusion。
+   - **Deep Research（每章节 3–4 次，均必要）**：
+     - **#1 evaluate_pool_rerank**（evaluate_node）：全池 top_k=len(pool)，供覆盖度评估。
+     - **#2 generate_claims_pool_rerank**（generate_claims_node，comprehensive 才执行）：top_k=write_top_k，主张提取（lite 跳过，共 3 次）。
+     - **#3 write_pool_rerank**（write_node）：top_k=write_top_k，写作正文，query = topic+section。
+     - **#4 write_verify_pool_rerank**（write_node）：top_k=verification_k，引文验证，query 同 #3。必须独立走 fuse_pools 而非截取 write_chunks：gap/agent 配额需按 verification_k 窗口比例独立保护（gap_min=ceil(verification_k×0.2)，agent_min=ceil(verification_k×0.25)）。
+     - Research 多次 rerank 合理：各节点 top_k 不同，gap/agent 配额窗口不同，章节池持续累积，后续节点在更大池上重新排序；与 Chat 的"最小化 rerank"原则不冲突。
+8. **跨池 chunk_id 去重**：`fuse_pools_with_gap_protection` 在合并候选池时按 chunk_id 去重，优先级 agent > gap > main，即 gap/agent 中已出现的 chunk_id 从 main pool 中剔除，确保最终输出无重复 chunk。此操作发生在全局 BGE rerank 之前。
+9. **search_scholar 工具必须关闭 aiohttp session**：`_handle_search_scholar` 每次创建新的 `SemanticScholarSearcher` 实例，其内部 `_ensure_session()` 会创建 aiohttp `ClientSession`。必须在 search 协程内用 `try/finally` 调用 `await ss.close()`，确保 session 在 event loop 关闭前被释放；否则在 agent 完成后触发 `Unclosed client session` 与 `RuntimeError: Event loop is closed`。
 
 ## 11. 参考实现入口
 

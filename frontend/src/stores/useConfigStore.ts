@@ -115,6 +115,10 @@ export const useConfigStore = create<ConfigState>()(
       ragConfig: {
         enabled: true,  // 默认启用本地 RAG
         localTopK: 45,  // hybrid chat 推荐更高本地召回预算，避免本地候选池过小
+        poolScoreThresholds: {
+          chat: { main: 0.3, gap: 0, agent: 0.1 },
+          research: { main: 0.35, gap: 0.05, agent: 0.15 }
+        },
         fusedPoolScoreThreshold: 0.35,  // 合并池分数阈值，仅作用于融合后的最终池
         localThreshold: 0.5,  // 已废弃，兼容持久化
         stepTopK: 10,  // 默认每步保留10条
@@ -129,6 +133,8 @@ export const useConfigStore = create<ConfigState>()(
         agentSonarModel: 'sonar-pro' as const,  // Sonar 检索工具用模型（仅当 Web 来源勾选 Sonar 时生效），与预研究分离
         maxIterations: 2,
         agentDebugMode: false,
+        enableGraphicAbstract: false,
+        graphicAbstractModel: 'nanobanana 2',
       },
 
       webSearchConfig: {
@@ -321,6 +327,7 @@ export const useConfigStore = create<ConfigState>()(
             // 确保新字段有默认值
             enabled: persisted.ragConfig?.enabled ?? true,
             localTopK: persisted.ragConfig?.localTopK ?? currentState.ragConfig.localTopK,
+            poolScoreThresholds: persisted.ragConfig?.poolScoreThresholds ?? currentState.ragConfig.poolScoreThresholds,
             fusedPoolScoreThreshold: (persisted.ragConfig as any)?.fusedPoolScoreThreshold ?? 0.35,
             localThreshold: persisted.ragConfig?.localThreshold ?? 0.5,
             stepTopK: persisted.ragConfig?.stepTopK ?? (persisted.ragConfig as any)?.finalTopK ?? 10,
@@ -345,6 +352,8 @@ export const useConfigStore = create<ConfigState>()(
             })(),
             maxIterations: (persisted.ragConfig as any)?.maxIterations ?? 2,
             agentDebugMode: persisted.ragConfig?.agentDebugMode ?? false,
+            enableGraphicAbstract: persisted.ragConfig?.enableGraphicAbstract ?? false,
+            graphicAbstractModel: persisted.ragConfig?.graphicAbstractModel ?? 'nanobanana 2',
           },
           webSearchConfig: {
             ...currentState.webSearchConfig,

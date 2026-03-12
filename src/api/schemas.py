@@ -47,6 +47,10 @@ class ChatRequest(BaseModel):
         None,
         description="本地检索返回的最大文档数，None 表示使用配置默认值",
     )
+    pool_score_thresholds: Optional[Dict[str, float]] = Field(
+        None,
+        description="各候选池分数阈值，例如 {'main': 0.35, 'gap': 0.05, 'agent': 0.15}",
+    )
     fused_pool_score_threshold: Optional[float] = Field(
         None,
         description="合并池分数阈值 (0-1)：仅在 local+web 融合后的最终池上过滤，低于此分数的结果丢弃。默认 0.35。",
@@ -156,6 +160,8 @@ class ChatRequest(BaseModel):
         False,
         description="前端调试面板开启时传 true，本请求期间后端临时提升相关 logger 为 DEBUG 便于追踪。",
     )
+    enable_graphic_abstract: Optional[bool] = Field(False, description="是否在末尾生成图文摘要")
+    graphic_abstract_model: Optional[str] = Field(None, description="画图使用的模型提供商 (gemini, openai, kimi)")
 
 
 class EvidenceSummary(BaseModel):
@@ -238,6 +244,8 @@ class TaskStateItem(BaseModel):
     created_at: Optional[float] = None
     started_at: Optional[float] = None
     finished_at: Optional[float] = None
+    pause_started_at: Optional[float] = None
+    paused_total_seconds: Optional[float] = None
     error_message: Optional[str] = None
     payload: Optional[Dict[str, Any]] = None
 
@@ -255,6 +263,13 @@ class TaskCancelResponse(BaseModel):
     """取消任务响应"""
 
     success: bool = Field(..., description="是否取消成功")
+    message: str = Field("", description="说明")
+
+
+class TaskControlResponse(BaseModel):
+    """任务控制响应（暂停/恢复）。"""
+
+    success: bool = Field(..., description="是否操作成功")
     message: str = Field("", description="说明")
 
 
@@ -632,6 +647,10 @@ class DeepResearchRequest(BaseModel):
     web_source_configs: Optional[Dict[str, Dict[str, Any]]] = Field(None, description="每个搜索源配置")
     serpapi_ratio: Optional[float] = Field(None, description="SerpAPI 轮询比例 0-1")
     local_top_k: Optional[int] = Field(None, description="本地检索 top_k")
+    pool_score_thresholds: Optional[Dict[str, float]] = Field(
+        None,
+        description="各候选池分数阈值，例如 {'main': 0.35, 'gap': 0.05, 'agent': 0.15}",
+    )
     fused_pool_score_threshold: Optional[float] = Field(
         None,
         description="合并池分数阈值 (0-1)，仅作用于融合后的最终池。默认 0.35。",
@@ -688,6 +707,10 @@ class DeepResearchStartRequest(BaseModel):
     web_source_configs: Optional[Dict[str, Dict[str, Any]]] = Field(None, description="每个搜索源配置")
     serpapi_ratio: Optional[float] = Field(None, description="SerpAPI 轮询比例 0-1")
     local_top_k: Optional[int] = Field(None, description="本地检索 top_k")
+    pool_score_thresholds: Optional[Dict[str, float]] = Field(
+        None,
+        description="各候选池分数阈值，例如 {'main': 0.35, 'gap': 0.05, 'agent': 0.15}",
+    )
     fused_pool_score_threshold: Optional[float] = Field(
         None,
         description="合并池分数阈值 (0-1)，仅作用于融合后的最终池。默认 0.35。",
@@ -728,7 +751,8 @@ class DeepResearchStartRequest(BaseModel):
         None,
         description="Sonar 检索工具模型（仅当 web_providers 含 sonar 时生效）: sonar | sonar-pro 等，默认 sonar-pro",
     )
-
+    enable_graphic_abstract: Optional[bool] = Field(False, description="是否在末尾生成图文摘要")
+    graphic_abstract_model: Optional[str] = Field(None, description="画图使用的模型提供商 (gemini, openai, kimi)")
 
 class DeepResearchStartResponse(BaseModel):
     """Deep Research 第一阶段响应（保留，内部用）"""
@@ -796,6 +820,10 @@ class DeepResearchConfirmRequest(BaseModel):
     web_source_configs: Optional[Dict[str, Dict[str, Any]]] = Field(None, description="每个搜索源配置")
     serpapi_ratio: Optional[float] = Field(None, description="SerpAPI 轮询比例 0-1")
     local_top_k: Optional[int] = Field(None, description="本地检索 top_k")
+    pool_score_thresholds: Optional[Dict[str, float]] = Field(
+        None,
+        description="各候选池分数阈值，例如 {'main': 0.35, 'gap': 0.05, 'agent': 0.15}",
+    )
     fused_pool_score_threshold: Optional[float] = Field(
         None,
         description="合并池分数阈值 (0-1)，仅作用于融合后的最终池。默认 0.35。",
@@ -862,6 +890,8 @@ class DeepResearchConfirmRequest(BaseModel):
         description="跳过前置论点提炼（Claim Generation）阶段，直接进入写作",
     )
     max_sections: int = Field(4, ge=2, le=9, description="最大章节数")
+    enable_graphic_abstract: Optional[bool] = Field(False, description="是否在末尾生成图文摘要")
+    graphic_abstract_model: Optional[str] = Field(None, description="画图使用的模型提供商 (gemini, openai, kimi)")
 
 
 class DeepResearchSubmitResponse(BaseModel):

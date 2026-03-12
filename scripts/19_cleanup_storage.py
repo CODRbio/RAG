@@ -73,7 +73,8 @@ def main():
     print(f"\n清理结果:")
     print(f"  - 按时间清理: canvas={result['age_cleanup']['canvas']}, "
           f"session={result['age_cleanup']['session']}, "
-          f"project={result['age_cleanup']['project']}")
+          f"project={result['age_cleanup']['project']}, "
+          f"temp_col={result['age_cleanup']['temp_col']}")
     print(f"  - 按大小清理: {result['size_cleanup']} 条记录")
     print(f"  - 当前大小: {result['final_size_mb']:.2f} MB")
 

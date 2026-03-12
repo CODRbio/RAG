@@ -16,8 +16,6 @@ from src.api.routes_auth import get_current_user_id
 
 router = APIRouter(prefix="/config", tags=["config"])
 
-DEFAULT_DATABASE_URL = "sqlite:///data/rag.db"
-
 
 @router.get("/database")
 def get_config_database() -> dict:

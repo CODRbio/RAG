@@ -117,6 +117,8 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
     setWorkflowStep,
     setIsStreaming,
     setDeepResearchActive,
+    setActiveResponse,
+    patchActiveResponse,
   } = useChatStore();
   const setResearchDashboard = useChatStore((s) => s.setResearchDashboard);
   const {
@@ -411,6 +413,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       setIsStopping(false);
       setIsStreaming(false);
       setDeepResearchActive(false);
+      setActiveResponse(null);
       // For cancelled jobs keep the dialog open showing the stopped state (stalledJob banner)
       // so the user can inspect progress or restart. For done/error, go back to confirm.
       if (!wasCancelled) {
@@ -429,6 +432,21 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       setOptimizationPromptDraft('');
     }
     setActiveJobId(jobId);
+    const currentActive = useChatStore.getState().activeResponse;
+    if (currentActive) {
+      patchActiveResponse({ kind: 'research', surface: 'research', taskOrJobId: jobId });
+    } else {
+      setActiveResponse({
+        kind: 'research',
+        taskOrJobId: jobId,
+        surface: 'research',
+        stepKey: 'running',
+        stepLabel: 'Running Deep Research',
+        streamPhase: 'thinking',
+        targetMessageId: null,
+        hasVisibleOutput: false,
+      });
+    }
     latestJobIdRef.current = jobId;
     localStorage.setItem(DEEP_RESEARCH_JOB_KEY, jobId);
 
@@ -472,7 +490,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
                         if (!canvasData) return;
                         setCanvas(canvasData);
                         if (
-                          (status === 'running' || status === 'cancelling') &&
+                          (status === 'running' || status === 'pausing' || status === 'paused' || status === 'cancelling') &&
                           (canvasData.stage === 'drafting' || canvasData.stage === 'refine')
                         ) {
                           setCanvasOpen(true);
@@ -491,7 +509,36 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
                   await finalizeRunningJob(jobId);
                   return;
                 }
+                if (status === 'paused' || status === 'pausing') {
+                  useChatStore.getState().patchActiveResponse({
+                    stepKey: status,
+                    stepLabel: status === 'paused' ? 'Paused' : 'Pausing...',
+                    streamPhase: status === 'paused' ? 'paused' : 'thinking',
+                  });
+                  if (status === 'paused') {
+                    useChatStore.getState().setStreamingStep(null);
+                  }
+                }
               }
+            } else if (event === 'pause_requested') {
+              useChatStore.getState().patchActiveResponse({
+                stepKey: 'pausing',
+                stepLabel: 'Pausing...',
+                streamPhase: 'thinking',
+              });
+            } else if (event === 'paused') {
+              useChatStore.getState().setStreamingStep(null);
+              useChatStore.getState().patchActiveResponse({
+                stepKey: 'paused',
+                stepLabel: 'Paused',
+                streamPhase: 'paused',
+              });
+            } else if (event === 'resumed') {
+              useChatStore.getState().patchActiveResponse({
+                stepKey: 'running',
+                stepLabel: 'Resumed',
+                streamPhase: 'thinking',
+              });
             } else if (event === 'step') {
               const stepPayload = data as { step?: string | null; label?: string };
               useChatStore.getState().setStreamingStep(
@@ -499,6 +546,23 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
                   ? { step: stepPayload.step, label: stepPayload.label ?? stepPayload.step }
                   : null
               );
+              useChatStore.getState().patchActiveResponse({
+                stepKey: stepPayload?.step ?? null,
+                stepLabel: stepPayload?.label ?? stepPayload?.step ?? 'Thinking',
+                streamPhase: 'thinking',
+              });
+            } else if (event === 'delta') {
+              const delta = typeof data.delta === 'string' ? data.delta : '';
+              if (delta) {
+                const currentActive = useChatStore.getState().activeResponse;
+                if (currentActive?.targetMessageId) {
+                  appendToLastMessage(delta);
+                }
+                useChatStore.getState().patchActiveResponse({
+                  hasVisibleOutput: true,
+                  streamPhase: 'streaming',
+                });
+              }
             } else if (event === 'error') {
               console.error('[DeepResearch] Backend emitted error:', data);
               if (String(data.message).includes('不存在')) {
@@ -551,7 +615,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
             listDeepResearchJobs(10, 'running'),
             listDeepResearchJobs(10, 'pending'),
           ]);
-          const runnableStatuses = new Set(['planning', 'pending', 'running', 'cancelling', 'waiting_review']);
+          const runnableStatuses = new Set(['planning', 'pending', 'running', 'pausing', 'paused', 'cancelling', 'waiting_review']);
           const candidate = [...running, ...pending].find((j) => runnableStatuses.has(j.status));
           targetJobId = candidate?.job_id ?? null;
         }
@@ -562,6 +626,8 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
         const isRunnable = job.status === 'planning'
           || job.status === 'pending'
           || job.status === 'running'
+          || job.status === 'pausing'
+          || job.status === 'paused'
           || job.status === 'cancelling'
           || job.status === 'waiting_review';
         const sameSession = !sessionId || !job.session_id || job.session_id === sessionId;
@@ -703,6 +769,16 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
     }
 
     setIsClarifying(true);
+    setActiveResponse({
+      kind: 'research',
+      taskOrJobId: 'clarify',
+      surface: 'research',
+      stepKey: 'clarify',
+      stepLabel: 'Clarifying topic',
+      streamPhase: 'thinking',
+      targetMessageId: null,
+      hasVisibleOutput: false,
+    });
     try {
       const result = await clarifyForDeepResearch({
         message: trimTopic,
@@ -744,6 +820,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       addToast('澄清问题生成失败，已回退到最小问题集', 'warning');
     } finally {
       setIsClarifying(false);
+      setActiveResponse(null);
     }
   };
 
@@ -782,6 +859,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       use_content_fetcher: webEnabled ? webSearchConfig.contentFetcherMode : undefined,
       gap_query_intent: gapQueryIntent,
       local_top_k: localEnabled ? ragConfig.localTopK : undefined,
+      pool_score_thresholds: ragConfig.poolScoreThresholds?.research as unknown as Record<string, number> | undefined,
       fused_pool_score_threshold: ragConfig.fusedPoolScoreThreshold ?? 0.35,
       year_start: ragConfig.yearStart ?? undefined,
       year_end: ragConfig.yearEnd ?? undefined,
@@ -798,8 +876,20 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       output_language: outputLanguage,
       step_models: normalizeStepModels(stepModels),
       step_model_strict: stepModelStrict,
+      enable_graphic_abstract: ragConfig.enableGraphicAbstract,
+      graphic_abstract_model: ragConfig.graphicAbstractModel,
     };
     setIsStreaming(true);
+    setActiveResponse({
+      kind: 'research',
+      taskOrJobId: '',
+      surface: 'research',
+      stepKey: 'planning',
+      stepLabel: 'Planning research',
+      streamPhase: 'thinking',
+      targetMessageId: null,
+      hasVisibleOutput: false,
+    });
     setStartPhaseProgress({ stage: '正在启动...', percent: 0 });
     try {
       if (import.meta.env.DEV) {
@@ -815,6 +905,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       const jobResp = await deepResearchStart(startRequest);
       if (jobResp.session_id) setSessionId(jobResp.session_id);
       const jobId = jobResp.job_id;
+      patchActiveResponse({ taskOrJobId: jobId });
       setPlanningJobId(jobId);
       requestSessionListRefresh();
       console.log('[DeepResearch] Start job submitted (planning):', jobId);
@@ -915,6 +1006,12 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
         if (status.session_id) setSessionId(status.session_id);
         if (status.status === 'running') {
           const stageMsg = status.current_stage ?? '正在准备...';
+          patchActiveResponse({
+            taskOrJobId: jobId,
+            stepKey: 'planning',
+            stepLabel: stageMsg,
+            streamPhase: 'thinking',
+          });
           setStartPhaseProgress({
             stage: stageMsg,
             percent: Math.min(100, Math.max(0, status.progress ?? 0)),
@@ -945,6 +1042,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       setProgressLogs((prev) => [...prev, `[error] ${msg}`].slice(-300));
     } finally {
       setIsStreaming(false);
+      setActiveResponse(null);
     }
   };
 
@@ -976,7 +1074,18 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
     setPhase('running');
     setProgressLogs([]);
     addMessage({ role: 'user', content: `[Deep Research] ${topic}` });
-    addMessage({ role: 'assistant', content: '' });
+    const assistantMessageId = `assistant-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    addMessage({ id: assistantMessageId, role: 'assistant', content: '' });
+    setActiveResponse({
+      kind: 'research',
+      taskOrJobId: '',
+      surface: 'chat',
+      stepKey: 'queued',
+      stepLabel: 'Preparing Deep Research',
+      streamPhase: 'thinking',
+      targetMessageId: assistantMessageId,
+      hasVisibleOutput: false,
+    });
     setWorkflowStep('explore');
 
     const confirmRequest: DeepResearchConfirmRequest = {
@@ -1001,6 +1110,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       use_content_fetcher: webEnabled ? webSearchConfig.contentFetcherMode : undefined,
       gap_query_intent: gapQueryIntent,
       local_top_k: localEnabled ? ragConfig.localTopK : undefined,
+      pool_score_thresholds: ragConfig.poolScoreThresholds?.research as unknown as Record<string, number> | undefined,
       fused_pool_score_threshold: ragConfig.fusedPoolScoreThreshold ?? 0.35,
       year_start: ragConfig.yearStart ?? undefined,
       year_end: ragConfig.yearEnd ?? undefined,
@@ -1021,6 +1131,8 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       skip_refine_review: skipRefineReview,
       skip_claim_generation: skipClaimGeneration,
       max_sections: maxSections,
+      enable_graphic_abstract: ragConfig.enableGraphicAbstract,
+      graphic_abstract_model: ragConfig.graphicAbstractModel,
     };
 
     let submitted = false;
@@ -1057,6 +1169,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
       localStorage.removeItem(DEEP_RESEARCH_JOB_KEY);
       setActiveJobId(null);
       setDeepResearchActive(false);
+      setActiveResponse(null);
       setPhase('confirm');
     } finally {
       if (!submitted) {

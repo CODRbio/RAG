@@ -3,7 +3,7 @@ Context length limits and summarization when limits are exceeded.
 
 Policy: use full content when under limit; when over limit, summarize via ultra_lite
 before passing to the main LLM. Final integration (write_top_k / evidence assembly)
-uses a 200k hard cap with logging when truncated.
+uses a 500k hard cap with logging when truncated.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ DR_SECTION_EVIDENCE_MAX_CHARS = 70_000
 CLAIM_VERIFICATION_MAX_CHARS = 70_000
 COLLECTION_SCOPE_MAX_CHARS = 40_000
 ENTITY_EXTRACTOR_MAX_CHARS = 15_000
-FINAL_INTEGRATION_MAX_CHARS = 200_000
+FINAL_INTEGRATION_MAX_CHARS = 800_000
 SESSION_MEMORY_TURN_MAX_CHARS = 20_000
 CANVAS_REF_PREVIEW_MAX_CHARS = 500
 QUERY_MAX_CHARS = 2_500

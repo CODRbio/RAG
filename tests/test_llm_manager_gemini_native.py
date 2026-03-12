@@ -1,3 +1,7 @@
+import pytest
+import requests
+from unittest.mock import patch, MagicMock
+
 from src.llm.llm_manager import GeminiNativeProvider, HTTPChatClient, ProviderConfig, _gemini_native_base_url
 
 
@@ -104,3 +108,76 @@ def test_gemini_native_response_adapts_to_openai_shape():
     assert adapted["choices"][0]["message"]["content"] == "hello"
     assert adapted["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "search_web"
     assert adapted["usage"]["prompt_tokens"] == 10
+
+
+def test_gemini_image_prompt_uses_generate_content_url():
+    """Gemini native request for image-style prompt must hit :generateContent, not /chat/completions."""
+    client = _make_gemini_client()
+    payload = client._build_openai_payload(
+        messages=[{"role": "user", "content": "帮我画一个可爱的加菲猫吃意大利面"}],
+        model="gemini-3.1-flash-image-preview",
+        params={},
+        tools=None,
+    )
+    assert payload.get("_api_mode") == "gemini_native"
+    captured = {}
+
+    def capture_request(session, method, url, timeout, **kwargs):
+        captured["url"] = url
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "candidates": [{"finishReason": "STOP", "content": {"parts": [{"text": "ok"}]}}],
+            "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1, "totalTokenCount": 2},
+        }
+        resp.raise_for_status = MagicMock()
+        return resp
+
+    cfg = ProviderConfig(
+        name="gemini",
+        api_key="test-key",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        default_model="gemini-3.1-flash-image-preview",
+        platform="gemini",
+        models={},
+        params={},
+    )
+    provider = GeminiNativeProvider(cfg)
+    with patch("src.llm.llm_manager._request_with_retry", side_effect=capture_request):
+        provider.request(payload, timeout=60)
+
+    assert "/models/gemini-3.1-flash-image-preview:generateContent" in captured["url"]
+    assert "/chat/completions" not in captured["url"]
+
+
+def test_gemini_native_404_raises_no_fallback():
+    """When Gemini native returns 404, we must not fall back to OpenAI-compat /chat/completions."""
+    client = _make_gemini_client()
+    payload = client._build_openai_payload(
+        messages=[{"role": "user", "content": "hello"}],
+        model="gemini-3.1-pro-preview",
+        params={},
+        tools=None,
+    )
+    assert payload.get("_api_mode") == "gemini_native"
+    assert payload.get("_fallback_payload") is not None
+
+    err = requests.exceptions.HTTPError("404 Not Found")
+    err.response = MagicMock()
+    err.response.status_code = 404
+
+    cfg = ProviderConfig(
+        name="gemini",
+        api_key="test-key",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        default_model="gemini-3.1-pro-preview",
+        platform="gemini",
+        models={},
+        params={},
+    )
+    provider = GeminiNativeProvider(cfg)
+    with patch("src.llm.llm_manager._request_with_retry", side_effect=err):
+        with pytest.raises(RuntimeError) as exc_info:
+            provider.request(payload, timeout=60)
+    assert "404" in str(exc_info.value)
+    assert "no fallback" in str(exc_info.value).lower() or "4xx" in str(exc_info.value)

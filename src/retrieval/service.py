@@ -385,21 +385,21 @@ def _normalize_year_window(filters: Optional[Dict[str, Any]]) -> tuple[Optional[
     return year_start, year_end
 
 
-def _filter_fused_by_score_threshold(
-    fused_hits: List[Dict[str, Any]],
+def _filter_hits_by_score(
+    hits: List[Dict[str, Any]],
     threshold: Optional[float],
 ) -> List[Dict[str, Any]]:
-    """Filter fused-pool hits by score; applied only after fusion. None threshold = no filter."""
+    """Filter hits by score. None threshold = no filter."""
     if threshold is None:
-        return fused_hits
+        return hits
     try:
         t = float(threshold)
         if t <= 0:
-            return fused_hits
+            return hits
     except (TypeError, ValueError):
-        return fused_hits
+        return hits
     out: List[Dict[str, Any]] = []
-    for h in fused_hits:
+    for h in hits:
         raw = h.get("score")
         if raw is None:
             out.append(h)
@@ -409,8 +409,8 @@ def _filter_fused_by_score_threshold(
                 out.append(h)
         except (TypeError, ValueError):
             out.append(h)
-    if len(out) < len(fused_hits):
-        logger.info("[retrieval] fused_pool_score_threshold=%.2f: kept %d of %d", t, len(out), len(fused_hits))
+    if len(out) < len(hits):
+        logger.info("[retrieval] score_threshold=%.2f: kept %d of %d", t, len(out), len(hits))
     return out
 
 
@@ -437,11 +437,13 @@ def fuse_pools_with_gap_protection(
     agent_min_keep: Optional[int] = None,
     agent_ratio: Optional[float] = None,
     rank_pool_multiplier: Optional[float] = None,
+    pool_score_thresholds: Optional[Dict[str, float]] = None,
     trace_ctx: Optional[Dict[str, Any]] = None,
     reranker_mode: Optional[str] = None,
     skip_rerank: bool = False,
     diag: Optional[Dict[str, Any]] = None,
-) -> List[Dict[str, Any]]:
+    secondary_top_k: Optional[int] = None,
+) -> "Union[List[Dict[str, Any]], tuple[List[Dict[str, Any]], List[Dict[str, Any]]]]":
     """Merge main/gap/agent pools with deterministic soft-quota protection.
 
     Algorithm:
@@ -473,6 +475,8 @@ def fuse_pools_with_gap_protection(
         rank_pool_multiplier:
                          rerank pool expansion multiplier. Controls authority ranking
                          depth: rerank_k ~= ceil(top_k * multiplier), bounded by n_total.
+        pool_score_thresholds:
+                         Optional dict of {pool_name: threshold} for pre-fusion filtering.
         reranker_mode:   reranker mode forwarded to _rerank_candidates.
         skip_rerank:     use fast embedding rerank instead of cross-encoder.
         diag:            optional diagnostics dict; updated in-place with pool stats.
@@ -484,6 +488,21 @@ def fuse_pools_with_gap_protection(
     """
     trace_ctx = trace_ctx or {}
     agent_candidates = agent_candidates or []
+    
+    # Per-pool score thresholding (pre-fusion)
+    if pool_score_thresholds:
+        main_threshold = pool_score_thresholds.get("main")
+        if main_threshold is not None:
+            main_candidates = _filter_hits_by_score(main_candidates, main_threshold)
+        
+        gap_threshold = pool_score_thresholds.get("gap")
+        if gap_threshold is not None:
+            gap_candidates = _filter_hits_by_score(gap_candidates, gap_threshold)
+
+        agent_threshold = pool_score_thresholds.get("agent")
+        if agent_threshold is not None and agent_candidates:
+            agent_candidates = _filter_hits_by_score(agent_candidates, agent_threshold)
+    
     _trace_parts: List[str] = []
     if trace_ctx.get("job_id"):
         _trace_parts.append(f"job={str(trace_ctx.get('job_id'))[:12]}")
@@ -516,14 +535,33 @@ def fuse_pools_with_gap_protection(
         trace_suffix,
     )
 
-    # Tag all candidates with pool membership (copies dicts to avoid mutation)
+    # Tag all candidates with pool membership (copies dicts to avoid mutation).
+    # Cross-pool dedup: agent/gap take priority over main — any chunk_id already
+    # present in gap or agent is removed from main before the combined rerank.
+    def _pool_key(c: Dict[str, Any]) -> str:
+        return str(c.get("chunk_id") or (c.get("metadata") or {}).get("chunk_id") or id(c))
+
+    seen_ids: set = set()
     all_cands: List[Dict[str, Any]] = []
-    for c in main_candidates:
-        all_cands.append({**c, "_pool_tag": "main"})
     for c in gap_candidates:
-        all_cands.append({**c, "_pool_tag": "gap"})
+        k = _pool_key(c)
+        if k not in seen_ids:
+            seen_ids.add(k)
+            all_cands.append({**c, "_pool_tag": "gap"})
     for c in agent_candidates:
-        all_cands.append({**c, "_pool_tag": "agent"})
+        k = _pool_key(c)
+        if k not in seen_ids:
+            seen_ids.add(k)
+            all_cands.append({**c, "_pool_tag": "agent"})
+    for c in main_candidates:
+        k = _pool_key(c)
+        if k not in seen_ids:
+            seen_ids.add(k)
+            all_cands.append({**c, "_pool_tag": "main"})
+    logger.info(
+        "[retrieval] fuse_pools dedup: main=%d gap=%d agent=%d → combined=%d (removed %d dups)",
+        n_main, n_gap, n_agent, len(all_cands), n_main + n_gap + n_agent - len(all_cands),
+    )
 
     # Global rerank — one pass covering all candidates from both pools
     t_rerank = time.perf_counter()
@@ -555,123 +593,113 @@ def fuse_pools_with_gap_protection(
     def _cand_key(item: Dict[str, Any], idx: int) -> str:
         return str(item.get("chunk_id") or (item.get("metadata") or {}).get("chunk_id") or f"idx::{idx}")
 
+    ranked_ids = {_cand_key(c, i) for i, c in enumerate(reranked)}
+
     def _resolve_effective_keep(
         n_pool: int,
         min_keep: Optional[int],
         ratio: Optional[float],
         default_ratio: float,
         pool_name: str,
+        target_k: int,
     ) -> tuple[int, Optional[int]]:
         effective_keep = 0
         desired_keep: Optional[int] = None
         if n_pool <= 0:
             return 0, None
         if min_keep is not None:
-            effective_keep = max(0, min(int(min_keep), n_pool, target_top_k))
+            effective_keep = max(0, min(int(min_keep), n_pool, target_k))
         else:
             ratio_v = default_ratio if ratio is None else max(0.0, float(ratio))
-            desired_keep = math.ceil(target_top_k * ratio_v) if ratio_v > 0 else 0
-            effective_keep = min(desired_keep, n_pool, target_top_k)
+            desired_keep = math.ceil(target_k * ratio_v) if ratio_v > 0 else 0
+            effective_keep = min(desired_keep, n_pool, target_k)
         if desired_keep is not None and n_pool < desired_keep:
             logger.warning(
                 "[fuse_pools] %s pool too small: desired_quota=%d but only %d candidates available"
                 " — using %d as effective quota (top_k=%d)",
-                pool_name, desired_keep, n_pool, effective_keep, target_top_k,
+                pool_name, desired_keep, n_pool, effective_keep, target_k,
             )
         return effective_keep, desired_keep
 
-    effective_gap_keep, _ = _resolve_effective_keep(
-        n_pool=n_gap,
-        min_keep=gap_min_keep,
-        ratio=gap_ratio,
-        default_ratio=_GAP_MIN_KEEP_RATIO,
-        pool_name="gap",
-    )
-    effective_agent_keep, _ = _resolve_effective_keep(
-        n_pool=n_agent,
-        min_keep=agent_min_keep,
-        ratio=agent_ratio,
-        default_ratio=_AGENT_MIN_KEEP_RATIO,
-        pool_name="agent",
-    )
+    def _apply_quota_selection(target_k: int) -> tuple[
+        List[Dict[str, Any]],
+        Dict[str, Any],
+        Dict[str, Any],
+    ]:
+        """Apply quota enforcement on the already-ranked pool at a given target_k.
 
-    # Soft quota enforcement: force-include pool items if quota not met in top_k.
-    # Preference order: ranked tail first, then unranked original same pool.
-    top_slice = reranked[:target_top_k]
-    ranked_ids = {_cand_key(c, i) for i, c in enumerate(reranked)}
-    gap_backfill_ranked = 0
-    gap_backfill_unranked = 0
-    gap_deficit_before_fill = 0
-    agent_backfill_ranked = 0
-    agent_backfill_unranked = 0
-    agent_deficit_before_fill = 0
+        Reuses the BGE-ranked `reranked` list from the enclosing scope without
+        re-running the cross-encoder.  Returns (tagged_slice, gap_diag, agent_diag).
+        """
+        eff_gap, _ = _resolve_effective_keep(
+            n_gap, gap_min_keep, gap_ratio, _GAP_MIN_KEEP_RATIO, "gap", target_k
+        )
+        eff_agent, _ = _resolve_effective_keep(
+            n_agent, agent_min_keep, agent_ratio, _AGENT_MIN_KEEP_RATIO, "agent", target_k
+        )
 
-    def _enforce_pool_quota(pool_tag: str, effective_keep: int) -> tuple[int, int, int]:
-        nonlocal top_slice
-        if effective_keep <= 0:
-            return 0, 0, 0
-        in_top = [c for c in top_slice if c.get("_pool_tag") == pool_tag]
-        deficit = max(effective_keep - len(in_top), 0)
-        if deficit <= 0:
-            return 0, 0, 0
-        selected_ids = {_cand_key(c, i) for i, c in enumerate(top_slice)}
-        ranked_reserve = [
-            c for i, c in enumerate(reranked[target_top_k:], start=target_top_k)
-            if c.get("_pool_tag") == pool_tag and _cand_key(c, i) not in selected_ids
-        ]
-        forced: List[Dict[str, Any]] = ranked_reserve[:deficit]
-        backfill_ranked = len(forced)
-        if len(forced) < deficit:
-            forced_ids = {_cand_key(c, i) for i, c in enumerate(forced)}
-            ranked_or_selected_ids = selected_ids.union(forced_ids).union(ranked_ids)
-            unranked_reserve = [
-                c for i, c in enumerate(all_cands)
-                if c.get("_pool_tag") == pool_tag and _cand_key(c, i) not in ranked_or_selected_ids
+        slice_ = list(reranked[:target_k])
+        g_diag: Dict[str, Any] = {"eff_keep": eff_gap, "deficit": 0, "backfill_ranked": 0, "backfill_unranked": 0, "in_output": 0}
+        a_diag: Dict[str, Any] = {"eff_keep": eff_agent, "deficit": 0, "backfill_ranked": 0, "backfill_unranked": 0, "in_output": 0}
+
+        def _enforce(pool_tag: str, eff_keep: int, pool_diag: Dict[str, Any]) -> None:
+            nonlocal slice_
+            if eff_keep <= 0:
+                return
+            in_top = [c for c in slice_ if c.get("_pool_tag") == pool_tag]
+            deficit = max(eff_keep - len(in_top), 0)
+            pool_diag["deficit"] = deficit
+            if deficit <= 0:
+                return
+            selected_ids = {_cand_key(c, i) for i, c in enumerate(slice_)}
+            ranked_reserve = [
+                c for i, c in enumerate(reranked[target_k:], start=target_k)
+                if c.get("_pool_tag") == pool_tag and _cand_key(c, i) not in selected_ids
             ]
-            needed = deficit - len(forced)
-            extra = unranked_reserve[:needed]
-            forced.extend(extra)
-            backfill_unranked = len(extra)
-        else:
-            backfill_unranked = 0
+            forced: List[Dict[str, Any]] = ranked_reserve[:deficit]
+            backfill_ranked = len(forced)
+            if len(forced) < deficit:
+                forced_ids = {_cand_key(c, i) for i, c in enumerate(forced)}
+                ranked_or_selected_ids = selected_ids.union(forced_ids).union(ranked_ids)
+                unranked_reserve = [
+                    c for i, c in enumerate(all_cands)
+                    if c.get("_pool_tag") == pool_tag and _cand_key(c, i) not in ranked_or_selected_ids
+                ]
+                extra = unranked_reserve[:deficit - len(forced)]
+                forced.extend(extra)
+                backfill_unranked = len(extra)
+            else:
+                backfill_unranked = 0
+            pool_diag["backfill_ranked"] = backfill_ranked
+            pool_diag["backfill_unranked"] = backfill_unranked
+            if forced:
+                main_in_top = [i for i, c in enumerate(slice_) if c.get("_pool_tag") == "main"]
+                drop_indices = set(main_in_top[-len(forced):]) if main_in_top else set()
+                slice_ = [c for i, c in enumerate(slice_) if i not in drop_indices]
+                slice_.extend(forced)
 
-        if forced:
-            # Replace lowest-ranked main candidates first.
-            main_in_top = [i for i, c in enumerate(top_slice) if c.get("_pool_tag") == "main"]
-            drop_indices = set(main_in_top[-len(forced):]) if main_in_top else set()
-            top_slice = [c for i, c in enumerate(top_slice) if i not in drop_indices]
-            top_slice.extend(forced)
-        return deficit, backfill_ranked, backfill_unranked
+        _enforce("gap", eff_gap, g_diag)
+        _enforce("agent", eff_agent, a_diag)
 
-    gap_deficit_before_fill, gap_backfill_ranked, gap_backfill_unranked = _enforce_pool_quota(
-        "gap", effective_gap_keep
-    )
-    (
-        agent_deficit_before_fill,
-        agent_backfill_ranked,
-        agent_backfill_unranked,
-    ) = _enforce_pool_quota("agent", effective_agent_keep)
+        g_diag["in_output"] = sum(1 for c in slice_ if c.get("_pool_tag") == "gap")
+        a_diag["in_output"] = sum(1 for c in slice_ if c.get("_pool_tag") == "agent")
+        if eff_gap > 0 and g_diag["in_output"] < eff_gap:
+            logger.warning(
+                "[fuse_pools] gap quota not met after backfill:"
+                " wanted=%d in_output=%d (n_gap=%d top_k=%d)%s",
+                eff_gap, g_diag["in_output"], n_gap, target_k, trace_suffix,
+            )
+        if eff_agent > 0 and a_diag["in_output"] < eff_agent:
+            logger.warning(
+                "[fuse_pools] agent quota not met after backfill:"
+                " wanted=%d in_output=%d (n_agent=%d top_k=%d)%s",
+                eff_agent, a_diag["in_output"], n_agent, target_k, trace_suffix,
+            )
+        return slice_, g_diag, a_diag
 
-    out = top_slice
-    gap_in_output = sum(1 for c in out if c.get("_pool_tag") == "gap")
-    agent_in_output = sum(1 for c in out if c.get("_pool_tag") == "agent")
-    if effective_gap_keep > 0 and gap_in_output < effective_gap_keep:
-        logger.warning(
-            "[fuse_pools] gap quota not met after backfill:"
-            " wanted=%d in_output=%d (n_gap=%d top_k=%d)%s",
-            effective_gap_keep, gap_in_output, n_gap, target_top_k,
-            trace_suffix,
-        )
-    if effective_agent_keep > 0 and agent_in_output < effective_agent_keep:
-        logger.warning(
-            "[fuse_pools] agent quota not met after backfill:"
-            " wanted=%d in_output=%d (n_agent=%d top_k=%d)%s",
-            effective_agent_keep, agent_in_output, n_agent, target_top_k,
-            trace_suffix,
-        )
-
-    # Strip _pool_tag (keep _source_type and other internal keys for callers)
-    clean = [{k: v for k, v in c.items() if k != "_pool_tag"} for c in out]
+    # Primary selection
+    primary_slice, g_diag, a_diag = _apply_quota_selection(target_top_k)
+    clean = [{k: v for k, v in c.items() if k != "_pool_tag"} for c in primary_slice]
 
     if diag is not None:
         diag["pool_fusion"] = {
@@ -683,19 +711,26 @@ def fuse_pools_with_gap_protection(
             "rank_pool_multiplier": round(pool_multiplier, 3),
             "gap_ratio": (None if gap_ratio is None else float(gap_ratio)),
             "agent_ratio": (None if agent_ratio is None else float(agent_ratio)),
-            "gap_deficit_before_fill": gap_deficit_before_fill,
-            "gap_backfill_ranked": gap_backfill_ranked,
-            "gap_backfill_unranked": gap_backfill_unranked,
-            "agent_deficit_before_fill": agent_deficit_before_fill,
-            "agent_backfill_ranked": agent_backfill_ranked,
-            "agent_backfill_unranked": agent_backfill_unranked,
+            "gap_deficit_before_fill": g_diag["deficit"],
+            "gap_backfill_ranked": g_diag["backfill_ranked"],
+            "gap_backfill_unranked": g_diag["backfill_unranked"],
+            "agent_deficit_before_fill": a_diag["deficit"],
+            "agent_backfill_ranked": a_diag["backfill_ranked"],
+            "agent_backfill_unranked": a_diag["backfill_unranked"],
             "gap_boost_abs": 0.0,
-            "gap_min_keep": effective_gap_keep,
-            "gap_in_output": gap_in_output,
-            "agent_min_keep": effective_agent_keep,
-            "agent_in_output": agent_in_output,
+            "gap_min_keep": g_diag["eff_keep"],
+            "gap_in_output": g_diag["in_output"],
+            "agent_min_keep": a_diag["eff_keep"],
+            "agent_in_output": a_diag["in_output"],
             "output_count": len(clean),
         }
+
+    if secondary_top_k is not None:
+        # Reuse the already-ranked pool: re-apply quota selection at secondary_top_k
+        # without re-running the cross-encoder.
+        secondary_slice, _, _ = _apply_quota_selection(secondary_top_k)
+        secondary_clean = [{k: v for k, v in c.items() if k != "_pool_tag"} for c in secondary_slice]
+        return clean, secondary_clean
 
     return clean
 
@@ -739,6 +774,7 @@ class RetrievalService:
         """
         k = top_k if top_k is not None else self.top_k
         step_top_k = (filters or {}).get("step_top_k")
+        pool_only = bool((filters or {}).get("pool_only"))
         ui_reranker_mode = (filters or {}).get("reranker_mode") or None
         rank_pool_multiplier = (filters or {}).get("rank_pool_multiplier")
         try:
@@ -773,10 +809,10 @@ class RetrievalService:
         t0 = time.perf_counter()
         timeout_s = getattr(getattr(settings, "perf_retrieval", None), "timeout_seconds", 60) or 60
 
-        # No amplification here: the caller's result_limit is respected as-is.
-        # Pool expansion for the reranker happens inside fuse_pools_with_gap_protection
-        # via rank_pool_multiplier — that is the single intentional expansion point.
+        # Local branch uses amplified recall for better candidate pool; fusion trims to result_limit.
+        # Contract: local_recall_k = min(actual_recall, max(result_limit * 2, 20)).
         actual_recall = result_limit
+        local_recall_k = min(actual_recall, max(result_limit * 2, 20))
         year_start, year_end = _normalize_year_window(filters)
 
         # 诊断信息收集
@@ -961,7 +997,7 @@ class RetrievalService:
             graph_top_k = (filters or {}).get("graph_top_k")
             local_config = RetrievalConfig(
                 mode="hybrid",
-                top_k=result_limit,
+                top_k=local_recall_k,
                 rerank=False,
                 year_start=year_start,
                 year_end=year_end,
@@ -973,8 +1009,8 @@ class RetrievalService:
                 trace_ctx=trace_ctx,
             )
             logger.info(
-                "[retrieval] hybrid start result_limit=%s (local=result_limit, no amp) timeout_s=%s skip_rerank=%s",
-                result_limit, timeout_s, skip_rerank,
+                "[retrieval] hybrid start result_limit=%s local_recall_k=%s timeout_s=%s skip_rerank=%s",
+                result_limit, local_recall_k, timeout_s, skip_rerank,
             )
 
             # ── Timeout logic: we do not "require" local; we run local + web in parallel.
@@ -1123,7 +1159,6 @@ class RetrievalService:
             }
 
             # ── Pool-only mode: caller will do the final fuse_pools (e.g. chat gap) ──
-            pool_only = bool((filters or {}).get("pool_only"))
             if pool_only:
                 for h in local_main + web_main:
                     source_type = h.get("_source_type", "dense")
@@ -1138,15 +1173,12 @@ class RetrievalService:
                     gap_candidates=gap_candidates,
                     top_k=result_limit,
                     rank_pool_multiplier=rank_pool_multiplier,
+                    pool_score_thresholds=(filters or {}).get("pool_score_thresholds"),
                     reranker_mode=ui_reranker_mode,
                     skip_rerank=skip_rerank,
                     trace_ctx=trace_ctx,
                     diag=diag,
                 )
-                fused_pool_threshold = (filters or {}).get("fused_pool_score_threshold")
-                if fused_pool_threshold is None:
-                    fused_pool_threshold = (filters or {}).get("local_threshold")  # backward compat
-                fused_hits = _filter_fused_by_score_threshold(fused_hits, fused_pool_threshold)
 
                 logger.info("[retrieval] fuse_done fused=%d", len(fused_hits))
 
@@ -1157,7 +1189,7 @@ class RetrievalService:
             if mode == "local":
                 config = RetrievalConfig(
                     mode="hybrid",
-                    top_k=actual_recall,
+                    top_k=local_recall_k,
                     rerank=False,
                     year_start=year_start,
                     year_end=year_end,
@@ -1182,30 +1214,14 @@ class RetrievalService:
                 if not sources_used and local_pool:
                     sources_used.append("dense")
 
-                pool_only = bool((filters or {}).get("pool_only"))
-                if pool_only:
-                    for h in local_pool:
-                        all_chunks.append(_hit_to_chunk(h, h.get("_source_type", "dense"), query))
-                    logger.info("[retrieval] local pool_only: returning %d raw hits", len(local_pool))
-                else:
-                    fused_hits = fuse_pools_with_gap_protection(
-                        query=query,
-                        main_candidates=local_pool,
-                        gap_candidates=[],
-                        top_k=result_limit,
-                        rank_pool_multiplier=rank_pool_multiplier,
-                        reranker_mode=ui_reranker_mode,
-                        skip_rerank=skip_rerank,
-                        trace_ctx=trace_ctx,
-                        diag=diag,
-                    )
-                    fused_pool_threshold = (filters or {}).get("fused_pool_score_threshold")
-                    if fused_pool_threshold is None:
-                        fused_pool_threshold = (filters or {}).get("local_threshold")
-                    fused_hits = _filter_fused_by_score_threshold(fused_hits, fused_pool_threshold)
-                    logger.info("[retrieval] local fuse_done fused=%d from pool=%d", len(fused_hits), len(local_pool))
-                    for h in fused_hits:
-                        all_chunks.append(_hit_to_chunk(h, h.get("_source_type", "dense"), query))
+                # 无论 pool_only 与否，均返回 RRF 原始池；最终 BGE rerank 由调用层
+                # （routes_chat.py _fuse_chat_main_gap_agent_candidates）统一执行一次。
+                for h in local_pool:
+                    all_chunks.append(_hit_to_chunk(h, h.get("_source_type", "dense"), query))
+                logger.info(
+                    "[retrieval] local raw_pool: returning %d rrf hits (no intermediate rerank; "
+                    "pool_only=%s)", len(local_pool), pool_only,
+                )
             elif mode == "web":
                 try:
                     web_providers = (filters or {}).get("web_providers")
@@ -1257,34 +1273,38 @@ class RetrievalService:
                     )
                     total_candidates += len(web_hits)
                     sources_used.append("web")
-                    # Web 结果排序
-                    if web_hits:
-                        _web_top_k = min(result_limit, len(web_hits))
-                        if skip_rerank:
-                            try:
-                                web_hits = _embedding_rerank(query, web_hits, top_k=_web_top_k)
-                            except Exception as e:
-                                logger.warning("embedding rerank failed: %s", e)
-                                web_hits = web_hits[:_web_top_k]
-                        else:
-                            try:
-                                web_hits = _rerank_candidates(
-                                    query, web_hits, top_k=_web_top_k, reranker_mode=ui_reranker_mode, trace_ctx=trace_ctx,
-                                )
-                            except Exception as e:
-                                logger.warning("web cross-encoder rerank failed, falling back to embedding: %s", e)
+                    web_hits = _compress_web_fulltext(web_hits, query, filters)
+                    if pool_only:
+                        for h in web_hits:
+                            all_chunks.append(_hit_to_chunk(h, "web", query))
+                        logger.info("[retrieval] web pool_only: returning %d raw hits", len(web_hits))
+                    else:
+                        if web_hits:
+                            _web_top_k = min(result_limit, len(web_hits))
+                            if skip_rerank:
                                 try:
                                     web_hits = _embedding_rerank(query, web_hits, top_k=_web_top_k)
-                                except Exception:
+                                except Exception as e:
+                                    logger.warning("embedding rerank failed: %s", e)
                                     web_hits = web_hits[:_web_top_k]
-                    web_hits = _compress_web_fulltext(web_hits, query, filters)
-                    for h in web_hits:
-                        all_chunks.append(_hit_to_chunk(h, "web", query))
+                            else:
+                                try:
+                                    web_hits = _rerank_candidates(
+                                        query, web_hits, top_k=_web_top_k, reranker_mode=ui_reranker_mode, trace_ctx=trace_ctx,
+                                    )
+                                except Exception as e:
+                                    logger.warning("web cross-encoder rerank failed, falling back to embedding: %s", e)
+                                    try:
+                                        web_hits = _embedding_rerank(query, web_hits, top_k=_web_top_k)
+                                    except Exception:
+                                        web_hits = web_hits[:_web_top_k]
+                        for h in web_hits:
+                            all_chunks.append(_hit_to_chunk(h, "web", query))
                 except Exception:
                     pass
 
         retrieval_time_ms = (time.perf_counter() - t0) * 1000
-        result_limit_final = step_top_k if step_top_k is not None else k
+        result_limit_final = len(all_chunks) if pool_only else (step_top_k if step_top_k is not None else k)
         logger.info(
             "[retrieval] search_done mode=%s chunks=%d result_limit=%s total_ms=%.0f",
             mode, len(all_chunks), result_limit_final, retrieval_time_ms,
@@ -1302,7 +1322,7 @@ class RetrievalService:
         
         return EvidencePack(
             query=query,
-            chunks=all_chunks[:result_limit],
+            chunks=all_chunks if pool_only else all_chunks[:result_limit],
             total_candidates=total_candidates,
             retrieval_time_ms=retrieval_time_ms,
             sources_used=list(dict.fromkeys(sources_used)),

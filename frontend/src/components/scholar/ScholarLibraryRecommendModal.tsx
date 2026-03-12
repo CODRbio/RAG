@@ -94,9 +94,15 @@ export function ScholarLibraryRecommendModal({
         abortRef.current.signal,
         '-',
       )) {
+        if (event === 'heartbeat') {
+          const msg = (data?.stage as string) || (data?.elapsed_s != null ? `${data.elapsed_s}s` : '…');
+          setProgressLogs((prev) => (prev.length ? [...prev.slice(0, -1), msg] : [msg]));
+          continue;
+        }
         if (event === 'progress') {
           const msg = (data?.message as string) || (data?.stage as string) || '…';
           setProgressLogs((prev) => [...prev, msg]);
+          continue;
         }
         if (event === 'done') {
           const payload = data as unknown as LibraryRecommendResponse;
@@ -108,6 +114,11 @@ export function ScholarLibraryRecommendModal({
           const msg = (data?.message as string) || t('scholar.recommendError', '推荐失败');
           setError(msg);
           setProgressLogs((prev) => [...prev, msg]);
+          break;
+        }
+        if (event === 'cancelled' || event === 'timeout') {
+          setError(event === 'cancelled' ? t('scholar.recommendCancelled', '已取消') : t('scholar.recommendTimeout', '已超时'));
+          setProgressLogs((prev) => [...prev, event === 'cancelled' ? t('scholar.recommendCancelled', '已取消') : t('scholar.recommendTimeout', '已超时')]);
           break;
         }
       }

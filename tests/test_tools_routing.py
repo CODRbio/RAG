@@ -11,6 +11,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.llm.tools import get_routed_skills, get_tools_by_names
+from config.settings import settings
 
 
 def _tool_names(tools):
@@ -88,7 +89,8 @@ def test_routing_analysis_and_graph_keywords():
         )
     )
     assert "compare_papers" in analysis
-    assert "run_code" in analysis
+    assert "run_code" not in analysis
+    assert "summarize_quantitative" in analysis
 
     graph = _tool_names(
         get_routed_skills(
@@ -127,8 +129,23 @@ def test_routing_collab_stage_and_keyword_trigger():
 
 def test_get_tools_by_names_preserves_core_order_and_ignores_unknown():
     names = _tool_names(get_tools_by_names(["run_code", "search_local", "unknown_tool"]))
-    # CORE_TOOLS order places search_local before run_code
-    assert names == ["search_local", "run_code"]
+    assert names == ["search_local"]
+
+
+def test_run_code_only_routes_when_explicitly_enabled(monkeypatch):
+    monkeypatch.setattr(settings.tool_execution, "run_code_enabled", True)
+    names = _tool_names(
+        get_routed_skills(
+            message="请对结果做统计计算",
+            current_stage="explore",
+            search_mode="local",
+            allowed_web_providers=None,
+        )
+    )
+    assert "run_code" in names
+
+    ordered = _tool_names(get_tools_by_names(["run_code", "search_local"]))
+    assert ordered == ["search_local", "run_code"]
 
 
 if __name__ == "__main__":

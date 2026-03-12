@@ -188,6 +188,7 @@ class ChatSession(SQLModel, table=True):
     __tablename__ = "sessions"
 
     session_id: str = Field(primary_key=True)
+    user_id: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
     canvas_id: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
     stage: str = Field(default="explore", sa_column=Column(Text, nullable=False, server_default="explore"))
     rolling_summary: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))

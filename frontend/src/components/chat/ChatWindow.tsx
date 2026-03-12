@@ -159,7 +159,7 @@ export function ChatWindow() {
   const setCanvasId = useChatStore((s) => s.setCanvasId);
   const setResearchDashboard = useChatStore((s) => s.setResearchDashboard);
   const isStreaming = useChatStore((s) => s.isStreaming);
-  const streamingStep = useChatStore((s) => s.streamingStep);
+  const activeResponse = useChatStore((s) => s.activeResponse);
   const setStreamingStep = useChatStore((s) => s.setStreamingStep);
   // LocalDbChoiceDialog 由 App.tsx 全局挂载，ChatWindow 不再处理内联按钮
   const addToast = useToastStore((s) => s.addToast);
@@ -262,7 +262,7 @@ export function ChatWindow() {
       try {
         const job = await getDeepResearchJob(activeJobId);
         if (cancelled || ac.signal.aborted) return;
-        const running = ['pending', 'running', 'cancelling', 'waiting_review'].includes(job.status);
+        const running = ['pending', 'running', 'pausing', 'paused', 'cancelling', 'waiting_review'].includes(job.status);
         if (!running) {
           clearState();
           return;
@@ -366,7 +366,7 @@ export function ChatWindow() {
     setDeepResearchTopic(topicTrim || '');
     try {
       const jobs = await listDeepResearchJobs(15);
-      const runnable = ['pending', 'running', 'cancelling', 'waiting_review'];
+      const runnable = ['pending', 'running', 'pausing', 'paused', 'cancelling', 'waiting_review'];
       const match = (j: DeepResearchJobInfo) =>
         (sessionId && j.session_id === sessionId) ||
         (topicTrim && String(j.topic || '').trim() === topicTrim);
@@ -383,7 +383,7 @@ export function ChatWindow() {
         if (best.session_id) setSessionId(best.session_id);
         if (best.canvas_id) setCanvasId(best.canvas_id);
         if (best.result_dashboard && Object.keys(best.result_dashboard).length > 0) {
-          setResearchDashboard(best.result_dashboard as ResearchDashboardData);
+          setResearchDashboard(best.result_dashboard as unknown as ResearchDashboardData);
         }
       }
     } catch (e) {
@@ -498,7 +498,13 @@ export function ChatWindow() {
       <div className="flex items-center justify-between gap-3">
         <div className="min-w-0">
           <div className="font-medium truncate">
-            {backgroundJob?.status === 'cancelling' ? t('chat.bgResearchStopping') : t('chat.bgResearchRunning')}
+            {backgroundJob?.status === 'cancelling'
+              ? t('chat.bgResearchStopping')
+              : backgroundJob?.status === 'paused'
+                ? t('chat.bgResearchPaused')
+                : backgroundJob?.status === 'pausing'
+                  ? t('chat.bgResearchPausing')
+                  : t('chat.bgResearchRunning')}
           </div>
           <div className="text-[11px] text-sky-400 truncate">
             {backgroundJob?.topic || t('chat.unnamed')} · {t('chat.stage')}: {backgroundJob?.current_stage || 'unknown'}
@@ -616,13 +622,31 @@ export function ChatWindow() {
         <RetrievalDebugPanel summary={lastEvidenceSummary} />
       )}
       {messages.map((msg, idx) => {
+        const isInlineStatusMessage =
+          msg.role === 'assistant'
+          && activeResponse?.surface === 'chat'
+          && activeResponse?.targetMessageId === msg.id
+          && !activeResponse?.hasVisibleOutput;
         const displayContent =
           isStreaming && idx === messages.length - 1
             ? msg.content.replace(/\[([a-fA-F0-9]{8})\]/g, '[⏳...]')
             : msg.content;
+        if (isInlineStatusMessage) {
+          return (
+            <div
+              key={msg.id || idx}
+              className="flex justify-start animate-in slide-in-from-bottom-2 duration-300"
+            >
+              <div className="rounded-full px-3 py-1.5 text-xs font-medium text-slate-400 bg-slate-800/45 border border-slate-700/50 inline-flex items-center gap-2">
+                <span className="w-1.5 h-1.5 rounded-full bg-sky-400 animate-pulse" />
+                {activeResponse.stepLabel || t('chat.thinking', 'Thinking')}
+              </div>
+            </div>
+          );
+        }
         return (
         <div
-          key={idx}
+          key={msg.id || idx}
           className={`flex ${
             msg.role === 'user' ? 'justify-end' : 'justify-start'
           } animate-in slide-in-from-bottom-2 duration-300`}
@@ -697,12 +721,12 @@ export function ChatWindow() {
                   </span>
                   <button
                     type="button"
-                    onClick={() => handleImportSourcesClick(msg.id || `${index}`, msg.sources || [])}
-                    disabled={importingSources || importingMessageId === (msg.id || `${index}`)}
+                    onClick={() => handleImportSourcesClick(msg.id || `${idx}`, msg.sources || [])}
+                    disabled={importingSources || importingMessageId === (msg.id || `${idx}`)}
                     className="text-[10px] normal-case px-2 py-1 rounded-md border border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/10 disabled:opacity-50 inline-flex items-center gap-1"
                     title="将本轮引用文献批量导入文献库"
                   >
-                    {importingMessageId === (msg.id || `${index}`) ? <Loader2 size={11} className="animate-spin" /> : <BookmarkPlus size={11} />}
+                    {importingMessageId === (msg.id || `${idx}`) ? <Loader2 size={11} className="animate-spin" /> : <BookmarkPlus size={11} />}
                     导入文献库
                   </button>
                 </div>
@@ -816,16 +840,6 @@ export function ChatWindow() {
         </div>
       );
       })}
-
-      {/* Active step indicator (Thinking-style): while chat streaming or background Research has active step */}
-      {(isStreaming || backgroundJob) && streamingStep && (
-        <div className="flex justify-start animate-in fade-in duration-200">
-          <div className="rounded-full px-3 py-1.5 text-xs font-medium text-slate-400 bg-slate-800/60 border border-slate-700/50 inline-flex items-center gap-2">
-            <span className="w-1.5 h-1.5 rounded-full bg-sky-400 animate-pulse" />
-            {t('chat.thinking', 'Thinking')}: {streamingStep.label}
-          </div>
-        </div>
-      )}
 
       {/* PDF 溯源 Modal */}
       <PdfViewerModal

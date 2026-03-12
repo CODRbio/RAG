@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import APIRouter, Body, Depends, File, Form, UploadFile, HTTPException
+from fastapi import APIRouter, Body, Depends, File, Form, UploadFile, HTTPException, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from sqlmodel import Session
 
@@ -321,9 +321,11 @@ def list_papers_in_collection(name: str, user_id: str = Depends(get_current_user
 
 
 @router.delete("/collections/{name}/papers/{paper_id:path}")
-def delete_paper_from_collection(name: str, paper_id: str) -> dict:
+def delete_paper_from_collection(
+    name: str, paper_id: str, user_id: str = Depends(get_current_user_id)
+) -> dict:
     """
-    删除指定文件：从 Milvus 删除该 paper_id 的全部 chunks，并移除元数据记录。
+    删除指定文件：从 Milvus 删除该 paper_id 的全部 chunks，并移除元数据记录及磁盘文件。
     """
     from src.indexing.milvus_ops import milvus
     from src.indexing.paper_store import delete_paper
@@ -343,7 +345,7 @@ def delete_paper_from_collection(name: str, paper_id: str) -> dict:
         logger.error("Milvus delete failed for paper_id='%s': %s", paper_id, e)
         raise HTTPException(status_code=500, detail=f"Milvus 删除失败: {e}")
 
-    # 2. 从 SQLite 删除元数据
+    # 2. 从 DB 删除元数据并清理磁盘文件
     delete_paper(name, paper_id)
 
     return {"ok": True, "collection": name, "paper_id": paper_id, "deleted_chunks": deleted_count}
@@ -429,6 +431,29 @@ def _normalize_process_body(body: dict) -> dict:
 def _emit_job_event(job_id: str, event: str, data: dict) -> None:
     from src.indexing.ingest_job_store import append_event
     append_event(job_id, event, data)
+
+
+def _is_transient_ingest_error(e: Exception) -> bool:
+    """True if the error is transient (retry may succeed): timeouts, network, rate limit, 5xx."""
+    msg = (getattr(e, "message", "") or str(e)).lower()
+    if isinstance(e, (TimeoutError, ConnectionError, OSError)):
+        return True
+    if "timeout" in msg or "timed out" in msg:
+        return True
+    if "429" in msg or "rate limit" in msg or "too many requests" in msg:
+        return True
+    if "503" in msg or "502" in msg or "500" in msg or "service unavailable" in msg:
+        return True
+    return False
+
+
+def _ingest_retry_delay(attempt: int) -> None:
+    """Exponential backoff + jitter for ingest retries. In-place sleep."""
+    import random
+    base = 1.0
+    max_interval = 60.0
+    delay = min(base * (2 ** attempt) + random.uniform(0, 1), max_interval)
+    time.sleep(delay)
 
 
 def _filter_files_by_dedup(
@@ -588,6 +613,7 @@ def _run_ingest_job(job_id: str, cfg: dict) -> None:
     total_chunks = 0
     total_upserted = 0
     errors = []
+    max_retries = getattr(settings.tasks, "max_retries", 3)
 
     try:
         milvus.create_collection(collection_name, recreate=False, schema_version="v2")
@@ -733,74 +759,86 @@ def _run_ingest_job(job_id: str, cfg: dict) -> None:
         })
 
         output_dir = parsed_dir / paper_id
-        try:
-            enrich_queue: queue.Queue = queue.Queue()
-
-            def put_enrich_progress(kind_key: str, payload: dict, _fn: str = file_name) -> None:
-                kind = "table" if kind_key == "enrich_table" else "figure"
-                enrich_queue.put({
-                    "file": _fn,
-                    "kind": kind,
-                    "index": payload.get("index"),
-                    "total": payload.get("total"),
-                    "status": payload.get("status", ""),
-                    "message": payload.get("message"),
-                })
-
-            parse_timeout = 1800
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(
-                    processor.process,
-                    pdf_path,
-                    output_dir=output_dir,
-                    skip_enrichment=actual_skip,
-                    progress_callback=put_enrich_progress if not actual_skip else None,
-                )
-                start_ts = time.time()
-                while True:
-                    if _is_cancel_requested(job_id):
-                        future.cancel()
-                        return
-                    try:
-                        while True:
-                            ev = enrich_queue.get_nowait()
-                            _emit_job_event(job_id, "enrich_progress", ev)
-                    except queue.Empty:
-                        pass
-                    try:
-                        future.result(timeout=5)
-                        break
-                    except FuturesTimeoutError:
-                        elapsed = int(time.time() - start_ts)
-                        if elapsed > parse_timeout:
-                            future.cancel()
-                            raise TimeoutError(f"PDF 解析超时 ({elapsed}s > {parse_timeout}s)")
-                        msg = f"解析中 {file_name}... ({elapsed}s)"
-                        update_job(job_id, message=msg)
-                        _emit_job_event(job_id, "heartbeat", {
-                            "file": file_name,
-                            "stage": "parsing",
-                            "elapsed": elapsed,
-                            "message": msg,
-                        })
+        parse_ok = False
+        for parse_attempt in range(max_retries + 1):
             try:
-                while True:
-                    ev = enrich_queue.get_nowait()
-                    _emit_job_event(job_id, "enrich_progress", ev)
-            except queue.Empty:
-                pass
-            logger.info("Parsed: %s -> %s", file_name, output_dir)
-            save_ingest_checkpoint(job_id, file_name, "parsed", detail={"output_dir": str(output_dir)})
-            _emit_job_event(job_id, "checkpoint", {"file": file_name, "stage": "parsed", "status": "done"})
-        except Exception as e:
-            logger.error("Parse failed for %s: %s", file_name, e)
-            with state_lock:
-                errors.append({"file": file_name, "stage": "parse", "error": str(e)})
-                processed_files += 1
-                failed_files += 1
-                _pf, _ff = processed_files, failed_files
-            _emit_job_event(job_id, "file_error", {"file": file_name, "stage": "parse", "error": str(e)})
-            update_job(job_id, processed_files=_pf, failed_files=_ff, current_stage="parse_error")
+                enrich_queue: queue.Queue = queue.Queue()
+
+                def put_enrich_progress(kind_key: str, payload: dict, _fn: str = file_name) -> None:
+                    kind = "table" if kind_key == "enrich_table" else "figure"
+                    enrich_queue.put({
+                        "file": _fn,
+                        "kind": kind,
+                        "index": payload.get("index"),
+                        "total": payload.get("total"),
+                        "status": payload.get("status", ""),
+                        "message": payload.get("message"),
+                    })
+
+                parse_timeout = 1800
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    future = pool.submit(
+                        processor.process,
+                        pdf_path,
+                        output_dir=output_dir,
+                        skip_enrichment=actual_skip,
+                        progress_callback=put_enrich_progress if not actual_skip else None,
+                    )
+                    start_ts = time.time()
+                    while True:
+                        if _is_cancel_requested(job_id):
+                            future.cancel()
+                            return
+                        try:
+                            while True:
+                                ev = enrich_queue.get_nowait()
+                                _emit_job_event(job_id, "enrich_progress", ev)
+                        except queue.Empty:
+                            pass
+                        try:
+                            future.result(timeout=5)
+                            break
+                        except FuturesTimeoutError:
+                            elapsed = int(time.time() - start_ts)
+                            if elapsed > parse_timeout:
+                                future.cancel()
+                                raise TimeoutError(f"PDF 解析超时 ({elapsed}s > {parse_timeout}s)")
+                            msg = f"解析中 {file_name}... ({elapsed}s)"
+                            update_job(job_id, message=msg)
+                            _emit_job_event(job_id, "heartbeat", {
+                                "file": file_name,
+                                "stage": "parsing",
+                                "elapsed": elapsed,
+                                "message": msg,
+                            })
+                try:
+                    while True:
+                        ev = enrich_queue.get_nowait()
+                        _emit_job_event(job_id, "enrich_progress", ev)
+                except queue.Empty:
+                    pass
+                logger.info("Parsed: %s -> %s", file_name, output_dir)
+                save_ingest_checkpoint(job_id, file_name, "parsed", detail={"output_dir": str(output_dir)})
+                _emit_job_event(job_id, "checkpoint", {"file": file_name, "stage": "parsed", "status": "done"})
+                parse_ok = True
+                break
+            except Exception as e:
+                if not _is_transient_ingest_error(e) or parse_attempt == max_retries:
+                    logger.error("Parse failed for %s: %s", file_name, e)
+                    with state_lock:
+                        errors.append({"file": file_name, "stage": "parse", "error": str(e)})
+                        processed_files += 1
+                        failed_files += 1
+                        _pf, _ff = processed_files, failed_files
+                    _emit_job_event(job_id, "file_error", {"file": file_name, "stage": "parse", "error": str(e)})
+                    update_job(job_id, processed_files=_pf, failed_files=_ff, current_stage="parse_error")
+                    return
+                logger.warning(
+                    "Parse transient error for %s (attempt %s/%s), retrying: %s",
+                    file_name, parse_attempt + 1, max_retries + 1, e,
+                )
+                _ingest_retry_delay(parse_attempt)
+        if not parse_ok:
             return
 
         update_job(job_id, current_stage="chunking", message=f"切块 {file_name}...")
@@ -823,63 +861,75 @@ def _run_ingest_job(job_id: str, cfg: dict) -> None:
             update_job(job_id, processed_files=_pf, failed_files=_ff, current_stage="chunk_error")
             return
 
-        try:
-            with open(json_path, "r", encoding="utf-8") as f:
-                doc = json.load(f)
-            doc_id = doc.get("doc_id", paper_id)
-            enrich_meta = doc.get("enrichment_meta") or {}
-            table_count = int(enrich_meta.get("table_count", 0) or 0)
-            figure_count = int(enrich_meta.get("figure_count", 0) or 0)
-            table_success = int(enrich_meta.get("table_success", 0) or 0)
-            figure_success = int(enrich_meta.get("figure_success", 0) or 0)
-            content_flow = doc.get("content_flow", [])
-            doc_claims = doc.get("claims") or []
-            doc_metadata = doc.get("doc_metadata") or {}
-            # Merge job/file metadata so authors/year/venue/url/pdf_url/arxiv_id/source are kept.
-            merged_job_meta = {}
-            if isinstance(file_cfg.get("metadata"), dict):
-                merged_job_meta.update(file_cfg["metadata"])
-            if total == 1 and isinstance(cfg.get("metadata"), dict):
-                merged_job_meta.update(cfg["metadata"])
-            if merged_job_meta:
-                for key in ("title", "doi", "authors", "year", "venue", "url", "pdf_url", "arxiv_id", "source"):
-                    if key in merged_job_meta and merged_job_meta[key] is not None and (not doc_metadata.get(key)):
-                        doc_metadata[key] = merged_job_meta[key]
+        chunk_ok = False
+        for chunk_attempt in range(max_retries + 1):
+            try:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    doc = json.load(f)
+                doc_id = doc.get("doc_id", paper_id)
+                enrich_meta = doc.get("enrichment_meta") or {}
+                table_count = int(enrich_meta.get("table_count", 0) or 0)
+                figure_count = int(enrich_meta.get("figure_count", 0) or 0)
+                table_success = int(enrich_meta.get("table_success", 0) or 0)
+                figure_success = int(enrich_meta.get("figure_success", 0) or 0)
+                content_flow = doc.get("content_flow", [])
+                doc_claims = doc.get("claims") or []
+                doc_metadata = doc.get("doc_metadata") or {}
+                # Merge job/file metadata so authors/year/venue/url/pdf_url/arxiv_id/source are kept.
+                merged_job_meta = {}
+                if isinstance(file_cfg.get("metadata"), dict):
+                    merged_job_meta.update(file_cfg["metadata"])
+                if total == 1 and isinstance(cfg.get("metadata"), dict):
+                    merged_job_meta.update(cfg["metadata"])
+                if merged_job_meta:
+                    for key in ("title", "doi", "authors", "year", "venue", "url", "pdf_url", "arxiv_id", "source"):
+                        if key in merged_job_meta and merged_job_meta[key] is not None and (not doc_metadata.get(key)):
+                            doc_metadata[key] = merged_job_meta[key]
 
-            chunk_timeout = 600
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(chunk_blocks, content_flow, doc_id=doc_id, config=chunk_cfg, claims=doc_claims)
-                start_ts = time.time()
-                while True:
-                    if _is_cancel_requested(job_id):
-                        future.cancel()
-                        return
-                    try:
-                        chunks = future.result(timeout=5)
-                        break
-                    except FuturesTimeoutError:
-                        elapsed = int(time.time() - start_ts)
-                        if elapsed > chunk_timeout:
+                chunk_timeout = 600
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    future = pool.submit(chunk_blocks, content_flow, doc_id=doc_id, config=chunk_cfg, claims=doc_claims)
+                    start_ts = time.time()
+                    while True:
+                        if _is_cancel_requested(job_id):
                             future.cancel()
-                            raise TimeoutError(f"切块超时 ({elapsed}s > {chunk_timeout}s)")
-                        msg = f"切块中 {file_name}... ({elapsed}s)"
-                        update_job(job_id, message=msg)
-                        _emit_job_event(job_id, "heartbeat", {
-                            "file": file_name,
-                            "stage": "chunking",
-                            "elapsed": elapsed,
-                            "message": msg,
-                        })
-            save_ingest_checkpoint(job_id, file_name, "chunked", detail={"chunk_count": len(chunks)})
-            _emit_job_event(job_id, "checkpoint", {"file": file_name, "stage": "chunked", "status": "done", "chunk_count": len(chunks)})
-        except Exception as e:
-            with state_lock:
-                errors.append({"file": file_name, "stage": "chunk", "error": str(e)})
-                processed_files += 1
-                failed_files += 1
-                _pf, _ff = processed_files, failed_files
-            _emit_job_event(job_id, "file_error", {"file": file_name, "stage": "chunk", "error": str(e)})
-            update_job(job_id, processed_files=_pf, failed_files=_ff, current_stage="chunk_error")
+                            return
+                        try:
+                            chunks = future.result(timeout=5)
+                            break
+                        except FuturesTimeoutError:
+                            elapsed = int(time.time() - start_ts)
+                            if elapsed > chunk_timeout:
+                                future.cancel()
+                                raise TimeoutError(f"切块超时 ({elapsed}s > {chunk_timeout}s)")
+                            msg = f"切块中 {file_name}... ({elapsed}s)"
+                            update_job(job_id, message=msg)
+                            _emit_job_event(job_id, "heartbeat", {
+                                "file": file_name,
+                                "stage": "chunking",
+                                "elapsed": elapsed,
+                                "message": msg,
+                            })
+                save_ingest_checkpoint(job_id, file_name, "chunked", detail={"chunk_count": len(chunks)})
+                _emit_job_event(job_id, "checkpoint", {"file": file_name, "stage": "chunked", "status": "done", "chunk_count": len(chunks)})
+                chunk_ok = True
+                break
+            except Exception as e:
+                if not _is_transient_ingest_error(e) or chunk_attempt == max_retries:
+                    with state_lock:
+                        errors.append({"file": file_name, "stage": "chunk", "error": str(e)})
+                        processed_files += 1
+                        failed_files += 1
+                        _pf, _ff = processed_files, failed_files
+                    _emit_job_event(job_id, "file_error", {"file": file_name, "stage": "chunk", "error": str(e)})
+                    update_job(job_id, processed_files=_pf, failed_files=_ff, current_stage="chunk_error")
+                    return
+                logger.warning(
+                    "Chunk transient error for %s (attempt %s/%s), retrying: %s",
+                    file_name, chunk_attempt + 1, max_retries + 1, e,
+                )
+                _ingest_retry_delay(chunk_attempt)
+        if not chunk_ok:
             return
 
         if not chunks:
@@ -899,57 +949,70 @@ def _run_ingest_job(job_id: str, cfg: dict) -> None:
             "message": f"向量化 {file_name} ({len(chunks)} chunks)...",
         })
 
-        try:
-            # 若解析结果无 DOI，尝试从 PDF 回填（与入库前去重同源），便于长期化供检索 dedup
-            if not doc_metadata.get("doi") or not doc_metadata.get("title"):
-                try:
-                    from src.retrieval.dedup import extract_doi_from_pdf_tiered
-                    backfill_doi, backfill_title = extract_doi_from_pdf_tiered(pdf_path)
-                    if backfill_doi and not doc_metadata.get("doi"):
-                        doc_metadata["doi"] = backfill_doi
-                        doc_metadata.setdefault("extra", {})["doi_source"] = "pdf_extract"
-                    if backfill_title and not doc_metadata.get("title"):
-                        doc_metadata["title"] = backfill_title
-                        doc_metadata.setdefault("extra", {})["title_source"] = "pdf_extract"
-                except Exception as e:
-                    logger.debug("DOI backfill from PDF for %s: %s", file_name, e)
-            rows = _build_rows(chunks, doc_id, collection_name, doc_metadata=doc_metadata)
-            # 将 DOI/Title/Authors/Year 持久化到 paper_metadata（跨源去重 + 长期化）
-            if doc_metadata.get("doi") or doc_metadata.get("title"):
-                _update_paper_metadata(doc_id, doc_metadata)
-            texts = [r.pop("_text_for_embed") for r in rows]
-            with state_lock:
-                for t in texts[:3]:
-                    if len(sample_texts_for_scope) >= max_scope_samples:
-                        break
-                    if t and isinstance(t, str) and t.strip():
-                        sample_texts_for_scope.append(t.strip()[:4000])
-            batch_size = 32
-            total_batches = (len(texts) + batch_size - 1) // batch_size
-            for bi, i in enumerate(range(0, len(texts), batch_size)):
-                if _is_cancel_requested(job_id):
+        rows = None
+        embed_ok = False
+        for embed_attempt in range(max_retries + 1):
+            try:
+                # 若解析结果无 DOI，尝试从 PDF 回填（与入库前去重同源），便于长期化供检索 dedup
+                if not doc_metadata.get("doi") or not doc_metadata.get("title"):
+                    try:
+                        from src.retrieval.dedup import extract_doi_from_pdf_tiered
+                        backfill_doi, backfill_title = extract_doi_from_pdf_tiered(pdf_path)
+                        if backfill_doi and not doc_metadata.get("doi"):
+                            doc_metadata["doi"] = backfill_doi
+                            doc_metadata.setdefault("extra", {})["doi_source"] = "pdf_extract"
+                        if backfill_title and not doc_metadata.get("title"):
+                            doc_metadata["title"] = backfill_title
+                            doc_metadata.setdefault("extra", {})["title_source"] = "pdf_extract"
+                    except Exception as e:
+                        logger.debug("DOI backfill from PDF for %s: %s", file_name, e)
+                rows = _build_rows(chunks, doc_id, collection_name, doc_metadata=doc_metadata)
+                # 将 DOI/Title/Authors/Year 持久化到 paper_metadata（跨源去重 + 长期化）
+                if doc_metadata.get("doi") or doc_metadata.get("title"):
+                    _update_paper_metadata(doc_id, doc_metadata)
+                texts = [r.pop("_text_for_embed") for r in rows]
+                with state_lock:
+                    for t in texts[:3]:
+                        if len(sample_texts_for_scope) >= max_scope_samples:
+                            break
+                        if t and isinstance(t, str) and t.strip():
+                            sample_texts_for_scope.append(t.strip()[:4000])
+                batch_size = 32
+                total_batches = (len(texts) + batch_size - 1) // batch_size
+                for bi, i in enumerate(range(0, len(texts), batch_size)):
+                    if _is_cancel_requested(job_id):
+                        return
+                    msg = f"向量化 {file_name} batch {bi + 1}/{total_batches}..."
+                    update_job(job_id, message=msg)
+                    _emit_job_event(job_id, "heartbeat", {"file": file_name, "stage": "embedding", "message": msg})
+                    batch = texts[i:i + batch_size]
+                    logger.info("Embedding %s batch %d/%d (%d texts)", file_name, bi + 1, total_batches, len(batch))
+                    emb = embedder.encode(batch)
+                    for k, j in enumerate(range(i, min(i + batch_size, len(rows)))):
+                        rows[j]["dense_vector"] = emb["dense"][k].tolist()
+                        sp = emb["sparse"]._getrow(k).tocoo()
+                        rows[j]["sparse_vector"] = {int(col): float(val) for col, val in zip(sp.col, sp.data)}
+                save_ingest_checkpoint(job_id, file_name, "embedded", detail={"row_count": len(rows)})
+                _emit_job_event(job_id, "checkpoint", {"file": file_name, "stage": "embedded", "status": "done", "row_count": len(rows)})
+                embed_ok = True
+                break
+            except Exception as e:
+                if not _is_transient_ingest_error(e) or embed_attempt == max_retries:
+                    logger.error("Embed failed for %s: %s\n%s", file_name, e, traceback.format_exc())
+                    with state_lock:
+                        errors.append({"file": file_name, "stage": "embed", "error": str(e)})
+                        processed_files += 1
+                        failed_files += 1
+                        _pf, _ff = processed_files, failed_files
+                    _emit_job_event(job_id, "file_error", {"file": file_name, "stage": "embed", "error": str(e)})
+                    update_job(job_id, processed_files=_pf, failed_files=_ff, current_stage="embed_error")
                     return
-                msg = f"向量化 {file_name} batch {bi + 1}/{total_batches}..."
-                update_job(job_id, message=msg)
-                _emit_job_event(job_id, "heartbeat", {"file": file_name, "stage": "embedding", "message": msg})
-                batch = texts[i:i + batch_size]
-                logger.info("Embedding %s batch %d/%d (%d texts)", file_name, bi + 1, total_batches, len(batch))
-                emb = embedder.encode(batch)
-                for k, j in enumerate(range(i, min(i + batch_size, len(rows)))):
-                    rows[j]["dense_vector"] = emb["dense"][k].tolist()
-                    sp = emb["sparse"]._getrow(k).tocoo()
-                    rows[j]["sparse_vector"] = {int(col): float(val) for col, val in zip(sp.col, sp.data)}
-            save_ingest_checkpoint(job_id, file_name, "embedded", detail={"row_count": len(rows)})
-            _emit_job_event(job_id, "checkpoint", {"file": file_name, "stage": "embedded", "status": "done", "row_count": len(rows)})
-        except Exception as e:
-            logger.error("Embed failed for %s: %s\n%s", file_name, e, traceback.format_exc())
-            with state_lock:
-                errors.append({"file": file_name, "stage": "embed", "error": str(e)})
-                processed_files += 1
-                failed_files += 1
-                _pf, _ff = processed_files, failed_files
-            _emit_job_event(job_id, "file_error", {"file": file_name, "stage": "embed", "error": str(e)})
-            update_job(job_id, processed_files=_pf, failed_files=_ff, current_stage="embed_error")
+                logger.warning(
+                    "Embed transient error for %s (attempt %s/%s), retrying: %s",
+                    file_name, embed_attempt + 1, max_retries + 1, e,
+                )
+                _ingest_retry_delay(embed_attempt)
+        if not embed_ok or rows is None:
             return
 
         update_job(job_id, current_stage="indexing", message=f"入库 {file_name} ({len(rows)} rows)...")
@@ -961,97 +1024,109 @@ def _run_ingest_job(job_id: str, cfg: dict) -> None:
             "message": f"入库 {file_name} ({len(rows)} rows)...",
         })
 
-        try:
-            upsert_batch = 100
-            total_ubatches = (len(rows) + upsert_batch - 1) // upsert_batch
-            for ui, start in enumerate(range(0, len(rows), upsert_batch)):
-                if _is_cancel_requested(job_id):
-                    return
-                msg = f"入库 {file_name} batch {ui + 1}/{total_ubatches}..."
-                update_job(job_id, message=msg)
-                _emit_job_event(job_id, "heartbeat", {"file": file_name, "stage": "indexing", "message": msg})
-                batch = rows[start:start + upsert_batch]
-                logger.info("Upsert %s batch %d/%d (%d rows)", file_name, ui + 1, total_ubatches, len(batch))
-                milvus.upsert(collection_name, batch)
-            with state_lock:
-                total_chunks += len(chunks)
-                total_upserted += len(rows)
-            logger.info("Upsert done for %s: %d chunks, %d rows", file_name, len(chunks), len(rows))
-            save_ingest_checkpoint(job_id, file_name, "indexed", detail={"upserted": len(rows), "chunks": len(chunks)})
-            _emit_job_event(job_id, "checkpoint", {"file": file_name, "stage": "indexed", "status": "done", "upserted": len(rows)})
+        upsert_ok = False
+        for upsert_attempt in range(max_retries + 1):
             try:
-                from src.indexing.paper_store import upsert_paper
-                upsert_paper(
-                    collection=collection_name,
-                    paper_id=doc_id,
-                    filename=file_name,
-                    file_path=str(fpath),
-                    file_size=pdf_path.stat().st_size if pdf_path.exists() else 0,
-                    chunk_count=len(chunks),
-                    row_count=len(rows),
-                    enrich_tables_enabled=enrich_tables,
-                    enrich_figures_enabled=enrich_figures,
-                    table_count=table_count,
-                    figure_count=figure_count,
-                    table_success=table_success,
-                    figure_success=figure_success,
-                    status="done",
-                    content_hash=content_hashes.get(fpath, ""),
-                    user_id=user_id,
-                    library_id=file_cfg.get("library_id", cfg.get("library_id")),
-                    library_paper_id=file_cfg.get("library_paper_id", cfg.get("library_paper_id")),
-                    source=(
-                        file_cfg.get("source")
-                        or (file_cfg.get("metadata") or {}).get("source")
-                        or cfg.get("source")
-                        or (cfg.get("metadata") or {}).get("source")
-                        or ""
-                    ),
-                )
-            except Exception as pe:
-                logger.warning("paper_store write failed: %s", pe)
-            else:
-                # Link library paper to this collection so catalog shows "已入当前集合"
-                lib_paper_id = file_cfg.get("library_paper_id", cfg.get("library_paper_id"))
-                if lib_paper_id is not None and collection_name:
+                upsert_batch = 100
+                total_ubatches = (len(rows) + upsert_batch - 1) // upsert_batch
+                for ui, start in enumerate(range(0, len(rows), upsert_batch)):
+                    if _is_cancel_requested(job_id):
+                        return
+                    msg = f"入库 {file_name} batch {ui + 1}/{total_ubatches}..."
+                    update_job(job_id, message=msg)
+                    _emit_job_event(job_id, "heartbeat", {"file": file_name, "stage": "indexing", "message": msg})
+                    batch = rows[start:start + upsert_batch]
+                    logger.info("Upsert %s batch %d/%d (%d rows)", file_name, ui + 1, total_ubatches, len(batch))
+                    milvus.upsert(collection_name, batch)
+                with state_lock:
+                    total_chunks += len(chunks)
+                    total_upserted += len(rows)
+                logger.info("Upsert done for %s: %d chunks, %d rows", file_name, len(chunks), len(rows))
+                save_ingest_checkpoint(job_id, file_name, "indexed", detail={"upserted": len(rows), "chunks": len(chunks)})
+                _emit_job_event(job_id, "checkpoint", {"file": file_name, "stage": "indexed", "status": "done", "upserted": len(rows)})
+                try:
+                    from src.indexing.paper_store import upsert_paper
+                    upsert_paper(
+                        collection=collection_name,
+                        paper_id=doc_id,
+                        filename=file_name,
+                        file_path=str(fpath),
+                        file_size=pdf_path.stat().st_size if pdf_path.exists() else 0,
+                        chunk_count=len(chunks),
+                        row_count=len(rows),
+                        enrich_tables_enabled=enrich_tables,
+                        enrich_figures_enabled=enrich_figures,
+                        table_count=table_count,
+                        figure_count=figure_count,
+                        table_success=table_success,
+                        figure_success=figure_success,
+                        status="done",
+                        content_hash=content_hashes.get(fpath, ""),
+                        user_id=user_id,
+                        library_id=file_cfg.get("library_id", cfg.get("library_id")),
+                        library_paper_id=file_cfg.get("library_paper_id", cfg.get("library_paper_id")),
+                        source=(
+                            file_cfg.get("source")
+                            or (file_cfg.get("metadata") or {}).get("source")
+                            or cfg.get("source")
+                            or (cfg.get("metadata") or {}).get("source")
+                            or ""
+                        ),
+                    )
+                except Exception as pe:
+                    logger.warning("paper_store write failed: %s", pe)
+                else:
+                    # Link library paper to this collection so catalog shows "已入当前集合"
+                    lib_paper_id = file_cfg.get("library_paper_id", cfg.get("library_paper_id"))
+                    if lib_paper_id is not None and collection_name:
+                        try:
+                            from sqlmodel import Session
+                            from src.db.engine import get_engine
+                            from src.db.models import ScholarLibraryPaper
+                            with Session(get_engine()) as session:
+                                row = session.get(ScholarLibraryPaper, int(lib_paper_id))
+                                if row is not None:
+                                    row.collection_name = collection_name
+                                    row.collection_paper_id = doc_id
+                                    session.add(row)
+                                    session.commit()
+                        except Exception as le:
+                            logger.warning("Failed to link ScholarLibraryPaper to collection: %s", le)
+                upsert_ok = True
+                break
+            except Exception as e:
+                if not _is_transient_ingest_error(e) or upsert_attempt == max_retries:
+                    logger.error("Upsert failed for %s: %s\n%s", file_name, e, traceback.format_exc())
+                    with state_lock:
+                        errors.append({"file": file_name, "stage": "upsert", "error": str(e)})
+                        processed_files += 1
+                        failed_files += 1
+                        _pf, _ff = processed_files, failed_files
+                    _emit_job_event(job_id, "file_error", {"file": file_name, "stage": "upsert", "error": str(e)})
                     try:
-                        from sqlmodel import Session
-                        from src.db.engine import get_engine
-                        from src.db.models import ScholarLibraryPaper
-                        with Session(get_engine()) as session:
-                            row = session.get(ScholarLibraryPaper, int(lib_paper_id))
-                            if row is not None:
-                                row.collection_name = collection_name
-                                row.collection_paper_id = doc_id
-                                session.add(row)
-                                session.commit()
-                    except Exception as le:
-                        logger.warning("Failed to link ScholarLibraryPaper to collection: %s", le)
-        except Exception as e:
-            logger.error("Upsert failed for %s: %s\n%s", file_name, e, traceback.format_exc())
-            with state_lock:
-                errors.append({"file": file_name, "stage": "upsert", "error": str(e)})
-                processed_files += 1
-                failed_files += 1
-                _pf, _ff = processed_files, failed_files
-            _emit_job_event(job_id, "file_error", {"file": file_name, "stage": "upsert", "error": str(e)})
-            try:
-                from src.indexing.paper_store import upsert_paper
-                upsert_paper(
-                    collection=collection_name,
-                    paper_id=doc_id,
-                    filename=file_name,
-                    file_path=str(fpath),
-                    enrich_tables_enabled=enrich_tables,
-                    enrich_figures_enabled=enrich_figures,
-                    status="error",
-                    error_message=str(e),
-                    content_hash=content_hashes.get(fpath, ""),
-                    user_id=user_id,
+                        from src.indexing.paper_store import upsert_paper
+                        upsert_paper(
+                            collection=collection_name,
+                            paper_id=doc_id,
+                            filename=file_name,
+                            file_path=str(fpath),
+                            enrich_tables_enabled=enrich_tables,
+                            enrich_figures_enabled=enrich_figures,
+                            status="error",
+                            error_message=str(e),
+                            content_hash=content_hashes.get(fpath, ""),
+                            user_id=user_id,
+                        )
+                    except Exception:
+                        pass
+                    update_job(job_id, processed_files=_pf, failed_files=_ff, current_stage="upsert_error")
+                    return
+                logger.warning(
+                    "Upsert transient error for %s (attempt %s/%s), retrying: %s",
+                    file_name, upsert_attempt + 1, max_retries + 1, e,
                 )
-            except Exception:
-                pass
-            update_job(job_id, processed_files=_pf, failed_files=_ff, current_stage="upsert_error")
+                _ingest_retry_delay(upsert_attempt)
+        if not upsert_ok:
             return
 
         _emit_job_event(job_id, "file_done", {"file": file_name, "chunks": len(chunks), "upserted": len(rows)})
@@ -1248,23 +1323,45 @@ def list_ingest_job_checkpoints(job_id: str, user_id: str = Depends(get_current_
     return {"job_id": job_id, "checkpoints": grouped}
 
 
+def _parse_after_id_from_request(request: Request, after_id: int = 0) -> int:
+    """Resume cursor from Last-Event-ID header (SSE standard) or query after_id."""
+    raw = None
+    if hasattr(request, "headers"):
+        raw = request.headers.get("Last-Event-ID")
+    if raw is not None and str(raw).strip():
+        s = str(raw).strip()
+        if s.isdigit():
+            return max(0, int(s))
+        if s.startswith("h-") and s[2:].isdigit():
+            return max(0, int(s[2:]))
+    if hasattr(request, "query_params") and request.query_params.get("after_id") is not None:
+        try:
+            return max(0, int(request.query_params.get("after_id", 0)))
+        except (TypeError, ValueError):
+            pass
+    return max(0, int(after_id))
+
+
 @router.get("/jobs/{job_id}/events")
-def stream_ingest_job_events(job_id: str, after_id: int = 0) -> StreamingResponse:
+def stream_ingest_job_events(job_id: str, request: Request, after_id: int = 0) -> StreamingResponse:
     from src.indexing.ingest_job_store import get_job, list_events
 
     if not get_job(job_id):
         raise HTTPException(status_code=404, detail="job 不存在")
 
+    cursor = _parse_after_id_from_request(request, after_id)
+    cursor_ref = [cursor]
+
     def event_stream():
-        cursor = max(0, int(after_id))
         idle_ticks = 0
         while True:
-            events = list_events(job_id, after_id=cursor, limit=500)
+            events = list_events(job_id, after_id=cursor_ref[0], limit=500)
             if events:
                 idle_ticks = 0
                 for ev in events:
-                    cursor = max(cursor, int(ev["event_id"]))
-                    yield _sse(ev["event"], ev["data"])
+                    eid = int(ev["event_id"])
+                    cursor_ref[0] = max(cursor_ref[0], eid)
+                    yield _sse(ev["event"], ev["data"], event_id=eid)
                 continue
 
             job = get_job(job_id)
@@ -1274,10 +1371,11 @@ def stream_ingest_job_events(job_id: str, after_id: int = 0) -> StreamingRespons
 
             if job.get("status") in {"done", "error", "cancelled"}:
                 # 终态时再做一次拉取，确保最后事件不丢
-                final_events = list_events(job_id, after_id=cursor, limit=500)
+                final_events = list_events(job_id, after_id=cursor_ref[0], limit=500)
                 for ev in final_events:
-                    cursor = max(cursor, int(ev["event_id"]))
-                    yield _sse(ev["event"], ev["data"])
+                    eid = int(ev["event_id"])
+                    cursor_ref[0] = max(cursor_ref[0], eid)
+                    yield _sse(ev["event"], ev["data"], event_id=eid)
                 break
 
             idle_ticks += 1
@@ -1290,10 +1388,19 @@ def stream_ingest_job_events(job_id: str, after_id: int = 0) -> StreamingRespons
                         "stage": job.get("current_stage", ""),
                         "message": job.get("message", "waiting"),
                     },
+                    event_id=cursor_ref[0],
                 )
             time.sleep(1)
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 def _truncate(content: str, max_len: int = 65000) -> str:
@@ -1401,5 +1508,10 @@ def _build_rows(chunks, doc_id: str, collection_name: str = "",
     return rows
 
 
-def _sse(event: str, data: dict) -> str:
-    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+def _sse(event: str, data: dict, event_id: Optional[int] = None) -> str:
+    """SSE line: optional id: for resume (Last-Event-ID)."""
+    parts = []
+    if event_id is not None:
+        parts.append(f"id: {event_id}\n")
+    parts.append(f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n")
+    return "".join(parts)

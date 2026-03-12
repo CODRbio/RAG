@@ -49,3 +49,26 @@ def test_claude_adaptive_thinking_gets_default_effort():
     )
     assert payload["thinking"] == {"type": "adaptive", "effort": "medium"}
     assert payload["max_tokens"] == 64000
+
+
+class _MockAnthropicStreamProvider:
+    def request(self, payload, timeout=None):
+        _ = payload, timeout
+        return {}
+
+    def request_stream(self, payload, timeout=None):
+        _ = payload, timeout
+        yield {"event": "message_start", "data": {"message": {"usage": {"input_tokens": 2}}}}
+        yield {"event": "content_block_delta", "data": {"delta": {"type": "text_delta", "text": "Hello"}}}
+        yield {"event": "content_block_delta", "data": {"delta": {"type": "text_delta", "text": " Claude"}}}
+        yield {"event": "message_delta", "data": {"usage": {"input_tokens": 2, "output_tokens": 3}}}
+        yield {"event": "message_stop", "data": {}}
+
+
+def test_claude_stream_chat_normalizes_text_deltas():
+    client = HTTPChatClient(_make_claude_client().config, _MockAnthropicStreamProvider())
+
+    events = list(client.stream_chat([{"role": "user", "content": "hello"}]))
+
+    assert [e["delta"] for e in events if e["type"] == "text_delta"] == ["Hello", " Claude"]
+    assert events[-1]["response"]["final_text"] == "Hello Claude"

@@ -2,9 +2,8 @@
 Centralized SQLAlchemy/SQLModel engine and session factory.
 
 All store modules import `engine` and `get_session` from here.
-The database URL is resolved from config/rag_config.json or the
-RAG_DATABASE_URL environment variable, making the switch to
-PostgreSQL a single configuration change.
+The database URL is resolved from config/rag_config.local.json or the
+RAG_DATABASE_URL environment variable.
 """
 
 from __future__ import annotations
@@ -14,9 +13,7 @@ import os
 from pathlib import Path
 from typing import Generator
 
-from sqlalchemy import event
 from sqlalchemy.engine import Engine
-from sqlalchemy.pool import SingletonThreadPool
 from sqlmodel import Session, SQLModel, create_engine
 
 _engine: Engine | None = None
@@ -28,7 +25,6 @@ def _resolve_db_url() -> str:
     1. RAG_DATABASE_URL environment variable
     2. config/rag_config.local.json  database.url
     3. config/rag_config.json        database.url
-    4. Fallback: sqlite:///data/rag.db
     """
     env_url = os.environ.get("RAG_DATABASE_URL")
     if env_url:
@@ -47,7 +43,11 @@ def _resolve_db_url() -> str:
             except Exception:
                 pass
 
-    return "sqlite:///data/rag.db"
+    raise RuntimeError(
+        "No database URL configured. "
+        "Set RAG_DATABASE_URL environment variable or add database.url to config/rag_config.local.json. "
+        "Example: postgresql+psycopg://user:password@localhost:5432/rag"
+    )
 
 
 def get_resolved_db_url() -> str:
@@ -65,29 +65,13 @@ def get_local_config_path() -> Path:
     return _config_root() / "rag_config.local.json"
 
 
-def _make_absolute_sqlite_url(url: str) -> str:
-    """
-    Resolve relative sqlite:/// paths to absolute so the DB is always
-    created in <project_root>/data/rag.db regardless of cwd.
-    """
-    if not url.startswith("sqlite:///"):
-        return url
-    rel_path = url[len("sqlite:///"):]
-    if os.path.isabs(rel_path):
-        return url
-    root = Path(__file__).resolve().parents[2]
-    abs_path = (root / rel_path).resolve()
-    abs_path.parent.mkdir(parents=True, exist_ok=True)
-    return f"sqlite:///{abs_path}"
-
-
 def _normalize_db_url(url: str) -> str:
     """
-    Normalize common DB URL variants.
+    Normalize PostgreSQL URL variants to the psycopg driver form.
 
-    - Keep explicit SQLAlchemy driver URLs unchanged.
-    - Expand relative SQLite paths to absolute later via _make_absolute_sqlite_url().
-    - Default PostgreSQL URLs to psycopg so the app works once psycopg is installed.
+    - postgres://...     → postgresql+psycopg://...
+    - postgresql://...   → postgresql+psycopg://...
+    - postgresql+psycopg://... (already explicit) → unchanged
     """
     normalized = (url or "").strip()
     if not normalized:
@@ -105,31 +89,13 @@ def get_engine() -> Engine:
     if _engine is not None:
         return _engine
 
-    raw_url = _resolve_db_url()
-    db_url = _make_absolute_sqlite_url(_normalize_db_url(raw_url))
-
-    is_sqlite = db_url.startswith("sqlite")
-    connect_args = {"check_same_thread": False, "timeout": 30} if is_sqlite else {}
-    # One connection per thread for SQLite to reduce "database is locked" under concurrent requests.
-    pool_class = SingletonThreadPool if is_sqlite else None
+    db_url = _normalize_db_url(_resolve_db_url())
 
     _engine = create_engine(
         db_url,
         echo=False,
-        connect_args=connect_args,
         pool_pre_ping=True,
-        poolclass=pool_class,
     )
-
-    if is_sqlite:
-        @event.listens_for(_engine, "connect")
-        def _set_sqlite_pragmas(dbapi_conn, _connection_record):
-            cursor = dbapi_conn.cursor()
-            cursor.execute("PRAGMA journal_mode=WAL")
-            cursor.execute("PRAGMA synchronous=NORMAL")
-            cursor.execute("PRAGMA foreign_keys=ON")
-            cursor.execute("PRAGMA busy_timeout=30000")
-            cursor.close()
 
     return _engine
 
@@ -158,6 +124,7 @@ def _ensure_schema_updates() -> None:
     engine = get_engine()
     _add_column_if_missing = [
         ("deep_research_jobs", "started_at", "REAL"),
+        ("sessions", "user_id", "TEXT NOT NULL DEFAULT ''"),
         ("canvases", "preliminary_knowledge", "TEXT NOT NULL DEFAULT ''"),
         ("scholar_libraries", "folder_path", "TEXT"),
         ("scholar_library_papers", "venue", "TEXT NOT NULL DEFAULT ''"),

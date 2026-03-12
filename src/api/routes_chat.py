@@ -2,12 +2,14 @@
 对话 API：POST /chat, POST /chat/stream, GET /sessions/{id}, DELETE /sessions/{id}
 """
 
+import base64
 import contextlib
 import concurrent.futures
 import json
 import math
 import logging
 import re
+import requests as _http
 import time
 import threading
 import uuid
@@ -19,7 +21,7 @@ from pydantic import BaseModel, Field
 from fastapi.responses import StreamingResponse
 
 from config.settings import settings
-from src.api.routes_auth import get_optional_user_id
+from src.api.routes_auth import get_current_user_id, get_optional_user_id
 from src.utils.prompt_manager import PromptManager
 
 _pm = PromptManager()
@@ -99,11 +101,11 @@ from src.collaboration.citation.manager import (
 from src.collaboration.canvas.models import Citation
 from dataclasses import asdict
 from src.retrieval.sonar_citations import parse_sonar_citations
+from src.retrieval.structured_queries import web_queries_per_provider_from_1plus1plus1
 from src.retrieval.service import (
     fuse_pools_with_gap_protection,
     get_retrieval_service,
     _hit_to_chunk as service_hit_to_chunk,
-    _filter_fused_by_score_threshold,
 )
 from src.retrieval.evidence import EvidenceChunk, EvidencePack
 from src.generation.evidence_synthesizer import EvidenceSynthesizer, build_synthesis_system_prompt
@@ -118,6 +120,36 @@ router = APIRouter(tags=["chat"])
 _CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "rag_config.json"
 _DEEP_RESEARCH_CANCEL_EVENTS: dict[str, threading.Event] = {}
 _DEEP_RESEARCH_CANCEL_LOCK = threading.Lock()
+_DEEP_RESEARCH_PAUSE_EVENTS: dict[str, threading.Event] = {}
+_DEEP_RESEARCH_PAUSE_LOCK = threading.Lock()
+
+
+def _is_admin_user(user_id: str) -> bool:
+    profile = get_user_profile(user_id)
+    return bool(profile and profile.get("role") == "admin")
+
+
+def _ensure_session_access(session_id: str, current_user_id: str) -> dict[str, Any] | None:
+    store = get_session_store()
+    meta = store.get_session_meta(session_id)
+    is_admin = _is_admin_user(current_user_id)
+    if meta is not None:
+        owner_id = str(meta.get("user_id") or "").strip()
+        if owner_id == current_user_id or is_admin:
+            return meta
+        raise HTTPException(status_code=403, detail="forbidden")
+    try:
+        from src.collaboration.research.job_store import get_latest_job_by_session
+
+        latest_job = get_latest_job_by_session(session_id)
+    except Exception:
+        latest_job = None
+    if latest_job:
+        owner_id = str(latest_job.get("user_id") or "").strip()
+        if owner_id == current_user_id or is_admin:
+            return None
+        raise HTTPException(status_code=403, detail="forbidden")
+    raise HTTPException(status_code=404, detail="session not found")
 _DEEP_RESEARCH_SUSPENDED: dict[str, dict[str, Any]] = {}
 _DEEP_RESEARCH_SUSPENDED_LOCK = threading.Lock()
 
@@ -140,6 +172,49 @@ def _dr_is_cancel_requested(job_id: str) -> bool:
 def _dr_clear_cancel_event(job_id: str) -> None:
     with _DEEP_RESEARCH_CANCEL_LOCK:
         _DEEP_RESEARCH_CANCEL_EVENTS.pop(job_id, None)
+
+
+def _dr_request_pause(job_id: str) -> None:
+    with _DEEP_RESEARCH_PAUSE_LOCK:
+        ev = _DEEP_RESEARCH_PAUSE_EVENTS.get(job_id)
+        if ev is None:
+            ev = threading.Event()
+            _DEEP_RESEARCH_PAUSE_EVENTS[job_id] = ev
+        ev.set()
+
+
+def _dr_is_pause_requested(job_id: str) -> bool:
+    with _DEEP_RESEARCH_PAUSE_LOCK:
+        ev = _DEEP_RESEARCH_PAUSE_EVENTS.get(job_id)
+    return bool(ev and ev.is_set())
+
+
+def _dr_clear_pause_event(job_id: str) -> None:
+    with _DEEP_RESEARCH_PAUSE_LOCK:
+        ev = _DEEP_RESEARCH_PAUSE_EVENTS.get(job_id)
+        if ev is not None:
+            ev.clear()
+
+
+def _dr_wait_if_paused(job_id: str) -> None:
+    from src.collaboration.research.job_store import append_event, get_job, update_job
+
+    announced = False
+    while _dr_is_pause_requested(job_id):
+        if _dr_is_cancel_requested(job_id):
+            raise RuntimeError("Deep Research cancelled by user")
+        if not announced:
+            job = get_job(job_id) or {}
+            current_stage = str(job.get("current_stage") or "")
+            update_job(
+                job_id,
+                status="paused",
+                current_stage=current_stage,
+                message="任务已暂停",
+            )
+            append_event(job_id, "paused", {"job_id": job_id, "message": "任务已暂停", "current_stage": current_stage})
+            announced = True
+        time.sleep(0.2)
 
 
 def _dr_release_slot_eager(job_id: str) -> None:
@@ -376,7 +451,16 @@ def _run_start_job_bg(
     hb_thread = threading.Thread(target=_heartbeat_loop, daemon=True, name=f"dr-hb-{job_id[:8]}")
     hb_thread.start()
     try:
-        result = start_deep_research(**{**start_kwargs, "progress_callback": _progress_cb})
+        result = start_deep_research(
+            **{
+                **start_kwargs,
+                "progress_callback": _progress_cb,
+                "cancel_check": lambda: _dr_is_cancel_requested(job_id),
+                "pause_waiter": lambda: _dr_wait_if_paused(job_id),
+            }
+        )
+        if result.get("error"):
+            raise RuntimeError(str(result.get("error")))
         if result.get("canvas_id"):
             store.update_session_meta(session_id, {"canvas_id": result.get("canvas_id", "")})
             try:
@@ -406,6 +490,7 @@ def _run_start_job_bg(
         except Exception:
             pass
     except Exception as exc:
+        is_cancelled = _dr_is_cancel_requested(job_id) or "cancelled" in str(exc).lower() or "canceled" in str(exc).lower()
         _chat_logger.error(
             "[start-job] %s failed | session=%s error=%s",
             job_id[:12],
@@ -414,7 +499,7 @@ def _run_start_job_bg(
             exc_info=True,
         )
         err_state: Dict[str, Any] = {
-            "status": "error",
+            "status": "error" if not is_cancelled else "cancelled",
             "session_id": session_id,
             "result": None,
             "error": str(exc),
@@ -423,11 +508,17 @@ def _run_start_job_bg(
             _START_JOBS[job_id] = err_state
         _persist_start_job(job_id, err_state)
         try:
-            _update_db_job(job_id, status="error", error_message=str(exc)[:500], message="规划失败")
+            _update_db_job(
+                job_id,
+                status="cancelled" if is_cancelled else "error",
+                error_message="" if is_cancelled else str(exc)[:500],
+                message="规划已取消" if is_cancelled else "规划失败",
+            )
         except Exception:
             pass
     finally:
         _hb_stop.set()  # signal heartbeat thread to stop
+        _dr_clear_pause_event(job_id)
 
 
 # ── 第一层：正则强制走 rag 的关键词（只做"强制 rag"，不做"强制 chat"）──
@@ -549,6 +640,11 @@ def _build_filters(body: ChatRequest) -> dict:
         filters["serpapi_ratio"] = body.serpapi_ratio
     if body.use_query_expansion is not None:
         filters["use_query_expansion"] = body.use_query_expansion
+    
+    pool_thresholds = getattr(body, "pool_score_thresholds", None)
+    if pool_thresholds is not None:
+        filters["pool_score_thresholds"] = pool_thresholds
+
     # Fused-pool score threshold (after merge); backward compat: fallback from local_threshold
     fused_threshold = getattr(body, "fused_pool_score_threshold", None)
     if fused_threshold is None and body.local_threshold is not None:
@@ -589,6 +685,9 @@ def _build_filters(body: ChatRequest) -> dict:
     filters["rank_pool_multiplier"] = float(
         getattr(settings.search, "chat_rank_pool_multiplier", 3.0)
     )
+    # Chat 主检索以 pool_only 模式返回原始候选池；
+    # 唯一一次 BGE rerank 由 §5¾ _fuse_chat_main_gap_agent_candidates() 统一执行。
+    filters["pool_only"] = True
     return filters
 
 
@@ -857,9 +956,17 @@ def _evaluate_chat_evidence_sufficiency(
     }
 
 
+class _ChatGapQueryItem(BaseModel):
+    """Per-gap structured queries (recall/precision/discovery) for per-engine search."""
+    recall: str = ""
+    precision: str = ""
+    discovery: str = ""
+    precision_zh: Optional[str] = None
+
+
 class _ChatGapQueriesResponse(BaseModel):
-    """LLM 返回：针对证据缺口的 1–3 条可检索 query"""
-    gap_queries: List[str] = Field(default_factory=list)
+    """LLM 返回：针对证据缺口的 1–3 组可检索 query（每组含 recall/precision/discovery，适配不同引擎）"""
+    gap_queries: List[_ChatGapQueryItem] = Field(default_factory=list)
 
 
 def _generate_chat_gap_queries(
@@ -867,10 +974,10 @@ def _generate_chat_gap_queries(
     evidence_context: str,
     llm_client: Any,
     model_override: Optional[str] = None,
-) -> List[str]:
+) -> List[Dict[str, Any]]:
     """
-    根据用户问题和已有证据，生成 1–3 条针对缺口的检索 query。
-    借鉴 Deep Research 的 gap 思路，返回非空泛、可直接检索的短 query 列表。
+    根据用户问题和已有证据，生成 1–3 组针对缺口的检索 query。
+    每组为 {recall, precision, discovery, precision_zh?}，用于按引擎生成 web_queries_per_provider。
     """
     if not (query or "").strip():
         return []
@@ -900,7 +1007,12 @@ def _generate_chat_gap_queries(
                     raw = re.sub(r"\n?```$", "", raw)
                 parsed = _ChatGapQueriesResponse.model_validate_json(raw)
         if parsed and getattr(parsed, "gap_queries", None):
-            return [str(q).strip() for q in parsed.gap_queries if str(q).strip()][:3]
+            out: List[Dict[str, Any]] = []
+            for item in parsed.gap_queries[:3]:
+                d = item.model_dump() if hasattr(item, "model_dump") else {"recall": getattr(item, "recall", ""), "precision": getattr(item, "precision", ""), "discovery": getattr(item, "discovery", ""), "precision_zh": getattr(item, "precision_zh", None)}
+                if (d.get("recall") or d.get("precision") or d.get("discovery") or "").strip():
+                    out.append(d)
+            return out
     except Exception as e:
         _chat_logger.debug("chat gap queries generation failed: %s", e)
     return []
@@ -959,12 +1071,10 @@ def _fuse_chat_main_gap_agent_candidates(
         gap_min_keep=math.ceil(final_top_k * chat_gap_ratio),
         agent_min_keep=math.ceil(final_top_k * chat_agent_ratio),
         rank_pool_multiplier=float(getattr(settings.search, "chat_rank_pool_multiplier", 3.0)),
+        pool_score_thresholds=filters.get("pool_score_thresholds"),
         trace_ctx={"phase": "chat_agent_final_fusion", "section": "chat"},
         reranker_mode=(filters or {}).get("reranker_mode") or "bge_only",
         diag=fusion_diag,
-    )
-    fused_hits = _filter_fused_by_score_threshold(
-        fused_hits, (filters or {}).get("fused_pool_score_threshold")
     )
     final_chunks = [
         service_hit_to_chunk(h, h.get("_source_type", "dense"), query or message)
@@ -1068,6 +1178,7 @@ def _build_deep_research_filters(body: Any) -> dict:
         "web_source_configs",
         "serpapi_ratio",
         "local_top_k",
+        "pool_score_thresholds",
         "fused_pool_score_threshold",
         "local_threshold",
         "year_start",
@@ -1083,6 +1194,8 @@ def _build_deep_research_filters(body: Any) -> dict:
         "collection",
         "use_content_fetcher",
         "gap_query_intent",
+        "enable_graphic_abstract",
+        "graphic_abstract_model",
     ):
         val = getattr(body, key, None)
         if val is not None and val != "":
@@ -1185,10 +1298,63 @@ def _request_debug_level(body: ChatRequest):
             logging.getLogger(n).setLevel(lvl)
 
 
+_GA_IMAGES_DIR = Path("data/ga_images")
+
+
+def _generate_ga_image_gemini(model: str, prompt: str, api_key: str, base_url: str) -> bytes:
+    """Call Gemini native generateContent with IMAGE responseModality, return PNG bytes."""
+    root = base_url.rstrip("/")
+    if root.endswith("/openai"):
+        root = root[: -len("/openai")]
+    url = f"{root}/models/{model}:generateContent"
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]},
+    }
+    resp = _http.post(url, json=payload, headers={"x-goog-api-key": api_key}, timeout=120)
+    resp.raise_for_status()
+    data = resp.json()
+    for part in (data.get("candidates") or [{}])[0].get("content", {}).get("parts", []):
+        if "inlineData" in part:
+            return base64.b64decode(part["inlineData"]["data"])
+    raise ValueError(f"Gemini returned no image data. Response keys: {list(data.keys())}")
+
+
+def _generate_ga_image_openai_compat(model: str, prompt: str, api_key: str, base_url: str) -> bytes:
+    """Call OpenAI-compatible /images/generations, return PNG bytes."""
+    url = f"{base_url.rstrip('/')}/images/generations"
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "n": 1,
+        "size": "1024x1024",
+        "response_format": "b64_json",
+    }
+    resp = _http.post(url, json=payload, headers={"Authorization": f"Bearer {api_key}"}, timeout=120)
+    resp.raise_for_status()
+    data = resp.json()
+    return base64.b64decode(data["data"][0]["b64_json"])
+
+
+def _generate_ga_image(provider: str, model: str, prompt: str) -> bytes:
+    """Dispatch image generation to the correct provider API. Returns raw PNG bytes."""
+    manager = get_manager(str(_CONFIG_PATH))
+    pcfg = manager.config.platforms.get(provider)
+    if not pcfg:
+        raise ValueError(f"Platform '{provider}' not found in config")
+    if not pcfg.api_key or pcfg.api_key in ("sk-xxx", "sk-ant-xxx", "AIzxxx"):
+        raise ValueError(f"API key for platform '{provider}' is not configured")
+    if provider == "gemini":
+        return _generate_ga_image_gemini(model, prompt, pcfg.api_key, pcfg.base_url)
+    else:
+        return _generate_ga_image_openai_compat(model, prompt, pcfg.api_key, pcfg.base_url)
+
+
 def _run_chat_impl(
     body: ChatRequest,
     optional_user_id: str | None = None,
     step_callback: Optional[Callable[[Optional[str], str], None]] = None,
+    delta_callback: Optional[Callable[[str], None]] = None,
 ) -> tuple[str, str, list[Citation], EvidenceSummary, ParsedIntent, dict | None, list | None, dict[str, str], dict | None, bool, Optional[str]]:
     import time as _time
     from src.debug import get_debug_logger
@@ -1198,12 +1364,34 @@ def _run_chat_impl(
         if step_callback:
             step_callback(step_id, label or "")
 
+    def _stream_llm_text(chat_client, stream_messages, *, model_override=None) -> str:
+        final_result: dict[str, Any] | None = None
+        text_parts: list[str] = []
+        for ev in chat_client.stream_chat(stream_messages, model=model_override, max_tokens=None):
+            if ev.get("type") == "text_delta":
+                delta = str(ev.get("delta") or "")
+                if not delta:
+                    continue
+                text_parts.append(delta)
+                if delta_callback:
+                    delta_callback(delta)
+            elif ev.get("type") == "completed":
+                maybe_result = ev.get("response")
+                if isinstance(maybe_result, dict):
+                    final_result = maybe_result
+        if final_result is not None:
+            return str(final_result.get("final_text") or "")
+        return "".join(text_parts)
+
     t_start = _time.perf_counter()
 
     session_id = body.session_id
     store = get_session_store()
     if not session_id:
-        session_id = store.create_session(canvas_id=body.canvas_id or "")
+        session_id = store.create_session(
+            canvas_id=body.canvas_id or "",
+            user_id=optional_user_id or "",
+        )
     memory = load_session_memory(session_id)
     if memory is None:
         raise HTTPException(status_code=404, detail="session not found")
@@ -1370,7 +1558,7 @@ def _run_chat_impl(
         memory.add_turn("user", message)
         citations_data = [_serialize_citation(c) for c in result.citations] if result.citations else []
         memory.add_turn("assistant", response_text, citations=citations_data)
-        memory.update_rolling_summary(client)
+        memory.update_rolling_summary(lite_client)
         dr_pstats = _compute_citation_provider_stats(result.citations) if result.citations else None
         evidence_summary = EvidenceSummary(
             query=topic,
@@ -1396,7 +1584,7 @@ def _run_chat_impl(
         _chat_logger.info("[chat] ②½ 指代不明 → 返回澄清问题，跳过检索")
         memory.add_turn("user", message)
         memory.add_turn("assistant", ctx_analysis.clarification, citations=[])
-        memory.update_rolling_summary(client)
+        memory.update_rolling_summary(lite_client)
         empty_evidence = EvidenceSummary(
             query=message,
             total_chunks=0,
@@ -1562,7 +1750,7 @@ def _run_chat_impl(
                 _chat_logger.info("[chat] ④¾ 查询与本地库范围不符 → 提示用户选择")
                 memory.add_turn("user", message)
                 memory.add_turn("assistant", mismatch_msg, citations=[])
-                memory.update_rolling_summary(client)
+                memory.update_rolling_summary(lite_client)
                 empty_evidence = EvidenceSummary(
                     query=query or message,
                     total_chunks=0,
@@ -1676,6 +1864,10 @@ def _run_chat_impl(
         _step("retrieval", "Searching (1+1+1)")
         t_retrieval = _time.perf_counter()
         filters = _build_filters(body)
+        if filters.pop("fused_pool_score_threshold", None) is not None:
+            _chat_logger.info(
+                "[chat] fused_pool_score_threshold ignored in chat candidate-pool flow"
+            )
         if filters.get("step_top_k") is None:
             _fallback_step = body.local_top_k if body.local_top_k is not None else 20
             filters["step_top_k"] = _chat_effective_step_top_k(_fallback_step)
@@ -1719,6 +1911,16 @@ def _run_chat_impl(
             active_quotas = {k: v for k, v in _collection_quotas.items() if v >= 0.05}
             if not active_quotas:
                 active_quotas = _collection_quotas  # fallback: use all
+            _retrieval_timeout_s = int(
+                getattr(getattr(settings, "perf_retrieval", None), "timeout_seconds", 60) or 60
+            )
+            _web_soft_cap_s = int(
+                getattr(getattr(settings, "perf_retrieval", None), "web_soft_wait_seconds", 500) or 500
+            )
+            _soft_wait_s = min(_retrieval_timeout_s * 5, _web_soft_cap_s)
+            # Keep multi-collection wrapper timeout aligned with retrieval soft-wait.
+            # Add 120s buffer for rerank/synthesis tail latency.
+            _multi_col_wait_timeout_s = max(120, int(_soft_wait_s + 120))
 
             def _search_one_collection(col_name: str, ratio: float) -> EvidencePack:
                 col_step_k = max(3, math.ceil(total_step_k * ratio))
@@ -1735,17 +1937,29 @@ def _run_chat_impl(
                 )
 
             col_packs: List[EvidencePack] = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=len(active_quotas)) as _col_ex:
-                futures_map = {
-                    _col_ex.submit(_search_one_collection, col, ratio): col
-                    for col, ratio in active_quotas.items()
-                }
-                for fut in concurrent.futures.as_completed(futures_map, timeout=120):
-                    col_name = futures_map[fut]
+            if len(active_quotas) == 1:
+                _single_col, _single_ratio = next(iter(active_quotas.items()))
+                _pack = _search_one_collection(_single_col, _single_ratio)
+                col_packs.append(_pack)
+            else:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=len(active_quotas)) as _col_ex:
+                    futures_map = {
+                        _col_ex.submit(_search_one_collection, col, ratio): col
+                        for col, ratio in active_quotas.items()
+                    }
                     try:
-                        col_packs.append(fut.result())
-                    except Exception as _ce:
-                        _chat_logger.warning("[chat] ⑤ 多库检索 col=%s 失败: %s", col_name, _ce)
+                        for fut in concurrent.futures.as_completed(
+                            futures_map,
+                            timeout=_multi_col_wait_timeout_s,
+                        ):
+                            col_name = futures_map[fut]
+                            try:
+                                _pack = fut.result()
+                                col_packs.append(_pack)
+                            except Exception as _ce:
+                                _chat_logger.warning("[chat] ⑤ 多库检索 col=%s 失败: %s", col_name, _ce)
+                    except concurrent.futures.TimeoutError as _te:
+                        raise
 
             # Merge all chunks: dedup by chunk_id, sort by relevance_score desc, truncate to write_top_k
             merged_chunks: List[EvidenceChunk] = []
@@ -1887,7 +2101,6 @@ def _run_chat_impl(
                 reranker_mode="bge_only",
                 diag=fusion_diag,
             )
-            fused_hits = _filter_fused_by_score_threshold(fused_hits, filters.get("fused_pool_score_threshold"))
             reused_chunks = [
                 service_hit_to_chunk(h, h.get("_source_type", "dense"), query or message)
                 for h in fused_hits
@@ -1947,7 +2160,6 @@ def _run_chat_impl(
                 reranker_mode="bge_only",
                 diag=merged_diag,
             )
-            fused_hits = _filter_fused_by_score_threshold(fused_hits, filters.get("fused_pool_score_threshold"))
             merged_chunks = [
                 service_hit_to_chunk(h, h.get("_source_type", "dense"), query or message)
                 for h in fused_hits
@@ -2098,20 +2310,26 @@ def _run_chat_impl(
             lite_client,
             model_override=body.model_override or None,
         )
-        gap_queries = [q for q in (gap_queries or []) if (q or "").strip()][:3]
+        gap_queries = [q for q in (gap_queries or []) if isinstance(q, dict) and (q.get("recall") or q.get("precision") or q.get("discovery"))][:3]
         if gap_queries:
             step_k = _chat_effective_step_top_k(body.step_top_k or body.local_top_k or 20) or 20
             supp_k = max(10, step_k)
-            main_candidates = [_chunk_to_hit(c) for c in pack.chunks]
             gap_candidates: List[Dict[str, Any]] = []
             _supp_total = 0
+            web_providers = (filters or {}).get("web_providers") or []
 
-            def _search_one_gap(gq: str) -> "EvidencePack":
+            def _search_one_gap(gap_item: Dict[str, Any]) -> "EvidencePack":
+                local_query = (gap_item.get("recall") or gap_item.get("precision") or gap_item.get("discovery") or "").strip()
+                if not local_query:
+                    return EvidencePack(query="", chunks=[], total_candidates=0, retrieval_time_ms=0, sources_used=[], diagnostics={})
                 supp_filters = dict(filters or {})
                 supp_filters["trace_phase"] = "chat_gap_supplement"
                 supp_filters["pool_only"] = True
+                qpp = web_queries_per_provider_from_1plus1plus1(gap_item, web_providers)
+                if qpp:
+                    supp_filters["web_queries_per_provider"] = qpp
                 return retrieval.search(
-                    query=gq,
+                    query=local_query,
                     mode=effective_search_mode,
                     filters=supp_filters or None,
                     top_k=supp_k,
@@ -2119,7 +2337,7 @@ def _run_chat_impl(
 
             _chat_logger.info(
                 "[chat] ⑤¾ gap 补搜开始（并行） | gap_queries=%d | queries=%s",
-                len(gap_queries), [q[:60] for q in gap_queries],
+                len(gap_queries), [(g.get("recall") or g.get("precision") or "")[:60] for g in gap_queries],
             )
             _gap_parallel = max(1, int(getattr(settings.search, "chat_gap_parallel", 2)))
             with concurrent.futures.ThreadPoolExecutor(max_workers=min(_gap_parallel, len(gap_queries))) as gap_ex:
@@ -2132,74 +2350,88 @@ def _run_chat_impl(
                             gap_candidates.append(_chunk_to_hit(c))
                         _supp_total += len(supp_pack.chunks)
                     except Exception as e:
-                        _chat_logger.warning("[chat] gap supplement search failed for %r: %s", gq[:50], e)
+                        _chat_logger.warning("[chat] gap supplement search failed for %r: %s", (gq.get("recall") or gq.get("precision") or "")[:50], e)
             if gap_candidates:
                 chat_gap_candidates_hits = list(gap_candidates)
-                fusion_diag: Dict[str, Any] = {}
-                _gap_fusion_k = write_k or step_k  # final output uses write_top_k; intermediate steps use step_top_k
-                fused = fuse_pools_with_gap_protection(
-                    query=query or message,
-                    main_candidates=main_candidates,
-                    gap_candidates=gap_candidates,
-                    top_k=_gap_fusion_k,
-                    gap_min_keep=math.ceil(_gap_fusion_k * float(getattr(settings.search, "chat_gap_ratio", 0.2))),
-                    gap_ratio=float(getattr(settings.search, "chat_gap_ratio", 0.2)),
-                    rank_pool_multiplier=float(getattr(settings.search, "chat_rank_pool_multiplier", 3.0)),
-                    trace_ctx={"phase": "chat_gap_fusion", "section": "chat"},
-                    reranker_mode=(filters or {}).get("reranker_mode") or "bge_only",
-                    diag=fusion_diag,
-                )
-                fused = _filter_fused_by_score_threshold(fused, (filters or {}).get("fused_pool_score_threshold"))
-                new_chunks = [
-                    service_hit_to_chunk(h, h.get("_source_type", "dense"), query or message)
-                    for h in fused
-                ]
-                _pf = fusion_diag.get("pool_fusion") or {}
-                pack = EvidencePack(
-                    query=pack.query,
-                    chunks=new_chunks,
-                    total_candidates=pack.total_candidates + _supp_total,
-                    retrieval_time_ms=pack.retrieval_time_ms,
-                    sources_used=pack.sources_used,
-                    diagnostics={
-                        **(pack.diagnostics or {}),
-                        "pool_fusion": _pf,
-                        "chat_gap_queries": gap_queries,
-                        "chat_gap_supplement_chunks": len(gap_candidates),
-                    },
-                )
-                max_chunks_for_context = min(write_k or len(pack.chunks), len(pack.chunks))
-                synthesizer = EvidenceSynthesizer(max_chunks=max_chunks_for_context)
-                context_str, synthesis_meta = synthesizer.synthesize(pack)
-                context_str, _ctx_budget_diag = _budget_chat_evidence_context(
-                    context_str,
-                    llm_client=lite_client,
-                    ultra_lite_provider=getattr(body, "ultra_lite_provider", None),
-                    purpose="chat_gap_fusion_context",
-                )
-                synth_dict = synthesis_meta.to_dict()
-                evidence_summary.query = pack.query
-                evidence_summary.total_chunks = len(pack.chunks)
-                evidence_summary.sources_used = pack.sources_used
-                evidence_summary.year_range = synth_dict.get("year_range")
-                evidence_summary.source_breakdown = synth_dict.get("unique_source_breakdown") or synth_dict.get("source_breakdown")
-                evidence_summary.evidence_type_breakdown = synth_dict.get("evidence_type_breakdown")
-                evidence_summary.cross_validated_count = synth_dict.get("cross_validated_count", 0)
-                evidence_summary.total_documents = synth_dict.get("total_documents", 0)
-                evidence_summary.diagnostics = pack.diagnostics
-                if canvas_id:
-                    sync_evidence_to_canvas(canvas_id, pack)
+                # gap 候选暂存；不做中间 BGE rerank，延迟至下方统一融合步骤执行
                 _chat_logger.info(
-                    "[chat] ⑤¾ gap 补搜完成 | gap_queries=%d | gap_candidates=%d | fused_out=%d | fusion=%s"
-                    " | ctx_budget(raw=%d,soft=%d,final=%d,summary=%s,hard_cap=%s)",
-                    len(gap_queries), len(gap_candidates), len(new_chunks), _pf,
-                    _ctx_budget_diag.get("raw_chars", 0),
-                    _ctx_budget_diag.get("after_soft_chars", 0),
-                    _ctx_budget_diag.get("final_chars", 0),
-                    _ctx_budget_diag.get("used_summary", False),
-                    _ctx_budget_diag.get("used_hard_cap", False),
+                    "[chat] ⑤¾ gap 候选收集完成 | gap_queries=%d | gap_candidates=%d（延迟至统一 BGE 融合）",
+                    len(gap_queries), len(gap_candidates),
                 )
+                if pack is not None:
+                    pack = EvidencePack(
+                        query=pack.query,
+                        chunks=pack.chunks,
+                        total_candidates=pack.total_candidates + _supp_total,
+                        retrieval_time_ms=pack.retrieval_time_ms,
+                        sources_used=pack.sources_used,
+                        diagnostics={
+                            **(pack.diagnostics or {}),
+                            "chat_gap_queries": gap_queries,
+                            "chat_gap_supplement_chunks": len(gap_candidates),
+                        },
+                    )
         _step(None, "")
+
+    # ── 5¾. 统一单次 BGE rerank：main + gap → pack.chunks / context_str ──
+    # 整个 chat pipeline 唯一一次 BGE rerank（非 agent 路径此处即为最终排序；
+    # agent 路径在此获得良好的初始上下文，agent 补充结果在下方第⑧步再做一次）。
+    if do_retrieval and pack is not None:
+        _main_pool_before_fusion = len(pack.chunks)
+        _pre_agent_chunks, _pre_agent_fusion_diag = _fuse_chat_main_gap_agent_candidates(
+            query=query or message,
+            message=message,
+            main_chunks=pack.chunks,
+            gap_candidate_hits=chat_gap_candidates_hits,
+            agent_chunks=[],
+            write_k=write_k,
+            filters=filters or {},
+        )
+        pack = EvidencePack(
+            query=pack.query,
+            chunks=_pre_agent_chunks,
+            total_candidates=max(
+                pack.total_candidates,
+                _main_pool_before_fusion + len(chat_gap_candidates_hits),
+            ),
+            retrieval_time_ms=pack.retrieval_time_ms,
+            sources_used=list(dict.fromkeys(
+                (c.provider or ("local" if c.source_type in ("dense", "graph") else "web"))
+                for c in _pre_agent_chunks
+            )),
+            diagnostics={**(pack.diagnostics or {}), "pool_fusion": _pre_agent_fusion_diag},
+        )
+        max_chunks_for_context = min(write_k, len(pack.chunks))
+        synthesizer = EvidenceSynthesizer(max_chunks=max_chunks_for_context)
+        context_str, synthesis_meta = synthesizer.synthesize(pack)
+        context_str, _ctx_budget_diag = _budget_chat_evidence_context(
+            context_str,
+            llm_client=lite_client,
+            ultra_lite_provider=getattr(body, "ultra_lite_provider", None),
+            purpose="chat_pre_agent_fusion_context",
+        )
+        synth_dict = synthesis_meta.to_dict()
+        evidence_summary.query = pack.query
+        evidence_summary.total_chunks = len(pack.chunks)
+        evidence_summary.sources_used = pack.sources_used
+        evidence_summary.year_range = synth_dict.get("year_range")
+        evidence_summary.source_breakdown = synth_dict.get("unique_source_breakdown") or synth_dict.get("source_breakdown")
+        evidence_summary.evidence_type_breakdown = synth_dict.get("evidence_type_breakdown")
+        evidence_summary.cross_validated_count = synth_dict.get("cross_validated_count", 0)
+        evidence_summary.total_documents = synth_dict.get("total_documents", 0)
+        evidence_summary.diagnostics = pack.diagnostics
+        if canvas_id:
+            sync_evidence_to_canvas(canvas_id, pack)
+        _chat_logger.info(
+            "[chat] ⑤¾+ 单次 BGE 融合完成 | main=%d gap=%d → fused=%d"
+            " | ctx_budget(raw=%d,soft=%d,final=%d,summary=%s,hard_cap=%s)",
+            _main_pool_before_fusion, len(chat_gap_candidates_hits), len(_pre_agent_chunks),
+            _ctx_budget_diag.get("raw_chars", 0),
+            _ctx_budget_diag.get("after_soft_chars", 0),
+            _ctx_budget_diag.get("final_chars", 0),
+            _ctx_budget_diag.get("used_summary", False),
+            _ctx_budget_diag.get("used_hard_cap", False),
+        )
 
     # ── 6. System Prompt 组装 ──
     wf = run_workflow(
@@ -2236,6 +2468,14 @@ def _run_chat_impl(
 
     if preliminary_knowledge_block:
         system_content = system_content.rstrip() + "\n\n" + preliminary_knowledge_block + "\n"
+
+    # 注入 rolling summary：早期被驱逐对话的压缩摘要，让 LLM 感知长会话历史背景
+    _ROLLING_SUMMARY_INJECT_MAX = 3000  # 保守上限（~750 token），防止挤占主 context
+    if memory.rolling_summary:
+        _rs = memory.rolling_summary[:_ROLLING_SUMMARY_INJECT_MAX]
+        system_content = system_content.rstrip() + (
+            "\n\n【早期对话摘要】（本次会话已压缩的历史背景，供参考）\n" + _rs + "\n"
+        )
 
     if canvas_id:
         wm = get_or_generate_working_memory(canvas_id, _CONFIG_PATH)
@@ -2274,7 +2514,9 @@ def _run_chat_impl(
     store.update_session_stage(session_id, next_stage)
 
     # ── 7. 构建消息列表 ──
-    history = memory.get_context_window(n=10)
+    # 加载全部活跃窗口（由 MAX_BUFFER_CHARS=40000 控制上界），
+    # _apply_pre_send_prompt_budget 将按 token 预算做精确裁剪，无需在此固定 n=10
+    history = memory.get_context_window()
     messages = [{"role": "system", "content": system_content}]
     for t in history:
         messages.append({"role": t.role, "content": t.content})
@@ -2389,6 +2631,7 @@ def _run_chat_impl(
             )
 
             # Agent evidence must re-enter final fused context before final answer generation.
+            # pack.chunks 已是 main+gap BGE 融合结果；gap_candidate_hits 传空避免 gap 双重纳入。
             if agent_extra_chunks:
                 if pack is None:
                     pack = EvidencePack(query=query or message, chunks=[])
@@ -2396,7 +2639,7 @@ def _run_chat_impl(
                     query=query or message,
                     message=message,
                     main_chunks=pack.chunks,
-                    gap_candidate_hits=chat_gap_candidates_hits,
+                    gap_candidate_hits=[],
                     agent_chunks=agent_extra_chunks,
                     write_k=write_k,
                     filters=filters or {},
@@ -2405,7 +2648,7 @@ def _run_chat_impl(
                 base_diag["pool_fusion"] = final_pool_fusion
                 base_diag["agent_refusion"] = {
                     "agent_extra_chunks": len(agent_extra_chunks),
-                    "gap_candidates": len(chat_gap_candidates_hits),
+                    "gap_candidates": 0,  # gap 已融入 pack.chunks（pre-agent fusion）
                     "main_candidates": len(pack.chunks),
                     "output_count": len(final_chunks),
                 }
@@ -2470,21 +2713,39 @@ def _run_chat_impl(
                 )
                 _step("answering", "Writing answer")
                 t_regen = _time.perf_counter()
-                regen_resp = client.chat(regen_messages, model=body.model_override or None, max_tokens=None)
-                response_text = (regen_resp.get("final_text") or "").strip() or response_text
+                if delta_callback:
+                    response_text = (_stream_llm_text(
+                        client,
+                        regen_messages,
+                        model_override=body.model_override or None,
+                    ) or "").strip() or response_text
+                else:
+                    regen_resp = client.chat(regen_messages, model=body.model_override or None, max_tokens=None)
+                    response_text = (regen_resp.get("final_text") or "").strip() or response_text
                 regen_ms = (_time.perf_counter() - t_regen) * 1000
                 _chat_logger.info(
                     "[chat] ⑧b Agent 回流重生成 | fused_chunks=%d | agent_chunks=%d | regen_ms=%.0f",
                     len(pack.chunks), len(agent_extra_chunks), regen_ms,
                 )
             else:
+                if delta_callback and response_text:
+                    for chunk in _chunk_text(response_text):
+                        delta_callback(chunk)
                 _chat_logger.info("[chat] ⑧b Agent 无新增检索块，复用 agent 最终回答")
             _step(None, "")
         else:
             _step("answering", "Writing answer")
             react_result = None
-            resp = client.chat(messages, model=body.model_override or None, max_tokens=None)
-            response_text = (resp.get("final_text") or "").strip()
+            if delta_callback:
+                response_text = (_stream_llm_text(
+                    client,
+                    messages,
+                    model_override=body.model_override or None,
+                ) or "").strip()
+                resp = {"meta": {"usage": None}}
+            else:
+                resp = client.chat(messages, model=body.model_override or None, max_tokens=None)
+                response_text = (resp.get("final_text") or "").strip()
             llm_ms = (_time.perf_counter() - t_llm) * 1000
             usage = resp.get("meta", {}).get("usage") or resp.get("usage") or {}
             _chat_logger.info(
@@ -2604,11 +2865,55 @@ def _run_chat_impl(
         except Exception as cache_err:
             _chat_logger.debug("[chat] evidence cache write failed: %s", cache_err)
 
+    # ── 9.5 Graphic Abstract ──
+    _GA_MODEL_MAP = {
+        "nanobanana 2":   ("gemini", "gemini-3.1-flash-image-preview"),
+        "nanobanana pro": ("gemini", "gemini-3-pro-image-preview"),
+        "gpt-image-1.5":  ("openai", "gpt-image-1.5"),
+        "kimi-k2.5":      ("kimi",   "kimi-k2.5"),
+        "qwen-image-2.0": ("qwen",   "qwen-image-2.0"),
+    }
+    if getattr(body, "enable_graphic_abstract", False) and response_text.strip():
+        ga_model_raw = (getattr(body, "graphic_abstract_model", None) or "nanobanana 2").strip()
+        ga_provider, ga_model = _GA_MODEL_MAP.get(ga_model_raw, ("gemini", ga_model_raw))
+
+        _step("graphic_abstract", f"Drawing Graphic Abstract ({ga_model})")
+        _chat_logger.info("[chat] 🎨 开始生成 Graphic Abstract, provider=%s, model=%s", ga_provider, ga_model)
+        try:
+            # 先用文字模型把回复压缩为图像提示词（≤200词），避免直接把长文丢给图像模型
+            ga_img_prompt = (
+                "Create a clean, professional scientific graphic abstract (infographic poster) "
+                "that visually summarizes the following research findings. "
+                "Use a white or light background, clear typography, and an academic color palette "
+                "(blues, teals, greys). Include key concepts, relationships, and conclusions as "
+                "labeled diagram elements, icons, or flow arrows. No decorative borders.\n\n"
+                f"Research summary:\n{response_text[:2000]}"
+            )
+
+            _GA_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+            img_bytes = _generate_ga_image(ga_provider, ga_model, ga_img_prompt)
+
+            img_filename = f"{uuid.uuid4().hex}.png"
+            img_path = _GA_IMAGES_DIR / img_filename
+            img_path.write_bytes(img_bytes)
+            img_url = f"/ga_images/{img_filename}"
+
+            ga_md = f"\n\n### Graphic Abstract\n\n![Graphic Abstract]({img_url})\n"
+            if delta_callback:
+                delta_callback(ga_md)
+            response_text += ga_md
+
+        except Exception as e:
+            _chat_logger.error("[chat] Graphic Abstract 生成失败: %s", e, exc_info=True)
+            if delta_callback:
+                delta_callback("\n> *Graphic abstract generation failed.*")
+            response_text += "\n> *Graphic abstract generation failed.*"
+
     # ── 10. 写入 Memory ──
     memory.add_turn("user", message)
     citations_data = [_serialize_citation(c) for c in citations] if citations else []
     memory.add_turn("assistant", response_text, citations=citations_data)
-    memory.update_rolling_summary(client)
+    memory.update_rolling_summary(lite_client)
 
     # ── 11. 总结 ──
     total_ms = (_time.perf_counter() - t_start) * 1000
@@ -2639,10 +2944,11 @@ def _run_chat(
     body: ChatRequest,
     optional_user_id: str | None = None,
     step_callback: Optional[Callable[[Optional[str], str], None]] = None,
+    delta_callback: Optional[Callable[[str], None]] = None,
 ) -> tuple[str, str, list[Citation], EvidenceSummary, ParsedIntent, dict | None, list | None, dict[str, str], dict | None, bool, Optional[str]]:
     """包装 _run_chat_impl：当前端开启调试面板时临时提升本请求的日志级别为 DEBUG。"""
     with _request_debug_level(body):
-        return _run_chat_impl(body, optional_user_id, step_callback)
+        return _run_chat_impl(body, optional_user_id, step_callback, delta_callback)
 
 
 def _citation_to_chat_citation(c: Citation) -> ChatCitation:
@@ -2692,7 +2998,10 @@ def chat_submit(
     payload = body.model_dump()
     store = get_session_store()
     if not body.session_id:
-        created_session_id = store.create_session(canvas_id=body.canvas_id or "")
+        created_session_id = store.create_session(
+            canvas_id=body.canvas_id or "",
+            user_id=optional_user_id or "",
+        )
         payload["session_id"] = created_session_id
         # 提问时即用首条消息作为会话标题，历史里立即显示问题而非「未命名对话」
         first_msg = (body.message or "").strip()
@@ -2702,7 +3011,7 @@ def chat_submit(
         created_session_id = body.session_id
     payload["_optional_user_id"] = optional_user_id
     session_id = created_session_id or ""
-    user_id = optional_user_id or body.user_id or ""
+    user_id = optional_user_id or ""
     try:
         task_id = q.submit(TaskKind.chat, session_id, user_id or "", payload)
     except Exception as e:
@@ -2823,7 +3132,10 @@ def chat_stream(
     payload = body.model_dump()
     store = get_session_store()
     if not body.session_id:
-        created_session_id = store.create_session(canvas_id=body.canvas_id or "")
+        created_session_id = store.create_session(
+            canvas_id=body.canvas_id or "",
+            user_id=optional_user_id or "",
+        )
         payload["session_id"] = created_session_id
         # 提问时即用首条消息作为会话标题，历史里立即显示问题而非「未命名对话」
         first_msg = (body.message or "").strip()
@@ -2833,7 +3145,7 @@ def chat_stream(
         created_session_id = body.session_id
     payload["_optional_user_id"] = optional_user_id
     session_id = created_session_id or ""
-    user_id = optional_user_id or body.user_id or ""
+    user_id = optional_user_id or ""
     try:
         task_id = q.submit(TaskKind.chat, session_id, user_id or "", payload)
     except Exception as e:
@@ -2999,7 +3311,10 @@ def clarify_for_deep_research(
     store = get_session_store()
     session_id = (body.session_id or "").strip()
     if not session_id:
-        session_id = store.create_session(session_type="research")
+        session_id = store.create_session(
+            session_type="research",
+            user_id=optional_user_id or "",
+        )
 
     # Set title + session_type immediately so the session shows a meaningful
     # name in the sidebar instead of "未命名对话".
@@ -3229,8 +3544,9 @@ def start_deep_research_endpoint(
     session_id = body.session_id or store.create_session(
         canvas_id=body.canvas_id or "",
         session_type="research",
+        user_id=optional_user_id or "",
     )
-    user_id = optional_user_id or body.user_id or ""
+    user_id = optional_user_id or ""
     meta = store.get_session_meta(session_id)
     preliminary_knowledge = ((meta or {}).get("preferences") or {}).get("preliminary_knowledge", "")
 
@@ -3258,6 +3574,7 @@ def start_deep_research_endpoint(
             canvas_id=body.canvas_id or "",
             job_id=job_id,
             status="planning",
+            user_id=optional_user_id or "",
         )
     except Exception as _db_err:
         _chat_logger.warning("[deep-research/start] DB planning job creation failed: %s", _db_err)
@@ -3335,23 +3652,28 @@ def get_start_phase_status(job_id: str) -> DeepResearchStartStatusResponse:
         # Third layer: DB planning job (survives even full process restarts)
         from src.collaboration.research.job_store import get_job as _get_db_job
         db_job = _get_db_job(job_id)
-        if db_job and db_job.get("status") in ("planning", "error"):
+        if db_job and db_job.get("status") in ("planning", "running", "pausing", "paused", "cancelled", "error"):
             db_status = db_job["status"]
             _chat_logger.info("[start-job] status served from DB job_id=%s status=%s", job_id[:12], db_status)
             return DeepResearchStartStatusResponse(
                 job_id=job_id,
-                status="running" if db_status == "planning" else "error",
+                status="running" if db_status in ("planning", "running", "pausing", "paused") else "error",
                 session_id=db_job.get("session_id", ""),
-                error=db_job.get("error_message") if db_status == "error" else None,
+                error=(
+                    db_job.get("error_message")
+                    if db_status == "error"
+                    else ("任务已取消" if db_status == "cancelled" else None)
+                ),
                 canvas_id=db_job.get("canvas_id", ""),
-                current_stage=db_job.get("current_stage", ""),
+                current_stage=db_job.get("message", "") or db_job.get("current_stage", ""),
                 progress=0,
             )
         raise HTTPException(status_code=404, detail=f"Start job not found: {job_id}")
 
-    status = job.get("status", "running")
+    raw_status = str(job.get("status", "running"))
+    status = "running" if raw_status in {"paused", "pausing"} else ("error" if raw_status == "cancelled" else raw_status)
     session_id = job.get("session_id", "")
-    error = job.get("error")
+    error = job.get("error") or ("任务已取消" if raw_status == "cancelled" else None)
     result: Dict[str, Any] = job.get("result") or {}
 
     return DeepResearchStartStatusResponse(
@@ -3386,11 +3708,14 @@ def _run_deep_research_job_safe(
 
     t0 = _time.perf_counter()
     store = get_session_store()
-    session_id = body.session_id or store.create_session(canvas_id=body.canvas_id or "")
+    session_id = body.session_id or store.create_session(
+        canvas_id=body.canvas_id or "",
+        user_id=optional_user_id or "",
+    )
     _ensure_research_session_title(store, session_id, body.topic)
     manager = get_manager(str(_CONFIG_PATH))
     client = manager.get_client(body.llm_provider or None)
-    user_id = optional_user_id or body.user_id or ""
+    user_id = optional_user_id or ""
     filters = _build_deep_research_filters(body)
 
     def _format_dr_step_label(event_type: str, payload: Dict[str, Any]) -> str:
@@ -3450,6 +3775,7 @@ def _run_deep_research_job_safe(
             "user_documents": body.user_documents,
             "progress_callback": _progress_cb,
             "cancel_check": lambda: _dr_is_cancel_requested(job_id),
+            "pause_waiter": lambda: _dr_wait_if_paused(job_id),
             "review_waiter": lambda section_id: get_pending_review(job_id, section_id),
             "skip_draft_review": bool(body.skip_draft_review),
             "skip_refine_review": bool(body.skip_refine_review),
@@ -3513,6 +3839,7 @@ def _run_deep_research_job_safe(
                     llm_client=client,
                     progress_callback=_progress_cb,
                     cancel_check=lambda: _dr_is_cancel_requested(job_id),
+                    pause_waiter=lambda: _dr_wait_if_paused(job_id),
                     review_waiter=lambda section_id: get_pending_review(job_id, section_id),
                     model_override=body.model_override or None,
                 )
@@ -3861,6 +4188,7 @@ def _run_deep_research_job_safe(
             _chat_logger.debug("purge_dr_checkpoints on %s failed (non-fatal): %s", status, _ce)
         _dr_pop_suspended_runtime(job_id)
     finally:
+        _dr_clear_pause_event(job_id)
         _dr_clear_cancel_event(job_id)
 
 
@@ -3901,6 +4229,8 @@ def _complete_deep_research_job(*, job_id: str, session_id: str, topic: str, res
         total_time_ms=total_time_ms,
         finished_at=_time.time(),
     )
+    for chunk in _chunk_text(response_text):
+        append_event(job_id, "delta", {"delta": chunk})
     append_event(job_id, "step", {"step": None, "label": ""})
     try:
         from src.collaboration.research.job_store import purge_dr_checkpoints
@@ -3916,6 +4246,7 @@ def _complete_deep_research_job(*, job_id: str, session_id: str, topic: str, res
             "session_id": session_id,
             "canvas_id": canvas_id,
             "total_time_ms": total_time_ms,
+            "final_text": response_text,
             "citations": [_serialize_citation(c) for c in citations],
             "dashboard": dashboard_data,
         },
@@ -4005,6 +4336,7 @@ def _resume_suspended_job(job_id: str) -> None:
         _dr_pop_suspended_runtime(job_id)
     finally:
         _dr_set_resume_idle(job_id)
+        _dr_clear_pause_event(job_id)
         _dr_clear_cancel_event(job_id)
 
 
@@ -4020,7 +4352,10 @@ def submit_deep_research_endpoint(
     import time as _t
 
     store = get_session_store()
-    session_id = body.session_id or store.create_session(canvas_id=body.canvas_id or "")
+    session_id = body.session_id or store.create_session(
+        canvas_id=body.canvas_id or "",
+        user_id=optional_user_id or "",
+    )
     _ensure_research_session_title(store, session_id, body.topic)
     payload = body.model_dump()
     payload["session_id"] = session_id
@@ -4055,6 +4390,7 @@ def submit_deep_research_endpoint(
             session_id=session_id,
             canvas_id=body.canvas_id or "",
             request_payload=payload,
+            user_id=optional_user_id or "",
         )
         job_id = str(job.get("job_id") or "")
 
@@ -4074,12 +4410,15 @@ def confirm_deep_research_endpoint(
     """Phase 2: execute deep research using confirmed brief/outline and stream progress."""
     from src.collaboration.research.agent import execute_deep_research
 
-    session_id = body.session_id or get_session_store().create_session(canvas_id=body.canvas_id or "")
+    session_id = body.session_id or get_session_store().create_session(
+        canvas_id=body.canvas_id or "",
+        user_id=optional_user_id or "",
+    )
     store = get_session_store()
     _ensure_research_session_title(store, session_id, body.topic)
     manager = get_manager(str(_CONFIG_PATH))
     client = manager.get_client(body.llm_provider or None)
-    user_id = optional_user_id or body.user_id or ""
+    user_id = optional_user_id or ""
     filters = _build_deep_research_filters(body)
 
     progress_events: List[Dict[str, Any]] = []
@@ -4152,7 +4491,7 @@ def confirm_deep_research_endpoint(
             yield f"event: dashboard\ndata: {json.dumps(dashboard_data, ensure_ascii=False, default=str)}\n\n"
         for chunk in _chunk_text(response_text):
             yield f"event: delta\ndata: {json.dumps({'delta': chunk}, ensure_ascii=False)}\n\n"
-        yield "event: done\ndata: {}\n\n"
+        yield f"event: done\ndata: {json.dumps({'final_text': response_text}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -4191,8 +4530,9 @@ def get_deep_research_job_events(job_id: str, after_id: int = 0, limit: int = 20
     }
 
 
-def _dr_sse(event: str, data: dict) -> str:
-    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+def _dr_sse(event: str, data: dict, event_id=None) -> str:
+    id_line = f"id: {event_id}\n" if event_id is not None else ""
+    return f"{id_line}event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
 def _dr_job_status_payload(job: dict) -> dict:
@@ -4259,7 +4599,10 @@ def stream_deep_research_events(job_id: str, after_id: int = 0) -> StreamingResp
                 idle_ticks = 0
                 for ev in events:
                     cursor = max(cursor, int(ev["event_id"]))
-                    yield _dr_sse(ev["event"], _ev_payload(ev))
+                    payload = _ev_payload(ev)
+                    # Emit id: line so the browser / streamSSEResumable adapter can track
+                    # the last seen event_id and resume from exactly this point on reconnect.
+                    yield _dr_sse(ev["event"], payload, event_id=payload.get("_event_id"))
                 continue
 
             job = get_job(job_id)
@@ -4273,7 +4616,9 @@ def stream_deep_research_events(job_id: str, after_id: int = 0) -> StreamingResp
                 final_events = list_events(job_id, after_id=cursor, limit=500)
                 for ev in final_events:
                     cursor = max(cursor, int(ev["event_id"]))
-                    yield _dr_sse(ev["event"], _ev_payload(ev))
+                    payload = _ev_payload(ev)
+                    yield _dr_sse(ev["event"], payload, event_id=payload.get("_event_id"))
+                # Terminal job_status has no persistent event_id; omit id: line intentionally
                 yield _dr_sse("job_status", _dr_job_status_payload(job))
                 break
 
@@ -4310,6 +4655,7 @@ def cancel_deep_research_job(job_id: str, force: bool = False) -> dict:
         return {"ok": True, "job_id": job_id, "status": current_status}
     if force or current_status in ("pending", "planning"):
         msg = "任务已强制取消" if force and current_status not in ("pending", "planning") else "任务已取消（未启动）"
+        _dr_clear_pause_event(job_id)
         update_job(job_id, status="cancelled", message=msg, finished_at=_t.time())
         append_event(job_id, "cancelled", {"job_id": job_id, "message": msg})
         append_event(job_id, "step", {"step": None, "label": ""})
@@ -4324,10 +4670,50 @@ def cancel_deep_research_job(job_id: str, force: bool = False) -> dict:
         _dr_release_slot_eager(job_id)
         return {"ok": True, "job_id": job_id, "status": "cancelled"}
     _dr_request_cancel(job_id)
+    _dr_clear_pause_event(job_id)
     _dr_release_slot_eager(job_id)  # unblock any queued job for the same session immediately
     update_job(job_id, status="cancelling", message="收到停止请求，正在终止任务...")
     append_event(job_id, "cancel_requested", {"job_id": job_id, "message": "已请求停止"})
     return {"ok": True, "job_id": job_id, "status": "cancelling"}
+
+
+@router.post("/deep-research/jobs/{job_id}/pause")
+def pause_deep_research_job(job_id: str) -> dict:
+    """Request cooperative pause for a Deep Research job."""
+    from src.collaboration.research.job_store import get_job, update_job, append_event
+
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job 不存在")
+    current_status = str(job.get("status") or "")
+    if current_status in {"done", "error", "cancelled"}:
+        return {"ok": False, "job_id": job_id, "status": current_status}
+    if current_status in {"paused", "pausing"}:
+        return {"ok": True, "job_id": job_id, "status": current_status}
+    if current_status == "waiting_review":
+        return {"ok": False, "job_id": job_id, "status": current_status, "message": "等待审核中的任务无需暂停"}
+    _dr_request_pause(job_id)
+    update_job(job_id, status="pausing", message="收到暂停请求，正在暂停任务...")
+    append_event(job_id, "pause_requested", {"job_id": job_id, "message": "已请求暂停"})
+    return {"ok": True, "job_id": job_id, "status": "pausing"}
+
+
+@router.post("/deep-research/jobs/{job_id}/resume")
+def resume_deep_research_job(job_id: str) -> dict:
+    """Resume a paused Deep Research job."""
+    from src.collaboration.research.job_store import get_job, update_job, append_event
+
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job 不存在")
+    current_status = str(job.get("status") or "")
+    if current_status not in {"paused", "pausing"}:
+        return {"ok": False, "job_id": job_id, "status": current_status}
+    _dr_clear_pause_event(job_id)
+    next_status = "running"
+    update_job(job_id, status=next_status, message="任务已恢复")
+    append_event(job_id, "resumed", {"job_id": job_id, "message": "任务已恢复"})
+    return {"ok": True, "job_id": job_id, "status": next_status}
 
 
 @router.delete("/deep-research/jobs/{job_id}")
@@ -4386,7 +4772,7 @@ def restart_deep_research_phase(
     if not source_job:
         raise HTTPException(status_code=404, detail="job 不存在")
     source_status = str(source_job.get("status") or "")
-    if source_status in {"pending", "running", "cancelling", "waiting_review"}:
+    if source_status in {"pending", "running", "pausing", "paused", "cancelling", "waiting_review"}:
         _dr_request_cancel(job_id)
         update_job(job_id, status="cancelling", message="收到重启请求，正在终止旧任务...")
         append_event(
@@ -4425,6 +4811,7 @@ def restart_deep_research_phase(
         session_id=str(source_job.get("session_id") or payload.get("session_id") or ""),
         canvas_id=str(source_job.get("canvas_id") or payload.get("canvas_id") or ""),
         request_payload=payload,
+        user_id=str(source_job.get("user_id") or optional_user_id or ""),
     )
     new_job_id = str(job.get("job_id") or "")
     return DeepResearchSubmitResponse(
@@ -4447,7 +4834,7 @@ def restart_deep_research_section(
     if not source_job:
         raise HTTPException(status_code=404, detail="job 不存在")
     source_status = str(source_job.get("status") or "")
-    if source_status in {"pending", "running", "cancelling", "waiting_review"}:
+    if source_status in {"pending", "running", "pausing", "paused", "cancelling", "waiting_review"}:
         _dr_request_cancel(job_id)
         update_job(job_id, status="cancelling", message="收到重启请求，正在终止旧任务...")
         append_event(
@@ -4485,6 +4872,7 @@ def restart_deep_research_section(
         session_id=str(source_job.get("session_id") or payload.get("session_id") or ""),
         canvas_id=str(source_job.get("canvas_id") or payload.get("canvas_id") or ""),
         request_payload=payload,
+        user_id=str(source_job.get("user_id") or optional_user_id or ""),
     )
     new_job_id = str(job.get("job_id") or "")
     return DeepResearchSubmitResponse(
@@ -4520,7 +4908,7 @@ def restart_incomplete_sections(
         raise HTTPException(status_code=400, detail="action must be research|write")
 
     source_status = str(source_job.get("status") or "")
-    if source_status in {"pending", "running", "cancelling", "waiting_review"}:
+    if source_status in {"pending", "running", "pausing", "paused", "cancelling", "waiting_review"}:
         _dr_request_cancel(job_id)
         update_job(job_id, status="cancelling", message="收到重启请求，正在终止旧任务...")
         append_event(job_id, "restart_requested", {
@@ -4548,6 +4936,7 @@ def restart_incomplete_sections(
         session_id=str(source_job.get("session_id") or payload.get("session_id") or ""),
         canvas_id=str(source_job.get("canvas_id") or payload.get("canvas_id") or ""),
         request_payload=payload,
+        user_id=str(source_job.get("user_id") or optional_user_id or ""),
     )
     new_job_id = str(job.get("job_id") or "")
     return DeepResearchSubmitResponse(
@@ -4589,7 +4978,7 @@ def restart_with_outline(
         raise HTTPException(status_code=400, detail="action must be research|write")
 
     source_status = str(source_job.get("status") or "")
-    if source_status in {"pending", "running", "cancelling", "waiting_review"}:
+    if source_status in {"pending", "running", "pausing", "paused", "cancelling", "waiting_review"}:
         _dr_request_cancel(job_id)
         from src.collaboration.research.job_store import update_job
         update_job(job_id, status="cancelling", message="收到重启请求，正在终止旧任务...")
@@ -4617,6 +5006,7 @@ def restart_with_outline(
         session_id=str(source_job.get("session_id") or payload.get("session_id") or ""),
         canvas_id=str(source_job.get("canvas_id") or payload.get("canvas_id") or ""),
         request_payload=payload,
+        user_id=str(source_job.get("user_id") or optional_user_id or ""),
     )
     new_job_id = str(job.get("job_id") or "")
     return DeepResearchSubmitResponse(
@@ -4884,9 +5274,12 @@ def update_insight_status_endpoint(job_id: str, insight_id: int, body: dict) -> 
 
 
 @router.get("/sessions/{session_id}", response_model=SessionInfo)
-def get_session(session_id: str) -> SessionInfo:
+def get_session(
+    session_id: str,
+    current_user_id: str = Depends(get_current_user_id),
+) -> SessionInfo:
     store = get_session_store()
-    meta = store.get_session_meta(session_id)
+    meta = _ensure_session_access(session_id, current_user_id)
     if meta is not None:
         store.touch_session(session_id)
     if meta is None:
@@ -4894,7 +5287,10 @@ def get_session(session_id: str) -> SessionInfo:
         try:
             from src.collaboration.research.job_store import get_latest_job_by_session
             latest_job = get_latest_job_by_session(session_id)
-            if latest_job:
+            if latest_job and (
+                _is_admin_user(current_user_id)
+                or str(latest_job.get("user_id") or "").strip() == current_user_id
+            ):
                 dashboard = latest_job.get("result_dashboard") or {}
                 dash = dashboard if isinstance(dashboard, dict) and dashboard else None
                 return SessionInfo(
@@ -4942,7 +5338,10 @@ def get_session(session_id: str) -> SessionInfo:
     try:
         from src.collaboration.research.job_store import get_latest_job_by_session
         latest_job = get_latest_job_by_session(session_id)
-        if latest_job:
+        if latest_job and (
+            _is_admin_user(current_user_id)
+            or str(latest_job.get("user_id") or "").strip() == current_user_id
+        ):
             dashboard = latest_job.get("result_dashboard") or {}
             if isinstance(dashboard, dict) and dashboard:
                 latest_dashboard = dashboard
@@ -4960,7 +5359,11 @@ def get_session(session_id: str) -> SessionInfo:
 
 
 @router.delete("/sessions/{session_id}")
-def delete_session(session_id: str) -> dict:
+def delete_session(
+    session_id: str,
+    current_user_id: str = Depends(get_current_user_id),
+) -> dict:
+    _ensure_session_access(session_id, current_user_id)
     store = get_session_store()
     if not store.delete_session(session_id):
         raise HTTPException(status_code=404, detail="session not found")
@@ -4968,10 +5371,14 @@ def delete_session(session_id: str) -> dict:
 
 
 @router.get("/sessions", response_model=List[SessionListItem])
-def list_sessions(limit: int = 100) -> List[SessionListItem]:
+def list_sessions(
+    limit: int = 100,
+    current_user_id: str = Depends(get_current_user_id),
+) -> List[SessionListItem]:
     """获取所有会话列表。会合并 Deep Research 任务中存在的 session，确保有后台调研的会话出现在历史中。"""
     store = get_session_store()
-    sessions = store.list_all_sessions(limit=limit)
+    is_admin = _is_admin_user(current_user_id)
+    sessions = store.list_all_sessions(limit=limit, user_id=None if is_admin else current_user_id)
     session_ids = {s["session_id"] for s in sessions}
     items: list[SessionListItem] = [
         SessionListItem(
@@ -4992,6 +5399,9 @@ def list_sessions(limit: int = 100) -> List[SessionListItem]:
 
         jobs = list_jobs(limit=50)
         for j in jobs:
+            owner_id = str(j.get("user_id") or "").strip()
+            if not is_admin and owner_id != current_user_id:
+                continue
             sid = (j.get("session_id") or "").strip()
             if not sid or sid in session_ids:
                 continue

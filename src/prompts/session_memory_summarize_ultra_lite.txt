@@ -1,7 +1,14 @@
-Summarize in ONE short sentence: main topic and current focus.
+Extract 3-5 key facts from the new conversation segment and merge with the previous summary.
 
-Previous: {previous_summary}
-New segment:
+Previous summary:
+{previous_summary}
+
+New conversation segment:
 {turns_text}
 
-Output only the updated one-sentence summary.
+Output rules:
+- CRITICAL: Write the output in the SAME language as the conversation (Chinese conversation → Chinese output; English conversation → English output)
+- Each fact starts with "• "
+- Cover: main topic, user's core need, confirmed conclusions or decisions (if any)
+- Max 300 characters total
+- Output the bullet list only, no headings or preamble

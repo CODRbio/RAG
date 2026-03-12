@@ -1,8 +1,8 @@
 {
   "database": {
-    "url": "sqlite:///data/rag.db",
+    "_note": "在 rag_config.local.json 中覆盖此 URL，填入真实的 PostgreSQL 连接信息",
+    "url": "postgresql+psycopg://user:password@localhost:5432/rag",
     "echo": false
-
   },
   "capsolver_extension_path": "extra_tools/CapSolverExtension",
   "llm": {
@@ -115,7 +115,8 @@
     "cascade_bge_multiplier": 1.5,
     "chat_gap_parallel": 2,
     "chat_gap_ratio": 0.2,
-    "research_gap_ratio": 0.25,
+    "research_gap_ratio": 0.2,
+    "research_agent_ratio": 0.25,
     "chat_rank_pool_multiplier": 3.0,
     "research_rank_pool_multiplier": 3.0
   },
@@ -270,6 +271,29 @@
     "token_expire_hours": 24,
     "admin_username": "admin",
     "admin_default_password": "admin123"
+  },
+  "tool_execution": {
+    "_comment": "run_code 默认关闭。只有在受信任环境中才建议开启；开启后仍仅限受限 Python 计算。",
+    "run_code_enabled": false,
+    "timeout_seconds": 5,
+    "cpu_seconds": 2,
+    "max_memory_mb": 128,
+    "max_code_chars": 6000,
+    "max_output_chars": 12000,
+    "allowed_modules": [
+      "collections",
+      "datetime",
+      "decimal",
+      "fractions",
+      "functools",
+      "itertools",
+      "json",
+      "math",
+      "random",
+      "re",
+      "statistics",
+      "time"
+    ]
   },
   "logging": {
     "level": "INFO",

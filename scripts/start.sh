@@ -270,10 +270,6 @@ ensure_postgres() {
   local db_url host_port db_host db_port
   db_url="$(get_resolved_db_url)"
   case "$db_url" in
-    sqlite://*)
-      echo -e "${CYAN}[start.sh] 当前数据库为 SQLite，跳过 PostgreSQL 基础服务检查${NC}"
-      return 0
-      ;;
     postgresql*://*)
       :
       ;;

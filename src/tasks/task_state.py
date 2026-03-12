@@ -1,6 +1,6 @@
 """
 Task state model and status machine for unified Chat + Research queue.
-States: queued -> running -> completed | error | cancelled | timeout
+States: queued -> running -> pausing -> paused -> running | completed | error | cancelled | timeout
 """
 
 from __future__ import annotations
@@ -20,6 +20,8 @@ class TaskKind(str, Enum):
 class TaskStatus(str, Enum):
     queued = "queued"
     running = "running"
+    pausing = "pausing"
+    paused = "paused"
     completed = "completed"
     error = "error"
     cancelled = "cancelled"
@@ -38,6 +40,8 @@ class TaskState:
     started_at: Optional[float] = None
     finished_at: Optional[float] = None
     error_message: Optional[str] = None
+    pause_started_at: Optional[float] = None
+    paused_total_seconds: float = 0.0
     payload: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -52,6 +56,8 @@ class TaskState:
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "error_message": self.error_message,
+            "pause_started_at": self.pause_started_at,
+            "paused_total_seconds": self.paused_total_seconds,
             "payload": self.payload,
         }
 
@@ -70,6 +76,8 @@ class TaskState:
             started_at=float(data["started_at"]) if data.get("started_at") is not None else None,
             finished_at=float(data["finished_at"]) if data.get("finished_at") is not None else None,
             error_message=data.get("error_message"),
+            pause_started_at=float(data["pause_started_at"]) if data.get("pause_started_at") is not None else None,
+            paused_total_seconds=float(data.get("paused_total_seconds", 0.0) or 0.0),
             payload=dict(data.get("payload") or {}),
         )
 
@@ -82,4 +90,13 @@ class TaskState:
         )
 
     def is_active(self) -> bool:
-        return self.status == TaskStatus.running
+        return self.status in (TaskStatus.running, TaskStatus.pausing, TaskStatus.paused)
+
+    def effective_runtime_seconds(self, now: Optional[float] = None) -> float:
+        if self.started_at is None:
+            return 0.0
+        current = float(now if now is not None else time.time())
+        paused_total = float(self.paused_total_seconds or 0.0)
+        if self.pause_started_at is not None:
+            paused_total += max(0.0, current - float(self.pause_started_at))
+        return max(0.0, current - float(self.started_at) - paused_total)

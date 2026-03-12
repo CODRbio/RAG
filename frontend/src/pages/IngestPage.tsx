@@ -176,10 +176,15 @@ export function IngestPage() {
   // New knowledge base modal
   const [newCollectionName, setNewCollectionName] = useState('');
 
-  // Delete confirmation (password)
+  // Delete collection confirmation (password)
   const [deleteConfirmModal, setDeleteConfirmModal] = useState<{ baseName: string; libraryId: number } | null>(null);
   const [deletePassword, setDeletePassword] = useState('');
   const [deleteVerifying, setDeleteVerifying] = useState(false);
+
+  // Delete paper confirmation (password)
+  const [deletePaperModal, setDeletePaperModal] = useState<{ paperId: string; filename: string; collection: string } | null>(null);
+  const [deletePaperPassword, setDeletePaperPassword] = useState('');
+  const [deletePaperVerifying, setDeletePaperVerifying] = useState(false);
 
   // Sync selectedBaseName to config store for sidebar/chat
   useEffect(() => {
@@ -331,20 +336,30 @@ export function IngestPage() {
     loadPapers();
   }, [loadPapers]);
 
-  const handleDeletePaper = async (paperId: string, filename: string) => {
+  const handleDeletePaper = (paperId: string, filename: string) => {
     if (!selectedBaseName) return;
-    if (!window.confirm(`确定删除「${filename || paperId}」？\n将同时删除该文件在集合中的所有向量数据，不可恢复。`)) {
-      return;
-    }
-    addToast(`正在删除 ${filename || paperId}...`, 'info');
+    setDeletePaperModal({ paperId, filename, collection: selectedBaseName });
+    setDeletePaperPassword('');
+  };
+
+  const handleConfirmDeletePaperWithPassword = async () => {
+    if (!deletePaperModal || !deletePaperPassword.trim() || !user) return;
+    setDeletePaperVerifying(true);
     try {
-      const res = await deletePaper(selectedBaseName, paperId);
+      await apiLogin({ user_id: user.user_id, password: deletePaperPassword });
+      const { paperId, filename, collection } = deletePaperModal;
+      addToast(`正在删除 ${filename || paperId}...`, 'info');
+      const res = await deletePaper(collection, paperId);
       addToast(`已删除 ${filename || paperId} (${res.deleted_chunks} chunks)`, 'success');
+      setDeletePaperModal(null);
+      setDeletePaperPassword('');
       loadPapers();
       loadCollections();
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       addToast(`删除失败: ${msg}`, 'error');
+    } finally {
+      setDeletePaperVerifying(false);
     }
   };
 
@@ -1553,6 +1568,49 @@ export function IngestPage() {
                 className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50 text-sm flex items-center gap-2"
               >
                 {deleteVerifying ? <Loader2 size={14} className="animate-spin" /> : null}
+                确认删除
+              </button>
+            </div>
+          </div>
+        )}
+      </Modal>
+
+      {/* 删除文献：密码确认 Modal */}
+      <Modal
+        open={deletePaperModal !== null}
+        onClose={() => { setDeletePaperModal(null); setDeletePaperPassword(''); }}
+        title="删除文献（危险操作）"
+        maxWidth="max-w-md"
+      >
+        {deletePaperModal && (
+          <div className="space-y-4">
+            <p className="text-sm text-gray-700">
+              将永久删除文献「<strong>{deletePaperModal.filename || deletePaperModal.paperId}</strong>」及其向量数据与磁盘文件，此操作不可恢复。
+            </p>
+            <p className="text-sm text-amber-700">
+              请输入当前登录账号密码以确认：
+            </p>
+            <input
+              type="password"
+              value={deletePaperPassword}
+              onChange={(e) => setDeletePaperPassword(e.target.value)}
+              placeholder="密码"
+              className="w-full border rounded-md p-2 text-sm focus:ring-2 focus:ring-red-500 outline-none"
+              onKeyDown={(e) => e.key === 'Enter' && handleConfirmDeletePaperWithPassword()}
+            />
+            <div className="flex justify-end gap-2 pt-2">
+              <button
+                onClick={() => { setDeletePaperModal(null); setDeletePaperPassword(''); }}
+                className="px-4 py-2 text-gray-600 hover:bg-gray-100 rounded-lg text-sm"
+              >
+                取消
+              </button>
+              <button
+                onClick={handleConfirmDeletePaperWithPassword}
+                disabled={!deletePaperPassword.trim() || deletePaperVerifying}
+                className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50 text-sm flex items-center gap-2"
+              >
+                {deletePaperVerifying ? <Loader2 size={14} className="animate-spin" /> : null}
                 确认删除
               </button>
             </div>

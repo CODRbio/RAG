@@ -11,17 +11,26 @@ Usage:
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
+import selectors
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import traceback
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 import threading
+
+try:
+    import resource
+except Exception:  # pragma: no cover - non-POSIX fallback
+    resource = None  # type: ignore[assignment]
 
 from src.log import get_logger
 
@@ -66,6 +75,16 @@ def set_agent_sonar_model(model: Optional[str]) -> None:
     _agent_chunks_local.agent_sonar_model = (model or "sonar-pro").strip() or "sonar-pro"
 
 
+def set_tool_retrieval_params(params: Optional[Dict[str, Any]]) -> None:
+    """Set retrieval filters (providers, configs, year window) for tool calls in this thread."""
+    _agent_chunks_local.retrieval_params = params or {}
+
+
+def get_tool_retrieval_params() -> Dict[str, Any]:
+    """Get the thread-local retrieval params."""
+    return getattr(_agent_chunks_local, "retrieval_params", {}) or {}
+
+
 def get_agent_sonar_model() -> str:
     """Return the thread-local Sonar model for search_sonar, default sonar-pro."""
     return getattr(_agent_chunks_local, "agent_sonar_model", None) or "sonar-pro"
@@ -88,6 +107,373 @@ def _collect_chunks(chunks: list) -> None:
     store = getattr(_agent_chunks_local, "chunks", None)
     if store is not None:
         store.extend(chunks)
+
+
+_RUN_CODE_BLOCKED_CALLS = {
+    "__import__",
+    "breakpoint",
+    "compile",
+    "delattr",
+    "eval",
+    "exec",
+    "exit",
+    "getattr",
+    "globals",
+    "help",
+    "input",
+    "locals",
+    "open",
+    "quit",
+    "setattr",
+    "vars",
+}
+_RUN_CODE_BLOCKED_NAMES = {
+    "aiohttp",
+    "asyncio",
+    "builtins",
+    "ctypes",
+    "importlib",
+    "multiprocessing",
+    "os",
+    "pathlib",
+    "pickle",
+    "resource",
+    "shutil",
+    "signal",
+    "socket",
+    "subprocess",
+    "sys",
+    "threading",
+}
+_RUN_CODE_ALLOWED_BUILTINS = [
+    "abs",
+    "all",
+    "any",
+    "ascii",
+    "bin",
+    "bool",
+    "callable",
+    "chr",
+    "complex",
+    "dict",
+    "divmod",
+    "enumerate",
+    "filter",
+    "float",
+    "format",
+    "frozenset",
+    "hash",
+    "hex",
+    "int",
+    "isinstance",
+    "issubclass",
+    "iter",
+    "len",
+    "list",
+    "map",
+    "max",
+    "min",
+    "next",
+    "oct",
+    "ord",
+    "pow",
+    "print",
+    "range",
+    "repr",
+    "reversed",
+    "round",
+    "set",
+    "slice",
+    "sorted",
+    "str",
+    "sum",
+    "tuple",
+    "zip",
+    "Exception",
+    "ValueError",
+    "TypeError",
+    "RuntimeError",
+    "ArithmeticError",
+    "AssertionError",
+    "IndexError",
+    "KeyError",
+    "ZeroDivisionError",
+]
+
+
+def _get_tool_execution_settings():
+    from config.settings import settings
+    return settings.tool_execution
+
+
+def _run_code_enabled() -> bool:
+    try:
+        return bool(_get_tool_execution_settings().run_code_enabled)
+    except Exception:
+        return False
+
+
+def _tool_is_enabled(name: str) -> bool:
+    if name == "run_code":
+        return _run_code_enabled()
+    return True
+
+
+# run_code 并发槽位 Semaphore。
+# 实际 max_concurrent 从配置读取，但 Semaphore 需要在模块加载时初始化。
+# _handle_run_code 会在获取锁之前动态检查当前配置值，
+# 此处初始值仅作为默认兜底，不影响运行时行为。
+_RUN_CODE_SEMAPHORE: threading.Semaphore = threading.Semaphore(2)
+_RUN_CODE_SEMAPHORE_SIZE: int = 2  # 跟踪当前 Semaphore 容量，用于懒更新
+
+
+def _get_run_code_semaphore() -> threading.Semaphore:
+    """返回与当前配置 max_concurrent 对齐的 Semaphore（懒更新）。"""
+    global _RUN_CODE_SEMAPHORE, _RUN_CODE_SEMAPHORE_SIZE
+    try:
+        desired = max(1, _get_tool_execution_settings().max_concurrent)
+    except Exception:
+        desired = 2
+    if desired != _RUN_CODE_SEMAPHORE_SIZE:
+        _RUN_CODE_SEMAPHORE = threading.Semaphore(desired)
+        _RUN_CODE_SEMAPHORE_SIZE = desired
+    return _RUN_CODE_SEMAPHORE
+
+
+class _RunCodeValidationError(ValueError):
+    pass
+
+
+class _RunCodeSafetyValidator(ast.NodeVisitor):
+    def __init__(self, allowed_modules: set[str]):
+        self.allowed_modules = allowed_modules
+
+    def visit_Import(self, node: ast.Import) -> None:
+        for alias in node.names:
+            root = (alias.name or "").split(".", 1)[0]
+            if root not in self.allowed_modules:
+                raise _RunCodeValidationError(f"禁止导入模块: {root}")
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        if node.level:
+            raise _RunCodeValidationError("禁止相对导入")
+        root = ((node.module or "").split(".", 1)[0]).strip()
+        if root not in self.allowed_modules:
+            raise _RunCodeValidationError(f"禁止导入模块: {root or '(empty)'}")
+        self.generic_visit(node)
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        if str(node.attr or "").startswith("__"):
+            raise _RunCodeValidationError("禁止访问双下划线属性")
+        self.generic_visit(node)
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if node.id in _RUN_CODE_BLOCKED_NAMES:
+            raise _RunCodeValidationError(f"禁止访问名称: {node.id}")
+        self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        fn = node.func
+        if isinstance(fn, ast.Name) and fn.id in _RUN_CODE_BLOCKED_CALLS:
+            raise _RunCodeValidationError(f"禁止调用函数: {fn.id}")
+        if isinstance(fn, ast.Attribute) and fn.attr in _RUN_CODE_BLOCKED_CALLS:
+            raise _RunCodeValidationError(f"禁止调用函数: {fn.attr}")
+        self.generic_visit(node)
+
+
+def _validate_run_code(code: str, *, max_code_chars: int, allowed_modules: List[str]) -> None:
+    source = (code or "").strip()
+    if not source:
+        raise _RunCodeValidationError("代码为空")
+    if len(source) > max_code_chars:
+        raise _RunCodeValidationError(f"代码长度超过上限（{max_code_chars} 字符）")
+    try:
+        tree = ast.parse(source, filename="<agent-run_code>", mode="exec")
+    except SyntaxError as exc:
+        raise _RunCodeValidationError(f"代码语法错误: {exc.msg} (line {exc.lineno})") from exc
+    _RunCodeSafetyValidator({m.strip() for m in allowed_modules if m.strip()}).visit(tree)
+
+
+def _build_run_code_wrapper(code: str, allowed_modules: List[str]) -> str:
+    payload = json.dumps(code, ensure_ascii=False)
+    allowed_json = json.dumps(sorted({m.strip() for m in allowed_modules if m.strip()}), ensure_ascii=False)
+    safe_builtins_json = json.dumps(_RUN_CODE_ALLOWED_BUILTINS, ensure_ascii=False)
+    return f"""
+import builtins as _b
+
+_ALLOWED_MODULES = set({allowed_json})
+_SAFE_BUILTIN_NAMES = {safe_builtins_json}
+
+def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
+    root = (name or "").split(".", 1)[0]
+    if root not in _ALLOWED_MODULES:
+        raise ImportError(f"Import '{{root}}' is not allowed in run_code.")
+    return _b.__import__(name, globals, locals, fromlist, level)
+
+_SAFE_BUILTINS = {{
+    name: getattr(_b, name)
+    for name in _SAFE_BUILTIN_NAMES
+    if hasattr(_b, name)
+}}
+_SAFE_BUILTINS["__import__"] = _safe_import
+
+_USER_GLOBALS = {{
+    "__builtins__": _SAFE_BUILTINS,
+    "__name__": "__main__",
+}}
+_CODE = {payload}
+exec(compile(_CODE, "<agent-run_code>", "exec"), _USER_GLOBALS, _USER_GLOBALS)
+"""
+
+
+def _run_code_preexec(max_memory_mb: int, cpu_seconds: int) -> Callable[[], None] | None:
+    if os.name != "posix" or resource is None:
+        return None
+
+    import platform as _platform
+    if _platform.system() == "Darwin":
+        # macOS 上 RLIMIT_AS / RLIMIT_DATA 不被内核强制执行，
+        # 内存限制实际无效。生产环境建议部署在 Linux 上。
+        logger.warning(
+            "run_code: macOS 下 RLIMIT_AS/RLIMIT_DATA 无法强制内存上限，"
+            "max_memory_mb=%d 配置在此平台不生效。建议生产环境使用 Linux。",
+            max_memory_mb,
+        )
+
+    memory_bytes = max_memory_mb * 1024 * 1024
+
+    def _apply_limits() -> None:
+        # start_new_session=True 已在 fork 后调用 os.setsid()，此处无需重复
+        try:
+            resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds + 1))
+        except Exception:
+            pass
+        for limit_name in ("RLIMIT_AS", "RLIMIT_DATA"):
+            limit = getattr(resource, limit_name, None)
+            if limit is None:
+                continue
+            try:
+                resource.setrlimit(limit, (memory_bytes, memory_bytes))
+            except Exception:
+                pass
+        for limit_name, soft_value in (("RLIMIT_NOFILE", 32), ("RLIMIT_CORE", 0)):
+            limit = getattr(resource, limit_name, None)
+            if limit is None:
+                continue
+            try:
+                resource.setrlimit(limit, (soft_value, soft_value))
+            except Exception:
+                pass
+        # RLIMIT_NPROC 是 per-UID 的全局配额，只降软限制，保留系统硬限制，
+        # 避免影响同 UID 下其他服务的 fork 能力。
+        nproc_limit = getattr(resource, "RLIMIT_NPROC", None)
+        if nproc_limit is not None:
+            try:
+                _, hard = resource.getrlimit(nproc_limit)
+                resource.setrlimit(nproc_limit, (min(8, hard), hard))
+            except Exception:
+                pass
+
+    return _apply_limits
+
+
+def _terminate_process(proc: subprocess.Popen[bytes]) -> None:
+    try:
+        if os.name == "posix":
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:
+            proc.kill()
+    except ProcessLookupError:
+        pass
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def _collect_process_output(
+    proc: subprocess.Popen[bytes],
+    *,
+    timeout_seconds: int,
+    max_output_chars: int,
+) -> tuple[str, str, Optional[str]]:
+    if proc.stdout is None or proc.stderr is None:
+        out, err = proc.communicate(timeout=timeout_seconds)
+        return (out or b"").decode("utf-8", errors="replace"), (err or b"").decode("utf-8", errors="replace"), None
+
+    deadline = time.monotonic() + timeout_seconds
+    selector = selectors.DefaultSelector()
+    streams = {
+        proc.stdout.fileno(): ("stdout", proc.stdout),
+        proc.stderr.fileno(): ("stderr", proc.stderr),
+    }
+    out_chunks: List[bytes] = []
+    err_chunks: List[bytes] = []
+    collected = 0
+    limit_bytes = max_output_chars * 4
+    failure_reason: Optional[str] = None
+
+    for fd, (_name, stream) in streams.items():
+        try:
+            os.set_blocking(fd, False)
+        except Exception:
+            pass
+        selector.register(stream, selectors.EVENT_READ, data=fd)
+
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                failure_reason = "timeout"
+                _terminate_process(proc)
+                break
+            events = selector.select(timeout=min(remaining, 0.1))
+            if not events and proc.poll() is not None:
+                break
+            for key, _mask in events:
+                fd = int(key.data)
+                try:
+                    chunk = os.read(fd, 4096)
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    try:
+                        selector.unregister(key.fileobj)
+                    except Exception:
+                        pass
+                    continue
+                collected += len(chunk)
+                if collected > limit_bytes:
+                    failure_reason = "output_limit"
+                    _terminate_process(proc)
+                    break
+                if fd == proc.stdout.fileno():
+                    out_chunks.append(chunk)
+                else:
+                    err_chunks.append(chunk)
+            if failure_reason:
+                break
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            _terminate_process(proc)
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass  # 极少数情况下 SIGKILL 仍未响应，放弃等待
+    finally:
+        try:
+            selector.close()
+        except Exception:
+            pass
+
+    stdout = b"".join(out_chunks).decode("utf-8", errors="replace")
+    stderr = b"".join(err_chunks).decode("utf-8", errors="replace")
+    return stdout, stderr, failure_reason
 
 
 # ────────────────────────────────────────────────
@@ -506,12 +892,13 @@ def _handle_search_local(query: str, top_k: int = 10, **_) -> str:
     step_top_k = get_tool_step_top_k()
     effective_top_k = min(requested_top_k, step_top_k) if step_top_k else requested_top_k
     svc = _get_tool_retrieval_svc()
-    # Chat 场景下 Agent 检索固定 bge_only，与主检索一致，不用 ColBERT
-    tool_filters: Dict[str, Any] = {"reranker_mode": "bge_only"}
+    # Agent tool retrieval should return a source-ordered candidate pool; the
+    # authority rerank happens later in chat final fusion.
+    tool_filters: Dict[str, Any] = {"reranker_mode": "bge_only", "pool_only": True}
     if step_top_k:
         tool_filters["step_top_k"] = step_top_k
     pack = svc.search(query=query, mode="local", top_k=effective_top_k, filters=tool_filters)
-    _collect_chunks(pack.chunks[:min(effective_top_k, 15)])
+    _collect_chunks(pack.chunks)
     return pack.to_context_string(max_chunks=min(effective_top_k, 15))
 
 
@@ -520,12 +907,22 @@ def _handle_search_web(query: str, top_k: int = 10, **_) -> str:
     step_top_k = get_tool_step_top_k()
     effective_top_k = min(requested_top_k, step_top_k) if step_top_k else requested_top_k
     svc = _get_tool_retrieval_svc()
-    # Chat 场景下 Agent 检索固定 bge_only，与主检索一致，不用 ColBERT
-    tool_filters: Dict[str, Any] = {"reranker_mode": "bge_only"}
+    tool_filters: Dict[str, Any] = {"reranker_mode": "bge_only", "pool_only": True}
     if step_top_k:
         tool_filters["step_top_k"] = step_top_k
+    
+    params = get_tool_retrieval_params()
+    if params.get("web_providers"):
+        tool_filters["web_providers"] = params["web_providers"]
+    if params.get("web_source_configs"):
+        tool_filters["web_source_configs"] = params["web_source_configs"]
+    for k in ["year_start", "year_end"]:
+        if params.get(k) is not None:
+            tool_filters[k] = params[k]
+    
+    logger.info(f"Agent search_web query='{query}' providers={tool_filters.get('web_providers')} year={tool_filters.get('year_start')}-{tool_filters.get('year_end')}")
     pack = svc.search(query=query, mode="web", top_k=effective_top_k, filters=tool_filters)
-    _collect_chunks(pack.chunks[:min(effective_top_k, 15)])
+    _collect_chunks(pack.chunks)
     return pack.to_context_string(max_chunks=min(effective_top_k, 15))
 
 
@@ -592,28 +989,36 @@ def _handle_search_scholar(query: str, year_from: Optional[int] = None, limit: i
         import asyncio
         from src.retrieval.semantic_scholar import SemanticScholarSearcher
         from src.retrieval.evidence import EvidenceChunk
+        
+        params = get_tool_retrieval_params()
+        effective_start = year_from if year_from is not None else params.get("year_start")
+        effective_end = params.get("year_end")
+        
+        requested_limit = max(1, int(limit or 5))
         ss = SemanticScholarSearcher()
+
+        async def _search_and_close() -> list:
+            try:
+                return await ss.search(query, limit=requested_limit, year_start=effective_start, year_end=effective_end)
+            finally:
+                await ss.close()
+
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
                 import concurrent.futures
                 with concurrent.futures.ThreadPoolExecutor() as pool:
-                    future = pool.submit(
-                        asyncio.run,
-                        ss.search(query, limit=limit, year_start=year_from),
-                    )
+                    future = pool.submit(asyncio.run, _search_and_close())
                     results = future.result(timeout=45)
             else:
-                results = loop.run_until_complete(
-                    ss.search(query, limit=limit, year_start=year_from),
-                )
+                results = loop.run_until_complete(_search_and_close())
         except RuntimeError:
-            results = asyncio.run(ss.search(query, limit=limit, year_start=year_from))
+            results = asyncio.run(_search_and_close())
         if not results:
             return "未找到相关学术论文。"
         lines = []
         chunks = []
-        for r in results[:limit]:
+        for r in results[:requested_limit]:
             meta = r.get("metadata", {})
             title = meta.get("title", r.get("content", ""))
             year = meta.get("year", "")
@@ -726,25 +1131,30 @@ def _handle_search_ncbi(query: str, limit: int = 5, **_) -> str:
         from src.retrieval.ncbi_search import get_ncbi_searcher
         from src.retrieval.evidence import EvidenceChunk
 
+        params = get_tool_retrieval_params()
+        y_start = params.get("year_start")
+        y_end = params.get("year_end")
+
+        requested_limit = max(1, int(limit or 5))
         searcher = get_ncbi_searcher()
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
                 import concurrent.futures
                 with concurrent.futures.ThreadPoolExecutor() as pool:
-                    future = pool.submit(asyncio.run, searcher.search(query, limit=limit))
+                    future = pool.submit(asyncio.run, searcher.search(query, limit=requested_limit, year_start=y_start, year_end=y_end))
                     results = future.result(timeout=30)
             else:
-                results = loop.run_until_complete(searcher.search(query, limit=limit))
+                results = loop.run_until_complete(searcher.search(query, limit=requested_limit, year_start=y_start, year_end=y_end))
         except RuntimeError:
-            results = asyncio.run(searcher.search(query, limit=limit))
+            results = asyncio.run(searcher.search(query, limit=requested_limit, year_start=y_start, year_end=y_end))
 
         if not results:
             return "PubMed 未找到相关文献。"
 
         lines = []
         chunks = []
-        for r in results[:limit]:
+        for r in results[:requested_limit]:
             meta = r.get("metadata", {})
             title = meta.get("title", r.get("content", ""))
             year = meta.get("year", "")
@@ -890,38 +1300,78 @@ def _handle_summarize_quantitative(evidence_text: str, variable: str, **_) -> st
 
 
 def _handle_run_code(code: str, **_) -> str:
-    """以子进程方式执行 Python 代码。"""
-    # TODO(Security): 生产环境强烈建议将 subprocess 替换为安全的隔离沙盒 API (如 E2B)。
-    tmp_file = None
-    try:
-        tmp_file = tempfile.NamedTemporaryFile(
-            suffix=".py",
-            delete=False,
-            mode="w",
-            encoding="utf-8",
+    """以受限子进程方式执行 Python 代码。默认关闭，仅适用于受信任环境。"""
+    cfg = _get_tool_execution_settings()
+    if not _run_code_enabled():
+        return (
+            "run_code 已禁用。请改用 summarize_quantitative，"
+            "或在受信任环境中显式开启 tool_execution.run_code_enabled。"
         )
-        with tmp_file:
-            tmp_file.write(code)
 
-        result = subprocess.run(
-            [sys.executable, tmp_file.name],
-            capture_output=True,
-            text=True,
-            timeout=15,
+    try:
+        _validate_run_code(
+            code,
+            max_code_chars=cfg.max_code_chars,
+            allowed_modules=list(cfg.allowed_modules),
         )
-        if result.returncode == 0:
-            return result.stdout
-        return f"{result.stdout}{result.stderr}"
-    except subprocess.TimeoutExpired:
-        return "代码执行超时（15秒），已中止。"
-    except Exception as e:
-        return f"执行错误: {e}"
+    except _RunCodeValidationError as exc:
+        return f"代码执行被拒绝: {exc}"
+
+    sem = _get_run_code_semaphore()
+    if not sem.acquire(blocking=False):
+        return (
+            f"run_code 并发上限已满（max_concurrent={cfg.max_concurrent}），请稍后重试。"
+        )
+    try:
+        with tempfile.TemporaryDirectory(prefix="agent_run_code_") as tmp_dir:
+            script_path = os.path.join(tmp_dir, "runner.py")
+            with open(script_path, "w", encoding="utf-8") as f:
+                f.write(_build_run_code_wrapper(code, list(cfg.allowed_modules)))
+
+            proc = subprocess.Popen(
+                [sys.executable, "-I", "-S", "-B", script_path],
+                cwd=tmp_dir,
+                env={
+                    "PYTHONIOENCODING": "utf-8",
+                    "PYTHONUNBUFFERED": "1",
+                },
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                preexec_fn=_run_code_preexec(cfg.max_memory_mb, cfg.cpu_seconds),
+                start_new_session=True,
+            )
+            stdout, stderr, failure_reason = _collect_process_output(
+                proc,
+                timeout_seconds=cfg.timeout_seconds,
+                max_output_chars=cfg.max_output_chars,
+            )
+            stdout = stdout[: cfg.max_output_chars]
+            stderr = stderr[: cfg.max_output_chars]
+
+            if failure_reason == "timeout":
+                return f"代码执行超时（{cfg.timeout_seconds}秒），已终止。"
+            if failure_reason == "output_limit":
+                return f"代码输出超过上限（{cfg.max_output_chars} 字符），已终止。"
+
+            if proc.returncode == 0:
+                return stdout.strip() or "(代码执行成功，无输出)"
+
+            if proc.returncode is not None and proc.returncode < 0:
+                signum = -proc.returncode
+                if signum in {getattr(signal, "SIGKILL", 9), getattr(signal, "SIGXCPU", 24)}:
+                    return "代码因资源限制被终止。"
+                return f"代码被信号终止: SIG{signum}"
+
+            combined = "\n".join(part for part in [stdout.strip(), stderr.strip()] if part).strip()
+            if not combined:
+                combined = f"exit={proc.returncode}"
+            return f"代码执行失败: {combined}"
+    except Exception as exc:
+        logger.exception("run_code execution failed")
+        return f"执行错误: {exc}"
     finally:
-        if tmp_file is not None:
-            try:
-                os.remove(tmp_file.name)
-            except OSError:
-                pass
+        sem.release()
 
 
 # ── 注册核心 Tools ──
@@ -1014,7 +1464,8 @@ _TOOL_REGISTRY: Dict[str, ToolDef] = {t.name: t for t in CORE_TOOLS}
 _GROUP_SEARCH_LOCAL = frozenset({"search_local"})
 _GROUP_WEB = frozenset({"search_web", "search_scholar", "search_ncbi"})
 _GROUP_SONAR = frozenset({"search_sonar"})
-_GROUP_ANALYSIS = frozenset({"compare_papers", "run_code", "summarize_quantitative"})
+_GROUP_ANALYSIS = frozenset({"compare_papers", "summarize_quantitative"})
+_GROUP_ANALYSIS_OPTIONAL = frozenset({"run_code"})
 _GROUP_GRAPH = frozenset({"explore_graph"})
 _GROUP_COLLAB = frozenset({"canvas", "get_citations"})
 
@@ -1049,7 +1500,7 @@ _TOOL_ORDER: Dict[str, int] = {t.name: i for i, t in enumerate(CORE_TOOLS)}
 
 def get_tools_by_names(names: List[str]) -> List[ToolDef]:
     """Return ToolDef instances matching the given tool names, preserving CORE_TOOLS order."""
-    tools = [_TOOL_REGISTRY[n] for n in names if n in _TOOL_REGISTRY]
+    tools = [_TOOL_REGISTRY[n] for n in names if n in _TOOL_REGISTRY and _tool_is_enabled(n)]
     tools.sort(key=lambda t: _TOOL_ORDER.get(t.name, 999))
     return tools
 
@@ -1106,6 +1557,8 @@ def get_routed_skills(
     # 3. Analysis group — keyword activated
     if _RE_ANALYSIS.search(message):
         selected |= _GROUP_ANALYSIS
+        if _run_code_enabled():
+            selected |= _GROUP_ANALYSIS_OPTIONAL
 
     # 4. Graph group — keyword activated
     if _RE_GRAPH.search(message):
@@ -1122,7 +1575,7 @@ def get_routed_skills(
     if not selected and search_mode != "none":
         selected.add("search_local")
 
-    tools = [_TOOL_REGISTRY[name] for name in selected if name in _TOOL_REGISTRY]
+    tools = [_TOOL_REGISTRY[name] for name in selected if name in _TOOL_REGISTRY and _tool_is_enabled(name)]
     tools.sort(key=lambda t: _TOOL_ORDER.get(t.name, 999))
 
     logger.info(

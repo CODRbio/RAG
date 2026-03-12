@@ -380,52 +380,31 @@ export async function startIngestJob(
   return { job_id: body.job_id };
 }
 
+/**
+ * SSE stream for ingest job events with resume (Last-Event-ID / after_id).
+ * Uses shared resumable adapter; parses id for reconnect.
+ */
 export async function* streamIngestJobEvents(
   jobId: string,
   signal?: AbortSignal,
   afterId = 0,
 ): AsyncGenerator<IngestProgressEvent> {
+  const { streamSSEResumable, INGEST_TERMINAL_EVENTS } = await import('./sse');
   const token = localStorage.getItem('token');
-  const response = await fetch(
-    `${BASE_URL}/ingest/jobs/${encodeURIComponent(jobId)}/events?after_id=${afterId}`,
-    {
-      method: 'GET',
-      headers: {
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      },
-      signal,
+  const initialAfter = typeof afterId === 'number' ? String(afterId) : String(afterId ?? 0);
+  for await (const { event, data } of streamSSEResumable({
+    getUrl: (lastEventId) => {
+      const aid = lastEventId || initialAfter;
+      return `${BASE_URL}/ingest/jobs/${encodeURIComponent(jobId)}/events?after_id=${encodeURIComponent(aid)}`;
     },
-  );
-  if (!response.ok) {
-    const errBody = await response.text().catch(() => '');
-    throw new Error(`HTTP ${response.status}: ${response.statusText} - ${errBody}`);
-  }
-  const reader = response.body?.getReader();
-  if (!reader) throw new Error('No response body');
-
-  const decoder = new TextDecoder();
-  let buffer = '';
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = lines.pop() || '';
-
-    let currentEvent = '';
-    for (const line of lines) {
-      if (line.startsWith('event: ')) {
-        currentEvent = line.slice(7).trim();
-      } else if (line.startsWith('data: ')) {
-        const dataStr = line.slice(6);
-        try {
-          const data = JSON.parse(dataStr);
-          yield { event: currentEvent, data };
-        } catch {
-          yield { event: currentEvent, data: { raw: dataStr } };
-        }
-      }
-    }
+    getHeaders: () => (token ? { Authorization: `Bearer ${token}` } : {}),
+    terminalEvents: [...INGEST_TERMINAL_EVENTS],
+    signal,
+    maxRetries: 5,
+    baseMs: 1000,
+    maxMs: 30000,
+  })) {
+    yield { event, data: data as IngestProgressEvent['data'] };
   }
 }
 

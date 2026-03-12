@@ -1,5 +1,4 @@
-Summarize the following conversation segment in 2-3 sentences.
-Focus on the main topic, key concepts discussed, and the user's current direction.
+Merge the new conversation segment with the previous summary into an updated structured summary.
 
 Previous summary:
 {previous_summary}
@@ -7,4 +6,8 @@ Previous summary:
 New conversation segment:
 {turns_text}
 
-Output only the updated summary.
+Output rules:
+- CRITICAL: Write the output in the SAME language as the conversation (Chinese conversation → Chinese output; English conversation → English output)
+- Cover: main research topic, user's focus, key conclusions or decisions (if any), current progress
+- 100-200 words; prioritize information density over fluency
+- Output the summary directly, no prefix

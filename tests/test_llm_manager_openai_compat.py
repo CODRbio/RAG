@@ -1,4 +1,6 @@
-from src.llm.llm_manager import HTTPChatClient, ProviderConfig
+from unittest.mock import patch, MagicMock
+
+from src.llm.llm_manager import HTTPChatClient, OpenAICompatProvider, ProviderConfig
 from src.llm.tools import has_tool_calls, parse_tool_calls
 
 
@@ -62,7 +64,7 @@ def test_gemini_openai_compat_normalizes_minimal_reasoning_effort():
         tools=None,
     )
     assert payload.get("_api_mode") == "gemini_native"
-    assert payload.get("config", {}).get("thinkingConfig") == {"thinkingLevel": "low"}
+    assert payload.get("generationConfig", {}).get("thinkingConfig") == {"thinkingLevel": "low"}
     assert payload.get("_fallback_payload", {}).get("reasoning_effort") == "low"
 
 
@@ -134,3 +136,138 @@ def test_kimi_keeps_provider_specific_thinking_field():
     )
     assert payload.get("thinking") == {"type": "enabled"}
     assert "tools" in payload
+
+
+class _MockStreamProvider:
+    def __init__(self, events, raw_response=None, stream_error=None):
+        self._events = events
+        self._raw_response = raw_response or {}
+        self._stream_error = stream_error
+
+    def request(self, payload, timeout=None):
+        _ = payload, timeout
+        return self._raw_response
+
+    def request_stream(self, payload, timeout=None):
+        _ = payload, timeout
+        if self._stream_error:
+            raise self._stream_error
+        for item in self._events:
+            yield item
+
+
+def test_openai_stream_chat_normalizes_chat_completions_deltas():
+    cfg = ProviderConfig(
+        name="openai",
+        api_key="test-key",
+        base_url="https://api.openai.com/v1",
+        default_model="gpt-4o-mini",
+        platform="openai",
+        models={},
+        params={},
+    )
+    provider = _MockStreamProvider([
+        {"event": "message", "data": {"choices": [{"delta": {"content": "Hel"}}]}},
+        {"event": "message", "data": {"choices": [{"delta": {"content": "lo"}}]}},
+        {"event": "message", "data": {"choices": [{"delta": {}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 1, "completion_tokens": 2}}},
+    ])
+    client = HTTPChatClient(cfg, provider)
+
+    events = list(client.stream_chat([{"role": "user", "content": "hi"}]))
+
+    assert events[0] == {"type": "text_delta", "delta": "Hel"}
+    assert events[1] == {"type": "text_delta", "delta": "lo"}
+    assert events[-1]["type"] == "completed"
+    assert events[-1]["response"]["final_text"] == "Hello"
+    assert events[-1]["response"]["meta"]["usage"] == {"prompt_tokens": 1, "completion_tokens": 2}
+
+
+def test_openai_stream_chat_normalizes_responses_api_deltas():
+    cfg = ProviderConfig(
+        name="openai-thinking",
+        api_key="test-key",
+        base_url="https://api.openai.com/v1",
+        default_model="gpt-5.4",
+        platform="openai",
+        models={},
+        params={},
+    )
+    provider = _MockStreamProvider([
+        {"event": "response.output_text.delta", "data": {"delta": "A"}},
+        {"event": "response.output_text.delta", "data": {"delta": "B"}},
+        {"event": "response.completed", "data": {"response": {"output": [], "output_text": "AB", "usage": {"prompt_tokens": 3, "completion_tokens": 4}}}},
+    ])
+    client = HTTPChatClient(cfg, provider)
+
+    events = list(client.stream_chat(
+        [{"role": "user", "content": "hi"}],
+        tools=[{"type": "function", "function": {"name": "search", "parameters": {}}}],
+        reasoning_effort="high",
+    ))
+
+    assert [e["delta"] for e in events if e["type"] == "text_delta"] == ["A", "B"]
+    assert events[-1]["response"]["final_text"] == "AB"
+    assert events[-1]["response"]["meta"]["usage"] == {"prompt_tokens": 3, "completion_tokens": 4}
+
+
+def test_stream_chat_falls_back_to_buffered_chunks_when_native_stream_unavailable():
+    cfg = ProviderConfig(
+        name="openai",
+        api_key="test-key",
+        base_url="https://api.openai.com/v1",
+        default_model="gpt-4o-mini",
+        platform="openai",
+        models={},
+        params={},
+    )
+    provider = _MockStreamProvider(
+        [],
+        raw_response={"choices": [{"message": {"content": "fallback text"}}], "usage": {"prompt_tokens": 1, "completion_tokens": 1}},
+        stream_error=NotImplementedError("no native stream"),
+    )
+    client = HTTPChatClient(cfg, provider)
+
+    events = list(client.stream_chat([{"role": "user", "content": "hi"}]))
+
+    assert "".join(e["delta"] for e in events if e["type"] == "text_delta") == "fallback text"
+    assert events[-1]["response"]["final_text"] == "fallback text"
+
+
+def test_openai_compat_provider_uses_expected_endpoint_by_api_mode():
+    """OpenAICompatProvider must call /responses when _api_mode=responses and /chat/completions otherwise."""
+    cfg = ProviderConfig(
+        name="openai",
+        api_key="test-key",
+        base_url="https://api.openai.com/v1",
+        default_model="gpt-4o-mini",
+        platform="openai",
+        models={},
+        params={},
+    )
+    provider = OpenAICompatProvider(cfg)
+    captured = {}
+
+    def capture_request(session, method, url, timeout, **kwargs):
+        captured["url"] = url
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }
+        resp.raise_for_status = MagicMock()
+        return resp
+
+    with patch("src.llm.llm_manager._request_with_retry", side_effect=capture_request):
+        provider.request(
+            {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}], "_api_mode": "responses"},
+            timeout=30,
+        )
+    assert captured["url"].rstrip("/").endswith("/responses")
+
+    with patch("src.llm.llm_manager._request_with_retry", side_effect=capture_request):
+        provider.request(
+            {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]},
+            timeout=30,
+        )
+    assert captured["url"].rstrip("/").endswith("/chat/completions")

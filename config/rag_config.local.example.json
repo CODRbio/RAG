@@ -3,7 +3,7 @@
   "debug": false,
   "capsolver_extension_path": "extra_tools/CapSolverExtension",
   "database": {
-    "url": "sqlite:///data/rag.db"
+    "url": "postgresql+psycopg://rag:change-me@localhost:5433/rag"
   },
   "llm": {
     "platforms": {

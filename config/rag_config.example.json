@@ -1,6 +1,6 @@
 {
   "database": {
-    "url": "sqlite:///data/rag.db",
+    "url": "postgresql+psycopg://user:password@localhost:5432/rag",
     "echo": false
   },
   "capsolver_extension_path": "extra_tools/CapSolverExtension",
@@ -50,9 +50,9 @@
       "gemini-vision":    { "platform": "gemini",     "default_model": "gemini-3.1-pro-preview","params": { "temperature": 0.2 } },
       "gemini-flash":     { "platform": "gemini",     "default_model": "gemini-flash-latest"   },
       "gemini-flash-lite":{ "platform": "gemini",     "default_model": "gemini-flash-lite-latest" },
-      "claude":           { "platform": "claude",     "default_model": "claude-sonnet-4-6"      },
-      "claude-thinking":  { "platform": "claude",     "default_model": "claude-sonnet-4-6",     "params": { "thinking": { "type": "enabled", "budget_tokens": 10000 } } },
-      "claude-haiku":     { "platform": "claude",     "default_model": "claude-haiku-4-5"      },
+      "claude":           { "platform": "claude",     "default_model": "claude-sonnet-4-6",     "params": { "enable_prompt_cache": true } },
+      "claude-thinking":  { "platform": "claude",     "default_model": "claude-sonnet-4-6",     "params": { "thinking": { "type": "enabled", "budget_tokens": 10000 }, "enable_prompt_cache": true } },
+      "claude-haiku":     { "platform": "claude",     "default_model": "claude-haiku-4-5",      "params": { "enable_prompt_cache": true } },
       "kimi":             { "platform": "kimi",       "default_model": "kimi-k2.5"              },
       "kimi-vision":      { "platform": "kimi",       "default_model": "kimi-k2.5"              },
       "kimi-thinking":    { "platform": "kimi",       "default_model": "kimi-k2.5",             "params": { "thinking": { "type": "enabled" } } },
@@ -114,7 +114,20 @@
     "cascade_bge_multiplier": 1.5,
     "chat_gap_parallel": 2,
     "chat_gap_ratio": 0.2,
-    "research_gap_ratio": 0.25,
+    "research_gap_ratio": 0.2,
+    "research_agent_ratio": 0.25,
+    "pool_score_thresholds": {
+      "chat": {
+        "main": 0.3,
+        "gap": 0,
+        "agent": 0.1
+      },
+      "research": {
+        "main": 0.35,
+        "gap": 0.05,
+        "agent": 0.15
+      }
+    },
     "chat_rank_pool_multiplier": 3.0,
     "research_rank_pool_multiplier": 3.0
   },
@@ -309,6 +322,29 @@
       "cache_enabled": false,
       "cache_ttl_seconds": 1800
     }
+  },
+  "tool_execution": {
+    "_comment": "run_code 默认关闭。只有在受信任环境中才建议开启；开启后仍仅限受限 Python 计算。",
+    "run_code_enabled": false,
+    "timeout_seconds": 5,
+    "cpu_seconds": 2,
+    "max_memory_mb": 128,
+    "max_code_chars": 6000,
+    "max_output_chars": 12000,
+    "allowed_modules": [
+      "collections",
+      "datetime",
+      "decimal",
+      "fractions",
+      "functools",
+      "itertools",
+      "json",
+      "math",
+      "random",
+      "re",
+      "statistics",
+      "time"
+    ]
   },
   "tasks": {
     "redis_url": "redis://localhost:6379/0",

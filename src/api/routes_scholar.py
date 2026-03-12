@@ -29,13 +29,40 @@ from src.services.collection_library_binding_service import (
     ensure_collection_binding,
     resolve_bound_library_for_collection,
 )
-from src.tasks.dispatcher import process_download_and_ingest
+from src.tasks.dispatcher import process_download_and_ingest, _scholar_is_cancelled
 from src.tasks.redis_queue import get_task_queue
 from src.tasks.task_state import TaskKind, TaskStatus, TaskState
 from src.utils.path_manager import PathManager
 
 logger = get_logger(__name__)
 router = APIRouter(prefix="/scholar", tags=["scholar"])
+
+# Registry of background tasks (batch, recommend) for graceful shutdown
+_scholar_bg_tasks: set = set()
+
+
+def _register_scholar_bg_task(t: asyncio.Task) -> None:
+    _scholar_bg_tasks.add(t)
+    t.add_done_callback(_scholar_bg_tasks.discard)
+
+
+async def wait_scholar_background_tasks_or_timeout(timeout_seconds: float) -> None:
+    """Wait for in-flight Scholar tasks up to timeout_seconds; then cancel any remaining."""
+    if not _scholar_bg_tasks:
+        return
+    try:
+        done, pending = await asyncio.wait(
+            _scholar_bg_tasks.copy(),
+            timeout=max(0.1, timeout_seconds),
+            return_when=asyncio.ALL_COMPLETED,
+        )
+        for t in pending:
+            t.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+            logger.info("[scholar] graceful shutdown: waited %.1fs, cancelled %d task(s)", timeout_seconds, len(pending))
+    except Exception as e:
+        logger.warning("[scholar] shutdown wait failed: %s", e)
 
 
 class ScholarSearchRequest(BaseModel):
@@ -784,7 +811,7 @@ async def scholar_batch_download(
                 if heartbeat_stop.is_set():
                     break
                 s = q.get_state(task_id)
-                if s and s.status in (TaskStatus.completed, TaskStatus.error):
+                if s and s.status in (TaskStatus.completed, TaskStatus.error, TaskStatus.cancelled):
                     break
                 elapsed = time.time() - batch_start
                 payload = s.payload if s else {}
@@ -808,6 +835,8 @@ async def scholar_batch_download(
 
         async def _one(paper: DownloadRequest):
             nonlocal completed, failed
+            if _scholar_is_cancelled(task_id, q):
+                return {"cancelled": True, "success": False}
             try:
                 include_academia = getattr(req, "include_academia", False)
                 if req.auto_ingest:
@@ -867,7 +896,9 @@ async def scholar_batch_download(
                     "message": str(e) or e.__class__.__name__,
                 }
             async with progress_lock:
-                if result.get("ingest_triggered") or result.get("success"):
+                if result.get("cancelled"):
+                    pass
+                elif result.get("ingest_triggered") or result.get("success"):
                     completed += 1
                 else:
                     failed += 1
@@ -904,18 +935,38 @@ async def scholar_batch_download(
                 state.finished_at = time.time()
                 state.payload["completed"] = completed
                 state.payload["failed"] = failed
-                if failed == total:
+                if state.status == TaskStatus.cancelled:
+                    q.set_state(state)
+                    logger.info(
+                        '{"task_type":"scholar_batch","task_id":"%s","event":"task_cancelled","duration_ms":%.0f}',
+                        task_id, (state.finished_at - (state.started_at or state.created_at or 0)) * 1000,
+                    )
+                elif failed == total:
                     state.status = TaskStatus.error
                     state.error_message = "所有论文下载均失败"
+                    q.set_state(state)
+                    q.push_event(
+                        task_id,
+                        "done",
+                        {"completed": completed, "failed": failed, "total": total},
+                    )
+                    logger.info(
+                        '{"task_type":"scholar_batch","task_id":"%s","event":"task_failed","duration_ms":%.0f,"error_message":"%s"}',
+                        task_id, (time.time() - batch_start) * 1000, state.error_message or "all_failed",
+                    )
                 else:
                     state.status = TaskStatus.completed
                     state.error_message = None
-                q.set_state(state)
-                q.push_event(
-                    task_id,
-                    "done",
-                    {"completed": completed, "failed": failed, "total": total},
-                )
+                    q.set_state(state)
+                    q.push_event(
+                        task_id,
+                        "done",
+                        {"completed": completed, "failed": failed, "total": total},
+                    )
+                    logger.info(
+                        '{"task_type":"scholar_batch","task_id":"%s","event":"task_completed","duration_ms":%.0f}',
+                        task_id, (time.time() - batch_start) * 1000,
+                    )
         except Exception as e:
             logger.exception("[scholar-batch] task_id=%s failed: %s", task_id, e)
             state = q.get_state(task_id)
@@ -952,6 +1003,7 @@ async def scholar_batch_download(
     # Schedule on the app's event loop (same as context pool). BackgroundTasks would run in
     # thread pool and expects a callable, not a coroutine.
     batch_task = asyncio.create_task(_batch_job(), name=f"scholar-batch:{task_id}")
+    _register_scholar_bg_task(batch_task)
 
     def _log_batch_task_result(task: asyncio.Task) -> None:
         try:
@@ -1203,7 +1255,7 @@ def create_scholar_library(
 
 @router.delete("/libraries/{lib_id:int}")
 def delete_scholar_library(lib_id: int, user_id: str = Depends(get_current_user_id)):
-    """Delete a scholar library and all its papers (temp or permanent)."""
+    """Delete a scholar library and all its papers (temp or permanent). Deletes folder_path directory if set."""
     if _is_temp_library(lib_id):
         if lib_id not in _temp_store:
             raise HTTPException(status_code=404, detail="库不存在")
@@ -1213,9 +1265,19 @@ def delete_scholar_library(lib_id: int, user_id: str = Depends(get_current_user_
         lib = session.get(ScholarLibrary, lib_id)
         if not lib or getattr(lib, "user_id", None) != user_id:
             raise HTTPException(status_code=404, detail="库不存在")
+        folder_path = getattr(lib, "folder_path", None)
         session.delete(lib)
         session.commit()
-        return {"ok": True}
+    if folder_path:
+        import shutil
+        try:
+            p = Path(folder_path)
+            if p.exists() and p.is_dir():
+                shutil.rmtree(p)
+                logger.info("Deleted library folder: %s", folder_path)
+        except Exception as e:
+            logger.warning("Failed to delete library folder %s: %s", folder_path, e)
+    return {"ok": True}
 
 
 def _scholar_source_priority(source: str) -> int:
@@ -1759,7 +1821,7 @@ async def _run_recommend_job(
             if heartbeat_stop.is_set():
                 break
             s = q.get_state(task_id)
-            if s and s.status in (TaskStatus.completed, TaskStatus.error, TaskStatus.timeout):
+            if s and s.status in (TaskStatus.completed, TaskStatus.error, TaskStatus.timeout, TaskStatus.cancelled):
                 break
             elapsed = time.time() - job_start
             q.push_event(task_id, "heartbeat", {"stage": "recommend", "elapsed_s": round(elapsed, 1)})
@@ -1790,6 +1852,15 @@ async def _run_recommend_job(
                 q.set_state(state)
             return
 
+        if _scholar_is_cancelled(task_id, q):
+            state = q.get_state(task_id)
+            if state:
+                state.status = TaskStatus.cancelled
+                state.finished_at = time.time()
+                q.set_state(state)
+            q.push_event(task_id, "cancelled", {"status": "cancelled"})
+            return
+
         q.push_event(
             task_id,
             "progress",
@@ -1813,6 +1884,8 @@ async def _run_recommend_job(
                 ),
             )
             response_dict = await asyncio.wait_for(future, timeout=_RECOMMEND_JOB_TIMEOUT_S)
+        except asyncio.CancelledError:
+            raise
         except asyncio.TimeoutError:
             q.push_event(
                 task_id,
@@ -1835,6 +1908,15 @@ async def _run_recommend_job(
                 state.finished_at = time.time()
                 state.error_message = str(exc) or exc.__class__.__name__
                 q.set_state(state)
+            return
+
+        if _scholar_is_cancelled(task_id, q):
+            state = q.get_state(task_id)
+            if state:
+                state.status = TaskStatus.cancelled
+                state.finished_at = time.time()
+                q.set_state(state)
+            q.push_event(task_id, "cancelled", {"status": "cancelled"})
             return
 
         q.push_event(
@@ -1940,6 +2022,7 @@ async def recommend_library_papers_start(
         ),
         name=f"recommend:{task_id}",
     )
+    _register_scholar_bg_task(recommend_task)
 
     def _log_recommend_task(t: asyncio.Task) -> None:
         try:
@@ -2807,7 +2890,26 @@ def delete_library_paper_pdf(lib_id: int, record_id: int, user_id: str = Depends
         paper.downloaded_at = None
         session.add(paper)
         session.commit()
-    return {"ok": True, "paper_id": stem}
+
+    # Remove the ingested Paper record and its Milvus vectors if this PDF was previously ingested
+    removed_from_collection = False
+    try:
+        from src.indexing.paper_store import get_paper_by_library_paper_id, delete_paper
+        from src.indexing.milvus_ops import milvus
+
+        ingested = get_paper_by_library_paper_id(record_id)
+        if ingested:
+            col = ingested["collection"]
+            pid = ingested["paper_id"]
+            if col and milvus.client.has_collection(col):
+                milvus.client.delete(collection_name=col, filter=f'paper_id == "{pid}"')
+            delete_paper(col, pid)
+            removed_from_collection = True
+            logger.info("delete_library_paper_pdf: removed vectors for paper_id=%s collection=%s", pid, col)
+    except Exception as e:
+        logger.warning("delete_library_paper_pdf: vector cleanup failed for record_id=%s: %s", record_id, e)
+
+    return {"ok": True, "paper_id": stem, "removed_from_collection": removed_from_collection}
 
 
 @router.delete("/libraries/{lib_id:int}/papers/{paper_id:int}")

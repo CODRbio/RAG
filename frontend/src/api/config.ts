@@ -40,4 +40,24 @@ export async function listDir(path?: string | null): Promise<DirListing> {
   return res.data;
 }
 
+export interface CacheClearResult {
+  ok: boolean;
+  crossref_cache_deleted?: number;
+  crossref_cache_by_doi_deleted?: number;
+  paper_metadata_deleted?: number;
+  older_than_days?: number | string;
+}
+
+export async function clearCrossrefCache(olderThanDays = 0): Promise<CacheClearResult> {
+  const res = await client.delete<CacheClearResult>('/admin/cache/crossref', {
+    params: olderThanDays > 0 ? { older_than_days: olderThanDays } : {},
+  });
+  return res.data;
+}
+
+export async function clearPaperMetadataCache(): Promise<CacheClearResult> {
+  const res = await client.delete<CacheClearResult>('/admin/cache/paper-metadata');
+  return res.data;
+}
+
 export { DEFAULT_DATABASE_URL };

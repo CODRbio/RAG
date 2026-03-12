@@ -71,3 +71,25 @@ def test_chat_agent_refusion_no_agent_chunks():
     assert len(out_chunks) <= 4
     assert pool_fusion.get("agent_in", 0) == 0
     assert pool_fusion.get("agent_in_output", 0) == 0
+
+
+def test_chat_agent_refusion_ignores_chat_score_threshold():
+    main_chunks: List[EvidenceChunk] = [_chunk(f"m{i}", 1.0 - i * 0.01) for i in range(8)]
+    gap_hits = [_gap_hit("g1", 0.2), _gap_hit("g2", 0.1)]
+    agent_chunks = [_chunk("a1", 0.15, source_type="web", provider="web")]
+
+    out_chunks, pool_fusion = _fuse_chat_main_gap_agent_candidates(
+        query="q",
+        message="q",
+        main_chunks=main_chunks,
+        gap_candidate_hits=gap_hits,
+        agent_chunks=agent_chunks,
+        write_k=5,
+        filters={"fused_pool_score_threshold": 0.99},
+    )
+
+    out_ids = {c.chunk_id for c in out_chunks}
+    assert len(out_chunks) == 5
+    assert pool_fusion.get("gap_in_output", 0) >= 1
+    assert pool_fusion.get("agent_in_output", 0) >= 1
+    assert "a1" in out_ids

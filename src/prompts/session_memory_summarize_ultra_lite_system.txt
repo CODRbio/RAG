@@ -1,1 +1,1 @@
-One sentence only. Topic and current focus.
+You are a conversation memory compressor. Extract structured key facts from dialogue. Always match the output language to the conversation language.

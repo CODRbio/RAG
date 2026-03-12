@@ -26,6 +26,14 @@ except Exception:
     _obs_metrics = None
 
 
+def _scholar_is_cancelled(task_id: str, q=None) -> bool:
+    """Return True if the Scholar task is marked cancelled (for in-loop polling)."""
+    if q is None:
+        q = get_task_queue()
+    state = q.get_state(task_id)
+    return state is not None and state.status == TaskStatus.cancelled
+
+
 def _mark_timeout_if_stale(task_id: str, q) -> bool:
     state = q.get_state(task_id)
     if not state or state.status != TaskStatus.queued:
@@ -53,6 +61,34 @@ def _chunk_text(text: str, chunk_size: int = 80) -> list:
     return chunks
 
 
+def _wait_if_chat_paused(task_id: str, q) -> None:
+    """Cooperatively block while a chat task stays paused."""
+    pause_announced = False
+    while True:
+        state = q.get_state(task_id)
+        if not state:
+            return
+        if state.status == TaskStatus.cancelled:
+            raise RuntimeError("chat task cancelled")
+        if state.status == TaskStatus.pausing:
+            if state.pause_started_at is None:
+                state.pause_started_at = time.time()
+            state.status = TaskStatus.paused
+            q.set_state(state)
+            if not pause_announced:
+                q.push_event(task_id, "paused", {"status": TaskStatus.paused.value})
+                pause_announced = True
+            time.sleep(0.2)
+            continue
+        if state.status == TaskStatus.paused:
+            if state.pause_started_at is None:
+                state.pause_started_at = time.time()
+                q.set_state(state)
+            time.sleep(0.2)
+            continue
+        return
+
+
 def run_chat_task_sync(task_id: str, payload: Dict[str, Any]) -> None:
     """
     Run a single Chat task (sync): load ChatRequest from payload, call _run_chat,
@@ -77,14 +113,46 @@ def run_chat_task_sync(task_id: str, payload: Dict[str, Any]) -> None:
 
     try:
         body = ChatRequest(**payload)
+        emitted_delta_count = 0
 
         def _step_cb(step_id, label):
+            _wait_if_chat_paused(task_id, q)
             q.push_event(task_id, "step", {"step": step_id or "", "label": label or ""})
 
-        (session_id_out, response_text, citations, evidence_summary, parsed, dashboard_data, tool_trace_data, ref_map,
-         agent_debug, _prompt_local_db, _local_db_msg) = _run_chat(body, optional_user_id, step_callback=_step_cb)
-        session_id = session_id_out or session_id
+        def _delta_cb(delta: str):
+            nonlocal emitted_delta_count
+            if not delta:
+                return
+            _wait_if_chat_paused(task_id, q)
+            emitted_delta_count += 1
+            q.push_event(task_id, "delta", {"delta": delta})
+            latest = q.get_state(task_id)
+            if latest and latest.status == TaskStatus.cancelled:
+                raise RuntimeError("chat task cancelled")
+
         store = get_session_store()
+        session_meta = store.get_session_meta(session_id) or {}
+        q.push_event(task_id, "meta", {
+            "session_id": session_id,
+            "canvas_id": (session_meta or {}).get("canvas_id") or "",
+            "citations": [],
+            "ref_map": {},
+            "evidence_summary": None,
+            "intent": None,
+            "current_stage": store.get_session_stage(session_id) or "explore",
+            "prompt_local_db_choice": False,
+            "local_db_mismatch_message": None,
+        })
+        _wait_if_chat_paused(task_id, q)
+
+        (session_id_out, response_text, citations, evidence_summary, parsed, dashboard_data, tool_trace_data, ref_map,
+         agent_debug, _prompt_local_db, _local_db_msg) = _run_chat(
+            body,
+            optional_user_id,
+            step_callback=_step_cb,
+            delta_callback=_delta_cb,
+        )
+        session_id = session_id_out or session_id
         current_stage = store.get_session_stage(session_id) or "explore"
         session_meta = store.get_session_meta(session_id) or {}
         canvas_id = (session_meta or {}).get("canvas_id") or ""
@@ -120,33 +188,45 @@ def run_chat_task_sync(task_id: str, payload: Dict[str, Any]) -> None:
             q.push_event(task_id, "tool_trace", tool_trace_data)
         if agent_debug:
             q.push_event(task_id, "agent_debug", agent_debug)
-        for chunk in _chunk_text(response_text):
-            q.push_event(task_id, "delta", {"delta": chunk})
-            latest = q.get_state(task_id)
-            if latest and latest.status == TaskStatus.cancelled:
-                q.push_event(task_id, "cancelled", {"status": "cancelled"})
-                return
+        if emitted_delta_count == 0:
+            for chunk in _chunk_text(response_text):
+                _wait_if_chat_paused(task_id, q)
+                q.push_event(task_id, "delta", {"delta": chunk})
+                latest = q.get_state(task_id)
+                if latest and latest.status == TaskStatus.cancelled:
+                    q.push_event(task_id, "cancelled", {"status": "cancelled"})
+                    return
         latest = q.get_state(task_id)
         if latest and latest.status == TaskStatus.cancelled:
             q.push_event(task_id, "cancelled", {"status": "cancelled"})
             return
-        elapsed = time.time() - float(state.started_at or time.time())
+        elapsed = state.effective_runtime_seconds(time.time())
         if elapsed > settings.tasks.run_timeout_seconds:
             state.status = TaskStatus.timeout
             state.error_message = "run timeout"
+            state.pause_started_at = None
             q.push_event(task_id, "timeout", {"reason": "run_timeout"})
             if _obs_metrics and hasattr(_obs_metrics, "task_queue_timeout_total"):
                 _obs_metrics.task_queue_timeout_total.labels(kind=state.kind.value).inc()
         else:
-            q.push_event(task_id, "done", {})
+            q.push_event(task_id, "done", {"final_text": response_text})
             state.status = TaskStatus.completed
         state.finished_at = time.time()
+        state.pause_started_at = None
         q.set_state(state)
     except Exception as e:
+        if "cancelled" in str(e).lower() or "canceled" in str(e).lower():
+            state.status = TaskStatus.cancelled
+            state.finished_at = time.time()
+            state.pause_started_at = None
+            q.set_state(state)
+            q.push_event(task_id, "cancelled", {"status": "cancelled"})
+            return
         logger.exception("[dispatcher] chat task_id=%s failed: %s", task_id, e)
         state.status = TaskStatus.error
         state.finished_at = time.time()
         state.error_message = str(e)
+        state.pause_started_at = None
         q.set_state(state)
         q.push_event(task_id, "error", {"message": str(e)})
     finally:
@@ -260,6 +340,13 @@ async def process_download_and_ingest(
         )
         q.set_state(state)
 
+    if _scholar_is_cancelled(task_id, q):
+        state.status = TaskStatus.cancelled
+        state.finished_at = time.time()
+        q.set_state(state)
+        q.push_event(task_id, "cancelled", {"status": "cancelled"})
+        return {"success": False, "message": "cancelled", "cancelled": True}
+
     state.status = TaskStatus.running
     state.started_at = state.started_at or time.time()
     state.payload["progress"] = 10
@@ -365,6 +452,15 @@ async def process_download_and_ingest(
             except asyncio.CancelledError:
                 pass
 
+    if _scholar_is_cancelled(task_id, q):
+        state.status = TaskStatus.cancelled
+        state.finished_at = time.time()
+        state.payload["progress"] = 0
+        state.payload["stage"] = "CANCELLED"
+        q.set_state(state)
+        q.push_event(task_id, "cancelled", {"status": "cancelled"})
+        return {"success": False, "message": "cancelled", "cancelled": True}
+
     if not dl_result.get("success"):
         state.status = TaskStatus.error
         state.finished_at = time.time()
@@ -405,6 +501,14 @@ async def process_download_and_ingest(
     paper_id = dl_result["paper_id"]
     filepath = dl_result["filepath"]
     collection_name = collection or settings.collection.global_
+
+    if _scholar_is_cancelled(task_id, q):
+        state.status = TaskStatus.cancelled
+        state.finished_at = time.time()
+        state.payload["stage"] = "CANCELLED"
+        q.set_state(state)
+        q.push_event(task_id, "cancelled", {"status": "cancelled"})
+        return {"success": True, "cancelled": True, "ingest_triggered": False}
 
     state.payload["progress"] = 50
     state.payload["stage"] = "INGESTING"

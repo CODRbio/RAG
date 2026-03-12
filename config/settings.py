@@ -128,7 +128,8 @@ class SearchSettings:
     cascade_bge_multiplier: float = float(os.getenv("CASCADE_BGE_MULTIPLIER", "1.5"))
     chat_gap_parallel: int = int(os.getenv("CHAT_GAP_PARALLEL", "2"))
     chat_gap_ratio: float = float(os.getenv("CHAT_GAP_RATIO", "0.2"))
-    research_gap_ratio: float = float(os.getenv("RESEARCH_GAP_RATIO", "0.25"))
+    research_gap_ratio: float = float(os.getenv("RESEARCH_GAP_RATIO", "0.2"))
+    research_agent_ratio: float = float(os.getenv("RESEARCH_AGENT_RATIO", "0.25"))
     chat_rank_pool_multiplier: float = float(os.getenv("CHAT_RANK_POOL_MULTIPLIER", "3.0"))
     research_rank_pool_multiplier: float = float(os.getenv("RESEARCH_RANK_POOL_MULTIPLIER", "3.0"))
 
@@ -615,6 +616,10 @@ def _auth_from_config() -> Dict[str, Any]:
     return (_RAW_CONFIG.get("auth") or {})
 
 
+def _tool_execution_from_config() -> Dict[str, Any]:
+    return (_RAW_CONFIG.get("tool_execution") or {})
+
+
 def _tasks_from_config() -> Dict[str, Any]:
     return (_RAW_CONFIG.get("tasks") or {})
 
@@ -706,6 +711,35 @@ class AuthSettings:
 
 
 @dataclass
+class ToolExecutionSettings:
+    """Agent 工具执行安全配置。run_code 默认关闭，仅在显式启用时开放。"""
+    run_code_enabled: bool = False
+    timeout_seconds: int = 5
+    cpu_seconds: int = 2
+    max_memory_mb: int = 128
+    max_code_chars: int = 6000
+    max_output_chars: int = 12000
+    max_concurrent: int = 2
+    """同时允许运行的 run_code 子进程上限，防止并发聚合攻击。"""
+    allowed_modules: List[str] = field(
+        default_factory=lambda: [
+            "collections",
+            "datetime",
+            "decimal",
+            "fractions",
+            "functools",
+            "itertools",
+            "json",
+            "math",
+            "random",
+            "re",
+            "statistics",
+            "time",
+        ]
+    )
+
+
+@dataclass
 class TaskQueueSettings:
     """统一任务队列：Research + Chat 全局槽位与 Redis"""
     redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
@@ -716,6 +750,8 @@ class TaskQueueSettings:
     heartbeat_interval_seconds: int = 15
     task_state_ttl_seconds: int = 86400
     ingest_max_concurrent: int = 2
+    max_retries: int = 3
+    graceful_shutdown_timeout_seconds: int = 30
 
 
 class Settings:
@@ -753,7 +789,8 @@ class Settings:
             cascade_bge_multiplier=s.get("cascade_bge_multiplier", float(os.getenv("CASCADE_BGE_MULTIPLIER", "1.5"))),
             chat_gap_parallel=s.get("chat_gap_parallel", int(os.getenv("CHAT_GAP_PARALLEL", "2"))),
             chat_gap_ratio=s.get("chat_gap_ratio", float(os.getenv("CHAT_GAP_RATIO", "0.2"))),
-            research_gap_ratio=s.get("research_gap_ratio", float(os.getenv("RESEARCH_GAP_RATIO", "0.25"))),
+            research_gap_ratio=s.get("research_gap_ratio", float(os.getenv("RESEARCH_GAP_RATIO", "0.2"))),
+            research_agent_ratio=s.get("research_agent_ratio", float(os.getenv("RESEARCH_AGENT_RATIO", "0.25"))),
             chat_rank_pool_multiplier=s.get("chat_rank_pool_multiplier", float(os.getenv("CHAT_RANK_POOL_MULTIPLIER", "3.0"))),
             research_rank_pool_multiplier=s.get("research_rank_pool_multiplier", float(os.getenv("RESEARCH_RANK_POOL_MULTIPLIER", "3.0"))),
         )
@@ -959,6 +996,23 @@ class Settings:
             admin_username=str(au.get("admin_username", "admin")),
             admin_default_password=str(au.get("admin_default_password", "admin123")),
         )
+        te = _tool_execution_from_config()
+        default_tool_exec = ToolExecutionSettings()
+        allowed_modules_raw = te.get("allowed_modules", default_tool_exec.allowed_modules)
+        self.tool_execution = ToolExecutionSettings(
+            run_code_enabled=bool(te.get("run_code_enabled", default_tool_exec.run_code_enabled)),
+            timeout_seconds=max(1, int(te.get("timeout_seconds", default_tool_exec.timeout_seconds))),
+            cpu_seconds=max(1, int(te.get("cpu_seconds", default_tool_exec.cpu_seconds))),
+            max_memory_mb=max(32, int(te.get("max_memory_mb", default_tool_exec.max_memory_mb))),
+            max_code_chars=max(256, int(te.get("max_code_chars", default_tool_exec.max_code_chars))),
+            max_output_chars=max(512, int(te.get("max_output_chars", default_tool_exec.max_output_chars))),
+            max_concurrent=max(1, int(te.get("max_concurrent", default_tool_exec.max_concurrent))),
+            allowed_modules=[
+                str(mod).strip()
+                for mod in (allowed_modules_raw or default_tool_exec.allowed_modules)
+                if str(mod).strip()
+            ] or list(default_tool_exec.allowed_modules),
+        )
         tq = _tasks_from_config()
         self.tasks = TaskQueueSettings(
             redis_url=str(os.getenv("REDIS_URL", tq.get("redis_url", "redis://localhost:6379/0"))),
@@ -969,6 +1023,8 @@ class Settings:
             heartbeat_interval_seconds=int(tq.get("heartbeat_interval_seconds", 15)),
             task_state_ttl_seconds=int(tq.get("task_state_ttl_seconds", 86400)),
             ingest_max_concurrent=int(tq.get("ingest_max_concurrent", 2)),
+            max_retries=int(tq.get("max_retries", 3)),
+            graceful_shutdown_timeout_seconds=int(tq.get("graceful_shutdown_timeout_seconds", 30)),
         )
         sd = _scholar_downloader_from_config()
         timeouts_raw = sd.get("timeouts") or {}

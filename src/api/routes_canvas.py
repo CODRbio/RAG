@@ -10,7 +10,7 @@ import requests
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from src.api.routes_auth import get_optional_user_id
+from src.api.routes_auth import get_current_user_id, get_optional_user_id
 
 from src.api.schemas import (
     CanvasAIEditRequest,
@@ -36,6 +36,7 @@ from src.collaboration.canvas.canvas_manager import (
     delete_canvas,
     delete_canvas_citation,
     export_canvas,
+    get_canvas_store,
     filter_canvas_citations,
     get_canvas,
     get_canvas_citations,
@@ -47,12 +48,28 @@ from src.collaboration.canvas.canvas_manager import (
 )
 from src.collaboration.canvas.models import DraftBlock, OutlineSection
 from src.collaboration.citation.formatter import format_bibtex, format_reference_list, format_ris
+from src.collaboration.memory.persistent_store import get_user_profile
 from src.collaboration.memory.session_memory import get_session_store
 from src.utils.prompt_manager import PromptManager
 
 _pm = PromptManager()
 
 router = APIRouter(prefix="/canvas", tags=["canvas"])
+
+
+def _is_admin_user(user_id: str) -> bool:
+    profile = get_user_profile(user_id)
+    return bool(profile and profile.get("role") == "admin")
+
+
+def _require_canvas_owner(canvas_id: str, current_user_id: str):
+    canvas = get_canvas(canvas_id)
+    if canvas is None:
+        raise HTTPException(status_code=404, detail="canvas not found")
+    owner_id = get_canvas_store().get_canvas_owner(canvas_id)
+    if owner_id == current_user_id or _is_admin_user(current_user_id):
+        return canvas
+    raise HTTPException(status_code=403, detail="forbidden")
 
 
 def _canvas_to_response(c) -> CanvasResponse:
@@ -140,7 +157,19 @@ def canvas_create(
     body: CanvasCreateRequest,
     user_id: str | None = Depends(get_optional_user_id),
 ) -> CanvasResponse:
-    c = create_canvas(session_id=body.session_id, topic=body.topic, user_id=user_id or "")
+    effective_user_id = user_id or ""
+    if body.session_id:
+        store = get_session_store()
+        session_meta = store.get_session_meta(body.session_id)
+        if session_meta:
+            session_owner = str(session_meta.get("user_id") or "").strip()
+            if session_owner:
+                if not effective_user_id:
+                    raise HTTPException(status_code=401, detail="Invalid or missing token")
+                if session_owner != effective_user_id and not _is_admin_user(effective_user_id):
+                    raise HTTPException(status_code=403, detail="forbidden")
+                effective_user_id = session_owner
+    c = create_canvas(session_id=body.session_id, topic=body.topic, user_id=effective_user_id)
     if body.session_id:
         store = get_session_store()
         if store.get_session_meta(body.session_id):
@@ -149,18 +178,21 @@ def canvas_create(
 
 
 @router.get("/{canvas_id}", response_model=CanvasResponse)
-def canvas_get(canvas_id: str) -> CanvasResponse:
-    c = get_canvas(canvas_id)
-    if c is None:
-        raise HTTPException(status_code=404, detail="canvas not found")
+def canvas_get(
+    canvas_id: str,
+    current_user_id: str = Depends(get_current_user_id),
+) -> CanvasResponse:
+    c = _require_canvas_owner(canvas_id, current_user_id)
     return _canvas_to_response(c)
 
 
 @router.patch("/{canvas_id}", response_model=CanvasResponse)
-def canvas_update(canvas_id: str, body: CanvasUpdateRequest) -> CanvasResponse:
-    c = get_canvas(canvas_id)
-    if c is None:
-        raise HTTPException(status_code=404, detail="canvas not found")
+def canvas_update(
+    canvas_id: str,
+    body: CanvasUpdateRequest,
+    current_user_id: str = Depends(get_current_user_id),
+) -> CanvasResponse:
+    _require_canvas_owner(canvas_id, current_user_id)
     fields = body.model_dump(exclude_unset=True)
     update_canvas(canvas_id, **fields)
     c = get_canvas(canvas_id)
@@ -168,17 +200,23 @@ def canvas_update(canvas_id: str, body: CanvasUpdateRequest) -> CanvasResponse:
 
 
 @router.delete("/{canvas_id}")
-def canvas_delete(canvas_id: str) -> dict:
+def canvas_delete(
+    canvas_id: str,
+    current_user_id: str = Depends(get_current_user_id),
+) -> dict:
+    _require_canvas_owner(canvas_id, current_user_id)
     if not delete_canvas(canvas_id):
         raise HTTPException(status_code=404, detail="canvas not found")
     return {"ok": True, "canvas_id": canvas_id}
 
 
 @router.post("/{canvas_id}/outline", response_model=CanvasResponse)
-def canvas_upsert_outline(canvas_id: str, body: OutlineUpsertRequest) -> CanvasResponse:
-    c = get_canvas(canvas_id)
-    if c is None:
-        raise HTTPException(status_code=404, detail="canvas not found")
+def canvas_upsert_outline(
+    canvas_id: str,
+    body: OutlineUpsertRequest,
+    current_user_id: str = Depends(get_current_user_id),
+) -> CanvasResponse:
+    _require_canvas_owner(canvas_id, current_user_id)
     sections = [
         OutlineSection(
             id=s.id or str(uuid.uuid4())[:8],
@@ -197,10 +235,12 @@ def canvas_upsert_outline(canvas_id: str, body: OutlineUpsertRequest) -> CanvasR
 
 
 @router.post("/{canvas_id}/drafts", response_model=CanvasResponse)
-def canvas_upsert_draft(canvas_id: str, body: DraftUpsertRequest) -> CanvasResponse:
-    c = get_canvas(canvas_id)
-    if c is None:
-        raise HTTPException(status_code=404, detail="canvas not found")
+def canvas_upsert_draft(
+    canvas_id: str,
+    body: DraftUpsertRequest,
+    current_user_id: str = Depends(get_current_user_id),
+) -> CanvasResponse:
+    _require_canvas_owner(canvas_id, current_user_id)
     b = body.block
     block = DraftBlock(
         section_id=b.section_id,
@@ -216,10 +256,11 @@ def canvas_upsert_draft(canvas_id: str, body: DraftUpsertRequest) -> CanvasRespo
 
 
 @router.post("/{canvas_id}/snapshot")
-def canvas_snapshot(canvas_id: str) -> dict:
-    c = get_canvas(canvas_id)
-    if c is None:
-        raise HTTPException(status_code=404, detail="canvas not found")
+def canvas_snapshot(
+    canvas_id: str,
+    current_user_id: str = Depends(get_current_user_id),
+) -> dict:
+    _require_canvas_owner(canvas_id, current_user_id)
     try:
         ver = create_snapshot(canvas_id)
         return {"ok": True, "canvas_id": canvas_id, "version_number": ver}
@@ -228,32 +269,41 @@ def canvas_snapshot(canvas_id: str) -> dict:
 
 
 @router.post("/{canvas_id}/restore/{version_number}")
-def canvas_restore(canvas_id: str, version_number: int) -> dict:
+def canvas_restore(
+    canvas_id: str,
+    version_number: int,
+    current_user_id: str = Depends(get_current_user_id),
+) -> dict:
+    _require_canvas_owner(canvas_id, current_user_id)
     if not restore_snapshot(canvas_id, version_number):
         raise HTTPException(status_code=404, detail="canvas or version not found")
     return {"ok": True, "canvas_id": canvas_id, "restored_version": version_number}
 
 
 @router.get("/{canvas_id}/snapshots", response_model=list[CanvasVersionItem])
-def canvas_list_snapshots(canvas_id: str, limit: int = Query(50, ge=1, le=200)) -> list[CanvasVersionItem]:
-    c = get_canvas(canvas_id)
-    if c is None:
-        raise HTTPException(status_code=404, detail="canvas not found")
+def canvas_list_snapshots(
+    canvas_id: str,
+    limit: int = Query(50, ge=1, le=200),
+    current_user_id: str = Depends(get_current_user_id),
+) -> list[CanvasVersionItem]:
+    _require_canvas_owner(canvas_id, current_user_id)
     rows = list_snapshots(canvas_id, limit=limit)
     return [CanvasVersionItem(**r) for r in rows]
 
 
 @router.get("/{canvas_id}/export", response_model=ExportResponse)
-def canvas_export(canvas_id: str, format: str = "json") -> ExportResponse:
+def canvas_export(
+    canvas_id: str,
+    format: str = "json",
+    current_user_id: str = Depends(get_current_user_id),
+) -> ExportResponse:
     """
     导出画布。
     - format=json: 返回完整 JSON 结构
     - format=markdown: 返回 Markdown 格式（大纲 + 草稿 + 引用）
     """
     import json as json_lib
-    c = get_canvas(canvas_id)
-    if c is None:
-        raise HTTPException(status_code=404, detail="canvas not found")
+    c = _require_canvas_owner(canvas_id, current_user_id)
     if format == "markdown":
         if getattr(c, "refined_markdown", "").strip():
             content = c.refined_markdown
@@ -297,11 +347,13 @@ def canvas_export(canvas_id: str, format: str = "json") -> ExportResponse:
 
 
 @router.post("/{canvas_id}/refine-full", response_model=CanvasRefineResponse)
-def canvas_refine_full(canvas_id: str, body: CanvasRefineRequest) -> CanvasRefineResponse:
+def canvas_refine_full(
+    canvas_id: str,
+    body: CanvasRefineRequest,
+    current_user_id: str = Depends(get_current_user_id),
+) -> CanvasRefineResponse:
     """对全文进行再次精炼，支持多轮迭代与回退。"""
-    c = get_canvas(canvas_id)
-    if c is None:
-        raise HTTPException(status_code=404, detail="canvas not found")
+    c = _require_canvas_owner(canvas_id, current_user_id)
 
     source_md = (body.content_md or "").strip()
     if not source_md:
@@ -424,11 +476,13 @@ def canvas_refine_full(canvas_id: str, body: CanvasRefineRequest) -> CanvasRefin
 
 
 @router.post("/{canvas_id}/citations/filter", response_model=CitationFilterResponse)
-def canvas_filter_citations(canvas_id: str, body: CitationFilterRequest) -> CitationFilterResponse:
+def canvas_filter_citations(
+    canvas_id: str,
+    body: CitationFilterRequest,
+    current_user_id: str = Depends(get_current_user_id),
+) -> CitationFilterResponse:
     """筛选引用池：keep_keys 仅保留指定引用；remove_keys 删除指定引用。"""
-    c = get_canvas(canvas_id)
-    if c is None:
-        raise HTTPException(status_code=404, detail="canvas not found")
+    _require_canvas_owner(canvas_id, current_user_id)
     if body.keep_keys is not None:
         removed = filter_canvas_citations(canvas_id, body.keep_keys)
         remaining = body.keep_keys
@@ -443,11 +497,13 @@ def canvas_filter_citations(canvas_id: str, body: CitationFilterRequest) -> Cita
 
 
 @router.delete("/{canvas_id}/citations/{cite_key}")
-def canvas_delete_citation(canvas_id: str, cite_key: str) -> dict:
+def canvas_delete_citation(
+    canvas_id: str,
+    cite_key: str,
+    current_user_id: str = Depends(get_current_user_id),
+) -> dict:
     """删除指定 cite_key 的引用。"""
-    c = get_canvas(canvas_id)
-    if c is None:
-        raise HTTPException(status_code=404, detail="canvas not found")
+    _require_canvas_owner(canvas_id, current_user_id)
     if not delete_canvas_citation(canvas_id, cite_key):
         raise HTTPException(status_code=404, detail="citation not found")
     return {"ok": True, "canvas_id": canvas_id, "removed_cite_key": cite_key}
@@ -457,10 +513,9 @@ def canvas_delete_citation(canvas_id: str, cite_key: str) -> dict:
 def canvas_citations(
     canvas_id: str,
     format: str = Query("both", description="bibtex | text | ris | both"),
+    current_user_id: str = Depends(get_current_user_id),
 ) -> dict:
-    c = get_canvas(canvas_id)
-    if c is None:
-        raise HTTPException(status_code=404, detail="canvas not found")
+    _require_canvas_owner(canvas_id, current_user_id)
     citations = get_canvas_citations(canvas_id)
     if format == "bibtex":
         return {"format": "bibtex", "content": format_bibtex(citations)}
@@ -610,11 +665,13 @@ _AI_EDIT_PROMPTS = {
 
 
 @router.post("/{canvas_id}/ai-edit", response_model=CanvasAIEditResponse)
-def canvas_ai_edit(canvas_id: str, body: CanvasAIEditRequest) -> CanvasAIEditResponse:
+def canvas_ai_edit(
+    canvas_id: str,
+    body: CanvasAIEditRequest,
+    current_user_id: str = Depends(get_current_user_id),
+) -> CanvasAIEditResponse:
     """AI 段落级编辑：重写/扩展/精简/添加引用"""
-    c = get_canvas(canvas_id)
-    if c is None:
-        raise HTTPException(status_code=404, detail="canvas not found")
+    c = _require_canvas_owner(canvas_id, current_user_id)
 
     action = body.action
     if action not in _AI_EDIT_PROMPTS:

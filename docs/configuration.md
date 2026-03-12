@@ -30,15 +30,16 @@
 
 ### `database`
 
-统一数据库配置（当前默认 SQLite，后续可平滑切换 PostgreSQL）。
+统一数据库配置。正式后端统一使用 PostgreSQL。
 
-- `url`：数据库连接字符串（默认 `sqlite:///data/rag.db`）
+- `url`：数据库连接字符串（推荐 `postgresql+psycopg://rag:change-me@localhost:5433/rag`）
 - `echo`：是否输出 SQL 调试日志
 
 说明：
 
 - 当前后端使用 **SQLModel + Alembic** 管理 schema 与迁移
-- 启动时会确保 `data/rag.db` 可用，并尝试自动迁移历史多库数据（若存在）
+- 生产与开发环境均以 PostgreSQL 为正式后端
+- SQLite 仅保留给历史版本迁移/兼容脚本，不再作为当前默认部署方案
 
 ### `llm`
 
@@ -163,6 +164,33 @@ NCBI 文献搜索配置。
 - 如果并发用户较多（同时多人检索），可适当增大 `headless_context_pool_size`（如 6），并酌情增加 `headless_search_reserved_slots`（如 2）
 - 如果搜索功能很少使用，可将 `headless_search_reserved_slots` 设为 0 以释放该 slot 给其他模块
 - 有头 context 主要用于文献下载和需要 UI 交互的验证码场景，一般 2 个即可满足需求
+
+### `tool_execution`
+
+Agent 工具执行安全配置。**`run_code` 默认关闭，必须显式启用。**
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `run_code_enabled` | `false` | 是否启用 `run_code` 工具 |
+| `timeout_seconds` | `5` | 单次代码执行墙钟超时（秒） |
+| `cpu_seconds` | `2` | 子进程 CPU 时间硬上限（秒，POSIX 仅限） |
+| `max_memory_mb` | `128` | 子进程内存上限（MB，Linux 有效；macOS 不受 RLIMIT 限制，见下方说明） |
+| `max_code_chars` | `6000` | 代码字符长度上限 |
+| `max_output_chars` | `12000` | stdout/stderr 合并输出上限 |
+| `max_concurrent` | `2` | 同时运行的 `run_code` 子进程上限，超限立即返回错误 |
+| `allowed_modules` | 见下方 | 允许导入的标准库白名单（字符串列表） |
+
+默认 `allowed_modules`（均为纯计算模块，无文件/网络访问能力）：
+`collections`, `datetime`, `decimal`, `fractions`, `functools`, `itertools`,
+`json`, `math`, `random`, `re`, `statistics`, `time`
+
+**安全说明：**
+
+- `run_code` 默认关闭；仅建议在受信任的内部环境显式开启
+- 开启后执行路径：AST 预检（禁止危险调用与导入）→ 受限 builtins 白名单 → 独立子进程（`-I -S -B`，干净环境）→ POSIX 资源限制（CPU / fd / 进程数）→ 超时 + 输出双熔断 → 进程组强制终止
+- **macOS 限制**：`RLIMIT_AS` / `RLIMIT_DATA` 在 macOS 上不被内核强制执行，`max_memory_mb` 配置在 macOS 下无效；启动时会打印 WARNING 日志。生产环境建议部署在 Linux 上
+- `max_concurrent` 防止并发聚合攻击，超出槽位的请求立即返回提示，不排队等待
+- 若面向外部用户开放，仍建议迁移到容器/沙箱执行后端，不要直接依赖宿主机解释器隔离
 
 ### `api`
 
@@ -409,7 +437,7 @@ Deep Research 配置。
 ```json
 {
   "database": {
-    "url": "sqlite:///data/rag.db",
+    "url": "postgresql+psycopg://rag:change-me@localhost:5433/rag",
     "echo": false
   },
   "llm": {

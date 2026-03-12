@@ -13,6 +13,9 @@ from typing import Any, Dict, List, Optional
 from sqlmodel import Session, select
 
 from src.db.engine import get_engine
+from src.log import get_logger
+
+logger = get_logger(__name__)
 from src.db.models import (
     DeepResearchJob,
     DRCheckpoint,
@@ -113,7 +116,8 @@ def list_jobs(limit: int = 20, status: Optional[str] = None) -> List[Dict[str, A
 
 
 def delete_job(job_id: str) -> bool:
-    """删除单个 Deep Research 任务（及其关联的 events、reviews、resume_queue 等）。仅允许终态/规划态任务。"""
+    """删除单个 Deep Research 任务（及其关联的 events、reviews、resume_queue 等）。仅允许终态/规划态任务。
+    同步释放对应的 Milvus job_* collection（如存在）。"""
     with Session(get_engine()) as session:
         row = session.get(DeepResearchJob, job_id)
         if not row:
@@ -123,6 +127,15 @@ def delete_job(job_id: str) -> bool:
             return False
         session.delete(row)
         session.commit()
+    # Drop associated Milvus temp collection immediately after DB commit
+    try:
+        from src.indexing.milvus_ops import milvus
+        col_name = "job_" + job_id.replace("-", "_")
+        if milvus.client.has_collection(col_name):
+            milvus.client.drop_collection(col_name)
+            logger.debug("Dropped Milvus collection %s for deleted DR job %s", col_name, job_id)
+    except Exception as e:
+        logger.warning("Failed to drop Milvus collection for DR job %s: %s", job_id, e)
     return True
 
 

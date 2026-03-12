@@ -367,12 +367,13 @@ export async function removePaperFromLibrary(
   await client.delete(`/scholar/libraries/${libId}/papers/${paperId}`);
 }
 
-/** Delete the downloaded PDF file for a library paper and clear downloaded_at. Paper remains in library so user can re-download. */
+/** Delete the downloaded PDF file for a library paper and clear downloaded_at. Paper remains in library so user can re-download.
+ *  Also removes the ingested vectors from the collection if the paper was previously ingested. */
 export async function deleteLibraryPaperPdf(
   libId: number,
   recordId: number,
-): Promise<{ ok: boolean; paper_id: string }> {
-  const res = await client.delete<{ ok: boolean; paper_id: string }>(
+): Promise<{ ok: boolean; paper_id: string; removed_from_collection: boolean }> {
+  const res = await client.delete<{ ok: boolean; paper_id: string; removed_from_collection: boolean }>(
     `/scholar/libraries/${libId}/papers/${recordId}/pdf`,
   );
   return res.data;
@@ -596,51 +597,27 @@ export interface ScholarTaskStreamEvent {
 
 /**
  * SSE stream for scholar tasks (e.g. recommend, batch download).
- * GET /scholar/task/{taskId}/stream with optional after_id for resume.
+ * Uses resumable adapter: parses id, reconnects with Last-Event-ID, handles heartbeat/cancelled/timeout.
  */
 export async function* streamScholarTaskEvents(
   taskId: string,
   signal?: AbortSignal,
   afterId: string = '-',
 ): AsyncGenerator<ScholarTaskStreamEvent> {
+  const { streamSSEResumable, SCHOLAR_TERMINAL_EVENTS } = await import('./sse');
   const token = localStorage.getItem('token');
-  const url = `${BASE_URL}/scholar/task/${encodeURIComponent(taskId)}/stream?after_id=${encodeURIComponent(afterId)}`;
-  const response = await fetch(url, {
-    method: 'GET',
-    headers: {
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+  for await (const { event, data } of streamSSEResumable({
+    getUrl: (lastEventId) => {
+      const aid = lastEventId || afterId;
+      return `${BASE_URL}/scholar/task/${encodeURIComponent(taskId)}/stream?after_id=${encodeURIComponent(aid || '-')}`;
     },
+    getHeaders: () => (token ? { Authorization: `Bearer ${token}` } : {}),
+    terminalEvents: [...SCHOLAR_TERMINAL_EVENTS],
     signal,
-  });
-  if (!response.ok) {
-    const errBody = await response.text().catch(() => '');
-    throw new Error(`HTTP ${response.status}: ${response.statusText} - ${errBody}`);
-  }
-  const reader = response.body?.getReader();
-  if (!reader) throw new Error('No response body');
-
-  const decoder = new TextDecoder();
-  let buffer = '';
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = lines.pop() || '';
-
-    let currentEvent = '';
-    for (const line of lines) {
-      if (line.startsWith('event: ')) {
-        currentEvent = line.slice(7).trim();
-      } else if (line.startsWith('data: ')) {
-        const dataStr = line.slice(6);
-        try {
-          const data = JSON.parse(dataStr) as Record<string, unknown>;
-          yield { event: currentEvent, data };
-        } catch {
-          yield { event: currentEvent, data: { raw: dataStr } };
-        }
-      }
-    }
+    maxRetries: 5,
+    baseMs: 1000,
+    maxMs: 30000,
+  })) {
+    yield { event, data: data as Record<string, unknown> };
   }
 }

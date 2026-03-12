@@ -60,6 +60,9 @@ def cleanup_stale_jobs() -> None:
     now = time.time()
     stale_dr_slots: list[tuple[str, str]] = []  # (job_id, session_id)
     stale_ingest_job_ids: list[str] = []
+    # waiting_review jobs have their checkpoint preserved so they can be manually resumed;
+    # only regular stale DR jobs (running/cancelling) have their checkpoints purged.
+    waiting_review_job_ids: set[str] = set()
     try:
         with Session(get_engine()) as session:
             dr_rows = session.exec(
@@ -76,9 +79,19 @@ def cleanup_stale_jobs() -> None:
                 except Exception:
                     sid = ""
                 stale_dr_slots.append((row.job_id, sid))
+                if row.status == "waiting_review":
+                    # Keep checkpoint intact — the job was paused at a review gate and can
+                    # be resumed via resume_queue after the server comes back up.
+                    waiting_review_job_ids.add(row.job_id)
+                    row.error_message = (
+                        "服务重启，任务在 review 节点中断，checkpoint 已保留；"
+                        "可重新提交 resume 请求从上次 review 节点继续"
+                    )
+                    row.message = "服务重启中断（review 节点），checkpoint 保留，可恢复"
+                else:
+                    row.error_message = "服务重启，任务中断"
+                    row.message = "服务重启，任务中断"
                 row.status = "error"
-                row.error_message = "服务重启，任务中断"
-                row.message = "服务重启，任务中断"
                 row.updated_at = now
                 row.finished_at = now
                 session.add(row)
@@ -137,7 +150,14 @@ def cleanup_stale_jobs() -> None:
         logger.warning("[task_runner] TTL ingest checkpoint purge failed: %s", e)
 
     # Purge DR checkpoints for jobs interrupted by this restart.
-    stale_dr_job_ids = [jid for jid, _ in stale_dr_slots]
+    # waiting_review jobs keep their checkpoints so they can be resumed after restart.
+    stale_dr_job_ids = [jid for jid, _ in stale_dr_slots if jid not in waiting_review_job_ids]
+    if waiting_review_job_ids:
+        logger.info(
+            "[task_runner] preserved checkpoint(s) for %d waiting_review DR job(s): %s",
+            len(waiting_review_job_ids),
+            list(waiting_review_job_ids),
+        )
     if stale_dr_job_ids:
         try:
             from src.collaboration.research.job_store import purge_dr_checkpoints
@@ -170,6 +190,27 @@ def cleanup_stale_jobs() -> None:
             )
         except Exception as e:
             logger.warning("[task_runner] cleanup_stale_jobs: Redis slot release failed: %s", e)
+
+    # Mark Scholar tasks stuck in 'running' (e.g. after API restart) as error.
+    try:
+        from src.tasks import get_task_queue
+        tq = get_task_queue()
+        scholar_repaired = tq.repair_stale_scholar_tasks(max_age_seconds=300)
+        if scholar_repaired > 0:
+            logger.warning("[task_runner] marked %d stale scholar task(s) as error on startup", scholar_repaired)
+    except Exception as e:
+        logger.warning("[task_runner] scholar orphan cleanup failed: %s", e)
+
+    # Mark Chat tasks stuck in 'running' (e.g. after API restart) as error and release their slots.
+    # Chat coroutines die with the process; any 'running' task after restart will never complete.
+    try:
+        from src.tasks import get_task_queue
+        tq = get_task_queue()
+        chat_repaired = tq.repair_stale_chat_tasks(max_age_seconds=60)
+        if chat_repaired > 0:
+            logger.warning("[task_runner] marked %d stale chat task(s) as error on startup", chat_repaired)
+    except Exception as e:
+        logger.warning("[task_runner] chat orphan cleanup failed: %s", e)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -340,7 +381,27 @@ def _ingest_subprocess_target(job_id: str, cfg: dict) -> None:
 
     Runs in a freshly spawned process so that any OOM kill or segfault only
     terminates this child, leaving the uvicorn worker alive to serve other users.
+
+    Guard: if the parent process restarted between the subprocess being spawned and
+    this entry point executing, cleanup_stale_jobs() may have already marked the job
+    as 'error'.  In that case we exit immediately rather than overwrite the error status
+    with a stale 'done' and potentially write duplicate vectors into the collection.
     """
+    try:
+        from src.indexing.ingest_job_store import get_job
+        job = get_job(job_id)
+        if not job or job.get("status") not in ("running", "pending"):
+            # Job was reset by a concurrent restart cleanup; abort silently.
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "[task_runner] ingest subprocess for job %s: status is '%s' at entry, aborting",
+                job_id,
+                job.get("status") if job else "missing",
+            )
+            return
+    except Exception:
+        pass  # If the status check itself fails, proceed and let the job logic handle it
+
     from src.api.routes_ingest import _run_ingest_job_safe
     _run_ingest_job_safe(job_id, cfg)
 
