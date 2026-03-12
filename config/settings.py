@@ -258,6 +258,11 @@ class ContentFetcherConfig:
     two_captcha_api_key: str = ""  # 与 BrightData 同时配置时，单页抓取上限 2 分钟；Cloudflare/Turnstile 优先用 2Captcha
     capsolver_api_key: str = ""  # 其他验证码优先 CapSolver，失败再 2Captcha；可与全局 capsolver.api_key 一致
     captcha_timeout_seconds: int = 120  # 验证码 API 轮询超时，与 downloader 一致
+    # 动态软超时（ActivityTimer）参数
+    idle_timeout_seconds: int = 30          # Playwright 无活动基础超时
+    captcha_detect_extra_seconds: int = 90  # 检测到验证码后额外时间
+    captcha_solving_extra_seconds: int = 120  # 调用解码 API 后额外时间
+    captcha_token_extra_seconds: int = 45   # token 应用后额外时间
     cache_enabled: bool = True
     cache_ttl_seconds: int = 3600
     disk_cache_enabled: bool = True
@@ -897,6 +902,10 @@ class Settings:
             two_captcha_api_key=(cf.get("two_captcha_api_key") or "").strip(),
             capsolver_api_key=capsolver_key,
             captcha_timeout_seconds=int(cf.get("captcha_timeout_seconds", 120)),
+            idle_timeout_seconds=int(cf.get("idle_timeout_seconds", 30)),
+            captcha_detect_extra_seconds=int(cf.get("captcha_detect_extra_seconds", 90)),
+            captcha_solving_extra_seconds=int(cf.get("captcha_solving_extra_seconds", 120)),
+            captcha_token_extra_seconds=int(cf.get("captcha_token_extra_seconds", 45)),
             cache_enabled=bool(cf.get("cache_enabled", True)),
             cache_ttl_seconds=int(cf.get("cache_ttl_seconds", 3600)),
             disk_cache_enabled=bool(cf.get("disk_cache_enabled", True)),

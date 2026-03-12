@@ -35,8 +35,9 @@ import asyncio
 import concurrent.futures
 import json
 import re
+import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field
@@ -52,6 +53,74 @@ from src.utils.prompt_manager import PromptManager
 _pm = PromptManager()
 
 logger = get_logger(__name__)
+
+
+class ActivityTimer:
+    """
+    活跃度感知的截止时间控制器。
+
+    初始 deadline = now + idle_timeout。每次调用 extend() 会把 deadline
+    推到 max(当前值, now + extra_seconds)，防止正在进行中的验证码解决被提前中断。
+    """
+
+    def __init__(self, idle_timeout: float) -> None:
+        self._deadline: float = time.monotonic() + idle_timeout
+        self._idle_timeout = idle_timeout
+
+    def extend(self, extra_seconds: float, reason: str = "") -> None:
+        """将 deadline 推到 max(当前值, now + extra_seconds)。"""
+        new_deadline = time.monotonic() + extra_seconds
+        if new_deadline > self._deadline:
+            logger.debug(
+                "[activity_timer] extended +%.1fs reason=%r, remaining=%.1fs",
+                extra_seconds,
+                reason,
+                new_deadline - time.monotonic(),
+            )
+            self._deadline = new_deadline
+
+    @property
+    def remaining(self) -> float:
+        return self._deadline - time.monotonic()
+
+    @property
+    def expired(self) -> bool:
+        return time.monotonic() >= self._deadline
+
+
+async def _run_with_activity_timer(
+    coro: Any,
+    timer: ActivityTimer,
+    poll_interval: float = 1.0,
+) -> Any:
+    """
+    运行 coro（包装为 Task），当 timer.expired 时取消任务。
+
+    watchdog 每 poll_interval 秒检查一次 timer，过期则取消。
+    返回协程结果；若被 watchdog 取消则返回 None。
+    """
+    task = asyncio.create_task(coro)
+
+    async def _watchdog() -> None:
+        while not task.done():
+            if timer.expired:
+                logger.debug("[activity_timer] watchdog: timer expired, cancelling task")
+                task.cancel()
+                return
+            await asyncio.sleep(poll_interval)
+
+    wd = asyncio.create_task(_watchdog())
+    try:
+        return await task
+    except asyncio.CancelledError:
+        logger.debug("[activity_timer] task cancelled by watchdog (timer expired)")
+        return None
+    finally:
+        wd.cancel()
+        try:
+            await wd
+        except asyncio.CancelledError:
+            pass
 
 
 class _FetchDecisionResponse(BaseModel):
@@ -214,6 +283,11 @@ class WebContentFetcher:
     two_captcha_api_key: str = ""  # 与 BrightData 同时启用时，单页抓取上限提高到 2 分钟；Cloudflare/Turnstile 仅用 2Captcha
     capsolver_api_key: str = ""  # 其他验证码优先 CapSolver，失败再 2Captcha
     captcha_timeout_seconds: int = 120
+    # 动态软超时参数
+    idle_timeout_seconds: int = 30          # Playwright 无任何活动时的基础超时
+    captcha_detect_extra_seconds: int = 90  # 检测到验证码后额外给予的时间
+    captcha_solving_extra_seconds: int = 120  # 调用解码 API 后额外给予的时间
+    captcha_token_extra_seconds: int = 45   # token 应用后额外给予的时间
     cache_enabled: bool = True
     cache_ttl_seconds: int = 3600
     disk_cache_enabled: bool = True
@@ -278,6 +352,10 @@ class WebContentFetcher:
                     two_captcha_api_key=getattr(cfg, "two_captcha_api_key", ""),
                     capsolver_api_key=getattr(cfg, "capsolver_api_key", ""),
                     captcha_timeout_seconds=getattr(cfg, "captcha_timeout_seconds", 120),
+                    idle_timeout_seconds=int(getattr(cfg, "idle_timeout_seconds", 30)),
+                    captcha_detect_extra_seconds=int(getattr(cfg, "captcha_detect_extra_seconds", 90)),
+                    captcha_solving_extra_seconds=int(getattr(cfg, "captcha_solving_extra_seconds", 120)),
+                    captcha_token_extra_seconds=int(getattr(cfg, "captcha_token_extra_seconds", 45)),
                     cache_enabled=getattr(cfg, "cache_enabled", True),
                     cache_ttl_seconds=getattr(cfg, "cache_ttl_seconds", 3600),
                     disk_cache_enabled=getattr(cfg, "disk_cache_enabled", True),
@@ -417,6 +495,18 @@ class WebContentFetcher:
         try:
             from playwright.async_api import async_playwright
 
+            # 创建活跃度感知 timer；验证码各里程碑通过回调推延 deadline
+            timer = ActivityTimer(float(self.idle_timeout_seconds))
+
+            def _on_captcha_progress(milestone: str) -> None:
+                extras: Dict[str, int] = {
+                    "captcha_detected": self.captcha_detect_extra_seconds,
+                    "solving_started":  self.captcha_solving_extra_seconds,
+                    "token_received":   self.captcha_token_extra_seconds,
+                }
+                if milestone in extras:
+                    timer.extend(float(extras[milestone]), reason=milestone)
+
             # Prefer headless context pool (bridge-safe: worker runs on owner loop)
             try:
                 from config.settings import settings
@@ -443,15 +533,21 @@ class WebContentFetcher:
                                 self.two_captcha_api_key,
                                 captcha_timeout_seconds=self.captcha_timeout_seconds,
                                 max_retries=2,
+                                on_progress=_on_captcha_progress,
                             )
                         return await page.content()
                     finally:
                         await page.close()
 
-                pool_html = await run_with_headless_context(
-                    _pool_worker,
-                    timeout=acquire_timeout,
-                    purpose="content_fetcher",
+                # 注：若 context pool 跨事件循环（bridge 模式），timer 取消外层 task 后
+                # pool 侧协程仍会继续执行直至自然结束（浏览器槽位短暂占用，不影响正确性）
+                pool_html = await _run_with_activity_timer(
+                    run_with_headless_context(
+                        _pool_worker,
+                        timeout=acquire_timeout,
+                        purpose="content_fetcher",
+                    ),
+                    timer,
                 )
                 if pool_html and len(pool_html) >= 200:
                     html = pool_html
@@ -460,37 +556,42 @@ class WebContentFetcher:
 
             # Fallback: ephemeral browser/context (only if pool did not produce html)
             if not (html and len(html) >= 200):
-                async with async_playwright() as p:
-                    cdp_url = SharedBrowserService.get_cdp_url_headless()
-                    own_browser = False
-                    if cdp_url:
-                        browser = await p.chromium.connect_over_cdp(cdp_url)
-                    else:
-                        browser = await p.chromium.launch(headless=True)
-                        own_browser = True
-                    try:
-                        context = await browser.new_context(**get_cdp_context_options())
-                        page = await context.new_page()
-                        await apply_stealth_to_page(page)
-                        await page.goto(
-                            url,
-                            wait_until="domcontentloaded",
-                            timeout=self.effective_timeout_seconds * 1000,
-                        )
-                        await page.wait_for_timeout(2000)
-                        if self._captcha_solver and self._captcha_solver.has_any_provider:
-                            await run_captcha_flow(
-                                page,
-                                self._captcha_solver,
-                                self.two_captcha_api_key,
-                                captcha_timeout_seconds=self.captcha_timeout_seconds,
-                                max_retries=2,
+                async def _ephemeral_fetch() -> Optional[str]:
+                    async with async_playwright() as p:
+                        cdp_url = SharedBrowserService.get_cdp_url_headless()
+                        own_browser = False
+                        if cdp_url:
+                            browser = await p.chromium.connect_over_cdp(cdp_url)
+                        else:
+                            browser = await p.chromium.launch(headless=True)
+                            own_browser = True
+                        try:
+                            context = await browser.new_context(**get_cdp_context_options())
+                            page = await context.new_page()
+                            await apply_stealth_to_page(page)
+                            await page.goto(
+                                url,
+                                wait_until="domcontentloaded",
+                                timeout=self.effective_timeout_seconds * 1000,
                             )
-                        html = await page.content()
-                        await context.close()
-                    finally:
-                        if own_browser:
-                            await browser.close()
+                            await page.wait_for_timeout(2000)
+                            if self._captcha_solver and self._captcha_solver.has_any_provider:
+                                await run_captcha_flow(
+                                    page,
+                                    self._captcha_solver,
+                                    self.two_captcha_api_key,
+                                    captcha_timeout_seconds=self.captcha_timeout_seconds,
+                                    max_retries=2,
+                                    on_progress=_on_captcha_progress,
+                                )
+                            result_html = await page.content()
+                            await context.close()
+                            return result_html
+                        finally:
+                            if own_browser:
+                                await browser.close()
+
+                html = await _run_with_activity_timer(_ephemeral_fetch(), timer)
 
             if not html or len(html) < 200:
                 return None
@@ -598,16 +699,19 @@ class WebContentFetcher:
             return text
 
         try:
+            # trafilatura / brightdata 各自内部已有独立超时，此处用松弛兜底防止意外挂死。
+            # playwright 路径由内部 ActivityTimer + watchdog 管理，不依赖此硬上限。
+            _outer_cap = max(float(self.idle_timeout_seconds) * 5, 300.0)
             try:
                 text = await asyncio.wait_for(
                     _fetch_with_cap(),
-                    timeout=float(self.effective_timeout_seconds),
+                    timeout=_outer_cap,
                 )
             except asyncio.TimeoutError:
                 logger.debug(
-                    "抓取总超时放弃: %s (上限 %ds)",
+                    "抓取总超时放弃: %s (外层兜底上限 %.0fs)",
                     url,
-                    self.effective_timeout_seconds,
+                    _outer_cap,
                 )
                 text = None
 

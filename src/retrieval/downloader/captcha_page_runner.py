@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from src.log import get_logger
 
@@ -516,6 +516,7 @@ async def run_captcha_flow(
     captcha_timeout_seconds: float = 120,
     max_retries: int = 2,
     load_state_timeout_ms: int = 10000,
+    on_progress: Optional[Callable[[str], None]] = None,
 ) -> bool:
     """
     Single entry for content-fetcher / lightweight callers.
@@ -532,14 +533,20 @@ async def run_captcha_flow(
             if captcha_type == CaptchaType.UNKNOWN:
                 return True
 
+            if on_progress is not None:
+                on_progress("captcha_detected")
+
             if captcha_type == CaptchaType.TURNSTILE:
-                return await solve_turnstile_via_2captcha(
+                solved = await solve_turnstile_via_2captcha(
                     page,
                     twocaptcha_api_key,
                     intercept_script=intercept_script,
                     timeout_seconds=min(captcha_timeout_seconds, 60),
                     max_retries=max_retries,
                 )
+                if solved and on_progress is not None:
+                    on_progress("captcha_solved")
+                return solved
 
             if not captcha_solver.has_any_provider:
                 logger.warning("No captcha API keys configured; cannot solve type=%s", captcha_type)
@@ -557,6 +564,8 @@ async def run_captcha_flow(
                     await asyncio.sleep(3)
                 continue
 
+            if on_progress is not None:
+                on_progress("solving_started")
             result: CaptchaSolveResult = await captcha_solver.solve(captcha_type, params)
             if not result.success or not result.token:
                 logger.warning("Solve failed type=%s error=%s", captcha_type, result.error)
@@ -565,6 +574,8 @@ async def run_captcha_flow(
                 continue
 
             await apply_captcha_token(page, captcha_type, result.token)
+            if on_progress is not None:
+                on_progress("token_received")
             try:
                 await page.wait_for_load_state("domcontentloaded", timeout=load_state_timeout_ms)
             except Exception:
@@ -573,6 +584,8 @@ async def run_captcha_flow(
 
             post_type = await detect_captcha_type(page)
             if post_type == CaptchaType.UNKNOWN:
+                if on_progress is not None:
+                    on_progress("captcha_solved")
                 return True
         except Exception as e:
             logger.debug("run_captcha_flow attempt %s: %s", attempt + 1, e)
