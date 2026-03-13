@@ -20,6 +20,34 @@ logger = get_logger(__name__)
 router = APIRouter(prefix="/graph", tags=["graph"])
 
 
+def _has_bbox(bbox: Any) -> bool:
+    if isinstance(bbox, list) and len(bbox) >= 4 and all(isinstance(v, (int, float)) for v in bbox[:4]):
+        return True
+    if isinstance(bbox, list) and bbox and isinstance(bbox[0], list):
+        first = bbox[0]
+        return len(first) >= 4 and all(isinstance(v, (int, float)) for v in first[:4])
+    return False
+
+
+def _public_chunk_detail(detail: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(detail)
+    page = out.get("page")
+    out["page"] = int(page) + 1 if isinstance(page, int) and page >= 0 else None
+    # Normalize bbox to flat [x0,y0,x1,y1] format
+    raw_bbox = out.get("bbox")
+    if isinstance(raw_bbox, list) and raw_bbox:
+        first = raw_bbox[0]
+        if isinstance(first, (list, tuple)) and len(first) >= 4:
+            out["bbox"] = [float(v) for v in first[:4]]
+        elif isinstance(first, (int, float)) and len(raw_bbox) >= 4:
+            out["bbox"] = [float(v) for v in raw_bbox[:4]]
+        else:
+            out["bbox"] = None
+    else:
+        out["bbox"] = None
+    return out
+
+
 def _get_hippo():
     """获取 HippoRAG 实例"""
     try:
@@ -47,6 +75,18 @@ def _query_chunk_in_collection(collection_name: str, chunk_id: str) -> Optional[
     except Exception as e:
         logger.warning("query chunk failed collection=%s chunk=%s err=%s", collection_name, chunk_id, e)
         return None
+
+    if not rows and len(chunk_id) < 32:
+        # Fallback: try prefix match for legacy truncated chunk IDs
+        try:
+            rows = milvus.query(
+                collection_name,
+                filter=f'chunk_id like "{escaped_chunk_id}%"',
+                output_fields=["chunk_id", "paper_id", "content", "raw_content", "section_path", "page", "content_type", "chunk_type", "bbox"],
+                limit=1,
+            )
+        except Exception:
+            pass
 
     if not rows:
         return None
@@ -313,6 +353,18 @@ def graph_chunk_detail(
     for cname in candidates:
         found = _query_chunk_in_collection(cname, chunk_id)
         if found:
+            effective_paper_id = found.get("paper_id") or paper_id
+            if effective_paper_id and not _has_bbox(found.get("bbox")):
+                fallback = _query_chunk_from_parsed(
+                    str(effective_paper_id),
+                    chunk_id,
+                    user_id=user_id,
+                    collection=collection,
+                )
+                if fallback:
+                    for key in ("bbox", "page", "section_path", "content", "content_type", "chunk_type"):
+                        if fallback.get(key) not in (None, "", []):
+                            found[key] = fallback.get(key)
             # 追加图上相邻实体，便于解释该 chunk 的关系来源
             related_entities: List[str] = []
             hippo = _get_hippo()
@@ -324,7 +376,7 @@ def graph_chunk_detail(
             found["related_entities"] = sorted(set(related_entities))[:30]
             if paper_id and not found.get("paper_id"):
                 found["paper_id"] = paper_id
-            return found
+            return _public_chunk_detail(found)
 
     # 回退：Milvus 不存在时，尝试从 parsed/enriched.json 重建并匹配 chunk_id
     if paper_id:
@@ -338,7 +390,7 @@ def graph_chunk_detail(
                     if ptype != "CHUNK":
                         related_entities.append(str(predecessor))
             fallback["related_entities"] = sorted(set(related_entities))[:30]
-            return fallback
+            return _public_chunk_detail(fallback)
 
     raise HTTPException(status_code=404, detail=f"chunk '{chunk_id}' 未找到")
 

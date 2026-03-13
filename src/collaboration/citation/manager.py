@@ -13,11 +13,12 @@ import unicodedata
 from typing import Dict, List, Literal, Optional, Set
 
 from config.settings import settings
-from src.collaboration.canvas.models import Citation
+from src.collaboration.canvas.models import Citation, CitationAnchor
 from src.retrieval.evidence import EvidenceChunk, EvidencePack
 
 
 CiteKeyFormat = Literal["numeric", "hash", "author_date"]
+_ANCHOR_SNIPPET_MAX_CHARS = 240
 
 
 class CiteKeyGenerator:
@@ -225,6 +226,62 @@ def _make_cite_key(
     return gen.generate(c)
 
 
+def _public_page_num(page_num: Optional[int]) -> Optional[int]:
+    if page_num is None:
+        return None
+    return int(page_num) + 1
+
+
+def _normalize_bbox(bbox: Optional[List]) -> Optional[List[float]]:
+    if not isinstance(bbox, list) or not bbox:
+        return None
+    # Handle nested format: [[x0, y0, x1, y1], ...]
+    if isinstance(bbox[0], (list, tuple)):
+        bbox = list(bbox[0])
+    if len(bbox) < 4:
+        return None
+    return [float(v) for v in bbox[:4]]
+
+
+def _make_anchor_snippet(text: Optional[str]) -> Optional[str]:
+    snippet = re.sub(r"\s+", " ", (text or "")).strip()
+    if not snippet:
+        return None
+    if len(snippet) <= _ANCHOR_SNIPPET_MAX_CHARS:
+        return snippet
+    return snippet[: _ANCHOR_SNIPPET_MAX_CHARS - 3].rstrip() + "..."
+
+
+def _chunk_to_anchor(chunk: EvidenceChunk) -> CitationAnchor:
+    return CitationAnchor(
+        chunk_id=chunk.chunk_id or "",
+        page_num=_public_page_num(getattr(chunk, "page_num", None)),
+        bbox=_normalize_bbox(getattr(chunk, "bbox", None)),
+        snippet=_make_anchor_snippet(getattr(chunk, "text", None)),
+    )
+
+
+def _merge_anchor_lists(existing: List[CitationAnchor], incoming: List[CitationAnchor]) -> List[CitationAnchor]:
+    seen: Set[str] = set()
+    merged: List[CitationAnchor] = []
+    for anchor in list(existing or []) + list(incoming or []):
+        key = (anchor.chunk_id or "").strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        merged.append(anchor)
+    return merged
+
+
+def _set_primary_trace(citation: Citation) -> Citation:
+    primary = citation.anchors[0] if citation.anchors else None
+    if primary:
+        citation.chunk_id = primary.chunk_id or citation.chunk_id
+        citation.page_num = primary.page_num
+        citation.bbox = primary.bbox
+    return citation
+
+
 def chunk_to_citation(
     chunk: EvidenceChunk,
     format: Optional[CiteKeyFormat] = None,
@@ -239,8 +296,7 @@ def chunk_to_citation(
     pdf_url = getattr(chunk, "pdf_url", None) or None
     doc_id = chunk.doc_id or None
 
-    bbox = getattr(chunk, "bbox", None) or None
-    page_num = getattr(chunk, "page_num", None) or None
+    anchor = _chunk_to_anchor(chunk)
 
     provider = getattr(chunk, "provider", None)
     if not provider:
@@ -253,7 +309,7 @@ def chunk_to_citation(
             provider = "web"
 
     citation = Citation(
-        id=chunk.chunk_id[:16] if chunk.chunk_id else "",
+        id=chunk.chunk_id or "",
         title=title,
         authors=authors,
         year=year,
@@ -262,8 +318,10 @@ def chunk_to_citation(
         pdf_url=pdf_url,
         doi=doi,
         cite_key="",
-        bbox=bbox,
-        page_num=page_num,
+        chunk_id=anchor.chunk_id or None,
+        bbox=anchor.bbox,
+        page_num=anchor.page_num,
+        anchors=[anchor] if anchor.chunk_id else [],
         provider=provider,
     )
 
@@ -308,6 +366,24 @@ def merge_citations_by_document(citations: List[Citation]) -> List[Citation]:
             key = c.cite_key or c.id
         if key not in merged:
             merged[key] = c
+            continue
+        existing = merged[key]
+        existing.anchors = _merge_anchor_lists(existing.anchors, c.anchors)
+        if not existing.chunk_id and c.chunk_id:
+            existing.chunk_id = c.chunk_id
+        if existing.page_num is None and c.page_num is not None:
+            existing.page_num = c.page_num
+        if not existing.bbox and c.bbox:
+            existing.bbox = c.bbox
+        if not existing.pdf_url and c.pdf_url:
+            existing.pdf_url = c.pdf_url
+        if not existing.doi and c.doi:
+            existing.doi = c.doi
+        if not existing.url and c.url:
+            existing.url = c.url
+        if not existing.doc_id and c.doc_id:
+            existing.doc_id = c.doc_id
+        _set_primary_trace(existing)
     return list(merged.values())
 
 
@@ -317,7 +393,7 @@ def resolve_response_citations(
     format: Optional[CiteKeyFormat] = None,
     doc_key_to_cite_key: Optional[Dict[str, str]] = None,
     existing_cite_keys: Optional[Set[str]] = None,
-    include_unreferenced_documents: bool = True,
+    include_unreferenced_documents: bool = False,
 ) -> tuple[str, List[Citation], Dict[str, str]]:
     """
     对 LLM 回答做引文后处理：将 [ref:xxxx] 占位符替换为正式 cite_key，并输出文档级引文列表。
@@ -391,11 +467,21 @@ def resolve_response_citations(
     gen = CiteKeyGenerator(format=format, existing_keys=seed_keys)
     citations: List[Citation] = []
     for doc_key, group in doc_groups.items():
+        unique_group: List[EvidenceChunk] = []
+        seen_chunk_ids: Set[str] = set()
+        for chunk in group:
+            chunk_id = (chunk.chunk_id or "").strip()
+            if chunk_id and chunk_id in seen_chunk_ids:
+                continue
+            if chunk_id:
+                seen_chunk_ids.add(chunk_id)
+            unique_group.append(chunk)
+
         if doc_key in shared_doc_map:
             cite_key = shared_doc_map[doc_key]
         else:
             # 先生成 cite_key，再写入共享映射
-            temp = _pick_best_metadata(group)
+            temp = _pick_best_metadata(unique_group)
             temp_citation = Citation(
                 id=doc_key[:16],
                 title=temp.doc_title or "",
@@ -411,7 +497,9 @@ def resolve_response_citations(
             shared_doc_map[doc_key] = cite_key
             shared_keys.add(cite_key)
 
-        best = _pick_best_metadata(group)
+        best = _pick_best_metadata(unique_group)
+        anchors = [_chunk_to_anchor(chunk) for chunk in unique_group if (chunk.chunk_id or "").strip()]
+        primary = anchors[0] if anchors else None
         prov = getattr(best, "provider", None)
         if not prov:
             has_url = bool(getattr(best, "url", None))
@@ -431,11 +519,13 @@ def resolve_response_citations(
             pdf_url=getattr(best, "pdf_url", None),
             doi=getattr(best, "doi", None),
             cite_key=cite_key,
-            bbox=getattr(best, "bbox", None),
-            page_num=getattr(best, "page_num", None),
+            chunk_id=primary.chunk_id if primary else None,
+            bbox=primary.bbox if primary else None,
+            page_num=primary.page_num if primary else None,
+            anchors=anchors,
             provider=prov,
         )
-        citations.append(citation)
+        citations.append(_set_primary_trace(citation))
 
     # ── 5. 构建 ref_hash → cite_key 映射（key 为完整 ref_hash，如 "ref:a1b2c3d4"）──
     ref_map: Dict[str, str] = {}

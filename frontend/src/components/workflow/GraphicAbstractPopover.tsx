@@ -79,7 +79,7 @@ export function GraphicAbstractPopover({ open, onClose }: Props) {
         <div className="flex items-center justify-between gap-2 mb-2">
           <label className="text-[11px] font-medium text-gray-600 flex items-center gap-1">
             画图模型
-            <Tip content="自动抽取回复/报告提要并绘制 Mermaid 逻辑图谱">
+            <Tip content="自动抽取回复或研究报告要点，并生成最终 Graphic Abstract 图像">
               <HelpCircle size={10} />
             </Tip>
           </label>
@@ -90,10 +90,9 @@ export function GraphicAbstractPopover({ open, onClose }: Props) {
           onChange={(e) => updateRagConfig({ graphicAbstractModel: e.target.value })}
           className="w-full border border-gray-200 rounded-lg px-2 py-1.5 text-[11px] bg-white text-gray-900 focus:ring-1 focus:ring-pink-400 outline-none disabled:bg-gray-50 disabled:text-gray-400"
         >
-          <option value="nanobanana 2">nanobanana 2 (Gemini Flash)</option>
+          <option value="nanobanana 2">nanobanana 2 (Gemini 2.5 Flash Image)</option>
           <option value="nanobanana pro">nanobanana pro (Gemini Pro)</option>
           <option value="gpt-image-1.5">gpt-image-1.5 (GPT)</option>
-          <option value="kimi-k2.5">kimi-k2.5 (Kimi)</option>
           <option value="qwen-image-2.0">qwen-image-2.0 (Qwen)</option>
         </select>
       </div>

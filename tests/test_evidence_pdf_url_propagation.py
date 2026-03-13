@@ -108,7 +108,7 @@ def test_chunk_to_citation_preserves_pdf_url_and_doi():
 def test_serialize_citation_includes_pdf_url():
     from src.retrieval.evidence import EvidenceChunk
     from src.collaboration.citation.manager import chunk_to_citation
-    from src.api.routes_chat import _serialize_citation
+    from src.api.routes_chat import _serialize_citation, _chat_citation_from_dict
 
     c = EvidenceChunk(
         chunk_id="c1",
@@ -124,3 +124,15 @@ def test_serialize_citation_includes_pdf_url():
     d = _serialize_citation(citation)
     assert d.get("pdf_url") == "https://example.com/paper.pdf"
     assert d.get("doi") == "10.1234/example"
+    assert d.get("chunk_id") == "c1"
+    assert d.get("anchors") == [{
+        "chunk_id": "c1",
+        "page_num": None,
+        "bbox": None,
+        "snippet": "content",
+    }]
+
+    roundtrip = _chat_citation_from_dict(d)
+    assert roundtrip.pdf_url == "https://example.com/paper.pdf"
+    assert roundtrip.chunk_id == "c1"
+    assert roundtrip.anchors[0].chunk_id == "c1"

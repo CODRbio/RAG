@@ -25,6 +25,11 @@ from langgraph.types import interrupt
 from pydantic import BaseModel, Field
 
 from config.settings import settings
+from src.collaboration.graphic_abstract import (
+    GRAPHIC_ABSTRACT_FAILURE_MD,
+    render_graphic_abstract_markdown,
+    resolve_graphic_abstract_model,
+)
 from src.collaboration.research.dashboard import (
     ResearchBrief,
     ResearchDashboard,
@@ -497,13 +502,14 @@ class _CoverageEvalResponse(BaseModel):
 
 
 # ────────────────────────────────────────────────
-# Depth Presets — "lite" vs "comprehensive"
+# Depth Presets — "lite" vs "comprehensive" vs "expert"
 # ────────────────────────────────────────────────
 # Each preset defines the bounds for all loops in the graph, preventing the
 # recursion-limit explosion that occurs when any loop runs unbounded.
 #
 #   lite          — fast but academically usable, ~5-15 min
 #   comprehensive — thorough academic review, ~20-60 min
+#   expert        — exhaustive expert-level synthesis, ~60-180 min
 #
 # Key thresholds (see architecture.md for full table):
 #
@@ -637,6 +643,45 @@ DEPTH_PRESETS: Dict[str, Dict[str, Any]] = {
         "cost_force_summary_steps": 420,
         "cost_tick_interval": 30,
     },
+    "expert": {
+        # ── Iteration budget ──
+        "max_section_research_rounds": 8,        # exhaustive multi-pass per section
+        "max_verify_rewrite_cycles": 3,          # global = (8+3) × num_sections
+        # ── Coverage ──
+        "coverage_threshold": 0.90,              # near-complete coverage required
+        # ── Queries (recall + precision) ──
+        "recall_queries_per_section": 6,
+        "precision_queries_per_section": 6,      # total = 12 + gaps
+        # ── Tiered search ceilings ──
+        "round1_max_tier": 3,                    # Round 1: T1→T2→T3 (full chain from start)
+        "gapfill_max_tier": 3,                   # Every gap-fill round: T1→T2→T3
+        "last_round_max_tier": 3,                # Last round: T1→T2→T3
+        "default_per_provider_top_k": 20,        # wider recall window per provider
+        # ── Write/verification top_k ──
+        "search_top_k_write": 20,
+        "search_top_k_write_max": 100,
+        "verification_k": 24,
+        # ── Tier-3 refined queries ──
+        "tier3_refined_queries": 3,
+        # ── Coverage plateau ──
+        "coverage_plateau_floor": 0.88,          # plateau only kicks in after very high coverage
+        "coverage_plateau_min_gain": 0.01,       # accept tiny gains before stopping
+        # ── Verification (3-tier) ──
+        "verify_light_threshold": 0.10,          # < 10% → flag only
+        "verify_medium_threshold": 0.20,         # 10-20% → gap-fill only
+        "verify_severe_threshold": 0.25,         # > 25% → full re-research
+        # ── Review gate ──
+        "review_gate_max_rounds": 400,           # ~20 min with backoff
+        "review_gate_base_sleep": 2,
+        "review_gate_max_sleep": 30,
+        "review_gate_early_stop_unchanged": 20,
+        # ── LangGraph ──
+        "recursion_limit": 1000,
+        # ── Cost monitor (graph steps) ──
+        "cost_warn_steps": 600,
+        "cost_force_summary_steps": 900,
+        "cost_tick_interval": 40,
+    },
 }
 
 DEFAULT_DEPTH = "comprehensive"
@@ -696,7 +741,7 @@ class DeepResearchState(TypedDict, total=False):
     review_gate_next: str
     review_handled_at: Dict[str, float]
     # ── Depth preset (controls all loop bounds) ──
-    depth: str                        # "lite" | "comprehensive"
+    depth: str                        # "lite" | "comprehensive" | "expert"
     depth_preset: Dict[str, Any]      # resolved preset values
     review_gate_rounds: int           # counter for review_gate self-loop
     review_gate_unchanged: int        # consecutive unchanged poll counter (for early-stop)
@@ -5146,39 +5191,32 @@ def synthesize_node(state: DeepResearchState) -> DeepResearchState:
     # ── Graphic Abstract ──
     dr_filters = state.get("filters") or {}
     if dr_filters.get("enable_graphic_abstract") and final_markdown.strip():
-        ga_model = dr_filters.get("graphic_abstract_model") or "nanobanana 2"
-        ga_provider = "gemini"
-        if ga_model.startswith("gpt"):
-            ga_provider = "openai"
-        elif ga_model.startswith("kimi"):
-            ga_provider = "kimi"
-            
+        ga_model_raw = dr_filters.get("graphic_abstract_model")
+        ga_provider, ga_model = resolve_graphic_abstract_model(ga_model_raw)
+
         _emit_progress(state, "synthesize_graphic_abstract", {"message": f"正在生成 Graphic Abstract ({ga_model})..."})
         try:
-            from src.llm.llm_manager import get_manager
-            from pathlib import Path
-            _config_path = Path(__file__).resolve().parents[3] / "config" / "rag_config.json"
-            ga_client = get_manager(str(_config_path)).get_client(ga_provider)
-            ga_prompt = (
-                "Please extract the core concepts and logical flow from the following report, "
-                "and generate a clear, structured Mermaid diagram (e.g. flowchart, mindmap, or sequence diagram) "
-                "to serve as a Graphic Abstract. "
-                "ONLY output the mermaid code block wrapped in ```mermaid ... ```, no other text or explanation.\n\n"
-                f"Report:\n{final_markdown[:40000]}"  # truncate to avoid context limit just in case
+            ga_result = render_graphic_abstract_markdown(
+                final_markdown,
+                model_raw=ga_model_raw,
+                content_kind="deep_research",
+                heading="## **Graphic Abstract**",
+                session_id=state.get("session_id"),
             )
-            ga_resp = ga_client.chat([{"role": "user", "content": ga_prompt}], model=ga_model, max_tokens=None)
-            ga_text = (ga_resp.get("final_text") or "").strip()
-            
-            if ga_text and not ga_text.startswith("```mermaid"):
-                if ga_text.startswith("```"):
-                    pass
-                else:
-                    ga_text = f"```mermaid\n{ga_text}\n```"
-            
-            if ga_text:
-                final_markdown += f"\n\n## **Graphic Abstract**\n\n{ga_text}\n"
+            logger.info(
+                "[research] Graphic Abstract generated, requested_model=%s, provider=%s, resolved_model=%s, backend=%s, key=%s, content_type=%s, url=%s",
+                ga_model_raw,
+                ga_provider,
+                ga_model,
+                ga_result.storage_backend,
+                ga_result.asset_key,
+                ga_result.content_type,
+                ga_result.image_url,
+            )
+            final_markdown += ga_result.markdown
         except Exception as e:
             logger.error(f"[research] Graphic Abstract 生成失败: {e}", exc_info=True)
+            final_markdown += GRAPHIC_ABSTRACT_FAILURE_MD
 
     state["markdown_parts"] = [final_markdown]
 
@@ -6045,7 +6083,7 @@ def run_deep_research(
     执行 Deep Research Agent。
 
     Args:
-        depth: Research depth — "lite" (fast, ~3-10 min) or "comprehensive" (thorough, ~15-40 min).
+        depth: Research depth — "lite" (fast, ~3-10 min), "comprehensive" (thorough, ~15-40 min), or "expert" (exhaustive, ~60-180 min).
 
     Returns:
         {

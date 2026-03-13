@@ -32,6 +32,13 @@ export interface UserItem {
 // Chat & Messages
 // ============================================================
 
+export interface CitationAnchor {
+  chunk_id: string;
+  page_num?: number | null;
+  bbox?: number[] | null;
+  snippet?: string | null;
+}
+
 export interface Source {
   id: string | number;
   cite_key: string;
@@ -49,6 +56,8 @@ export interface Source {
   provider?: string;  // local | tavily | google | scholar | semantic | semantic_snippet | semantic_bulk | ncbi | serpapi | serpapi_scholar | serpapi_google
   bbox?: number[];
   page_num?: number | null;
+  chunk_id?: string | null;
+  anchors?: CitationAnchor[];
 }
 
 export interface Message {
@@ -158,6 +167,7 @@ export interface ChatRequest {
   write_top_k?: number;
   graph_top_k?: number;
   llm_provider?: string;  // LLM 提供商: deepseek | openai | gemini | claude | kimi 等
+  intent_provider?: string;  // 意图判断专用 provider；只用于 chat follow-up / intent detection
   ultra_lite_provider?: string;  // 长文本压缩等超轻量任务用的 provider（如 openai-mini, gemini-flash）
   model_override?: string;  // 覆盖默认模型，如 claude-opus-4-6
   mode?: ChatMode;  // 执行模式: chat（默认）| deep_research
@@ -187,14 +197,17 @@ export interface ChatRequest {
 
 export interface ChatCitation {
   cite_key: string;
+  chunk_id?: string | null;
   title: string;
   authors: string[];
   year?: number | null;
   doc_id?: string | null;
   url?: string | null;
+  pdf_url?: string | null;
   doi?: string | null;
   bbox?: number[];
   page_num?: number | null;
+  anchors?: CitationAnchor[];
   provider?: string | null;
 }
 
@@ -294,6 +307,8 @@ export interface IntentDetectRequest {
   message: string;
   session_id?: string;
   current_stage?: string;
+  llm_provider?: string;
+  intent_provider?: string;
 }
 
 export interface IntentDetectResponse {
@@ -473,7 +488,7 @@ export interface DeepResearchConfirmRequest {
   user_context_mode?: 'supporting' | 'direct_injection';
   user_documents?: Array<{ name: string; content: string }>;
   // 研究深度
-  depth?: 'lite' | 'comprehensive';
+  depth?: 'lite' | 'comprehensive' | 'expert';
   // 阶段跳过控制
   skip_draft_review?: boolean;
   skip_refine_review?: boolean;
@@ -745,7 +760,7 @@ export interface RagConfig {
   maxIterations: number;  // Agent ReAct 最大迭代轮数，默认 2
   agentDebugMode: boolean;  // 是否显示 Agent 详细调试面板
   enableGraphicAbstract?: boolean; // 是否在末尾生成 Graphic Abstract
-  graphicAbstractModel?: string; // 生成 Graphic Abstract 所用的模型提供商（gemini, openai, kimi）
+  graphicAbstractModel?: string; // 生成 Graphic Abstract 所用的图像模型标识
 }
 
 export interface WebSearchConfig {
@@ -760,7 +775,7 @@ export interface WebSearchConfig {
 // ============================================================
 
 export interface DeepResearchDefaults {
-  depth: 'lite' | 'comprehensive';
+  depth: 'lite' | 'comprehensive' | 'expert';
   outputLanguage: 'auto' | 'en' | 'zh';
   yearStart: number | null;
   yearEnd: number | null;
@@ -773,6 +788,8 @@ export interface DeepResearchDefaults {
   skipClaimGeneration: boolean;
   maxSections: number;
   gapQueryIntent: 'broad' | 'review_pref' | 'reviews_only';
+  /** 意图判断专用 provider。用于 chat follow-up / intent detection，不影响主回答模型。 */
+  intent_provider?: string | null;
   /** 长文本压缩等超轻量任务用的 provider（高级配置中选择，与拉取模型列表比对） */
   ultra_lite_provider?: string | null;
 }
@@ -830,6 +847,8 @@ export const COMMAND_LIST: CommandDefinition[] = [
   { command: '/search', label: 'commands.search', description: 'commands.searchDesc', mode: 'chat', example: '/search deep sea cold seep' },
   { command: '/outline', label: 'commands.generateOutline', description: 'commands.generateOutlineDesc', mode: 'chat', example: '/outline' },
   { command: '/draft', label: 'commands.draftChapter', description: 'commands.draftChapterDesc', mode: 'chat', example: '/draft introduction' },
+  { command: '/rewrite', label: 'commands.rewrite', description: 'commands.rewriteDesc', mode: 'chat', example: '/rewrite 改成要点列表' },
+  { command: '/deepen', label: 'commands.deepen', description: 'commands.deepenDesc', mode: 'chat', example: '/deepen 深海热液口温度范围' },
   { command: '/export', label: 'commands.exportDoc', description: 'commands.exportDocDesc', mode: 'chat', example: '/export' },
   { command: '/status', label: 'commands.viewStatus', description: 'commands.viewStatusDesc', mode: 'chat', example: '/status' },
 ];

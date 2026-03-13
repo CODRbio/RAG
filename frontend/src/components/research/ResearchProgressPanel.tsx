@@ -17,6 +17,7 @@ import {
   DEEP_RESEARCH_JOB_KEY,
   DEEP_RESEARCH_ARCHIVED_JOBS_KEY,
 } from '../workflow/deep-research/types';
+import { logger } from '../../utils/logger';
 
 interface Props {
   dashboard: ResearchDashboardData | null;
@@ -151,7 +152,7 @@ export function ResearchProgressPanel({ dashboard, isActive }: Props) {
         'success',
       );
     } catch (err) {
-      console.error('[DeepResearch] evidence optimization failed:', err);
+      logger.ui.error('[DeepResearch] evidence optimization failed', err);
       addToast(t('research.optimizeEvidenceFailed'), 'error');
     } finally {
       setOptimizing(null);
@@ -176,7 +177,7 @@ export function ResearchProgressPanel({ dashboard, isActive }: Props) {
       setShowDeepResearchDialog(true);
       addToast(`Restart submitted for ${sectionTitle}`, 'success');
     } catch (err) {
-      console.error('[DeepResearch] section restart failed:', err);
+      logger.ui.error('[DeepResearch] section restart failed', err);
       addToast('Section restart failed', 'error');
     } finally {
       setRestarting(false);

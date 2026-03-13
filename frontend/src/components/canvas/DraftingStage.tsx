@@ -18,6 +18,7 @@ import {
   DEEP_RESEARCH_JOB_KEY,
   DEEP_RESEARCH_ARCHIVED_JOBS_KEY,
 } from '../workflow/deep-research/types';
+import { logger } from '../../utils/logger';
 
 interface DraftingStageProps {
   canvas: Canvas;
@@ -96,7 +97,7 @@ export function DraftingStage({ canvas }: DraftingStageProps) {
       afterRestartSubmitted(resp.job_id, resp.session_id, resp.canvas_id);
       addToast(`已提交阶段重启：${phase}`, 'success');
     } catch (err) {
-      console.error('[DraftingStage] restart phase failed:', err);
+      logger.ui.error('[DraftingStage] restart phase failed', err);
       addToast('阶段重启失败，请重试', 'error');
     } finally {
       setRestarting(false);
@@ -118,7 +119,7 @@ export function DraftingStage({ canvas }: DraftingStageProps) {
       afterRestartSubmitted(resp.job_id, resp.session_id, resp.canvas_id);
       addToast(`已提交章节重启：${sectionTitle}`, 'success');
     } catch (err) {
-      console.error('[DraftingStage] restart section failed:', err);
+      logger.ui.error('[DraftingStage] restart section failed', err);
       addToast('章节重启失败，请重试', 'error');
     } finally {
       setRestarting(false);
@@ -147,7 +148,7 @@ export function DraftingStage({ canvas }: DraftingStageProps) {
       afterRestartSubmitted(resp.job_id, resp.session_id, resp.canvas_id);
       addToast(`已提交 ${incompleteTitles.length} 个未完成章节的重启任务`, 'success');
     } catch (err) {
-      console.error('[DraftingStage] restart incomplete sections failed:', err);
+      logger.ui.error('[DraftingStage] restart incomplete sections failed', err);
       addToast('重启未完成章节失败，请重试', 'error');
     } finally {
       setBulkRestartingIncomplete(false);
@@ -445,7 +446,7 @@ export function DraftingStage({ canvas }: DraftingStageProps) {
         addToast('已手动进入精炼阶段，可继续编辑与全文精炼', 'success');
       }
     } catch (err) {
-      console.error('[DraftingStage] rescue refine failed:', err);
+      logger.ui.error('[DraftingStage] rescue refine failed', err);
       addToast('进入精炼失败，请重试', 'error');
     } finally {
       setRescueRefineLoading(false);

@@ -8,6 +8,7 @@ import { ConfirmPhase } from './deep-research/ConfirmPhase';
 import { ProgressMonitor } from './deep-research/ProgressMonitor';
 import type { EfficiencyRow } from './deep-research/types';
 import { DEEP_RESEARCH_PENDING_CONTEXT_KEY } from './deep-research/types';
+import { logger } from '../../utils/logger';
 
 /**
  * Deep Research 澄清对话框
@@ -72,7 +73,7 @@ export function DeepResearchDialog() {
     verify: '',
     synthesize: '',
   });
-  const [depth, setDepth] = useState<'lite' | 'comprehensive'>('comprehensive');
+  const [depth, setDepth] = useState<'lite' | 'comprehensive' | 'expert'>('comprehensive');
   const [skipDraftReview, setSkipDraftReview] = useState(false);
   const [skipRefineReview, setSkipRefineReview] = useState(false);
   const [skipClaimGeneration, setSkipClaimGeneration] = useState(false);
@@ -252,7 +253,7 @@ export function DeepResearchDialog() {
       await navigator.clipboard.writeText(task.optimizationPromptDraft);
       addToast('已复制优化提示词模板', 'success');
     } catch (err) {
-      console.error('[DeepResearch] copy optimization prompt failed:', err);
+      logger.ui.error('[DeepResearch] copy optimization prompt failed', err);
       addToast('复制失败，请手动复制文本', 'warning');
     }
   };

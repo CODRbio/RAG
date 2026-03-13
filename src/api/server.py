@@ -31,10 +31,12 @@ from src.api.routes_debug import router as debug_router
 from src.api.routes_scholar import router as scholar_router
 from src.api.routes_tasks import router as tasks_router
 from src.log import get_logger
+from src.api.middleware import CorrelationMiddleware
 from src.utils.storage_cleaner import run_cleanup, get_storage_stats
 from src.utils.task_runner import cleanup_stale_jobs, run_background_worker
 from src.observability import setup_observability
 from src.retrieval.browser_service import SharedBrowserService
+from src.services.media_store import get_media_local_root
 
 logger = get_logger(__name__)
 
@@ -171,6 +173,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.add_middleware(CorrelationMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -199,6 +202,10 @@ app.include_router(scholar_router)
 _GA_IMAGES_DIR = Path("data/ga_images")
 _GA_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/ga_images", StaticFiles(directory=str(_GA_IMAGES_DIR)), name="ga_images")
+
+# Static files: canonical media assets for local backend / development
+_MEDIA_DIR = get_media_local_root()
+app.mount("/media", StaticFiles(directory=str(_MEDIA_DIR)), name="media")
 
 # Observability: 中间件 + /metrics + /health/detailed
 setup_observability(app)

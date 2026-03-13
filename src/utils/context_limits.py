@@ -8,10 +8,10 @@ uses a 500k hard cap with logging when truncated.
 
 from __future__ import annotations
 
-import logging
 from typing import Any, Optional
 
-logger = logging.getLogger(__name__)
+from src.log import get_logger
+logger = get_logger(__name__)
 
 # Limit constants (characters) used across the codebase
 AUTO_COMPLETE_CONTEXT_MAX_CHARS = 30_000

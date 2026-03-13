@@ -2,9 +2,11 @@ import json
 from typing import Any, List
 from unittest.mock import MagicMock
 
+from src.api.routes_chat import _followup_stage1_expand_reason, _load_recent_cached_chunks
 from src.collaboration.intent.commands import analyze_chat_context, build_search_query_from_context
 from src.collaboration.intent.parser import ParsedIntent
-from src.collaboration.memory.session_memory import SessionStore
+from src.collaboration.memory.session_memory import SessionStore, _EVIDENCE_CACHE_MAX_TEXT_CHARS
+from src.retrieval.evidence import EvidenceChunk
 from src.retrieval.structured_queries import (
     generate_structured_queries_1plus1plus1,
     web_queries_per_provider_from_1plus1plus1,
@@ -17,6 +19,26 @@ class _FakeLlmClient:
 
     def chat(self, messages=None, **kwargs):
         return {"final_text": json.dumps(self._payload, ensure_ascii=False)}
+
+
+def _mk_chunk(
+    chunk_id: str,
+    doc_id: str,
+    *,
+    text: str = "evidence",
+    source_type: str = "web",
+    url: str | None = None,
+    provider: str = "scholar",
+) -> EvidenceChunk:
+    return EvidenceChunk(
+        chunk_id=chunk_id,
+        doc_id=doc_id,
+        text=text,
+        score=0.9,
+        source_type=source_type,  # type: ignore[arg-type]
+        url=url,
+        provider=provider,
+    )
 
 
 def test_analyze_chat_context_rewrite_only():
@@ -355,4 +377,167 @@ def test_session_recent_evidence_cache_is_bounded(monkeypatch):
     assert len(cached) == 3
     assert [item["query"] for item in cached] == ["q2", "q3", "q4"]
     assert len(cached[-1]["chunks"]) == 1
-    assert len(cached[-1]["chunks"][0]["text"]) == 2200
+    assert len(cached[-1]["chunks"][0]["text"]) == _EVIDENCE_CACHE_MAX_TEXT_CHARS
+
+
+def test_session_recent_evidence_cache_supports_dual_pools(monkeypatch):
+    store = SessionStore()
+    state = {"preferences": {}}
+
+    def _get_meta(_session_id):
+        return {
+            "session_id": "s1",
+            "canvas_id": "",
+            "stage": "explore",
+            "rolling_summary": "",
+            "summary_at_turn": 0,
+            "title": "",
+            "session_type": "chat",
+            "preferences": dict(state["preferences"]),
+            "created_at": "",
+            "updated_at": "",
+        }
+
+    def _update_meta(_session_id, meta):
+        prefs = state["preferences"]
+        incoming = meta.get("preferences") or {}
+        prefs.update(incoming)
+        state["preferences"] = prefs
+
+    monkeypatch.setattr(store, "get_session_meta", _get_meta)
+    monkeypatch.setattr(store, "update_session_meta", _update_meta)
+
+    final_chunk = {
+        "chunk_id": "f1",
+        "doc_id": "d1",
+        "text": "final",
+        "score": 0.9,
+        "source_type": "web",
+        "provider": "scholar",
+    }
+    pool_chunk = {
+        "chunk_id": "p1",
+        "doc_id": "d2",
+        "text": "pool",
+        "score": 0.7,
+        "source_type": "dense",
+        "provider": "local",
+    }
+    store.append_recent_evidence_cache(
+        "s1",
+        query="q",
+        final_chunks=[final_chunk],
+        candidate_pool=[pool_chunk],
+        max_turns=3,
+        max_chunks_per_turn=2,
+        max_candidate_pool_per_turn=4,
+    )
+
+    cached = store.get_recent_evidence_cache("s1")
+    assert len(cached) == 1
+    assert cached[0]["chunks"][0]["chunk_id"] == "f1"
+    assert cached[0]["final_chunks"][0]["chunk_id"] == "f1"
+    assert cached[0]["candidate_pool"][0]["chunk_id"] == "p1"
+
+
+def test_session_recent_evidence_cache_normalizes_legacy_chunks(monkeypatch):
+    store = SessionStore()
+
+    def _get_meta(_session_id):
+        return {
+            "session_id": "s1",
+            "canvas_id": "",
+            "stage": "explore",
+            "rolling_summary": "",
+            "summary_at_turn": 0,
+            "title": "",
+            "session_type": "chat",
+            "preferences": {
+                "recent_evidence_cache": [
+                    {
+                        "query": "legacy",
+                        "timestamp": "",
+                        "chunks": [
+                            {
+                                "chunk_id": "legacy-1",
+                                "doc_id": "d1",
+                                "text": "legacy",
+                                "score": 0.5,
+                                "source_type": "web",
+                            }
+                        ],
+                    }
+                ]
+            },
+            "created_at": "",
+            "updated_at": "",
+        }
+
+    monkeypatch.setattr(store, "get_session_meta", _get_meta)
+
+    cached = store.get_recent_evidence_cache("s1")
+    assert len(cached) == 1
+    assert cached[0]["final_chunks"][0]["chunk_id"] == "legacy-1"
+    assert cached[0]["chunks"][0]["chunk_id"] == "legacy-1"
+    assert cached[0]["candidate_pool"] == []
+
+
+def test_load_recent_cached_chunks_reads_candidate_pool(monkeypatch):
+    store = SessionStore()
+
+    def _get_recent(_session_id):
+        return [
+            {
+                "query": "q1",
+                "timestamp": "2026-01-01T00:00:00",
+                "chunks": [],
+                "final_chunks": [],
+                "candidate_pool": [
+                    {
+                        "chunk_id": "pool-1",
+                        "doc_id": "d1",
+                        "text": "pool one",
+                        "score": 0.4,
+                        "source_type": "web",
+                    }
+                ],
+            }
+        ]
+
+    monkeypatch.setattr(store, "get_recent_evidence_cache", _get_recent)
+
+    out = _load_recent_cached_chunks(store, "s1", pool_name="candidate_pool")
+    assert len(out) == 1
+    assert out[0].chunk_id == "pool-1"
+
+
+def test_followup_stage1_expand_reason_detects_broad_query():
+    chunks = [
+        _mk_chunk("c1", "d1"),
+        _mk_chunk("c2", "d2"),
+        _mk_chunk("c3", "d3"),
+    ]
+    reason = _followup_stage1_expand_reason(
+        query="对比一下上面两篇论文的结论",
+        message="对比一下上面两篇论文的结论",
+        is_deepen=False,
+        target_span="",
+        stage1_chunks=chunks,
+    )
+    assert reason == "broad_followup"
+
+
+def test_followup_stage1_expand_reason_detects_target_span_miss():
+    chunks = [
+        _mk_chunk("c1", "d1", url="https://a.example"),
+        _mk_chunk("c2", "d2", url="https://b.example"),
+        _mk_chunk("c3", "d3", url="https://c.example"),
+    ]
+    reason = _followup_stage1_expand_reason(
+        query="继续展开刚才第二篇论文的方法",
+        message="继续展开刚才第二篇论文的方法",
+        is_deepen=False,
+        target_span="第二篇论文的方法",
+        stage1_chunks=chunks,
+    )
+    assert reason == "target_span_coverage_missing"

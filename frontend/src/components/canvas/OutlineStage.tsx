@@ -8,6 +8,7 @@ import {
   DEEP_RESEARCH_JOB_KEY,
   DEEP_RESEARCH_ARCHIVED_JOBS_KEY,
 } from '../workflow/deep-research/types';
+import { logger } from '../../utils/logger';
 
 interface OutlineStageProps {
   canvas: Canvas;
@@ -93,7 +94,7 @@ export function OutlineStage({ canvas }: OutlineStageProps) {
       afterRestartSubmitted(resp.job_id, resp.session_id, resp.canvas_id);
       addToast(`已提交阶段重启：${phase}`, 'success');
     } catch (err) {
-      console.error('[OutlineStage] restart phase failed:', err);
+      logger.ui.error('[OutlineStage] restart phase failed', err);
       addToast('阶段重启失败，请重试', 'error');
     } finally {
       setRestarting(false);
@@ -122,7 +123,7 @@ export function OutlineStage({ canvas }: OutlineStageProps) {
       addToast('已提交：以此大纲继续研究', 'success');
       setIsEditMode(false);
     } catch (err) {
-      console.error('[OutlineStage] restart with outline failed:', err);
+      logger.ui.error('[OutlineStage] restart with outline failed', err);
       const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
       addToast(msg && typeof msg === 'string' ? msg : '提交失败，请从侧边栏「后台调研」进入该画布后再试', 'error');
     } finally {

@@ -15,6 +15,7 @@ from .parser import (
     IntentParser,
     IntentType,
     ParsedIntent,
+    resolve_intent_provider_name,
     is_deep_research,
     is_retrieval_intent,  # 兼容旧调用
 )
@@ -25,6 +26,7 @@ __all__ = [
     "IntentParser",
     "IntentType",
     "ParsedIntent",
+    "resolve_intent_provider_name",
     "analyze_chat_context",
     "is_deep_research",
     "is_retrieval_intent",

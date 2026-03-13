@@ -306,7 +306,21 @@
     "max_age_days": 30,
     "max_size_gb": 5,
     "cleanup_on_startup": true,
-    "cleanup_batch_size": 100
+    "cleanup_batch_size": 100,
+    "media": {
+      "backend": "local",
+      "public_base_url": "",
+      "local": {
+        "root": "data/media"
+      },
+      "s3": {
+        "bucket": "",
+        "region": "",
+        "endpoint": "",
+        "key_prefix": "",
+        "public_base_url": ""
+      }
+    }
   },
   "citation": {
     "key_format": "author_date",

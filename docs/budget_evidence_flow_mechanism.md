@@ -123,14 +123,25 @@ agent_min_keep = ceil(target_top_k * 0.1)
 rerank_k = min(max(ceil(target_top_k * 3.0), target_top_k + n_gap + n_agent), n_total)
 ```
 
+补充说明：
+
+- 上述公式只适用于 **fresh 主检索路径**。
+- `reuse_and_search` 与 `/deepen` 当前改为双池 follow-up 路径：
+  - Stage 1：最近 2 轮 `final_chunks` 单池 rerank
+  - Stage 2：必要时扩到最近若干轮 `candidate_pool` 单池 rerank
+- follow-up 双池路径不使用 `chat_gap_ratio` / `chat_agent_ratio` 保护，也不走三池 quota 公式；只有 Stage 2 后仍不足时，才回到现有 gap / agent 后备链路。
+
 ### 3.3 Chat 证据流转
 
 ```mermaid
 flowchart TD
     chatReq["Chat request"]
     chatPre["Preliminary knowledge optional"]
-    chatMain["Main retrieval 1+1+1"]
-    chatReuse{"followup reuse?"}
+    chatRoute{"fresh or follow-up"}
+    chatMain["Fresh main retrieval 1+1+1"]
+    chatFollow1["Stage1 final_chunks rerank"]
+    chatExpand{"expand to candidate_pool?"}
+    chatFollow2["Stage2 candidate_pool rerank"]
     chatGap{"evidence scarce?"}
     chatGapSearch["Gap queries x up to 3"]
     chatAgent{"use agent?"}
@@ -140,14 +151,25 @@ flowchart TD
     chatPrompt["Prompt budget"]
     chatLLM["LLM answer"]
 
-    chatReq --> chatPre --> chatMain --> chatReuse
-    chatReuse --> chatGap
+    chatReq --> chatPre --> chatRoute
+    chatRoute -->|"fresh"| chatMain --> chatGap
+    chatRoute -->|"reuse_and_search / deepen"| chatFollow1 --> chatExpand
+    chatExpand -->|"yes"| chatFollow2 --> chatGap
+    chatExpand -->|"no"| chatCtx
     chatGap -->|"yes"| chatGapSearch --> chatAgent
     chatGap -->|"no"| chatAgent
     chatAgent -->|"yes"| chatAgentRun --> chatFuse
     chatAgent -->|"no"| chatFuse
-    chatFuse --> chatCtx --> chatPrompt --> chatLLM
+    chatFuse --> chatCtx
+    chatCtx --> chatPrompt --> chatLLM
 ```
+
+当前 follow-up 真实行为：
+
+- `reuse_only`：继续复用高精度 `final_chunks`，不接入 Stage 2 本地扩池。
+- `reuse_and_search` / `/deepen`：优先使用证据缓存，不再一上来 fresh 主检索。
+- Stage 1 若命中 broad follow-up、`/deepen`、chunk 太少或 `target_span` 覆盖不足，会立即扩到 `candidate_pool`。
+- Stage 1 直接回答时，当前跳过完整 LLM sufficiency；Stage 2 后恢复现有 `evidence_scarce -> gap/agent` 判定。
 
 ### 3.4 Chat 阶段选择
 
@@ -164,9 +186,9 @@ agent 决策当前代码逻辑：
 skip_assist_agent_for_sufficient_context =
   agent_mode == "assist"
   and query_needs_rag
-  and do_retrieval
   and context_str 非空
   and not evidence_scarce
+  and (do_retrieval or follow-up 本地双池上下文已就绪)
 
 use_agent =
   agent_mode == "autonomous"
@@ -175,8 +197,11 @@ use_agent =
 
 也就是说：
 
-- `assist` 模式下，如果检索上下文已经足够，就不再启 agent
+- `assist` 模式下，如果 fresh 检索上下文或 follow-up 本地双池上下文已经足够，就不再启 agent
 - `autonomous` 模式下，始终走 agent
+- follow-up 的数量兜底当前也是感知问题类型的：
+  - broad follow-up：继续要求 `<3 chunks 或 <2 distinct_docs` 才判为数值不足
+  - 定向追问 / `/deepen`：只要 Stage 2 后 `chunks >= 2`，即可视为通过数值兜底
 
 ### 3.5 Chat 的上下文预算
 

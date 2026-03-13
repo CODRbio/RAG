@@ -2,6 +2,7 @@ import { useEffect, useState, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { AlertTriangle, Database, Globe, X } from 'lucide-react';
 import { useChatStore } from '../../stores';
+import { logger } from '../../utils/logger';
 
 const TIMEOUT_MS = 60_000;
 
@@ -47,16 +48,14 @@ export function LocalDbChoiceDialog() {
   const pct = (remaining / TIMEOUT_MS) * 100;
 
   const handleChoice = (choice: 'no_local' | 'use') => {
-    console.log('[LocalDbChoiceDialog] handleChoice:', choice,
-      '| autoTriggered:', autoTriggeredRef.current,
-      '| handler available:', !!handler);
+    logger.ui.debug('[LocalDbChoiceDialog] handleChoice', { choice, autoTriggered: autoTriggeredRef.current, handlerAvailable: !!handler });
     if (!autoTriggeredRef.current) {
       autoTriggeredRef.current = true;
       if (handler) {
         handler(choice);
       } else {
         // handler 尚未注入，直接关闭弹窗（最坏情况兜底）
-        console.warn('[LocalDbChoiceDialog] handler is null, clearing pending choice');
+        logger.ui.warn('[LocalDbChoiceDialog] handler is null, clearing pending choice');
         useChatStore.getState().clearPendingLocalDbChoice();
       }
     }

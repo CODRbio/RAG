@@ -63,6 +63,8 @@ COMMAND_PATTERNS = {
     "/status": IntentType.CHAT,
     "/export": IntentType.CHAT,
     "/set": IntentType.CHAT,
+    "/rewrite": IntentType.CHAT,   # 重写/格式调整已有回答，无新检索
+    "/deepen":  IntentType.CHAT,   # 追加补充查询并检索新证据后合并作答
 }
 
 
@@ -84,6 +86,34 @@ def is_deep_research(parsed: ParsedIntent) -> bool:
 def is_retrieval_intent(parsed: ParsedIntent) -> bool:
     """兼容旧调用：Deep Research 一定需要检索"""
     return is_deep_research(parsed)
+
+
+def resolve_intent_provider_name(
+    *,
+    intent_provider: Optional[str] = None,
+    configured_intent_provider: Optional[str] = None,
+    ultra_lite_provider: Optional[str] = None,
+    llm_provider: Optional[str] = None,
+) -> Optional[str]:
+    """
+    解析意图判断专用 provider。
+
+    优先级:
+    1. 请求显式 intent_provider
+    2. 全局 llm.intent_provider
+    3. 请求 llm_provider / 配置默认 provider（随后由 get_lite_client 降级为 lite 版）
+    4. 请求 ultra_lite_provider
+    """
+    for candidate in (
+        intent_provider,
+        configured_intent_provider,
+        llm_provider,
+        ultra_lite_provider,
+    ):
+        value = str(candidate or "").strip()
+        if value:
+            return value
+    return None
 
 
 class IntentParser:

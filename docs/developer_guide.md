@@ -346,7 +346,147 @@ pytest tests/test_llm_manager_claude.py -v -s
 
 ---
 
-## 10. 代码提交规范
+## 10. 日志系统
+
+### 10.1 架构概览
+
+日志系统由三个协作层组成：
+
+```
+前端（logger.ts）
+     │ X-Correlation-ID 请求头
+     ▼
+FastAPI CorrelationMiddleware  ←── 生成/透传 correlation_id，注入 ContextVar
+     │
+     ▼
+后端 LogManager（分层路由）
+  ├─ src.api.*        → logs/api/YYYY-MM-DD.log
+  ├─ src.llm.*        → logs/llm/YYYY-MM-DD.log
+  ├─ src.collaboration.* → logs/agent/YYYY-MM-DD.log
+  ├─ src.retrieval.*  ┐
+  │  src.indexing.*   ├─ logs/service/YYYY-MM-DD.log
+  │  src.chunking.*   │
+  │  src.parser.*     ┘
+  └─ 其他 src.*       → logs/system/YYYY-MM-DD.log
+
+  所有 ERROR+         → logs/error/YYYY-MM-DD.log（跨层聚合）
+```
+
+每条日志包含自动注入的 `correlation_id`，可将同一 HTTP 请求在 api / llm / service 多个日志文件中的记录串联起来：
+
+```
+2026-03-13 10:23:45.123 | INFO     | req-a1b2c3d4            | src.api.routes_chat | chat request received
+2026-03-13 10:23:45.201 | INFO     | req-a1b2c3d4            | src.llm.llm_manager | provider=openai model=gpt-4o
+2026-03-13 10:23:46.834 | INFO     | req-a1b2c3d4            | src.retrieval.service | retrieved 12 chunks
+```
+
+### 10.2 后端：添加日志
+
+```python
+# 统一导入方式（所有后端模块）
+from src.log import get_logger
+
+logger = get_logger(__name__)   # 模块路径自动决定路由到哪个日志文件
+
+# 使用
+logger.info("操作说明 %s", value)
+logger.warning("[模块] 警告内容: %s", detail)
+logger.error("[模块] 错误: %s", err, exc_info=True)
+```
+
+**命名约定：**
+- 使用 `__name__` 作为 logger 名称，保持与模块路径一致
+- 禁止直接使用 `import logging` + `logging.getLogger(__name__)`
+- 合法例外：`log_manager.py`、`debug_logger.py`、`log_utils.py`、`aiohttp_tls_patch.py`（早期启动工具）、需要 `logging.Logger` 类型注解的文件
+
+**在业务代码中携带 correlation_id（无需手动传递）：**
+
+```python
+# correlation_id 由 ContextVar 自动注入，logger 会自动读取
+# 如需在非请求上下文（如后台任务）中手动设置：
+from src.log import set_correlation_id, reset_correlation_id
+
+def my_background_job(job_id: str):
+    token = set_correlation_id(f"job-{job_id[:8]}")
+    try:
+        logger.info("开始处理后台任务") # 自动带上 job-xxx
+        # ...业务逻辑...
+    finally:
+        reset_correlation_id(token) # 必须重置，防止线程池上下文泄露
+```
+
+### 10.3 前端：添加日志
+
+```typescript
+import { logger } from '../../utils/logger';   // 按实际相对路径调整
+
+// API 调用层（fetch / SSE 事件）
+logger.api.debug('[ComponentName] POST /chat/submit', { url, bodyLen });
+logger.api.error('[ComponentName] fetch failed', err);
+
+// 组件交互层（UI 事件、状态变化）
+logger.ui.debug('[ComponentName] user action', { detail });
+logger.ui.error('[ComponentName] operation failed', err);
+
+// 跨域 error（始终输出）
+logger.error('Unhandled exception', err);
+```
+
+**作用域选择：**
+
+| 作用域 | 适用场景 |
+|--------|----------|
+| `logger.api` | `fetch`、`axios`、SSE 流、任何 HTTP 请求 |
+| `logger.ui` | 用户点击、表单提交、组件状态变更、弹窗逻辑 |
+| `logger.error` | 顶层未捕获异常 |
+
+**环境行为：**
+- 开发环境（`import.meta.env.DEV`）：`debug` 及以上全部打印
+- 生产环境：仅打印 `warn` 及以上；`error` 级别自动上报 `POST /api/logs/frontend`
+
+**日志工具路径（按文件深度）：**
+
+| 文件位置 | 导入路径 |
+|----------|----------|
+| `src/pages/` | `'../utils/logger'` |
+| `src/components/**/` | `'../../utils/logger'` |
+| `src/components/**/**/` | `'../../../utils/logger'` |
+
+### 10.4 关键文件速查
+
+| 文件 | 作用 |
+|------|------|
+| `src/log/log_manager.py` | LogManager：分层路由、线程安全的自定义跨天 `DailyFileHandler`、error 聚合。高性能 O(N) 自动清理。|
+| `src/log/context.py` | ContextVar：`get/set/reset/new_correlation_id()`。**重要**：使用 `set_correlation_id` 会返回 `Token`，在后台任务或并发环境必须用 `finally` 块调用 `reset_correlation_id(token)` 避免线程池上下文泄露串台。 |
+| `src/log/__init__.py` | 统一导出 |
+| `src/api/middleware/correlation.py` | FastAPI 中间件：生成/透传 `X-Correlation-ID`，并负责 `set/reset` 上下文 Token |
+| `frontend/src/utils/logger.ts` | 前端统一 logger |
+
+### 10.5 常见问题
+
+**Q: 如何跨日志文件查询同一请求？**
+
+```bash
+grep "req-a1b2c3d4" logs/api/2026-03-13.log logs/llm/2026-03-13.log logs/service/2026-03-13.log
+```
+
+**Q: 运行时临时调高日志级别？**
+
+```bash
+# 环境变量（重启生效）
+RAG_LOG_LEVEL=DEBUG uvicorn src.api.server:app ...
+
+# 或 API 热切换（仅影响 debug logger）
+curl -X POST /debug/toggle -d '{"enabled": true}'
+```
+
+**Q: 添加新模块时日志路由规则是什么？**
+
+模块前缀到日志目录的映射定义在 `src/log/log_manager.py` 的 `_LAYER_ROUTING` 列表中。如需为新的顶级子包添加路由，在该列表追加 `("src.新包名", "目录名")` 即可，无需修改其他代码。
+
+---
+
+## 11. 代码提交规范
 
 - 提交信息格式：`<type>(<scope>): <description>`
   - type：`feat / fix / refactor / docs / test / chore`

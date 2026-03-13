@@ -28,7 +28,7 @@ class ContextAnalysis:
     rewritten_query: str = ""
     clarification: str = ""
     followup_mode: str = "fresh"  # fresh / reuse_only / reuse_and_search
-    topic_relevance: str = "low"  # low / medium / high
+    topic_relevance: str = "medium"  # low / medium / high
     target_span: str = ""
 
 
@@ -92,9 +92,11 @@ def analyze_chat_context(
     if followup_mode not in ("fresh", "reuse_only", "reuse_and_search"):
         followup_mode = "fresh"
 
-    topic_relevance = (data.get("topic_relevance") or "low").strip().lower()
+    topic_relevance = (data.get("topic_relevance") or "medium").strip().lower()
     if topic_relevance not in ("low", "medium", "high"):
-        topic_relevance = "low"
+        topic_relevance = "medium"
+    if followup_mode in ("reuse_only", "reuse_and_search") and topic_relevance == "low":
+        topic_relevance = "medium"
 
     return ContextAnalysis(
         action=action,

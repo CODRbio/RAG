@@ -22,6 +22,7 @@ import type {
   ResearchDashboardData,
   ChatCitation,
 } from '../../../types';
+import { chatCitationToSource } from '../../../utils/citations';
 import {
   DEEP_RESEARCH_JOB_KEY,
   DEEP_RESEARCH_ARCHIVED_JOBS_KEY,
@@ -164,17 +165,7 @@ export function useDeepResearchTask(): UseDeepResearchTaskReturn {
   };
 
   const mapCitationsToSources = (citations: ChatCitation[]): Source[] => (
-    citations.map((cite, idx: number) => ({
-      id: idx + 1,
-      cite_key: cite.cite_key,
-      title: cite.title || cite.cite_key,
-      authors: cite.authors || [],
-      year: cite.year,
-      doc_id: cite.doc_id,
-      url: cite.url,
-      doi: cite.doi,
-      type: cite.url ? 'web' : 'local',
-    }))
+    citations.map((cite, idx: number) => chatCitationToSource(cite, cite.chunk_id || cite.cite_key || idx + 1))
   );
 
   const archiveJobId = (jobId: string) => {

@@ -932,7 +932,7 @@ def invoke_sonar_search(query: str, model: str = "sonar-pro") -> tuple:
     Reusable by both Agent tool handler and Deep Research pipeline.
     Returns: (str, list) — text is the model reply; list elements are EvidenceChunk-like dicts/chunks.
     """
-    from src.llm.llm_manager import get_manager
+    from src.llm.llm_manager import get_manager, _stream_and_collect
     from src.retrieval.sonar_citations import parse_sonar_citations
 
     manager = get_manager()
@@ -947,10 +947,13 @@ def invoke_sonar_search(query: str, model: str = "sonar-pro") -> tuple:
         "Answer the following question concisely with key points and sources. "
         "Use the same language as the question. Keep under 400 words.\n\n"
     ) + (query or "").strip()
-    resp = client.chat(
+    # 流量感知超时：每 chunk 间隔不超过 idle 秒；深度研究模型给更长的空闲窗口
+    _idle = 150 if "deep-research" in (model or "").lower() else 90
+    resp = _stream_and_collect(
+        client,
         [{"role": "user", "content": prompt}],
         model=model,
-        timeout_seconds=50,
+        idle_timeout_seconds=_idle,
     )
     raw = resp.get("raw") or {}
     citations = raw.get("citations")

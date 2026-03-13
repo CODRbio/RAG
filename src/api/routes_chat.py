@@ -2,14 +2,12 @@
 对话 API：POST /chat, POST /chat/stream, GET /sessions/{id}, DELETE /sessions/{id}
 """
 
-import base64
 import contextlib
 import concurrent.futures
 import json
 import math
 import logging
 import re
-import requests as _http
 import time
 import threading
 import uuid
@@ -70,8 +68,14 @@ from src.collaboration.intent import (
     build_search_query_from_context,
     check_query_collection_scope,
     is_deep_research,
+    resolve_intent_provider_name,
 )
 from src.collaboration.intent.commands import allocate_collection_quotas
+from src.collaboration.graphic_abstract import (
+    GRAPHIC_ABSTRACT_FAILURE_MD,
+    render_graphic_abstract_markdown,
+    resolve_graphic_abstract_model,
+)
 from src.collaboration.memory.session_memory import (
     SessionStore,
     get_session_store,
@@ -80,7 +84,7 @@ from src.collaboration.memory.session_memory import (
 from src.collaboration.memory.working_memory import get_or_generate_working_memory
 from src.collaboration.memory.persistent_store import get_user_profile
 from src.collaboration.workflow import run_workflow
-from src.llm.llm_manager import get_manager
+from src.llm.llm_manager import get_manager, _timeout_for_model, _stream_and_collect
 from src.llm.react_loop import react_loop
 from src.llm.tools import (
     CORE_TOOLS,
@@ -98,7 +102,7 @@ from src.collaboration.citation.manager import (
     resolve_response_citations,
     sync_evidence_to_canvas,
 )
-from src.collaboration.canvas.models import Citation
+from src.collaboration.canvas.models import Citation, CitationAnchor as CanvasCitationAnchor
 from dataclasses import asdict
 from src.retrieval.sonar_citations import parse_sonar_citations
 from src.retrieval.structured_queries import web_queries_per_provider_from_1plus1plus1
@@ -107,6 +111,7 @@ from src.retrieval.service import (
     get_retrieval_service,
     _hit_to_chunk as service_hit_to_chunk,
 )
+from src.retrieval.hybrid_retriever import _rerank_candidates
 from src.retrieval.evidence import EvidenceChunk, EvidencePack
 from src.generation.evidence_synthesizer import EvidenceSynthesizer, build_synthesis_system_prompt
 from src.utils.context_limits import summarize_if_needed, cap_and_log
@@ -150,6 +155,18 @@ def _ensure_session_access(session_id: str, current_user_id: str) -> dict[str, A
             return None
         raise HTTPException(status_code=403, detail="forbidden")
     raise HTTPException(status_code=404, detail="session not found")
+
+
+def _get_intent_client(manager, body: ChatRequest | IntentDetectRequest):
+    provider_name = resolve_intent_provider_name(
+        intent_provider=getattr(body, "intent_provider", None),
+        configured_intent_provider=getattr(settings.llm, "intent_provider", None),
+        ultra_lite_provider=getattr(body, "ultra_lite_provider", None),
+        llm_provider=getattr(body, "llm_provider", None),
+    )
+    return manager.get_lite_client(provider_name)
+
+
 _DEEP_RESEARCH_SUSPENDED: dict[str, dict[str, Any]] = {}
 _DEEP_RESEARCH_SUSPENDED_LOCK = threading.Lock()
 
@@ -239,10 +256,7 @@ def _dr_release_slot_eager(job_id: str) -> None:
         session_id = str(job.get("session_id") or "")
         get_task_queue().release_slot(job_id, session_id)
     except Exception as exc:
-        import logging as _logging
-        _logging.getLogger(__name__).debug(
-            "[dr] eager slot release failed job_id=%s: %s", job_id, exc
-        )
+        _chat_logger.debug("[dr] eager slot release failed job_id=%s: %s", job_id, exc)
 
 
 def _dr_store_suspended_runtime(job_id: str, runtime: dict[str, Any]) -> None:
@@ -610,12 +624,84 @@ def _chunk_text(text: str, chunk_size: int = 20):
         yield text[i:i + chunk_size]
 
 
+def _serialize_citation_anchor(anchor: CanvasCitationAnchor) -> dict:
+    if isinstance(anchor, dict):
+        return {
+            "chunk_id": str(anchor.get("chunk_id") or ""),
+            "page_num": anchor.get("page_num") if isinstance(anchor.get("page_num"), int) else None,
+            "bbox": anchor.get("bbox") if isinstance(anchor.get("bbox"), list) else None,
+            "snippet": anchor.get("snippet") if isinstance(anchor.get("snippet"), str) else None,
+        }
+    return {
+        "chunk_id": anchor.chunk_id or "",
+        "page_num": anchor.page_num,
+        "bbox": anchor.bbox,
+        "snippet": anchor.snippet,
+    }
+
+
+def _normalize_citation_anchor_dicts(raw_anchors: Any, fallback: dict | None = None) -> list[dict]:
+    anchors_out: list[dict] = []
+    seen: set[str] = set()
+    anchor_items = raw_anchors if isinstance(raw_anchors, list) else []
+    for raw in anchor_items:
+        if not isinstance(raw, dict):
+            continue
+        chunk_id = str(raw.get("chunk_id") or "").strip()
+        if not chunk_id or chunk_id in seen:
+            continue
+        seen.add(chunk_id)
+        bbox = raw.get("bbox") if isinstance(raw.get("bbox"), list) else None
+        snippet = raw.get("snippet")
+        anchors_out.append({
+            "chunk_id": chunk_id,
+            "page_num": raw.get("page_num") if isinstance(raw.get("page_num"), int) else None,
+            "bbox": bbox,
+            "snippet": snippet if isinstance(snippet, str) and snippet.strip() else None,
+        })
+
+    if not anchors_out and fallback:
+        chunk_id = str(fallback.get("chunk_id") or "").strip()
+        if chunk_id:
+            anchors_out.append({
+                "chunk_id": chunk_id,
+                "page_num": fallback.get("page_num") if isinstance(fallback.get("page_num"), int) else None,
+                "bbox": fallback.get("bbox") if isinstance(fallback.get("bbox"), list) else None,
+                "snippet": fallback.get("snippet") if isinstance(fallback.get("snippet"), str) else None,
+            })
+    return anchors_out
+
+
 def _serialize_citation(c: Citation | str) -> dict:
     """将 Citation 对象或字符串序列化为字典。"""
     if isinstance(c, str):
-        return {"cite_key": c, "title": "", "authors": [], "year": None, "doc_id": None, "url": None, "pdf_url": None, "provider": None}
+        return {
+            "cite_key": c,
+            "chunk_id": None,
+            "title": "",
+            "authors": [],
+            "year": None,
+            "doc_id": None,
+            "url": None,
+            "pdf_url": None,
+            "doi": None,
+            "bbox": None,
+            "page_num": None,
+            "anchors": [],
+            "provider": None,
+        }
+    anchors = _normalize_citation_anchor_dicts(
+        [_serialize_citation_anchor(anchor) for anchor in getattr(c, "anchors", [])],
+        fallback={
+            "chunk_id": getattr(c, "chunk_id", None),
+            "page_num": getattr(c, "page_num", None),
+            "bbox": getattr(c, "bbox", None),
+        },
+    )
+    primary = anchors[0] if anchors else {}
     return {
         "cite_key": c.cite_key or c.id,
+        "chunk_id": primary.get("chunk_id"),
         "title": c.title or "",
         "authors": c.authors or [],
         "year": c.year,
@@ -623,10 +709,40 @@ def _serialize_citation(c: Citation | str) -> dict:
         "url": c.url,
         "pdf_url": getattr(c, "pdf_url", None),
         "doi": c.doi,
-        "bbox": getattr(c, "bbox", None),
-        "page_num": getattr(c, "page_num", None),
+        "bbox": primary.get("bbox"),
+        "page_num": primary.get("page_num"),
+        "anchors": anchors,
         "provider": getattr(c, "provider", None),
     }
+
+
+def _chat_citation_from_dict(raw: dict | str) -> ChatCitation:
+    if isinstance(raw, str):
+        raw = _serialize_citation(raw)
+    anchors = _normalize_citation_anchor_dicts(
+        raw.get("anchors"),
+        fallback={
+            "chunk_id": raw.get("chunk_id"),
+            "page_num": raw.get("page_num"),
+            "bbox": raw.get("bbox"),
+        },
+    )
+    primary = anchors[0] if anchors else {}
+    return ChatCitation(
+        cite_key=str(raw.get("cite_key") or ""),
+        chunk_id=primary.get("chunk_id"),
+        title=str(raw.get("title") or ""),
+        authors=raw.get("authors") if isinstance(raw.get("authors"), list) else [],
+        year=raw.get("year") if isinstance(raw.get("year"), int) else None,
+        doc_id=str(raw.get("doc_id") or "") or None,
+        url=str(raw.get("url") or "") or None,
+        pdf_url=str(raw.get("pdf_url") or "") or None,
+        doi=str(raw.get("doi") or "") or None,
+        bbox=primary.get("bbox"),
+        page_num=primary.get("page_num"),
+        anchors=anchors,
+        provider=str(raw.get("provider") or "") or None,
+    )
 
 
 def _build_filters(body: ChatRequest) -> dict:
@@ -723,6 +839,14 @@ _CHAT_PROMPT_SAFETY_MARGIN = 0.10
 _CHAT_MIN_OUTPUT_TOKENS = 2048
 _AGENT_MIN_OUTPUT_TOKENS = 4096
 _CHAT_STEP_BUDGET_AMPLIFY = 1.2
+_FOLLOWUP_FINAL_STAGE_TURNS = 2
+_FOLLOWUP_CANDIDATE_POOL_MAX = 60
+_FOLLOWUP_BROAD_RE = re.compile(
+    r"\b(compare|comparison|versus|vs|difference|differences|latest|recent|progress|controversy|"
+    r"summary|summarize|limitations?|limitation|open questions?)\b"
+    r"|对比|比较|区别|差异|最新|进展|争议|总结|综述|局限|开放问题",
+    re.IGNORECASE,
+)
 
 
 def _chat_effective_step_top_k(step_k: Optional[int]) -> Optional[int]:
@@ -1149,25 +1273,123 @@ def _cache_payload_to_chunk(payload: Dict[str, Any]) -> Optional[EvidenceChunk]:
     )
 
 
-def _load_recent_cached_chunks(store: SessionStore, session_id: str, max_turns: int = 4) -> List[EvidenceChunk]:
+def _cache_row_payloads(row: Dict[str, Any], pool_name: str = "final_chunks") -> List[Dict[str, Any]]:
+    if not isinstance(row, dict):
+        return []
+    if pool_name == "candidate_pool":
+        payloads = row.get("candidate_pool")
+        if isinstance(payloads, list):
+            return [p for p in payloads if isinstance(p, dict)]
+        return []
+    payloads = row.get(pool_name)
+    if isinstance(payloads, list):
+        return [p for p in payloads if isinstance(p, dict)]
+    legacy = row.get("chunks")
+    if isinstance(legacy, list):
+        return [p for p in legacy if isinstance(p, dict)]
+    return []
+
+
+def _chunk_dedup_key(chunk: EvidenceChunk) -> str:
+    return (chunk.chunk_id or chunk.doc_group_key or "").strip()
+
+
+def _dedup_chunk_list(chunks: List[EvidenceChunk]) -> List[EvidenceChunk]:
+    dedup: Dict[str, EvidenceChunk] = {}
+    for chunk in chunks:
+        key = _chunk_dedup_key(chunk)
+        if key and key not in dedup:
+            dedup[key] = chunk
+    return list(dedup.values())
+
+
+def _load_recent_cached_chunks(
+    store: SessionStore,
+    session_id: str,
+    max_turns: int = 4,
+    *,
+    pool_name: str = "final_chunks",
+) -> List[EvidenceChunk]:
     """Load and flatten recent cached evidence chunks from session preferences."""
     rows = store.get_recent_evidence_cache(session_id)
     if not rows:
         return []
     selected = rows[-max(1, int(max_turns)):]
     out: List[EvidenceChunk] = []
-    for row in selected:
-        for payload in (row.get("chunks") or []):
+    for row in reversed(selected):
+        for payload in _cache_row_payloads(row, pool_name=pool_name):
             if isinstance(payload, dict):
                 c = _cache_payload_to_chunk(payload)
                 if c is not None:
                     out.append(c)
-    dedup: Dict[str, EvidenceChunk] = {}
-    for c in out:
-        key = c.chunk_id or c.doc_group_key
-        if key and key not in dedup:
-            dedup[key] = c
-    return list(dedup.values())
+    return _dedup_chunk_list(out)
+
+
+def _is_broad_followup_query(*texts: Optional[str]) -> bool:
+    for text in texts:
+        if text and _FOLLOWUP_BROAD_RE.search(text):
+            return True
+    return False
+
+
+def _rerank_followup_chunks(
+    query: str,
+    chunks: List[EvidenceChunk],
+    *,
+    top_k: int,
+    phase: str,
+    reranker_mode: str = "bge_only",
+) -> List[EvidenceChunk]:
+    deduped = _dedup_chunk_list(chunks)
+    if not deduped:
+        return []
+    limit = min(max(1, int(top_k)), len(deduped))
+    candidates = [_chunk_to_hit(c) for c in deduped]
+    try:
+        reranked = _rerank_candidates(
+            query=query,
+            candidates=candidates,
+            top_k=limit,
+            reranker_mode=reranker_mode,
+            trace_ctx={"phase": phase, "section": "chat"},
+        )
+        return [
+            service_hit_to_chunk(hit, hit.get("_source_type", "dense"), query)
+            for hit in reranked
+        ]
+    except Exception as exc:
+        _chat_logger.debug("follow-up rerank failed phase=%s: %s", phase, exc)
+        deduped.sort(key=lambda c: c.score, reverse=True)
+        return deduped[:limit]
+
+
+def _followup_stage1_expand_reason(
+    *,
+    query: str,
+    message: str,
+    is_deepen: bool,
+    target_span: str,
+    stage1_chunks: List[EvidenceChunk],
+) -> str:
+    if _is_broad_followup_query(query, message):
+        return "broad_followup"
+    if is_deepen:
+        return "deepen_command"
+    if len(stage1_chunks) < 3:
+        return "few_stage1_chunks"
+    if target_span:
+        doc_counts: Dict[str, int] = {}
+        for chunk in stage1_chunks[:4]:
+            key = chunk.doc_group_key
+            if key:
+                doc_counts[key] = doc_counts.get(key, 0) + 1
+        if not any(count >= 2 for count in doc_counts.values()):
+            return "target_span_coverage_missing"
+    return ""
+
+
+def _followup_candidate_pool_cap(step_top_k: int) -> int:
+    return min(max(1, int(step_top_k)) * 3, _FOLLOWUP_CANDIDATE_POOL_MAX)
 
 
 def _build_deep_research_filters(body: Any) -> dict:
@@ -1189,6 +1411,7 @@ def _build_deep_research_filters(body: Any) -> dict:
         "reranker_mode",
         "agent_sonar_model",
         "llm_provider",
+        "intent_provider",
         "ultra_lite_provider",
         "model_override",
         "collection",
@@ -1298,58 +1521,6 @@ def _request_debug_level(body: ChatRequest):
             logging.getLogger(n).setLevel(lvl)
 
 
-_GA_IMAGES_DIR = Path("data/ga_images")
-
-
-def _generate_ga_image_gemini(model: str, prompt: str, api_key: str, base_url: str) -> bytes:
-    """Call Gemini native generateContent with IMAGE responseModality, return PNG bytes."""
-    root = base_url.rstrip("/")
-    if root.endswith("/openai"):
-        root = root[: -len("/openai")]
-    url = f"{root}/models/{model}:generateContent"
-    payload = {
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]},
-    }
-    resp = _http.post(url, json=payload, headers={"x-goog-api-key": api_key}, timeout=120)
-    resp.raise_for_status()
-    data = resp.json()
-    for part in (data.get("candidates") or [{}])[0].get("content", {}).get("parts", []):
-        if "inlineData" in part:
-            return base64.b64decode(part["inlineData"]["data"])
-    raise ValueError(f"Gemini returned no image data. Response keys: {list(data.keys())}")
-
-
-def _generate_ga_image_openai_compat(model: str, prompt: str, api_key: str, base_url: str) -> bytes:
-    """Call OpenAI-compatible /images/generations, return PNG bytes."""
-    url = f"{base_url.rstrip('/')}/images/generations"
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "n": 1,
-        "size": "1024x1024",
-        "response_format": "b64_json",
-    }
-    resp = _http.post(url, json=payload, headers={"Authorization": f"Bearer {api_key}"}, timeout=120)
-    resp.raise_for_status()
-    data = resp.json()
-    return base64.b64decode(data["data"][0]["b64_json"])
-
-
-def _generate_ga_image(provider: str, model: str, prompt: str) -> bytes:
-    """Dispatch image generation to the correct provider API. Returns raw PNG bytes."""
-    manager = get_manager(str(_CONFIG_PATH))
-    pcfg = manager.config.platforms.get(provider)
-    if not pcfg:
-        raise ValueError(f"Platform '{provider}' not found in config")
-    if not pcfg.api_key or pcfg.api_key in ("sk-xxx", "sk-ant-xxx", "AIzxxx"):
-        raise ValueError(f"API key for platform '{provider}' is not configured")
-    if provider == "gemini":
-        return _generate_ga_image_gemini(model, prompt, pcfg.api_key, pcfg.base_url)
-    else:
-        return _generate_ga_image_openai_compat(model, prompt, pcfg.api_key, pcfg.base_url)
-
-
 def _run_chat_impl(
     body: ChatRequest,
     optional_user_id: str | None = None,
@@ -1430,6 +1601,7 @@ def _run_chat_impl(
     current_stage = store.get_session_stage(session_id)
     manager = get_manager(str(_CONFIG_PATH))
     client = manager.get_client(body.llm_provider or None)
+    intent_client = _get_intent_client(manager, body)
     lite_client = manager.get_lite_client(body.llm_provider or None)
     history_for_intent = memory.get_context_window(n=6)
 
@@ -1463,6 +1635,7 @@ def _run_chat_impl(
     # ── 2. 意图 + 上下文分析（单次 ultra-lite LLM 调用）──
     request_mode = (body.mode or "chat").strip().lower()
     ctx_analysis: ContextAnalysis | None = None
+    _cmd_token: str = ""  # set when message starts with "/"
 
     if request_mode == "deep_research":
         parsed = ParsedIntent(
@@ -1473,11 +1646,63 @@ def _run_chat_impl(
         )
         _chat_logger.info("[chat] ② 意图判断 → deep_research (前端 mode 指定)")
     elif message.startswith("/"):
-        parser = IntentParser(lite_client)
+        _cmd_token = message.split()[0].lower()
+        parser = IntentParser(intent_client)
         parsed = parser.parse(message, current_stage=current_stage, history=history_for_intent)
+
+        # 为 slash 命令合成 ContextAnalysis，使 followup_mode / topic_relevance 语义正确，
+        # 避免命令始终回落到 "fresh"/"low" 默认值，并防止走老式 _classify_query 兜底。
+        if _cmd_token == "/rewrite":
+            # 重写已有回答：不做新检索，仅复用缓存 chunks 重新生成
+            ctx_analysis = ContextAnalysis(
+                action="chat",
+                context_status="self_contained",
+                rewritten_query=(parsed.params.get("args") or "").strip(),
+                followup_mode="reuse_only",
+                topic_relevance="high",
+            )
+        elif _cmd_token == "/deepen":
+            _deepen_args = (parsed.params.get("args") or "").strip()
+            if not _deepen_args:
+                # 没有补充查询词，直接提示用户
+                _step(None, "")
+                _no_args_msg = "请在 /deepen 后面提供补充查询词，例如：`/deepen 深海热液口的温度范围`"
+                memory.add_turn("user", message)
+                memory.add_turn("assistant", _no_args_msg, citations=[])
+                memory.update_rolling_summary(lite_client)
+                return (
+                    session_id, _no_args_msg, [],
+                    EvidenceSummary(query=message, total_chunks=0, sources_used=[], retrieval_time_ms=0),
+                    parsed, None, None, {}, None, False, None,
+                )
+            ctx_analysis = ContextAnalysis(
+                action="rag",
+                context_status="self_contained",
+                rewritten_query=_deepen_args,
+                followup_mode="reuse_and_search",
+                topic_relevance="high",
+            )
+        elif _cmd_token in ("/search", "/explore"):
+            # 显式检索命令：始终新鲜检索
+            ctx_analysis = ContextAnalysis(
+                action="rag",
+                context_status="self_contained",
+                followup_mode="fresh",
+                topic_relevance="low",
+            )
+        else:
+            # /outline, /draft, /edit, /status, /export, /set 等：纯对话，无检索
+            ctx_analysis = ContextAnalysis(
+                action="chat",
+                context_status="self_contained",
+                followup_mode="fresh",
+                topic_relevance="low",
+            )
+
         _chat_logger.info(
-            "[chat] ② 意图判断 → %s (命令解析, confidence=%.2f)",
+            "[chat] ② 意图判断 → %s (命令解析, confidence=%.2f) | cmd=%s → followup=%s action=%s",
             parsed.intent_type.value, parsed.confidence,
+            _cmd_token, ctx_analysis.followup_mode, ctx_analysis.action,
         )
     else:
         # 统一上下文分析：一次 ultra-lite 调用完成 意图分类 + 指代检测 + query 重写/澄清
@@ -1487,7 +1712,7 @@ def _run_chat_impl(
             message=message,
             rolling_summary=memory.rolling_summary,
             history=history_for_intent,
-            llm_client=lite_client,
+            llm_client=intent_client,
         )
         analyze_ms = (_time.perf_counter() - t_analyze) * 1000
 
@@ -1608,13 +1833,15 @@ def _run_chat_impl(
         query_needs_rag = ctx_analysis.action == "rag"
     else:
         # /command 或前端指定 mode 时，走原有 _classify_query 兜底
-        query_needs_rag = _classify_query(message, history_for_intent, lite_client)
+        query_needs_rag = _classify_query(message, history_for_intent, intent_client)
     followup_mode = (ctx_analysis.followup_mode if ctx_analysis else "fresh").strip().lower()
     if followup_mode not in ("fresh", "reuse_only", "reuse_and_search"):
         followup_mode = "fresh"
-    topic_relevance = (ctx_analysis.topic_relevance if ctx_analysis else "low").strip().lower()
+    topic_relevance = (ctx_analysis.topic_relevance if ctx_analysis else "medium").strip().lower()
     if topic_relevance not in ("low", "medium", "high"):
-        topic_relevance = "low"
+        topic_relevance = "medium"
+    if followup_mode in ("reuse_only", "reuse_and_search") and topic_relevance == "low":
+        topic_relevance = "medium"
     target_span = (ctx_analysis.target_span if ctx_analysis else "").strip()
     # 追问高相关场景优先复用已有证据；是否补搜交给后续 Agent/证据缺口判断。
     # 仅 fresh（低相关/新主题）走常规预检索。
@@ -1652,12 +1879,46 @@ def _run_chat_impl(
 
     # ── 3.5 读取会话证据缓存（用于 follow-up reuse）──
     _reuse_cache_turns = int(getattr(settings.search, "chat_followup_cache_turns", 4) or 4)
-    cached_reuse_chunks = _load_recent_cached_chunks(store, session_id, max_turns=_reuse_cache_turns)
+    cached_reuse_chunks = _load_recent_cached_chunks(
+        store,
+        session_id,
+        max_turns=_reuse_cache_turns,
+        pool_name="final_chunks",
+    )
+    cached_followup_stage1_chunks = _load_recent_cached_chunks(
+        store,
+        session_id,
+        max_turns=min(_FOLLOWUP_FINAL_STAGE_TURNS, _reuse_cache_turns),
+        pool_name="final_chunks",
+    )
+    cached_followup_candidate_chunks = _load_recent_cached_chunks(
+        store,
+        session_id,
+        max_turns=_reuse_cache_turns,
+        pool_name="candidate_pool",
+    )
     reuse_enabled = (
         followup_mode in ("reuse_only", "reuse_and_search")
         and topic_relevance in ("medium", "high")
         and len(cached_reuse_chunks) > 0
     )
+    # /rewrite 无缓存时：无法"重写已有内容"，直接告知用户而非回落到新检索
+    if _cmd_token == "/rewrite" and not reuse_enabled:
+        _step(None, "")
+        _chat_logger.info("[chat] ③½ /rewrite: no cached context → inform user")
+        _rewrite_fallback = (
+            "没有找到可以重写的上下文——当前会话中还没有保留的检索证据。"
+            "请先进行一次检索查询，再使用 /rewrite 整理结果。"
+        )
+        memory.add_turn("user", message)
+        memory.add_turn("assistant", _rewrite_fallback, citations=[])
+        memory.update_rolling_summary(lite_client)
+        return (
+            session_id, _rewrite_fallback, [],
+            EvidenceSummary(query=message, total_chunks=0, sources_used=[], retrieval_time_ms=0),
+            parsed, None, None, {}, None, False, None,
+        )
+
     if followup_mode in ("reuse_only", "reuse_and_search") and not reuse_enabled:
         _chat_logger.info(
             "[chat] ③½ %s requested but cache unavailable/low relevance → fallback fresh",
@@ -1798,10 +2059,13 @@ def _run_chat_impl(
                     "Provide a brief, high-level overview answering the following question. "
                     "Outline key points and main sources. Keep it under 350 words. Respond in the same language as the question.\n\n"
                 ) + _prelim_query
-                _prelim_resp = _ppl_client.chat(
+                # 流量感知超时：每 chunk 间隔不超过 idle 秒；deep-research 给更长窗口
+                _idle_to = 150 if "deep-research" in (_prelim_model or "").lower() else 90
+                _prelim_resp = _stream_and_collect(
+                    _ppl_client,
                     [{"role": "user", "content": _prelim_prompt}],
                     model=_prelim_model,
-                    timeout_seconds=45,
+                    idle_timeout_seconds=_idle_to,
                 )
                 _prelim_text = (_prelim_resp.get("final_text") or "").strip()
                 if _prelim_text:
@@ -1856,8 +2120,12 @@ def _run_chat_impl(
     write_k = int(_write_k_raw) if _write_k_raw else 15
     if write_k <= 0:
         write_k = 15
+    followup_stage2_top_k = _chat_effective_step_top_k(body.step_top_k or body.local_top_k or 20) or 20
+    followup_candidate_pool_cap = _followup_candidate_pool_cap(followup_stage2_top_k)
     filters: Dict[str, Any] = {}
     chat_gap_candidates_hits: List[Dict[str, Any]] = []
+    cache_candidate_pool_chunks: List[EvidenceChunk] = []
+    retrieval = get_retrieval_service(collection=target_collection)
 
     # ── 5. 检索执行 ──
     if do_retrieval:
@@ -2005,6 +2273,7 @@ def _run_chat_impl(
                     _existing.add(c.chunk_id)
             if "sonar" not in pack.sources_used:
                 pack.sources_used.append("sonar")
+        cache_candidate_pool_chunks = _dedup_chunk_list(list(pack.chunks))
         # write_top_k = 混合检索后的最终保留数（送入 LLM 的 evidence 上限）。UI 传 ragConfig.writeTopK，此处生效。
         # Chat 单轮 Q&A = 一个产出单元；无 write_top_k 时使用默认窗口。
         max_chunks_for_context = min(write_k, len(pack.chunks))
@@ -2078,19 +2347,31 @@ def _run_chat_impl(
             retrieval_time_ms=0,
         )
         citations: list[Citation] = []
-        _chat_logger.info("[chat] ⑤ 检索 → 跳过 (路由判定为 chat)")
+        if query_needs_rag and reuse_enabled:
+            _chat_logger.info("[chat] ⑤ 检索 → 跳过 fresh 主检索（follow-up reuse path）")
+        else:
+            _chat_logger.info("[chat] ⑤ 检索 → 跳过 (路由判定为 chat)")
 
     # ── 5.1 follow-up 证据复用（reuse_only / reuse_and_search）──
+    followup_stage1_used = False
+    followup_stage2_used = False
+    followup_stage1_expand_reason = ""
     if reuse_enabled:
-        reuse_hits = [_chunk_to_hit(c) for c in cached_reuse_chunks]
         reuse_diag: Dict[str, Any] = {
             "followup_mode": followup_mode,
             "topic_relevance": topic_relevance,
             "cached_chunk_count": len(cached_reuse_chunks),
             "fresh_chunk_count": len(pack.chunks) if pack else 0,
             "target_span": target_span,
+            "stage1_used": False,
+            "stage1_expand_reason": "",
+            "stage1_chunk_count": 0,
+            "stage2_chunk_count": 0,
+            "candidate_pool_available": len(cached_followup_candidate_chunks) > 0,
+            "fallback_invoked": False,
         }
-        if followup_mode == "reuse_only" or not do_retrieval:
+        if followup_mode == "reuse_only":
+            reuse_hits = [_chunk_to_hit(c) for c in cached_reuse_chunks]
             fusion_diag: Dict[str, Any] = {}
             fused_hits = fuse_pools_with_gap_protection(
                 query=query or message,
@@ -2121,6 +2402,7 @@ def _run_chat_impl(
                 ),
                 diagnostics={"followup_reuse": reuse_diag},
             )
+            cache_candidate_pool_chunks = _dedup_chunk_list(list(cached_reuse_chunks))
             max_chunks_for_context = min(write_k, len(pack.chunks))
             synthesizer = EvidenceSynthesizer(max_chunks=max_chunks_for_context)
             context_str, synthesis_meta = synthesizer.synthesize(pack)
@@ -2147,42 +2429,39 @@ def _run_chat_impl(
                 "[chat] ⑤.1 followup reuse_only | cached=%d selected=%d write_k=%d",
                 len(cached_reuse_chunks), len(pack.chunks), write_k,
             )
-        elif followup_mode == "reuse_and_search" and pack:
-            fusion_diag = dict(pack.diagnostics or {})
-            merged_diag: Dict[str, Any] = {}
-            _cached_ids = {x.chunk_id for x in cached_reuse_chunks}
-            fused_hits = fuse_pools_with_gap_protection(
+        elif followup_mode == "reuse_and_search":
+            stage1_source_chunks = cached_followup_stage1_chunks or cached_reuse_chunks
+            stage1_ranked_chunks = _rerank_followup_chunks(
                 query=query or message,
-                main_candidates=[_chunk_to_hit(c) for c in pack.chunks] + reuse_hits,
-                gap_candidates=[],
-                top_k=min(write_k, len(pack.chunks) + len(reuse_hits)),
-                rank_pool_multiplier=float(getattr(settings.search, "chat_rank_pool_multiplier", 3.0)),
-                reranker_mode="bge_only",
-                diag=merged_diag,
+                chunks=stage1_source_chunks,
+                top_k=write_k,
+                phase="chat_followup_stage1",
             )
-            merged_chunks = [
-                service_hit_to_chunk(h, h.get("_source_type", "dense"), query or message)
-                for h in fused_hits
-            ]
-            reuse_diag["reuse_selected"] = sum(
-                1 for c in merged_chunks if c.chunk_id in _cached_ids
+            followup_stage1_expand_reason = _followup_stage1_expand_reason(
+                query=query or message,
+                message=message,
+                is_deepen=_cmd_token == "/deepen",
+                target_span=target_span,
+                stage1_chunks=stage1_ranked_chunks,
             )
-            reuse_diag["fresh_chunk_count"] = len(pack.chunks)
-            reuse_diag["merged_chunk_count"] = len(merged_chunks)
-            reuse_diag["pool_fusion"] = merged_diag.get("pool_fusion")
-            fusion_diag["followup_reuse"] = reuse_diag
+            reuse_diag["stage1_used"] = True
+            reuse_diag["stage1_expand_reason"] = followup_stage1_expand_reason
+            reuse_diag["stage1_chunk_count"] = len(stage1_ranked_chunks)
+            cache_candidate_pool_chunks = _dedup_chunk_list(
+                list(stage1_source_chunks) + list(cached_followup_candidate_chunks)
+            )
             pack = EvidencePack(
-                query=pack.query,
-                chunks=merged_chunks,
-                total_candidates=pack.total_candidates + len(reuse_hits),
-                retrieval_time_ms=pack.retrieval_time_ms,
+                query=query or message,
+                chunks=stage1_ranked_chunks,
+                total_candidates=len(stage1_source_chunks),
+                retrieval_time_ms=0.0,
                 sources_used=list(
                     dict.fromkeys(
                         (c.provider or ("local" if c.source_type in ("dense", "graph") else "web"))
-                        for c in merged_chunks
+                        for c in stage1_ranked_chunks
                     )
                 ),
-                diagnostics=fusion_diag,
+                diagnostics={"followup_reuse": reuse_diag},
             )
             max_chunks_for_context = min(write_k, len(pack.chunks))
             synthesizer = EvidenceSynthesizer(max_chunks=max_chunks_for_context)
@@ -2191,28 +2470,99 @@ def _run_chat_impl(
                 context_str,
                 llm_client=lite_client,
                 ultra_lite_provider=getattr(body, "ultra_lite_provider", None),
-                purpose="chat_followup_reuse_and_search",
+                purpose="chat_followup_stage1",
             )
             synth_dict = synthesis_meta.to_dict()
-            evidence_summary.query = pack.query
-            evidence_summary.total_chunks = len(pack.chunks)
-            evidence_summary.sources_used = pack.sources_used
-            evidence_summary.year_range = synth_dict.get("year_range")
-            evidence_summary.source_breakdown = synth_dict.get("unique_source_breakdown") or synth_dict.get("source_breakdown")
-            evidence_summary.evidence_type_breakdown = synth_dict.get("evidence_type_breakdown")
-            evidence_summary.cross_validated_count = synth_dict.get("cross_validated_count", 0)
-            evidence_summary.total_documents = synth_dict.get("total_documents", 0)
-            evidence_summary.diagnostics = pack.diagnostics
-            _chat_logger.info(
-                "[chat] ⑤.1 followup reuse_and_search | cached=%d fresh=%d merged=%d write_k=%d",
-                len(cached_reuse_chunks), reuse_diag["fresh_chunk_count"], len(pack.chunks), write_k,
+            evidence_summary = EvidenceSummary(
+                query=pack.query,
+                total_chunks=len(pack.chunks),
+                sources_used=pack.sources_used,
+                retrieval_time_ms=0.0,
+                year_range=synth_dict.get("year_range"),
+                source_breakdown=synth_dict.get("unique_source_breakdown") or synth_dict.get("source_breakdown"),
+                evidence_type_breakdown=synth_dict.get("evidence_type_breakdown"),
+                cross_validated_count=synth_dict.get("cross_validated_count", 0),
+                total_documents=synth_dict.get("total_documents", 0),
+                diagnostics=pack.diagnostics,
             )
+            if followup_stage1_expand_reason:
+                stage2_source_chunks = _dedup_chunk_list(
+                    list(stage1_ranked_chunks) + list(cached_followup_candidate_chunks)
+                )
+                if cached_followup_candidate_chunks and stage2_source_chunks:
+                    followup_stage2_used = True
+                    stage2_ranked_chunks = _rerank_followup_chunks(
+                        query=query or message,
+                        chunks=stage2_source_chunks,
+                        top_k=followup_stage2_top_k,
+                        phase="chat_followup_stage2",
+                    )
+                    reuse_diag["stage2_chunk_count"] = len(stage2_ranked_chunks)
+                    pack = EvidencePack(
+                        query=query or message,
+                        chunks=stage2_ranked_chunks,
+                        total_candidates=len(stage2_source_chunks),
+                        retrieval_time_ms=0.0,
+                        sources_used=list(
+                            dict.fromkeys(
+                                (c.provider or ("local" if c.source_type in ("dense", "graph") else "web"))
+                                for c in stage2_ranked_chunks
+                            )
+                        ),
+                        diagnostics={"followup_reuse": reuse_diag},
+                    )
+                    max_chunks_for_context = min(write_k, len(pack.chunks))
+                    synthesizer = EvidenceSynthesizer(max_chunks=max_chunks_for_context)
+                    context_str, synthesis_meta = synthesizer.synthesize(pack)
+                    context_str, _ctx_budget_diag = _budget_chat_evidence_context(
+                        context_str,
+                        llm_client=lite_client,
+                        ultra_lite_provider=getattr(body, "ultra_lite_provider", None),
+                        purpose="chat_followup_stage2",
+                    )
+                    synth_dict = synthesis_meta.to_dict()
+                    evidence_summary = EvidenceSummary(
+                        query=pack.query,
+                        total_chunks=len(pack.chunks),
+                        sources_used=pack.sources_used,
+                        retrieval_time_ms=0.0,
+                        year_range=synth_dict.get("year_range"),
+                        source_breakdown=synth_dict.get("unique_source_breakdown") or synth_dict.get("source_breakdown"),
+                        evidence_type_breakdown=synth_dict.get("evidence_type_breakdown"),
+                        cross_validated_count=synth_dict.get("cross_validated_count", 0),
+                        total_documents=synth_dict.get("total_documents", 0),
+                        diagnostics=pack.diagnostics,
+                    )
+                _chat_logger.info(
+                    "[chat] ⑤.1 followup reuse_and_search | stage1=%d expand=%s candidate_pool=%d stage2=%d",
+                    len(stage1_ranked_chunks),
+                    followup_stage1_expand_reason,
+                    len(cached_followup_candidate_chunks),
+                    reuse_diag["stage2_chunk_count"],
+                )
+            else:
+                followup_stage1_used = True
+                _chat_logger.info(
+                    "[chat] ⑤.1 followup reuse_and_search | stage1_direct=%d expand=no",
+                    len(stage1_ranked_chunks),
+                )
 
     # ── 5.5 证据充分性检查：LLM 判断是否有一致、实质的证据支撑（借鉴 DR），失败时用数量兜底 ──
     evidence_scarce = False
     _evidence_distinct_docs = 0
     _coverage_score: Optional[float] = None
     _sufficiency_reason: Optional[str] = None
+    _broad_followup = _is_broad_followup_query(query or message, message)
+    _targeted_followup = (
+        followup_mode == "reuse_and_search"
+        and (_cmd_token == "/deepen" or not _broad_followup)
+    )
+    _skip_full_sufficiency_for_stage1 = (
+        followup_mode == "reuse_and_search"
+        and followup_stage1_used
+        and not followup_stage2_used
+        and not followup_stage1_expand_reason
+    )
     if pack:
         _doc_keys: set[str] = set()
         for c in pack.chunks:
@@ -2222,8 +2572,17 @@ def _run_chat_impl(
                 _doc_keys.add(c.doc_group_key)
         _evidence_distinct_docs = len(_doc_keys)
         # 数量兜底：无有效 context 或 LLM 失败时使用
-        _numeric_fallback = len(pack.chunks) < 3 or _evidence_distinct_docs < 2
-        if query_needs_rag and context_str and context_str.strip():
+        if _targeted_followup:
+            _numeric_fallback = len(pack.chunks) < 2
+        else:
+            _numeric_fallback = len(pack.chunks) < 3 or _evidence_distinct_docs < 2
+        if _skip_full_sufficiency_for_stage1:
+            _chat_logger.info(
+                "[chat] ⑤½ follow-up stage1 direct answer | chunks=%d | broad=%s",
+                len(pack.chunks),
+                _broad_followup,
+            )
+        elif query_needs_rag and context_str and context_str.strip():
             sufficiency = _evaluate_chat_evidence_sufficiency(
                 message,
                 context_str,
@@ -2287,6 +2646,9 @@ def _run_chat_impl(
                 evidence_summary.coverage_score = _coverage_score
             if _sufficiency_reason:
                 evidence_summary.sufficiency_reason = _sufficiency_reason
+            if pack and pack.diagnostics and isinstance(pack.diagnostics.get("followup_reuse"), dict):
+                pack.diagnostics["followup_reuse"]["fallback_invoked"] = True
+                evidence_summary.diagnostics = pack.diagnostics
         if agent_mode == "standard" and evidence_scarce and query_needs_rag:
             agent_mode = "assist"
             _chat_logger.info(
@@ -2297,13 +2659,22 @@ def _run_chat_impl(
 
     # ── 5.6 证据不足时：生成 gap query、补搜、main+gap 一次融合（借鉴 DR）──
     if (
-        do_retrieval
-        and pack
+        pack
         and evidence_scarce
         and query_needs_rag
         and effective_search_mode != "none"
+        and (do_retrieval or followup_mode == "reuse_and_search")
     ):
         _step("gap_fill", "Gap fill")
+        if not filters:
+            filters = _build_filters(body)
+            if filters.pop("fused_pool_score_threshold", None) is not None:
+                _chat_logger.info(
+                    "[chat] fused_pool_score_threshold ignored in follow-up gap flow"
+                )
+            if filters.get("step_top_k") is None:
+                filters["step_top_k"] = followup_stage2_top_k
+            filters["reranker_mode"] = "bge_only"
         gap_queries = _generate_chat_gap_queries(
             message,
             context_str or "",
@@ -2353,6 +2724,13 @@ def _run_chat_impl(
                         _chat_logger.warning("[chat] gap supplement search failed for %r: %s", (gq.get("recall") or gq.get("precision") or "")[:50], e)
             if gap_candidates:
                 chat_gap_candidates_hits = list(gap_candidates)
+                cache_candidate_pool_chunks = _dedup_chunk_list(
+                    list(cache_candidate_pool_chunks)
+                    + [
+                        service_hit_to_chunk(hit, hit.get("_source_type", "dense"), query or message)
+                        for hit in gap_candidates
+                    ]
+                )
                 # gap 候选暂存；不做中间 BGE rerank，延迟至下方统一融合步骤执行
                 _chat_logger.info(
                     "[chat] ⑤¾ gap 候选收集完成 | gap_queries=%d | gap_candidates=%d（延迟至统一 BGE 融合）",
@@ -2523,12 +2901,16 @@ def _run_chat_impl(
     messages.append({"role": "user", "content": message})
 
     # ── 8. LLM 生成 ──
+    _followup_local_context_ready = (
+        followup_mode == "reuse_and_search"
+        and bool(context_str and context_str.strip())
+        and not evidence_scarce
+    )
     skip_assist_agent_for_sufficient_context = (
         agent_mode == "assist"
         and query_needs_rag
-        and do_retrieval
-        and bool(context_str and context_str.strip())
         and not evidence_scarce
+        and (do_retrieval or _followup_local_context_ready)
     )
     use_agent = agent_mode == "autonomous" or (
         agent_mode == "assist" and not skip_assist_agent_for_sufficient_context
@@ -2538,12 +2920,13 @@ def _run_chat_impl(
         "query_needs_rag=%s | search_mode=%s | evidence_scarce=%s | do_retrieval=%s",
         use_agent, agent_mode, _agent_mode_before_route,
         query_needs_rag, search_mode,
-        evidence_scarce if do_retrieval and pack else "N/A(未检索)",
+        evidence_scarce if pack else "N/A(未检索)",
         do_retrieval,
     )
     if skip_assist_agent_for_sufficient_context:
         _chat_logger.info(
-            "[chat] ⑦½ Agent 跳过 | reason=sufficient_retrieval_context | mode=assist→direct"
+            "[chat] ⑦½ Agent 跳过 | reason=sufficient_context | do_retrieval=%s | followup=%s | mode=assist→direct",
+            do_retrieval, _followup_local_context_ready,
         )
     tool_trace = None
 
@@ -2553,6 +2936,8 @@ def _run_chat_impl(
             "chat_agent_evidence_scarce_hint.txt",
             chunk_count=len(pack.chunks) if pack else 0,
             distinct_docs=_evidence_distinct_docs,
+            targeted_followup="yes" if _targeted_followup else "no",
+            target_span=target_span or "当前追问目标",
         )
     elif agent_mode == "assist" and do_retrieval and context_str:
         messages[0]["content"] = messages[0]["content"] + _pm.render("chat_agent_hint.txt")
@@ -2592,6 +2977,7 @@ def _run_chat_impl(
         pre_agent_chunk_ids = {c.chunk_id for c in pack.chunks}
 
     t_llm = _time.perf_counter()
+    _regen_succeeded = True   # 默认：未走 regen 路径，答案是权威最终结果
     try:
         if use_agent:
             _step("agent", "Agent reasoning")
@@ -2620,6 +3006,10 @@ def _run_chat_impl(
                 max_tokens=None,
             )
             agent_extra_chunks = drain_agent_chunks()
+            if agent_extra_chunks:
+                cache_candidate_pool_chunks = _dedup_chunk_list(
+                    list(cache_candidate_pool_chunks) + list(agent_extra_chunks)
+                )
             agent_chunk_ids = {c.chunk_id for c in agent_extra_chunks}
             response_text = react_result.final_text.strip()
             tool_trace = react_result.tool_trace if react_result.tool_trace else None
@@ -2714,14 +3104,18 @@ def _run_chat_impl(
                 _step("answering", "Writing answer")
                 t_regen = _time.perf_counter()
                 if delta_callback:
-                    response_text = (_stream_llm_text(
+                    _regen_text = (_stream_llm_text(
                         client,
                         regen_messages,
                         model_override=body.model_override or None,
-                    ) or "").strip() or response_text
+                    ) or "").strip()
+                    _regen_succeeded = bool(_regen_text)
+                    response_text = _regen_text or response_text
                 else:
                     regen_resp = client.chat(regen_messages, model=body.model_override or None, max_tokens=None)
-                    response_text = (regen_resp.get("final_text") or "").strip() or response_text
+                    _regen_text = (regen_resp.get("final_text") or "").strip()
+                    _regen_succeeded = bool(_regen_text)
+                    response_text = _regen_text or response_text
                 regen_ms = (_time.perf_counter() - t_regen) * 1000
                 _chat_logger.info(
                     "[chat] ⑧b Agent 回流重生成 | fused_chunks=%d | agent_chunks=%d | regen_ms=%.0f",
@@ -2772,9 +3166,11 @@ def _run_chat_impl(
     # ── 9. 引文后处理：将 [ref_hash] 替换为正式 cite_key ──
     ref_map: dict[str, str] = {}
     all_chunks = (pack.chunks if pack else [])
-    if all_chunks:
+    if all_chunks and _regen_succeeded:
         response_text, citations, ref_map = resolve_response_citations(
-            response_text, all_chunks,
+            response_text,
+            all_chunks,
+            include_unreferenced_documents=False,
         )
         if use_agent and len(all_chunks) > evidence_summary.total_chunks:
             evidence_summary.total_chunks = len(all_chunks)
@@ -2855,59 +3251,64 @@ def _run_chat_impl(
             _cache_chunks_per_turn = int(
                 getattr(settings.search, "chat_followup_cache_chunks_per_turn", 36) or 36
             )
+            _candidate_pool_chunks = _dedup_chunk_list(list(cache_candidate_pool_chunks))
+            if _candidate_pool_chunks:
+                _candidate_pool_chunks = _rerank_followup_chunks(
+                    query=query or message,
+                    chunks=_candidate_pool_chunks,
+                    top_k=followup_candidate_pool_cap,
+                    phase="chat_followup_cache_candidate_pool",
+                )
             store.append_recent_evidence_cache(
                 session_id=session_id,
                 query=query or message,
-                chunks=[_chunk_to_cache_payload(c) for c in pack.chunks],
+                final_chunks=[_chunk_to_cache_payload(c) for c in pack.chunks],
+                candidate_pool=[_chunk_to_cache_payload(c) for c in _candidate_pool_chunks],
                 max_turns=_cache_turns,
                 max_chunks_per_turn=_cache_chunks_per_turn,
+                max_candidate_pool_per_turn=followup_candidate_pool_cap,
             )
         except Exception as cache_err:
             _chat_logger.debug("[chat] evidence cache write failed: %s", cache_err)
 
     # ── 9.5 Graphic Abstract ──
-    _GA_MODEL_MAP = {
-        "nanobanana 2":   ("gemini", "gemini-3.1-flash-image-preview"),
-        "nanobanana pro": ("gemini", "gemini-3-pro-image-preview"),
-        "gpt-image-1.5":  ("openai", "gpt-image-1.5"),
-        "kimi-k2.5":      ("kimi",   "kimi-k2.5"),
-        "qwen-image-2.0": ("qwen",   "qwen-image-2.0"),
-    }
-    if getattr(body, "enable_graphic_abstract", False) and response_text.strip():
-        ga_model_raw = (getattr(body, "graphic_abstract_model", None) or "nanobanana 2").strip()
-        ga_provider, ga_model = _GA_MODEL_MAP.get(ga_model_raw, ("gemini", ga_model_raw))
+    if getattr(body, "enable_graphic_abstract", False) and response_text.strip() and _regen_succeeded:
+        ga_model_raw = getattr(body, "graphic_abstract_model", None)
+        ga_provider, ga_model = resolve_graphic_abstract_model(ga_model_raw)
 
         _step("graphic_abstract", f"Drawing Graphic Abstract ({ga_model})")
-        _chat_logger.info("[chat] 🎨 开始生成 Graphic Abstract, provider=%s, model=%s", ga_provider, ga_model)
+        _chat_logger.info(
+            "[chat] 🎨 开始生成 Graphic Abstract, requested_model=%s, provider=%s, resolved_model=%s",
+            ga_model_raw,
+            ga_provider,
+            ga_model,
+        )
         try:
-            # 先用文字模型把回复压缩为图像提示词（≤200词），避免直接把长文丢给图像模型
-            ga_img_prompt = (
-                "Create a clean, professional scientific graphic abstract (infographic poster) "
-                "that visually summarizes the following research findings. "
-                "Use a white or light background, clear typography, and an academic color palette "
-                "(blues, teals, greys). Include key concepts, relationships, and conclusions as "
-                "labeled diagram elements, icons, or flow arrows. No decorative borders.\n\n"
-                f"Research summary:\n{response_text[:2000]}"
+            # Predict the turn_id for the assistant message (current_count + 1)
+            assistant_turn_id = (store.get_turn_count(session_id) or 0) + 1
+            ga_result = render_graphic_abstract_markdown(
+                response_text,
+                model_raw=ga_model_raw,
+                content_kind="chat",
+                heading="### Graphic Abstract",
+                session_id=session_id,
+                turn_id=assistant_turn_id,
             )
-
-            _GA_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-            img_bytes = _generate_ga_image(ga_provider, ga_model, ga_img_prompt)
-
-            img_filename = f"{uuid.uuid4().hex}.png"
-            img_path = _GA_IMAGES_DIR / img_filename
-            img_path.write_bytes(img_bytes)
-            img_url = f"/ga_images/{img_filename}"
-
-            ga_md = f"\n\n### Graphic Abstract\n\n![Graphic Abstract]({img_url})\n"
+            _chat_logger.info(
+                "[chat] Graphic Abstract stored, backend=%s, key=%s, content_type=%s, url=%s",
+                ga_result.storage_backend,
+                ga_result.asset_key,
+                ga_result.content_type,
+                ga_result.image_url,
+            )
             if delta_callback:
-                delta_callback(ga_md)
-            response_text += ga_md
-
+                delta_callback(ga_result.markdown)
+            response_text += ga_result.markdown
         except Exception as e:
             _chat_logger.error("[chat] Graphic Abstract 生成失败: %s", e, exc_info=True)
             if delta_callback:
-                delta_callback("\n> *Graphic abstract generation failed.*")
-            response_text += "\n> *Graphic abstract generation failed.*"
+                delta_callback(GRAPHIC_ABSTRACT_FAILURE_MD)
+            response_text += GRAPHIC_ABSTRACT_FAILURE_MD
 
     # ── 10. 写入 Memory ──
     memory.add_turn("user", message)
@@ -2953,19 +3354,7 @@ def _run_chat(
 
 def _citation_to_chat_citation(c: Citation) -> ChatCitation:
     """将 Citation 对象转换为 ChatCitation schema。"""
-    return ChatCitation(
-        cite_key=c.cite_key or c.id,
-        title=c.title or "",
-        authors=c.authors or [],
-        year=c.year,
-        doc_id=c.doc_id,
-        url=c.url,
-        pdf_url=getattr(c, "pdf_url", None),
-        doi=c.doi,
-        bbox=getattr(c, "bbox", None),
-        page_num=getattr(c, "page_num", None),
-        provider=getattr(c, "provider", None),
-    )
+    return _chat_citation_from_dict(_serialize_citation(c))
 
 
 @router.post("/chat", response_model=ChatResponse)
@@ -3168,10 +3557,10 @@ def detect_intent(body: IntentDetectRequest) -> IntentDetectResponse:
     """
     意图检测 API（简化版）：Chat vs Deep Research 二分类。
     检索由前端 UI 开关决定，此处只判断执行模式。
-    LLM 优先使用 body.llm_provider（UI），无则使用 config 默认。
+    LLM 优先级：body.intent_provider > config.llm.intent_provider > body.llm_provider(lite) > body.ultra_lite_provider > config 默认。
     """
     manager = get_manager(str(_CONFIG_PATH))
-    client = manager.get_lite_client(body.llm_provider or None)
+    client = _get_intent_client(manager, body)
     parser = IntentParser(client)
 
     history = None
@@ -3348,10 +3737,12 @@ def clarify_for_deep_research(
                 "Outline the main sub-fields, recent trends, and key controversies or open questions. "
                 "Keep it under 300 words. Respond in English only.\n\nTopic: "
             ) + (body.message or "").strip()
-            prelim_resp = ppl_client.chat(
+            _idle_to = 150 if "deep-research" in (prelim_model or "").lower() else 90
+            prelim_resp = _stream_and_collect(
+                ppl_client,
                 [{"role": "user", "content": prelim_prompt}],
                 model=prelim_model,
-                timeout_seconds=40,
+                idle_timeout_seconds=_idle_to,
             )
             prelim_text = (prelim_resp.get("final_text") or "").strip()
             if prelim_text:
@@ -5309,19 +5700,7 @@ def get_session(
     for t in turns:
         # 将存储的 citations 字典列表转换为 ChatCitation 对象
         sources = [
-            ChatCitation(
-                cite_key=c.get("cite_key", ""),
-                title=c.get("title", ""),
-                authors=c.get("authors", []),
-                year=c.get("year"),
-                doc_id=c.get("doc_id"),
-                url=c.get("url"),
-                pdf_url=c.get("pdf_url"),
-                doi=c.get("doi"),
-                bbox=c.get("bbox"),
-                page_num=c.get("page_num"),
-                provider=c.get("provider"),
-            )
+            _chat_citation_from_dict(c)
             for c in (t.citations or [])
         ]
         try:

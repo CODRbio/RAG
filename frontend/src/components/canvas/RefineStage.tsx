@@ -36,6 +36,8 @@ import {
   DEEP_RESEARCH_JOB_KEY,
   DEEP_RESEARCH_ARCHIVED_JOBS_KEY,
 } from '../workflow/deep-research/types';
+import { logger } from '../../utils/logger';
+import { transformMarkdownMediaUrl } from '../../utils/mediaUrl';
 
 interface RefineStageProps {
   canvas: Canvas;
@@ -218,7 +220,7 @@ export function RefineStage({ canvas }: RefineStageProps) {
       requestSessionListRefresh();
       addToast('已提交综合重启', 'success');
     } catch (err) {
-      console.error('[RefineStage] restart synthesize failed:', err);
+      logger.ui.error('[RefineStage] restart synthesize failed', err);
       addToast('综合重启失败，请重试', 'error');
     } finally {
       setRestarting(false);
@@ -692,7 +694,10 @@ export function RefineStage({ canvas }: RefineStageProps) {
           ) : (
             <div className="p-6">
               <div className="prose prose-sm prose-invert max-w-none prose-headings:font-bold prose-h1:text-xl prose-h2:text-lg prose-p:text-[var(--text-secondary)]">
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                <ReactMarkdown 
+                  remarkPlugins={[remarkGfm]}
+                  urlTransform={transformMarkdownMediaUrl}
+                >
                   {canvasContent}
                 </ReactMarkdown>
               </div>

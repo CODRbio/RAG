@@ -46,6 +46,7 @@
 LLM 统一调度配置。
 
 - `default`：默认 provider
+- `intent_provider`：意图判断专用 provider（可选）
 - `dry_run`：是否启用 Mock 模式（测试用）
 - `providers`：各 provider 的 `api_key / base_url / default_model / models / params`
 - 支持 provider：
@@ -55,6 +56,38 @@ LLM 统一调度配置。
   - `claude` / `claude-thinking`
   - `kimi` / `kimi-thinking` / `kimi-vision`
   - `sonar`
+
+#### 模型入口映射
+
+当前系统里有多条“模型选择”链路，含义必须分开：
+
+| UI / 配置入口 | 请求字段 / 配置项 | 生效范围 | 说明 |
+|---|---|---|---|
+| 顶栏主模型 | `llm_provider` | 主回答、主写作 | 默认主模型 |
+| 设置页「意图判断模型」 | `intent_provider` | Chat 意图检测、多轮追问、上下文复用判断 | 默认跟随主模型的 lite 版，也可手动覆盖 |
+| 设置页「Ultra Lite」 | `ultra_lite_provider` | 长文本压缩、超轻量抽取/总结 | 不负责主回答 |
+| Graphic Abstract 图像模型 | `graphic_abstract_model` | 图像生成 | 仅用于图文摘要图片 |
+| `config.llm.intent_provider` | `llm.intent_provider` | 全局默认 | 当前端未显式传 `intent_provider` 时生效 |
+
+`intent_provider` 的后端回退优先级为：
+
+1. `body.intent_provider`
+2. `config.llm.intent_provider`
+3. `body.llm_provider`（随后通过 `get_lite_client` 自动降到 lite 版）
+4. `body.ultra_lite_provider`
+5. `llm.default`
+
+因此：
+
+- 不会再出现“UI 里配了本地意图模型，但请求没传”的悬空状态
+- 默认不会被 `Ultra Lite` 设置悄悄接管
+- 也不会把图像模型或 Ultra Lite 模型误当成主回答模型
+
+本地模型接入建议：
+
+- 把本地服务注册为一个普通 `llm.providers.<name>` 条目
+- 如果是 OpenAI-compatible 服务，填写对应 `base_url`
+- 然后在 UI 的「意图判断模型」中选择它，或在 `llm.intent_provider` 里设成全局默认
 
 ### `parser`
 

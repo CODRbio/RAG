@@ -5,7 +5,6 @@
 支持 local / web / hybrid 三种模式。hybrid 时 local 与 web 并行执行。
 """
 
-import logging
 import math
 import re
 import time
@@ -14,13 +13,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from config.settings import settings
+from src.log import get_logger
 from src.retrieval.evidence import EvidenceChunk, EvidencePack
 from src.retrieval.dedup import cross_source_dedup
 from src.retrieval.fulltext_compressor import compress_fulltext_hits_sync
 from src.retrieval.hybrid_retriever import HybridRetriever, RetrievalConfig, _rerank_candidates
 from src.retrieval.unified_web_search import unified_web_searcher
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # ── Provider normalization ────────────────────────────────────────────────────
 # Map raw provider strings (from search-engine metadata) to canonical names.

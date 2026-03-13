@@ -6,12 +6,12 @@
 from __future__ import annotations
 
 import hashlib
-import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any, Iterator, Optional
 
-logger = logging.getLogger(__name__)
+from src.log import get_logger
+logger = get_logger(__name__)
 
 # Block 可以是 dict（JSON）或带 heading_path/text/table_data/figure_data 的对象
 

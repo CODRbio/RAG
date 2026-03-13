@@ -36,6 +36,16 @@ class DraftBlock:
 
 
 @dataclass
+class CitationAnchor:
+    """文献定位锚点（真实引用的 chunk）。"""
+
+    chunk_id: str = ""
+    page_num: Optional[int] = None
+    bbox: Optional[list[float]] = None
+    snippet: Optional[str] = None
+
+
+@dataclass
 class Citation:
     """引文记录"""
 
@@ -49,8 +59,10 @@ class Citation:
     doi: Optional[str] = None
     bibtex: Optional[str] = None
     cite_key: Optional[str] = None
+    chunk_id: Optional[str] = None
     bbox: Optional[list[float]] = None
     page_num: Optional[int] = None
+    anchors: List[CitationAnchor] = field(default_factory=list)
     provider: Optional[str] = None  # tavily | scholar | semantic | ncbi | google | local
     created_at: datetime = field(default_factory=datetime.now)
 

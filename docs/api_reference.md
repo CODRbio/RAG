@@ -92,19 +92,18 @@ data: {"status": "completed"}
 ```json
 {
   "session_id": "uuid",
-  "message": "深海热液喷口的生物多样性",
-  "history": [],
-  "llm_provider": "claude",
-  "llm_model": null,
-  "mode": "hybrid",
-  "filters": {
-    "local_top_k": 45,
-    "step_top_k": 10,
-    "write_top_k": 15,
-    "reranker_mode": "bge_only"
-  },
+  "message": "继续展开上面第二点",
+  "search_mode": "hybrid",
+  "llm_provider": "qwen-thinking",
+  "intent_provider": "intent-local",
+  "ultra_lite_provider": "openai-mini",
+  "model_override": "qwen3.5-plus",
+  "local_top_k": 45,
+  "step_top_k": 10,
+  "write_top_k": 15,
+  "reranker_mode": "bge_only",
   "agent_mode": "assist",
-  "project_id": null
+  "graphic_abstract_model": "nanobanana 2"
 }
 ```
 
@@ -112,12 +111,23 @@ data: {"status": "completed"}
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `mode` | string | 检索模式：`local` / `web` / `hybrid` |
-| `filters.local_top_k` | int | 本地召回上限（推荐 45） |
-| `filters.step_top_k` | int | 单次检索输出上限（推荐 10） |
-| `filters.write_top_k` | int | 进 LLM 的证据上限（推荐 15） |
-| `filters.reranker_mode` | string | `bge_only` / `colbert` / `cascade` |
-| `agent_mode` | string | `disabled` / `assist` / `autonomous` |
+| `search_mode` | string | 检索模式：`local` / `web` / `hybrid` / `none` |
+| `llm_provider` | string | 主回答 / 主写作模型 |
+| `intent_provider` | string | 意图判断专用模型，仅用于意图检测、多轮追问与上下文复用判断 |
+| `ultra_lite_provider` | string | 长文本压缩等超轻量任务模型 |
+| `local_top_k` | int | 本地召回上限（推荐 45） |
+| `step_top_k` | int | 单次检索输出上限（推荐 10） |
+| `write_top_k` | int | 进 LLM 的证据上限（推荐 15） |
+| `reranker_mode` | string | `bge_only` / `colbert_only` / `cascade` |
+| `agent_mode` | string | `standard` / `assist` / `autonomous` |
+| `graphic_abstract_model` | string | 图文摘要图片模型 |
+
+**模型字段职责**：
+
+- `llm_provider`：主回答模型
+- `intent_provider`：Chat 意图/追问判断模型；未显式传入时，默认跟随 `llm_provider` 的 lite 版
+- `ultra_lite_provider`：压缩与超轻量任务模型
+- `graphic_abstract_model`：图像生成模型
 
 **响应**：
 ```json

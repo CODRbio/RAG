@@ -96,7 +96,7 @@ export function ClarifyPhase({
 
       <div className="flex items-center justify-between bg-gray-50 border border-gray-200 rounded-lg px-3 py-2.5">
         <div className="text-[11px] text-gray-500 flex items-center gap-1.5 flex-wrap">
-          <span className="font-medium text-gray-700">{depth === 'lite' ? 'Lite' : 'Comprehensive'}</span>
+          <span className="font-medium text-gray-700">{depth === 'lite' ? 'Lite' : depth === 'expert' ? 'Expert' : 'Comprehensive'}</span>
           <span className="text-gray-300">|</span>
           <span>Scope: <span className="font-medium">{scopeModel || 'default'}</span></span>
           <span className="text-gray-300">|</span>

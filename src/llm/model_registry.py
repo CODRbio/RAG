@@ -11,7 +11,6 @@
 
 from __future__ import annotations
 
-import logging
 import re
 import time
 from abc import ABC, abstractmethod
@@ -20,7 +19,8 @@ from typing import Any, Dict, List, Optional, Type
 
 import requests
 
-_log = logging.getLogger(__name__)
+from src.log import get_logger
+_log = get_logger(__name__)
 
 _FETCH_TIMEOUT = 15  # seconds
 

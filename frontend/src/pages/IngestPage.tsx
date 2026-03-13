@@ -52,6 +52,7 @@ import {
 } from '../api/scholar';
 import { login as apiLogin } from '../api/auth';
 import { useAuthStore } from '../stores/useAuthStore';
+import { logger } from '../utils/logger';
 
 // ---- Types ----
 
@@ -145,7 +146,7 @@ export function IngestPage() {
       const res = await listLLMProviders();
       setLlmProviders(res.providers || []);
     } catch (err) {
-      console.error('Failed to load LLM providers:', err);
+      logger.api.error('Failed to load LLM providers', err);
     }
   }, []);
 
@@ -207,7 +208,7 @@ export function IngestPage() {
       setCollections(cols.map((c) => c.name));
       setCollectionInfos(cols);
     } catch (err) {
-      console.error('Failed to load collections:', err);
+      logger.api.error('Failed to load collections', err);
       setConnectError(err instanceof Error ? err.message : '无法连接后端服务');
     } finally {
       setCollectionsLoading(false);
@@ -235,7 +236,7 @@ export function IngestPage() {
         return enriched[0]?.name ?? null;
       });
     } catch (err) {
-      console.warn('Failed to load scholar libraries for ingest', err);
+      logger.api.warn('Failed to load scholar libraries for ingest', err);
       setScholarLibraries([]);
       setSelectedBaseName(null);
     } finally {

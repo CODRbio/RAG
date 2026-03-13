@@ -13,7 +13,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-import logging
 import re
 import statistics
 from dataclasses import dataclass, field
@@ -25,9 +24,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.utils.prompt_manager import PromptManager
+from src.log import get_logger
 
 _pm = PromptManager()
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class _AnyJSONObject(BaseModel):

@@ -24,6 +24,7 @@ import { useAuthStore, useConfigStore, useChatStore, useUIStore, useToastStore }
 import { checkHealth } from '../../api/health';
 import { listLLMProviders, listAllLiveModels, type LLMProviderInfo } from '../../api/ingest';
 import { TaskCenter } from '../tasks/TaskCenter';
+import { logger } from '../../utils/logger';
 
 const LLM_PROVIDER_CACHE_KEY = 'llm_provider_cache_v1';
 const LLM_PROVIDER_BOOTSTRAP_FLAG = 'llm_provider_bootstrap_refreshed_v1';
@@ -287,7 +288,7 @@ export function Header() {
         addToast(currentLang === 'zh' ? '模型列表已刷新' : 'Model list refreshed', 'success');
       }
     } catch (err) {
-      console.warn('[Header] load providers failed:', err);
+      logger.ui.warn('[Header] load providers failed', err);
       if (opts?.toastOnFinish) {
         addToast(currentLang === 'zh' ? '模型列表刷新失败，已保留缓存' : 'Model refresh failed, cached list kept', 'warning');
       }

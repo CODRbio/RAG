@@ -11,7 +11,6 @@
 """
 
 import json
-import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
 from dataclasses import asdict
 from pathlib import Path
@@ -20,8 +19,9 @@ from fastapi import APIRouter, HTTPException, Query
 
 from src.api.schemas import ModelStatusResponse, ModelSyncRequest, ModelSyncResponse
 from src.utils.model_sync import check_models, sync_models
+from src.log import get_logger
 
-_log = logging.getLogger(__name__)
+_log = get_logger(__name__)
 
 router = APIRouter(tags=["models"])
 

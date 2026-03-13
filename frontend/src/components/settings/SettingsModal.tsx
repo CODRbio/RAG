@@ -3,7 +3,7 @@ import { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Modal } from '../ui/Modal';
 import { useUIStore, useConfigStore, useToastStore } from '../../stores';
-import { listUltraLiteProviders, type UltraLiteProviderOption } from '../../api/ingest';
+import { listLLMProviders, listUltraLiteProviders, type LLMProviderInfo, type UltraLiteProviderOption } from '../../api/ingest';
 import { getDatabaseConfig, updateDatabaseConfig, DEFAULT_DATABASE_URL, clearCrossrefCache, clearPaperMetadataCache } from '../../api/config';
 
 type CiteKeyFormat = 'author_date' | 'numeric' | 'hash';
@@ -22,7 +22,7 @@ export function SettingsModal() {
   const { ragConfig, updateRagConfig, deepResearchDefaults, updateDeepResearchDefaults } = useConfigStore();
   const addToast = useToastStore((s) => s.addToast);
   const [ultraLiteOptions, setUltraLiteOptions] = useState<UltraLiteProviderOption[]>([]);
-  const [ultraLiteDefault, setUltraLiteDefault] = useState<string | null>(null);
+  const [intentProviderOptions, setIntentProviderOptions] = useState<LLMProviderInfo[]>([]);
 
   const [citeKeyFormat, setCiteKeyFormat] = useState<CiteKeyFormat>(
     () => (localStorage.getItem('adv_cite_key_format') as CiteKeyFormat) || 'author_date'
@@ -48,10 +48,14 @@ export function SettingsModal() {
     getDatabaseConfig()
       .then((c) => setDatabaseUrl(c.url || DEFAULT_DATABASE_URL))
       .catch(() => setDatabaseUrl(DEFAULT_DATABASE_URL));
+    listLLMProviders()
+      .then((data) => {
+        setIntentProviderOptions((data.providers || []).filter((p) => !p.id.endsWith('-vision')));
+      })
+      .catch(() => {});
     listUltraLiteProviders(false)
       .then((data) => {
         setUltraLiteOptions(data.providers || []);
-        setUltraLiteDefault(data.default ?? null);
       })
       .catch(() => {});
   }, [showSettingsModal]);
@@ -132,6 +136,13 @@ export function SettingsModal() {
       <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${checked ? 'translate-x-4' : 'translate-x-0.5'}`} />
     </button>
   );
+
+  const formatIntentProviderLabel = (provider: LLMProviderInfo): string => {
+    const platform = (provider.platform || '').trim();
+    if (provider.label && provider.label !== provider.id) return `${provider.label} (${provider.id})`;
+    if (platform) return `${provider.id} (${platform})`;
+    return provider.id;
+  };
 
   return (
     <Modal
@@ -241,15 +252,30 @@ export function SettingsModal() {
           )}
         </div>
 
-        {/* ── Ultra Lite（长文本压缩） ── */}
+        {/* ── Intent / Ultra Lite ── */}
         <div className="border border-slate-700 rounded-lg p-3 bg-slate-800/50">
           <SectionHeader
             id="ultralite"
             icon={<Zap size={14} className="text-amber-400" />}
-            title={t('settings.ultraLite')}
+            title={t('settings.intentAndUltraLite')}
           />
           {expandedSections.has('ultralite') && (
             <div className="space-y-2 pt-2 pl-5">
+              <label className="block text-xs text-slate-300 mb-1.5">{t('settings.intentProvider')}</label>
+              <select
+                value={deepResearchDefaults.intent_provider ?? ''}
+                onChange={(e) => updateDeepResearchDefaults({ intent_provider: e.target.value || null })}
+                className="w-full rounded border border-slate-600 bg-slate-800 text-slate-200 text-sm px-2.5 py-1.5 focus:ring-2 focus:ring-amber-500 focus:border-amber-500 outline-none"
+              >
+                <option value="">{t('settings.intentProviderUseDefault')}</option>
+                {intentProviderOptions.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {formatIntentProviderLabel(p)}
+                  </option>
+                ))}
+              </select>
+              <p className="text-[10px] text-slate-400">{t('settings.intentProviderDesc')}</p>
+
               <label className="block text-xs text-slate-300 mb-1.5">{t('settings.ultraLiteProvider')}</label>
               <select
                 value={deepResearchDefaults.ultra_lite_provider ?? ''}
@@ -280,7 +306,7 @@ export function SettingsModal() {
               <div className="flex items-center justify-between">
                 <div>
                   <span className="text-sm text-slate-200">生成图文摘要</span>
-                  <p className="text-[10px] text-slate-400 mt-0.5">在回答末尾自动生成 Mermaid 逻辑图谱</p>
+                  <p className="text-[10px] text-slate-400 mt-0.5">在回答或研究报告末尾自动生成总结图像海报</p>
                 </div>
                 <Toggle
                   checked={ragConfig.enableGraphicAbstract ?? false}
@@ -290,16 +316,16 @@ export function SettingsModal() {
               </div>
               {ragConfig.enableGraphicAbstract && (
                 <div>
-                  <label className="block text-xs text-slate-300 mb-1.5">画图模型提供商 / 模型</label>
+                  <label className="block text-xs text-slate-300 mb-1.5">图像模型</label>
                   <select
                     value={ragConfig.graphicAbstractModel ?? 'nanobanana 2'}
                     onChange={(e) => updateRagConfig({ graphicAbstractModel: e.target.value })}
                     className="w-full rounded border border-slate-600 bg-slate-800 text-slate-200 text-sm px-2.5 py-1.5 focus:ring-2 focus:ring-pink-500 focus:border-pink-500 outline-none"
                   >
-                    <option value="nanobanana 2">nanobanana 2 (Gemini 3.1 Flash Image)</option>
+                    <option value="nanobanana 2">nanobanana 2 (Gemini 2.5 Flash Image)</option>
                     <option value="nanobanana pro">nanobanana pro (Gemini 3 Pro Image)</option>
                     <option value="gpt-image-1.5">gpt-image-1.5 (GPT)</option>
-                    <option value="kimi-k2.5">kimi-k2.5 (Kimi)</option>
+                    <option value="qwen-image-2.0">qwen-image-2.0 (Qwen)</option>
                   </select>
                 </div>
               )}

@@ -263,6 +263,7 @@ class ContentFetcherConfig:
     captcha_detect_extra_seconds: int = 90  # 检测到验证码后额外时间
     captcha_solving_extra_seconds: int = 120  # 调用解码 API 后额外时间
     captcha_token_extra_seconds: int = 45   # token 应用后额外时间
+    brightdata_timeout_seconds: int = 120   # BrightData REST API 独立超时
     cache_enabled: bool = True
     cache_ttl_seconds: int = 3600
     disk_cache_enabled: bool = True
@@ -458,6 +459,11 @@ class LLMSettings:
     def __init__(self):
         cfg = _llm_from_config()
         self.default: str = os.getenv("DEFAULT_LLM") or cfg.get("default") or "claude"
+        self.intent_provider: str = (
+            os.getenv("INTENT_LLM_PROVIDER")
+            or cfg.get("intent_provider")
+            or ""
+        )
         self.dry_run: bool = (
             os.getenv("LLM_DRY_RUN", "").lower() == "true" or cfg.get("dry_run") is True
         )
@@ -685,12 +691,35 @@ class GoogleSearchPerfSettings:
 
 
 @dataclass
+class LocalMediaStorageSettings:
+    root: str = "data/media"
+
+
+@dataclass
+class S3MediaStorageSettings:
+    bucket: str = ""
+    region: str = ""
+    endpoint: str = ""
+    key_prefix: str = ""
+    public_base_url: str = ""
+
+
+@dataclass
+class MediaStorageSettings:
+    backend: str = "local"
+    public_base_url: str = ""
+    local: LocalMediaStorageSettings = field(default_factory=LocalMediaStorageSettings)
+    s3: S3MediaStorageSettings = field(default_factory=S3MediaStorageSettings)
+
+
+@dataclass
 class StorageSettings:
     """持久化存储生命周期与容量限制"""
     max_age_days: int = 30          # 数据保留天数，默认 30 天
     max_size_gb: float = 5.0        # 总大小上限（GB），默认 5GB
     cleanup_on_startup: bool = True # 启动时是否自动清理
     cleanup_batch_size: int = 100   # 每批清理记录数
+    media: MediaStorageSettings = field(default_factory=MediaStorageSettings)
 
 
 @dataclass
@@ -906,6 +935,7 @@ class Settings:
             captcha_detect_extra_seconds=int(cf.get("captcha_detect_extra_seconds", 90)),
             captcha_solving_extra_seconds=int(cf.get("captcha_solving_extra_seconds", 120)),
             captcha_token_extra_seconds=int(cf.get("captcha_token_extra_seconds", 45)),
+            brightdata_timeout_seconds=int(cf.get("brightdata_timeout_seconds", 120)),
             cache_enabled=bool(cf.get("cache_enabled", True)),
             cache_ttl_seconds=int(cf.get("cache_ttl_seconds", 3600)),
             disk_cache_enabled=bool(cf.get("disk_cache_enabled", True)),
@@ -978,11 +1008,28 @@ class Settings:
             cdp_port=int(gp["cdp_port"]) if gp.get("cdp_port") is not None else None,
         )
         st = _storage_from_config()
+        media = st.get("media") or {}
+        media_local = media.get("local") or {}
+        media_s3 = media.get("s3") or {}
         self.storage = StorageSettings(
             max_age_days=int(st.get("max_age_days", 30)),
             max_size_gb=float(st.get("max_size_gb", 5.0)),
             cleanup_on_startup=bool(st.get("cleanup_on_startup", True)),
             cleanup_batch_size=int(st.get("cleanup_batch_size", 100)),
+            media=MediaStorageSettings(
+                backend=str(media.get("backend", "local")).strip() or "local",
+                public_base_url=str(media.get("public_base_url", "")).strip(),
+                local=LocalMediaStorageSettings(
+                    root=str(media_local.get("root", "data/media")).strip() or "data/media",
+                ),
+                s3=S3MediaStorageSettings(
+                    bucket=str(media_s3.get("bucket", "")).strip(),
+                    region=str(media_s3.get("region", "")).strip(),
+                    endpoint=str(media_s3.get("endpoint", "")).strip(),
+                    key_prefix=str(media_s3.get("key_prefix", "")).strip(),
+                    public_base_url=str(media_s3.get("public_base_url", "")).strip(),
+                ),
+            ),
         )
         gr = _graph_from_config()
         ee = gr.get("entity_extraction") or {}

@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Clock3, Library, Loader2, Search } from 'lucide-react';
+import { Clock3, Library, Loader2, Search, Plus } from 'lucide-react';
 import { Modal } from '../ui/Modal';
 import type { ScholarLibrary } from '../../api/scholar';
+import { useScholarStore, useToastStore } from '../../stores';
 
 interface ScholarLibrarySelectModalProps {
   open: boolean;
@@ -75,6 +76,14 @@ export function ScholarLibrarySelectModal({
   const [remainingSeconds, setRemainingSeconds] = useState(timeoutSeconds);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
+  // Create New Library states
+  const addToast = useToastStore((s) => s.addToast);
+  const createLibrary = useScholarStore((s) => s.createLibrary);
+  const loadLibraries = useScholarStore((s) => s.loadLibraries);
+  const [showCreateForm, setShowCreateForm] = useState(false);
+  const [newLibraryName, setNewLibraryName] = useState('');
+  const [isCreating, setIsCreating] = useState(false);
+
   useEffect(() => {
     if (!open) return;
     setSearchHistory(loadLibrarySearchHistory());
@@ -82,7 +91,34 @@ export function ScholarLibrarySelectModal({
     setSelectedLibraryId(resolvedDefaultId);
     setRemainingSeconds(timeoutSeconds);
     setIsSubmitting(false);
+    setShowCreateForm(false);
+    setNewLibraryName('');
+    setIsCreating(false);
   }, [open, resolvedDefaultId, timeoutSeconds]);
+
+  const handleCreateLibrary = async () => {
+    const name = newLibraryName.trim();
+    if (!name) return;
+    setIsCreating(true);
+    try {
+      const lib = await createLibrary(name, undefined, undefined, false);
+      if (lib) {
+        addToast('新建文献库成功', 'success');
+        await loadLibraries();
+        setSelectedLibraryId(lib.id);
+        setShowCreateForm(false);
+        setNewLibraryName('');
+      } else {
+        const err = useScholarStore.getState().libraryError;
+        addToast(err || '新建文献库失败', 'error');
+      }
+    } catch (e) {
+      const err = e as Error;
+      addToast(err.message || '新建文献库失败', 'error');
+    } finally {
+      setIsCreating(false);
+    }
+  };
 
   useEffect(() => {
     if (!open) return;
@@ -122,7 +158,7 @@ export function ScholarLibrarySelectModal({
     }
     const timer = window.setTimeout(() => setRemainingSeconds((s) => s - 1), 1000);
     return () => window.clearTimeout(timer);
-  }, [open, loading, isSubmitting, remainingSeconds, selectedLibraryId, onConfirm]);
+  }, [open, loading, isSubmitting, remainingSeconds, selectedLibraryId, onConfirm, searchText]);
 
   const handleConfirm = async () => {
     if (selectedLibraryId == null) return;
@@ -211,6 +247,49 @@ export function ScholarLibrarySelectModal({
                 </label>
               ))}
             </div>
+          )}
+        </div>
+
+        <div className="pt-2 border-t border-slate-800">
+          {showCreateForm ? (
+            <div className="flex flex-col gap-2">
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  value={newLibraryName}
+                  onChange={(e) => setNewLibraryName(e.target.value)}
+                  placeholder="输入新文献库名称..."
+                  className="flex-1 bg-slate-800 border border-slate-600 rounded-lg px-3 py-1.5 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none"
+                  autoFocus
+                />
+                <button
+                  type="button"
+                  onClick={handleCreateLibrary}
+                  disabled={isCreating || !newLibraryName.trim()}
+                  className="px-3 py-1.5 bg-sky-600 text-white rounded-lg text-sm disabled:opacity-50 flex items-center gap-1.5"
+                >
+                  {isCreating ? <Loader2 size={14} className="animate-spin" /> : null}
+                  创建
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowCreateForm(false)}
+                  disabled={isCreating}
+                  className="px-3 py-1.5 border border-slate-700 text-slate-300 hover:bg-slate-800 rounded-lg text-sm"
+                >
+                  取消
+                </button>
+              </div>
+            </div>
+          ) : (
+            <button
+              type="button"
+              onClick={() => setShowCreateForm(true)}
+              className="text-sm text-sky-400 hover:text-sky-300 flex items-center gap-1.5"
+            >
+              <Plus size={14} />
+              新建文献库
+            </button>
           )}
         </div>
 

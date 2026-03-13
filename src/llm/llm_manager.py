@@ -13,14 +13,15 @@
 
 from __future__ import annotations
 
-import logging
 import os
 import json
 import threading
 import time
 import hashlib
+import base64
 
-_log = logging.getLogger(__name__)
+from src.log import get_logger as _get_logger
+_log = _get_logger(__name__)
 
 # ── Observability ──
 try:
@@ -529,6 +530,53 @@ def _llm_perf_timeout() -> int:
     return DEFAULT_TIMEOUT
 
 
+def _normalize_timeout(timeout: Any) -> Any:
+    if timeout is None:
+        return _llm_perf_timeout()
+    if isinstance(timeout, tuple):
+        return timeout
+    return int(timeout)
+
+
+def _timeout_for_model(model: Optional[str] = None, base: Optional[int] = None) -> int:
+    """按模型名返回合适的请求超时秒数。
+
+    规则：
+    - sonar-deep-research          → 900s  (15 min，后台联网研究流程)
+    - sonar-reasoning-pro / *-pro  → 300s  (推理模型，给充足余量)
+    - sonar* / perplexity*         → 180s  (普通 Sonar 模型)
+    - 其他                         → base 或 perf_llm.timeout_seconds 或 DEFAULT_TIMEOUT
+    """
+    m = (model or "").lower()
+    if "deep-research" in m:
+        return 900
+    if "reasoning-pro" in m or ("reasoning" in m and "sonar" in m):
+        return 300
+    if "sonar" in m or "perplexity" in m:
+        return 180
+    return int(base if base is not None else _llm_perf_timeout())
+
+
+def _soft_timeout_timer(hard_timeout: float, label: str, soft_ratio: float = 0.6) -> threading.Timer:
+    """返回一个已启动的 daemon Timer，在 hard_timeout * soft_ratio 秒后打印 WARNING 日志。
+
+    这是"软超时"的日志层：到点只警告不 kill，真正的 kill 仍由 requests timeout 完成。
+    调用方负责在请求完成后调用 timer.cancel() 防止无谓日志。
+    """
+    soft_secs = hard_timeout * soft_ratio
+
+    def _warn() -> None:
+        _log.warning(
+            "[soft_timeout] %s 已等待 %.0f 秒（软阈值 %.0f s / 硬上限 %.0f s），仍在运行中",
+            label, soft_secs, soft_secs, hard_timeout,
+        )
+
+    t = threading.Timer(soft_secs, _warn)
+    t.daemon = True
+    t.start()
+    return t
+
+
 def _llm_perf_retry() -> tuple:
     if settings and hasattr(settings, "perf_llm"):
         max_r = getattr(settings.perf_llm, "max_retries", 2) or 0
@@ -541,25 +589,31 @@ def _request_with_retry(
     session: requests.Session,
     method: str,
     url: str,
-    timeout: int,
+    timeout: Union[int, float, tuple],
     **kwargs: Any,
 ) -> requests.Response:
     max_retries, backoff = _llm_perf_retry()
     last_err = None
     for attempt in range(max_retries + 1):
+        label = f"LLM request attempt={attempt+1} url={url}"
+        hard_timeout = float(timeout[0] + timeout[1]) if isinstance(timeout, tuple) else float(timeout)
+        soft_timer = _soft_timeout_timer(hard_timeout, label)
         try:
             resp = session.request(method, url, timeout=timeout, **kwargs)
+            soft_timer.cancel()
             if resp.status_code in (429, 500, 503) and attempt < max_retries:
                 time.sleep(backoff ** attempt)
                 continue
             resp.raise_for_status()
             return resp
         except requests.exceptions.HTTPError as e:
+            soft_timer.cancel()
             last_err = e
             if e.response.status_code not in (429, 500, 503) or attempt >= max_retries:
                 raise
             time.sleep(backoff ** attempt)
         except Exception as e:
+            soft_timer.cancel()
             last_err = e
             if attempt >= max_retries:
                 raise
@@ -569,11 +623,54 @@ def _request_with_retry(
     raise RuntimeError("request_with_retry failed")
 
 
+def _qwen_image_generation_url(base_url: str) -> str:
+    root = (base_url or "").rstrip("/")
+    if root.endswith("/compatible-mode/v1"):
+        prefix = root[: -len("/compatible-mode/v1")]
+        return f"{prefix}/api/v1/services/aigc/multimodal-generation/generation"
+    return f"{root}/api/v1/services/aigc/multimodal-generation/generation"
+
+
+def _normalize_image_size(size: str, *, provider: str) -> str:
+    normalized = (size or "1024x1024").strip().lower().replace("×", "x")
+    if provider == "qwen":
+        return normalized.replace("x", "*")
+    return normalized
+
+
+def _extract_openai_image_bytes(data: Dict[str, Any]) -> bytes:
+    items = data.get("data") or []
+    if not items:
+        raise ValueError(f"Image response contained no data items. Keys: {list(data.keys())}")
+    first = items[0] or {}
+    b64_payload = first.get("b64_json")
+    if isinstance(b64_payload, str) and b64_payload:
+        return base64.b64decode(b64_payload)
+    raise ValueError(f"OpenAI image response contained no b64_json payload. Keys: {list(first.keys())}")
+
+
+def _extract_qwen_image_url(data: Dict[str, Any]) -> str:
+    output = data.get("output") or {}
+    choices = output.get("choices") or []
+    if choices:
+        message = (choices[0] or {}).get("message") or {}
+        for item in message.get("content") or []:
+            if isinstance(item, dict) and isinstance(item.get("image"), str) and item.get("image"):
+                return item["image"]
+    results = output.get("results") or []
+    if results:
+        first = results[0] or {}
+        for key in ("url", "image", "image_url"):
+            if isinstance(first.get(key), str) and first.get(key):
+                return first[key]
+    raise ValueError(f"Qwen image response contained no image URL. Keys: {list(output.keys())}")
+
+
 def _request_stream_no_retry(
     session: requests.Session,
     method: str,
     url: str,
-    timeout: int,
+    timeout: Union[int, float, tuple],
     **kwargs: Any,
 ) -> requests.Response:
     resp = session.request(method, url, timeout=timeout, stream=True, **kwargs)
@@ -585,6 +682,12 @@ def _iter_sse_events(resp: requests.Response) -> Iterator[Dict[str, Any]]:
     event_name = "message"
     data_lines: List[str] = []
     event_id = ""
+
+    # Force UTF-8: SSE APIs (e.g. Gemini native streamGenerateContent) often omit
+    # charset in "Content-Type: text/event-stream".  requests then defaults to
+    # ISO-8859-1 (HTTP/1.1 spec default for text/*), which garbles multi-byte
+    # UTF-8 characters (Chinese, etc.) when decode_unicode=True is used.
+    resp.encoding = "utf-8"
 
     for raw_line in resp.iter_lines(decode_unicode=True):
         line = raw_line if isinstance(raw_line, str) else raw_line.decode("utf-8", errors="ignore")
@@ -655,7 +758,7 @@ class OpenAICompatProvider(Provider):
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.config.api_key}",
         }
-        timeout = int(timeout or _llm_perf_timeout())
+        timeout = _normalize_timeout(timeout)
         resp = _request_with_retry(
             self._session, "POST", url, timeout,
             headers=headers, json=payload,
@@ -685,7 +788,7 @@ class OpenAICompatProvider(Provider):
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.config.api_key}",
         }
-        timeout = int(timeout or _llm_perf_timeout())
+        timeout = _normalize_timeout(timeout)
         with _request_stream_no_retry(
             self._session,
             "POST",
@@ -718,7 +821,7 @@ class AnthropicProvider(Provider):
         }
         if self.config.params.get("enable_prompt_cache"):
             headers["anthropic-beta"] = "prompt-caching-2024-07-31"
-        timeout = int(timeout or _llm_perf_timeout())
+        timeout = _normalize_timeout(timeout)
         resp = _request_with_retry(
             self._session, "POST", url, timeout,
             headers=headers, json=payload,
@@ -736,7 +839,7 @@ class AnthropicProvider(Provider):
         }
         if self.config.params.get("enable_prompt_cache"):
             headers["anthropic-beta"] = "prompt-caching-2024-07-31"
-        timeout = int(timeout or _llm_perf_timeout())
+        timeout = _normalize_timeout(timeout)
         with _request_stream_no_retry(
             self._session,
             "POST",
@@ -764,6 +867,7 @@ class GeminiNativeProvider(Provider):
         candidates = raw.get("candidates") or []
         usage_meta = raw.get("usageMetadata") or raw.get("usage_metadata") or {}
         content_text_parts: List[str] = []
+        reasoning_text_parts: List[str] = []
         tool_calls: List[Dict[str, Any]] = []
         finish_reason = ""
         if candidates:
@@ -775,6 +879,14 @@ class GeminiNativeProvider(Provider):
                     continue
                 if isinstance(part.get("text"), str):
                     content_text_parts.append(part.get("text", ""))
+                if isinstance(part.get("thought"), str):
+                    reasoning_text_parts.append(part.get("thought", ""))
+                elif part.get("thought") is True and isinstance(part.get("text"), str):
+                    # In some versions, thought is a boolean flag on the text part
+                    reasoning_text_parts.append(part.get("text", ""))
+                    if content_text_parts and content_text_parts[-1] == part.get("text"):
+                        content_text_parts.pop()
+
                 if isinstance(part.get("functionCall"), dict):
                     fc = part.get("functionCall") or {}
                     tool_calls.append(
@@ -801,6 +913,7 @@ class GeminiNativeProvider(Provider):
                     "message": {
                         "role": "assistant",
                         "content": "".join(content_text_parts),
+                        "reasoning": "".join(reasoning_text_parts) if reasoning_text_parts else None,
                         "tool_calls": tool_calls,
                     },
                 }
@@ -822,7 +935,7 @@ class GeminiNativeProvider(Provider):
             "Content-Type": "application/json",
             "x-goog-api-key": self.config.api_key,
         }
-        timeout = int(timeout or _llm_perf_timeout())
+        timeout = _normalize_timeout(timeout)
         try:
             resp = _request_with_retry(
                 self._session,
@@ -838,17 +951,24 @@ class GeminiNativeProvider(Provider):
             return adapted
         except requests.exceptions.HTTPError as e:
             status = getattr(e.response, "status_code", None)
+            if fallback_payload:
+                _log.warning(
+                    "Gemini native request failed (HTTP %s), falling back to compat mode: %s",
+                    status, e,
+                )
+                return self._fallback.request(fallback_payload, timeout=timeout)
             if status is not None and 400 <= status < 500 and status != 429:
+                try:
+                    _err_body = e.response.text[:500] if e.response is not None else ""
+                except Exception:
+                    _err_body = ""
                 msg = (
                     f"Gemini native API error (no fallback): {status} for url={url!r} "
                     f"provider={self.config.name!r} model={model!r}. "
-                    "4xx client errors are not retried via OpenAI-compat endpoint."
+                    f"response_body={_err_body!r}"
                 )
                 _log.warning("%s", msg)
                 raise RuntimeError(msg) from e
-            if fallback_payload:
-                _log.warning("Gemini native request failed, falling back to compat mode: %s", e)
-                return self._fallback.request(fallback_payload, timeout=timeout)
             raise
         except Exception as e:
             if fallback_payload:
@@ -860,7 +980,36 @@ class GeminiNativeProvider(Provider):
         if str(payload.get("_api_mode") or "") != "gemini_native":
             yield from self._fallback.request_stream(payload, timeout=timeout)
             return
-        raise NotImplementedError("Gemini native streaming is not implemented")
+
+        fallback_payload = payload.pop("_fallback_payload", None)
+        api_mode = payload.pop("_api_mode", None)
+        model = str(payload.pop("_model_id", payload.get("model") or ""))
+        payload.pop("model", None)
+        # Use alt=sse for server-sent events
+        url = f"{_gemini_native_base_url(self.config.base_url)}/models/{model}:streamGenerateContent?alt=sse"
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": self.config.api_key,
+        }
+        timeout = _normalize_timeout(timeout)
+        try:
+            with _request_stream_no_retry(
+                self._session,
+                "POST",
+                url,
+                timeout,
+                headers=headers,
+                json=payload,
+            ) as resp:
+                for item in _iter_sse_events(resp):
+                    yield {**item, "_api_mode": api_mode or "gemini_native"}
+        except Exception as e:
+            if fallback_payload:
+                _log.warning("Gemini native stream failed, falling back to compat mode: %s", e)
+                yield from self._fallback.request_stream(fallback_payload, timeout=timeout)
+                return
+            raise
+
 
 
 # ============================================================
@@ -1391,6 +1540,17 @@ class HTTPChatClient(BaseChatClient):
                     timeout_override = None
             except Exception:
                 timeout_override = None
+        # 流量感知超时：idle_timeout_seconds 指每两个 chunk 之间的最大等待秒数。
+        # 只要 token 持续生成，总调用时长不受限制；空闲超过此值才视为超时。
+        # 转换为 requests 支持的 (connect_timeout, read_timeout) 元组格式。
+        idle_timeout = overrides.pop("idle_timeout_seconds", None)
+        if idle_timeout is not None and timeout_override is None:
+            try:
+                idle_secs = int(idle_timeout)
+                if idle_secs > 0:
+                    timeout_override = (30, idle_secs)
+            except Exception:
+                pass
         merged_params = deep_merge(self.config.params, overrides)
         is_anthropic = self.config.is_anthropic()
 
@@ -1530,7 +1690,59 @@ class HTTPChatClient(BaseChatClient):
         if is_anthropic:
             yield from self._normalize_anthropic_stream(stream_iter)
             return
+        if isinstance(self.provider, GeminiNativeProvider) and str(payload.get("_api_mode")) == "gemini_native":
+            yield from self._normalize_gemini_stream(stream_iter, payload)
+            return
         yield from self._normalize_openai_stream(stream_iter, payload)
+
+    def _normalize_gemini_stream(
+        self,
+        stream_iter: Iterator[Dict[str, Any]],
+        payload: Dict[str, Any],
+    ) -> Iterator[Dict[str, Any]]:
+        usage: Dict[str, Any] | None = None
+        final_raw: Dict[str, Any] = {}
+        saw_completed = False
+
+        for event in stream_iter:
+            data = event.get("data")
+            if not isinstance(data, dict):
+                continue
+
+            final_raw = data
+            candidates = data.get("candidates") or []
+            usage_meta = data.get("usageMetadata") or data.get("usage_metadata")
+            if usage_meta:
+                usage = {
+                    "prompt_tokens": usage_meta.get("promptTokenCount") or usage_meta.get("prompt_token_count"),
+                    "completion_tokens": usage_meta.get("candidatesTokenCount") or usage_meta.get("candidates_token_count"),
+                    "total_tokens": usage_meta.get("totalTokenCount") or usage_meta.get("total_token_count"),
+                    "reasoning_tokens": usage_meta.get("thoughtsTokenCount") or usage_meta.get("thoughts_token_count"),
+                }
+
+            for cand in candidates:
+                content = cand.get("content") or {}
+                parts = content.get("parts") or []
+                for part in parts:
+                    if not isinstance(part, dict):
+                        continue
+                    if "text" in part:
+                        # Some versions use a boolean thought flag on the text part
+                        if part.get("thought") is True:
+                            yield {"type": "reasoning_delta", "delta": part["text"]}
+                        else:
+                            yield {"type": "text_delta", "delta": part["text"]}
+                    if "thought" in part and not isinstance(part["thought"], bool):
+                        # Some versions use a separate thought field for the string
+                        yield {"type": "reasoning_delta", "delta": part["thought"]}
+
+                finish_reason = str(cand.get("finishReason") or cand.get("finish_reason") or "").upper()
+                if finish_reason and finish_reason != "FINISH_REASON_UNSPECIFIED" and not saw_completed:
+                    saw_completed = True
+                    yield {"type": "completed", "raw": final_raw, "usage": usage, "refusal": False}
+
+        if not saw_completed:
+            yield {"type": "completed", "raw": final_raw, "usage": usage, "refusal": False}
 
     def _normalize_openai_stream(
         self,
@@ -1569,15 +1781,22 @@ class HTTPChatClient(BaseChatClient):
                     raise RuntimeError(str((data.get("error") or {}).get("message") or data.get("message") or "stream error"))
                 continue
 
+            # 持续更新 final_raw；对于 Perplexity，最后一个含 finish_reason 的
+            # chunk 里带有 citations / search_results 顶层字段，必须保留。
+            final_raw = dict(data)
             choices = data.get("choices") or []
             if data.get("usage"):
                 usage = data.get("usage")
             for choice in choices:
                 delta = choice.get("delta") or {}
                 content = delta.get("content")
+                reasoning = delta.get("reasoning_content") or delta.get("reasoning") or delta.get("thought")
                 if isinstance(content, str) and content:
                     yield {"type": "text_delta", "delta": content}
-                elif isinstance(content, list):
+                if isinstance(reasoning, str) and reasoning:
+                    yield {"type": "reasoning_delta", "delta": reasoning}
+                
+                if isinstance(content, list):
                     for block in content:
                         if not isinstance(block, dict):
                             continue
@@ -1818,7 +2037,10 @@ class HTTPChatClient(BaseChatClient):
                         except Exception:
                             fn_args = {"_raw": fn_args}
                     tool_id_to_name[tc_id] = fn_name
-                    parts.append({"functionCall": {"id": tc_id, "name": fn_name, "args": fn_args or {}}})
+                    # Gemini v1beta does NOT accept "id" in input FunctionCall parts —
+                    # the model returns ids in its output but rejects them as input fields,
+                    # causing HTTP 400 at iteration 1+. Use name-based matching only.
+                    parts.append({"functionCall": {"name": fn_name, "args": fn_args or {}}})
                 if parts:
                     contents.append({"role": "model", "parts": parts})
                 continue
@@ -1871,9 +2093,16 @@ class HTTPChatClient(BaseChatClient):
         reasoning_effort = params.get("reasoning_effort")
         if reasoning_effort:
             effort = str(reasoning_effort).strip().lower()
-            if effort == "minimal":
-                effort = "low"
-            generation_config["thinkingConfig"] = {"thinkingLevel": effort}
+            # Gemini REST API uses thinkingConfig.thinkingBudget (integer token count),
+            # not thinkingLevel (which is not a valid REST API field and causes 400 errors).
+            _effort_to_budget = {
+                "minimal": 512,
+                "low": 1024,
+                "medium": 8192,
+                "high": 24576,
+            }
+            budget = _effort_to_budget.get(effort, 8192)
+            generation_config["thinkingConfig"] = {"thinkingBudget": budget}
         if generation_config:
             payload["generationConfig"] = generation_config
 
@@ -2417,6 +2646,102 @@ class LLMManager:
         key = pcfg.api_key
         return bool(key and key not in ("sk-xxx", "sk-ant-xxx", "AIzxxx", ""))
 
+    def _get_image_platform(self, provider: str) -> PlatformConfig:
+        platform = self.config.platforms.get(provider)
+        if not platform:
+            raise ValueError(f"Platform '{provider}' not found in config")
+        if not platform.api_key or platform.api_key in ("sk-xxx", "sk-ant-xxx", "AIzxxx", ""):
+            raise ValueError(f"API key for platform '{provider}' is not configured")
+        return platform
+
+    def generate_image(
+        self,
+        *,
+        provider: str,
+        model: str,
+        prompt: str,
+        size: str = "1024x1024",
+        timeout: Optional[int] = None,
+    ) -> bytes:
+        platform = self._get_image_platform(provider)
+        session = requests.Session()
+        timeout = _normalize_timeout(timeout)
+
+        if provider == "gemini":
+            root = _gemini_native_base_url(platform.base_url)
+            url = f"{root}/models/{model}:generateContent"
+            payload = {
+                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]},
+            }
+            resp = _request_with_retry(
+                session,
+                "POST",
+                url,
+                timeout,
+                headers={"Content-Type": "application/json", "x-goog-api-key": platform.api_key},
+                json=payload,
+            )
+            data = resp.json()
+            for part in (data.get("candidates") or [{}])[0].get("content", {}).get("parts", []):
+                if "inlineData" in part:
+                    return base64.b64decode(part["inlineData"]["data"])
+            raise ValueError(f"Gemini returned no image data. Response keys: {list(data.keys())}")
+
+        if provider == "openai":
+            url = f"{platform.base_url.rstrip('/')}/images/generations"
+            payload = {
+                "model": model,
+                "prompt": prompt,
+                "size": _normalize_image_size(size, provider="openai"),
+            }
+            resp = _request_with_retry(
+                session,
+                "POST",
+                url,
+                timeout,
+                headers={"Authorization": f"Bearer {platform.api_key}", "Content-Type": "application/json"},
+                json=payload,
+            )
+            return _extract_openai_image_bytes(resp.json())
+
+        if provider == "qwen":
+            url = _qwen_image_generation_url(platform.base_url)
+            payload = {
+                "model": model,
+                "input": {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [{"text": prompt}],
+                        }
+                    ]
+                },
+                "parameters": {
+                    "size": _normalize_image_size(size, provider="qwen"),
+                    "watermark": False,
+                    "prompt_extend": True,
+                },
+            }
+            resp = _request_with_retry(
+                session,
+                "POST",
+                url,
+                timeout,
+                headers={"Authorization": f"Bearer {platform.api_key}", "Content-Type": "application/json"},
+                json=payload,
+            )
+            image_url = _extract_qwen_image_url(resp.json())
+            image_resp = _request_with_retry(session, "GET", image_url, timeout)
+            return image_resp.content
+
+        if provider == "kimi":
+            raise NotImplementedError(
+                f"Image generation is not supported for provider '{provider}' in the current Moonshot/Kimi integration"
+            )
+
+        raise NotImplementedError(f"Image generation is not implemented for provider '{provider}'")
+
     def cleanup_logs(
         self,
         max_age_days: int = LOG_MAX_AGE_DAYS,
@@ -2429,6 +2754,54 @@ class LLMManager:
 # ============================================================
 # Convenience Functions
 # ============================================================
+
+def _stream_and_collect(
+    client: "LLMClient",
+    messages: List[Dict[str, Any]],
+    *,
+    model: Optional[str] = None,
+    idle_timeout_seconds: int = 90,
+    **overrides,
+) -> Dict[str, Any]:
+    """流式调用并累积为与 chat() 相同格式的响应字典（流量感知超时）。
+
+    idle_timeout_seconds: 相邻两个 chunk 之间最大等待秒数（活跃度窗口）。
+    只要模型持续生成 token，总调用时长不受限制；空闲超过此值才触发 Timeout。
+    citations / search_results 等元数据从流式最终 chunk 中提取（需配合已修复的
+    _normalize_openai_stream 使用）。
+    """
+    final_response: Optional[Dict[str, Any]] = None
+    text_parts: List[str] = []
+
+    for event in client.stream_chat(
+        messages,
+        model=model,
+        idle_timeout_seconds=idle_timeout_seconds,
+        **overrides,
+    ):
+        ev_type = event.get("type")
+        if ev_type == "text_delta":
+            delta = str(event.get("delta") or "")
+            if delta:
+                text_parts.append(delta)
+        elif ev_type == "completed":
+            resp = event.get("response")
+            if isinstance(resp, dict):
+                final_response = resp
+
+    if final_response is not None:
+        # stream_chat 内部已累积 final_text；若为空则用我们自己的 text_parts
+        if not final_response.get("final_text") and text_parts:
+            final_response = dict(final_response)
+            final_response["final_text"] = "".join(text_parts)
+        return final_response
+
+    return {
+        "final_text": "".join(text_parts),
+        "raw": {},
+        "meta": {},
+    }
+
 
 # 全局单例（延迟初始化）
 _manager: Optional[LLMManager] = None

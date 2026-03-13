@@ -13,13 +13,13 @@ keeping unauthenticated or tampered requests pure CPU.
 from __future__ import annotations
 
 import hashlib
-import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import jwt
 
-logger = logging.getLogger(__name__)
+from src.log import get_logger
+logger = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------

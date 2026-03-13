@@ -21,7 +21,7 @@ export default defineConfig({
           // returns a plain-text 500. We piggyback a custom header BEFORE Vite writes
           // the status line so that the frontend can distinguish proxy-level failures
           // from real application 500s and trigger a safe retry.
-          proxy.on('error', (err, _req, res) => {
+          proxy.on('error', (err: NodeJS.ErrnoException, _req, res) => {
             const isTransient =
               err.message?.includes('socket hang up') ||
               err.code === 'ECONNRESET' ||
@@ -37,6 +37,18 @@ export default defineConfig({
             }
           })
         },
+      },
+      '/ga_images': {
+        target: 'http://127.0.0.1:9999',
+        changeOrigin: true,
+        timeout: 300000,
+        proxyTimeout: 300000,
+      },
+      '/media': {
+        target: 'http://127.0.0.1:9999',
+        changeOrigin: true,
+        timeout: 300000,
+        proxyTimeout: 300000,
       },
     },
   },

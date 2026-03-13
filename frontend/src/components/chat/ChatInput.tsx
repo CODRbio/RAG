@@ -1,4 +1,5 @@
 import { useState, useRef, useCallback, useEffect, useMemo, type KeyboardEvent } from 'react';
+import { logger } from '../../utils/logger';
 import { useTranslation } from 'react-i18next';
 import { ArrowRight, Loader2, Telescope, Settings, Image as ImageIcon, Pause, Play, Square } from 'lucide-react';
 import { useChatStore, useConfigStore, useToastStore, useCanvasStore, useUIStore } from '../../stores';
@@ -17,7 +18,8 @@ import {
 import { exportCanvas, getCanvas } from '../../api/canvas';
 import { CommandPalette, DeepResearchSettingsPopover, GraphicAbstractPopover } from '../workflow';
 import { COMMAND_LIST } from '../../types';
-import type { ChatRequest, Source, EvidenceSummary, IntentInfo, CommandDefinition, WorkflowStep } from '../../types';
+import type { ChatRequest, Source, EvidenceSummary, IntentInfo, CommandDefinition, WorkflowStep, ChatCitation } from '../../types';
+import { chatCitationToSource } from '../../utils/citations';
 
 /** 1 分钟未选择时默认「本会话不用本地库」的间隔（毫秒） */
 const LOCAL_DB_CHOICE_TIMEOUT_MS = 60_000;
@@ -174,7 +176,7 @@ export function ChatInput() {
       });
       addToast(t('chat.stopRequested', 'Stop request sent, task is terminating'), 'info');
     } catch (err) {
-      console.error('[ChatInput] stop task failed:', err);
+      logger.ui.error('[ChatInput] stop task failed', err);
       addToast(t('chat.stopFailed', 'Stop failed'), 'error');
     }
   }, [addToast, controlTaskId, isResearchControl, patchActiveResponse, t]);
@@ -200,7 +202,7 @@ export function ChatInput() {
         addToast(t('chat.taskPauseRequested', 'Pause requested'), 'info');
       }
     } catch (err) {
-      console.error('[ChatInput] toggle pause failed:', err);
+      logger.ui.error('[ChatInput] toggle pause failed', err);
       addToast(t('chat.taskControlFailed', 'Task control failed'), 'error');
     }
   }, [addToast, applyControlState, controlTaskId, isPauseTransitioning, isPaused, isResearchControl, t]);
@@ -401,7 +403,7 @@ export function ChatInput() {
       }
       setShowDeepResearchDialog(true);
     } catch (err) {
-      console.error('[ChatInput] Clarify failed:', err);
+      logger.ui.error('[ChatInput] Clarify failed', err);
       setClarificationQuestions([
         {
           id: 'q1',
@@ -498,6 +500,7 @@ export function ChatInput() {
       search_mode: searchMode,
       mode,
       llm_provider: selectedProvider || undefined,
+      intent_provider: deepResearchDefaults.intent_provider || undefined,
       ultra_lite_provider: deepResearchDefaults.ultra_lite_provider || undefined,
       model_override: selectedModel || undefined,
       web_providers: (searchMode !== 'none' && webEnabled) ? enabledProviders : undefined,
@@ -528,32 +531,24 @@ export function ChatInput() {
         : undefined,
       agent_debug_mode: ragConfig.agentDebugMode ?? false,
       enable_graphic_abstract: ragConfig.enableGraphicAbstract ?? false,
-      graphic_abstract_model: ragConfig.graphicAbstractModel ?? 'gemini',
+      graphic_abstract_model: ragConfig.graphicAbstractModel ?? 'nanobanana 2',
     };
 
-    if (import.meta.env.DEV) {
-      console.info('[ChatInput] request.web_source_configs', {
-        search_mode: request.search_mode,
-        web_source_configs: request.web_source_configs,
-        semantic: request.web_source_configs?.semantic,
-      });
-      const base = import.meta.env.VITE_API_BASE_URL || '/api';
-      console.log('[ChatInput] POST', `${base}/chat/submit`, JSON.stringify(request, null, 2));
-    }
+    logger.api.debug('[ChatInput] request.web_source_configs', {
+      search_mode: request.search_mode,
+      web_source_configs: request.web_source_configs,
+      semantic: request.web_source_configs?.semantic,
+    });
+    const base = import.meta.env.VITE_API_BASE_URL || '/api';
+    logger.api.debug('[ChatInput] POST', { url: `${base}/chat/submit`, body: request });
 
     // ── 引用类型（供本轮所有流处理函数共享）─────────────────────────────────────
-    interface CitationData {
-      cite_key: string; title: string; authors: string[];
-      year?: number | null; doc_id?: string | null; url?: string | null; pdf_url?: string | null;
-      doi?: string | null; bbox?: number[]; page_num?: number | null; provider?: string;
-    }
-
     // ── 激活本地库选择弹窗（幂等，重复调用无效）──────────────────────────────────
     let localDbChoiceActivated = false;
     const activateLocalDbChoice = () => {
       if (localDbChoiceActivated) return;
       localDbChoiceActivated = true;
-      console.log('[ChatInput] activateLocalDbChoice: showing dialog, msg=', assistantMessageId);
+      logger.ui.debug('[ChatInput] activateLocalDbChoice: showing dialog', { assistantMessageId });
 
       setPendingLocalDbChoice(true, assistantMessageId, userMessage);
 
@@ -568,7 +563,7 @@ export function ChatInput() {
 
         // 始终从 store 读取最新 session_id（第一轮完成后 meta 事件可能已更新它）
         const latestSessionId = useChatStore.getState().sessionId;
-        console.log('[ChatInput] runChoice:', choice, 'latestSessionId=', latestSessionId);
+        logger.ui.debug('[ChatInput] runChoice', { choice, latestSessionId });
 
         let secondTaskId: string | null = null;
         try {
@@ -628,16 +623,14 @@ export function ChatInput() {
           for await (const { event: ev, data: d } of s2) {
             if (handleTaskControlEvent(ev, d)) continue;
             if (ev === 'meta') {
-              const m = d as { session_id?: string; canvas_id?: string; citations?: CitationData[]; evidence_summary?: EvidenceSummary | null; current_stage?: string };
+              const m = d as { session_id?: string; canvas_id?: string; citations?: ChatCitation[]; evidence_summary?: EvidenceSummary | null; current_stage?: string };
               if (m.session_id) setSessionId(m.session_id);
               if (m.current_stage) setWorkflowStep(toWorkflowStep(m.current_stage));
               if (m.evidence_summary) setLastEvidenceSummary(m.evidence_summary);
               if (m.citations?.length) {
-                const srcs: Source[] = m.citations.map((c, i) => ({
-                  id: i + 1, cite_key: c.cite_key, title: c.title || c.cite_key, authors: c.authors || [], year: c.year,
-                  doc_id: c.doc_id, url: c.url, pdf_url: c.pdf_url, doi: c.doi, bbox: c.bbox, page_num: c.page_num,
-                  type: c.url || c.pdf_url ? 'web' : 'local', provider: c.provider || (c.url || c.pdf_url ? 'web' : 'local'),
-                }));
+                const srcs: Source[] = m.citations.map((c, i) =>
+                  chatCitationToSource(c, c.chunk_id || c.cite_key || (i + 1))
+                );
                 setMessageSourcesById(newAssistantId, srcs, m.evidence_summary?.provider_stats);
               }
             }
@@ -672,7 +665,7 @@ export function ChatInput() {
             }
           }
         } catch (e) {
-          console.error('[ChatInput] localDbChoice follow-up error:', e);
+          logger.ui.error('[ChatInput] localDbChoice follow-up error', e);
           addToast(t('chat.sendFailed'), 'error');
         } finally {
           setStreamingStep(null);
@@ -685,7 +678,7 @@ export function ChatInput() {
       localDbChoiceRunRef.current = runChoice;
       if (localDbChoiceTimeoutRef.current) clearTimeout(localDbChoiceTimeoutRef.current);
       localDbChoiceTimeoutRef.current = setTimeout(() => {
-        console.log('[ChatInput] localDbChoice 60s timeout → auto no_local');
+        logger.ui.debug('[ChatInput] localDbChoice 60s timeout → auto no_local');
         localDbChoiceRunRef.current?.('no_local');
       }, LOCAL_DB_CHOICE_TIMEOUT_MS);
       setLocalDbChoiceTimeoutId(localDbChoiceTimeoutRef.current);
@@ -702,13 +695,13 @@ export function ChatInput() {
       const stream = streamChatByTaskId(task_id);
 
       for await (const { event, data } of stream) {
-        console.log('[ChatInput] SSE event:', event, typeof data === 'object' ? JSON.stringify(data).slice(0, 200) : data);
+        logger.api.debug('[ChatInput] SSE event', { event, data: typeof data === 'object' ? JSON.stringify(data).slice(0, 200) : data });
         if (handleTaskControlEvent(event, data)) continue;
 
         if (event === 'meta') {
           const meta = data as {
             session_id: string; canvas_id?: string;
-            citations: CitationData[]; evidence_summary: EvidenceSummary | null;
+            citations: ChatCitation[]; evidence_summary: EvidenceSummary | null;
             intent?: IntentInfo; current_stage?: string;
             prompt_local_db_choice?: boolean; local_db_mismatch_message?: string | null;
           };
@@ -726,19 +719,16 @@ export function ChatInput() {
             if (!meta.current_stage) setWorkflowStep('outline');
           }
           if (meta.citations && meta.citations.length > 0) {
-            const sources: Source[] = meta.citations.map((cite, idx) => ({
-              id: idx + 1, cite_key: cite.cite_key, title: cite.title || cite.cite_key,
-              authors: cite.authors || [], year: cite.year, doc_id: cite.doc_id,
-              url: cite.url, pdf_url: cite.pdf_url, doi: cite.doi, bbox: cite.bbox, page_num: cite.page_num,
-              type: cite.url || cite.pdf_url ? 'web' : 'local', provider: cite.provider || (cite.url || cite.pdf_url ? 'web' : 'local'),
-            }));
+            const sources: Source[] = meta.citations.map((cite, idx) =>
+              chatCitationToSource(cite, cite.chunk_id || cite.cite_key || (idx + 1))
+            );
             setMessageSourcesById(assistantMessageId, sources, meta.evidence_summary?.provider_stats || undefined);
           }
           if (meta.canvas_id) {
             setCanvasLoading(true);
             Promise.all([
-              getCanvas(meta.canvas_id).catch((err) => { console.error('[ChatInput] Canvas load failed:', err); return null; }),
-              exportCanvas(meta.canvas_id, 'markdown').catch((err) => { console.error('[ChatInput] Canvas export failed:', err); return null; }),
+              getCanvas(meta.canvas_id).catch((err) => { logger.api.error('[ChatInput] Canvas load failed', err); return null; }),
+              exportCanvas(meta.canvas_id, 'markdown').catch((err) => { logger.api.error('[ChatInput] Canvas export failed', err); return null; }),
             ])
               .then(([canvasData, exportResp]) => {
                 if (canvasData) setCanvas(canvasData);
@@ -749,7 +739,7 @@ export function ChatInput() {
 
         } else if (event === 'local_db_choice') {
           // 专属事件：后端检测到范围不符时单独推送，比 meta 字段更可靠
-          console.log('[ChatInput] local_db_choice event received');
+          logger.api.debug('[ChatInput] local_db_choice event received');
           activateLocalDbChoice();
 
         } else if (event === 'dashboard') {
@@ -781,7 +771,7 @@ export function ChatInput() {
           if (!useChatStore.getState().pendingLocalDbChoice) {
             const accContent = (useChatStore.getState().messages.find(m => m.id === assistantMessageId)?.content ?? '') + delta;
             if (accContent.includes('当前问题与本地知识库') && accContent.includes('您可以选择')) {
-              console.log('[ChatInput] delta fallback: activating localDbChoice');
+              logger.ui.debug('[ChatInput] delta fallback: activating localDbChoice');
               activateLocalDbChoice();
             }
           }
@@ -809,7 +799,7 @@ export function ChatInput() {
         }
       }
     } catch (error) {
-      console.error('Chat error:', error);
+      logger.api.error('Chat error', error);
       const resStatus = error && typeof error === 'object' && 'response' in error
         ? (error as { response?: { status?: number } }).response?.status
         : 0;
@@ -828,7 +818,7 @@ export function ChatInput() {
       if (taskId) clearStreamingTask(taskId);
     }
     } catch (err) {
-      console.error('[ChatInput] handleSend error (e.g. missing store field):', err);
+      logger.ui.error('[ChatInput] handleSend error (e.g. missing store field)', err);
       addToast(t('chat.sendFailed'), 'error');
     }
   };

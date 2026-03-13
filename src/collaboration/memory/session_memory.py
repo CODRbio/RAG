@@ -177,9 +177,13 @@ class SessionStore:
         raw = prefs.get("recent_evidence_cache")
         if not isinstance(raw, list):
             return []
-            
-        # 此时返回的应是过滤后的活跃项
-        return [item for item in raw if isinstance(item, dict) and item.get("chunks")]
+
+        out: List[Dict[str, Any]] = []
+        for item in raw:
+            normalized = self._normalize_cached_entry(item)
+            if normalized is not None:
+                out.append(normalized)
+        return out
 
     def pin_evidence_chunks(self, session_id: str, chunks: List[Dict[str, Any]]) -> None:
         """将特定文献块标记为“置顶(Pinned)”，不受常规滑动窗口淘汰影响。"""
@@ -195,7 +199,9 @@ class SessionStore:
             "query": "[PINNED_CONTEXT]",
             "timestamp": datetime.now().isoformat(),
             "is_pinned": True,
-            "chunks": [self._sanitize_cached_chunk(c) for c in chunks]
+            "chunks": [self._sanitize_cached_chunk(c) for c in chunks],
+            "final_chunks": [self._sanitize_cached_chunk(c) for c in chunks],
+            "candidate_pool": [],
         }
         
         # Pinned Context 容量熔断：检查总置顶字符数
@@ -224,13 +230,17 @@ class SessionStore:
         updated = False
         target_ids = set(chunk_ids)
         for item in cache:
-            for c in item.get("chunks", []):
+            final_chunks = self._entry_final_chunks(item)
+            for c in final_chunks:
                 if c.get("chunk_id") in target_ids:
                     c["hit_count"] = c.get("hit_count", 0) + 1
                     # 每次命中，相当于赋予该条目一次“续命”机会（即便它很旧）
                     item["timestamp"] = datetime.now().isoformat()
                     updated = True
-        
+            if final_chunks:
+                item["chunks"] = final_chunks
+                item["final_chunks"] = final_chunks
+
         if updated:
             self.update_session_meta(session_id, {"preferences": {"recent_evidence_cache": cache}})
 
@@ -238,34 +248,51 @@ class SessionStore:
         self,
         session_id: str,
         query: str,
-        chunks: List[Dict[str, Any]],
+        chunks: Optional[List[Dict[str, Any]]] = None,
         *,
         max_turns: int = MAX_EVIDENCE_TURNS,
         max_chunks_per_turn: int = 36,
+        final_chunks: Optional[List[Dict[str, Any]]] = None,
+        candidate_pool: Optional[List[Dict[str, Any]]] = None,
+        max_candidate_pool_per_turn: Optional[int] = None,
     ) -> None:
         """追加证据缓存，支持按命中权重(Hit Boosting)和置顶(Pinned)进行智能化淘汰。"""
-        if not session_id or not chunks:
+        if not session_id:
             return
-        
+
         meta = self.get_session_meta(session_id)
         if not meta: return
         prefs = meta.get("preferences") or {}
         existing = prefs.get("recent_evidence_cache") or []
-        
-        cleaned_chunks = [
+
+        source_final_chunks = final_chunks if final_chunks is not None else (chunks or [])
+        source_candidate_pool = candidate_pool or []
+        candidate_pool_limit = max_candidate_pool_per_turn
+        if candidate_pool_limit is None:
+            candidate_pool_limit = max(1, int(max_chunks_per_turn) * 3)
+
+        cleaned_final_chunks = [
             self._sanitize_cached_chunk(c)
-            for c in chunks[: max(1, int(max_chunks_per_turn))]
+            for c in source_final_chunks[: max(1, int(max_chunks_per_turn))]
             if isinstance(c, dict)
         ]
-        cleaned_chunks = [c for c in cleaned_chunks if c]
-        if not cleaned_chunks:
+        cleaned_final_chunks = [c for c in cleaned_final_chunks if c]
+        cleaned_candidate_pool = [
+            self._sanitize_cached_chunk(c)
+            for c in source_candidate_pool[: max(1, int(candidate_pool_limit))]
+            if isinstance(c, dict)
+        ]
+        cleaned_candidate_pool = [c for c in cleaned_candidate_pool if c]
+        if not cleaned_final_chunks and not cleaned_candidate_pool:
             return
 
         new_entry = {
             "query": (query or "").strip()[:500],
             "timestamp": datetime.now().isoformat(),
-            "chunks": cleaned_chunks,
-            "is_pinned": False
+            "chunks": cleaned_final_chunks,
+            "final_chunks": cleaned_final_chunks,
+            "candidate_pool": cleaned_candidate_pool,
+            "is_pinned": False,
         }
         existing.append(new_entry)
         
@@ -278,7 +305,7 @@ class SessionStore:
         
         def _get_item_weight(item):
             # 基础权重是时间，命中次数作为增益
-            max_hit = max([c.get("hit_count", 0) for c in item.get("chunks", [])] or [0])
+            max_hit = max([c.get("hit_count", 0) for c in self._entry_final_chunks(item)] or [0])
             return max_hit
 
         # 仅对普通项进行截断
@@ -286,6 +313,7 @@ class SessionStore:
             # 排序：优先保留命中次数高的，其次保留最近的
             normal_items.sort(key=lambda x: (_get_item_weight(x), x.get("timestamp")), reverse=True)
             normal_items = normal_items[:max_turns]
+        normal_items.sort(key=lambda x: x.get("timestamp") or "")
             
         final_cache = pinned_items + normal_items
         self.update_session_meta(
@@ -317,6 +345,33 @@ class SessionStore:
             "bbox": list(chunk.get("bbox") or []) if isinstance(chunk.get("bbox"), list) else None,
             "provider": str(chunk.get("provider") or "") or None,
         }
+
+    @staticmethod
+    def _entry_final_chunks(item: Dict[str, Any]) -> List[Dict[str, Any]]:
+        final_chunks = item.get("final_chunks")
+        if isinstance(final_chunks, list):
+            return [c for c in final_chunks if isinstance(c, dict)]
+        legacy_chunks = item.get("chunks")
+        if isinstance(legacy_chunks, list):
+            return [c for c in legacy_chunks if isinstance(c, dict)]
+        return []
+
+    @classmethod
+    def _normalize_cached_entry(cls, item: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(item, dict):
+            return None
+        final_chunks = cls._entry_final_chunks(item)
+        candidate_pool = item.get("candidate_pool")
+        if not isinstance(candidate_pool, list):
+            candidate_pool = []
+        candidate_pool = [c for c in candidate_pool if isinstance(c, dict)]
+        if not final_chunks and not candidate_pool:
+            return None
+        normalized = dict(item)
+        normalized["final_chunks"] = final_chunks
+        normalized["chunks"] = final_chunks
+        normalized["candidate_pool"] = candidate_pool
+        return normalized
 
     def touch_session(self, session_id: str) -> None:
         """仅更新 updated_at，用于「重新激活」后使会话排到历史列表最前。"""

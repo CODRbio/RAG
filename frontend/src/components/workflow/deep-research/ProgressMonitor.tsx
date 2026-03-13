@@ -5,7 +5,7 @@ import type { ResearchMonitorState, EfficiencyRow } from './types';
 interface ProgressMonitorProps {
   researchMonitor: ResearchMonitorState;
   progressLogs: string[];
-  depth: 'lite' | 'comprehensive';
+  depth: 'lite' | 'comprehensive' | 'expert';
   optimizationPromptDraft: string;
   onGenerateOptimizationPrompt: (
     lowEfficiencyRows: EfficiencyRow[],
@@ -25,7 +25,7 @@ export function ProgressMonitor({
   onInsertOptimizationPrompt,
   onCopyOptimizationPrompt,
 }: ProgressMonitorProps) {
-  const targetCoverage = depth === 'lite' ? 0.6 : 0.8;
+  const targetCoverage = depth === 'lite' ? 0.6 : depth === 'expert' ? 0.9 : 0.8;
 
   const monitorSectionEntries = useMemo(
     () => Object.entries(researchMonitor.sectionCoverage),

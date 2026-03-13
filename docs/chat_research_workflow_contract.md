@@ -102,10 +102,15 @@
 ### 4.1 Chat
 
 - Chat 最终融合使用主检索、gap 补搜、agent 补搜三类候选共同组成的池。
+- 但该规则只适用于 **fresh 主检索路径**；`reuse_and_search` / `/deepen` 当前改为 follow-up 双池路径，不再直接走 main/gap/agent 三池保护。
 - Chat 采用“候选池优先”语义：
   - local / web / gap / agent 各自先提供源内有序候选池
   - 只有在 `main + gap` 或 `main + gap + agent` 这种跨池边界，才执行权威 rerank
   - Chat 路径不再对 fused pool 追加绝对分数阈值过滤，避免配额保护后的候选再次被批量删除
+- follow-up 双池路径当前真实行为：
+  - **Stage 1**：仅读最近 2 轮 `final_chunks`，按新的 `merged_query` 做单池 rerank。
+  - **Stage 2**：若命中 broad follow-up、`/deepen`、Stage 1 chunk `< 3` 或 `target_span` 覆盖不足，则扩到最近若干轮 `candidate_pool`，与 Stage 1 候选合并后再做单池 rerank。
+  - follow-up 的 Stage 1 / Stage 2 **不做** gap / agent / source 配额保护，只做去重与 relevance 排序。
 - Chat 目标保护比例（软配额，候选不足时按全局排序补齐）：
   - **gap**：`chat_gap_ratio = 0.2`（20%），用于 gap 补搜融合与最终 main+gap+agent 融合。
   - **agent**：`chat_agent_ratio = 0.1`（10%），用于最终融合时 agent 池最低保留比例。
@@ -150,23 +155,45 @@
 ```mermaid
 flowchart TD
     chatPre[PreResearch]
-    chatMain[Search1Plus1Plus1]
+    chatRoute{fresh or follow-up}
+    chatMain[Fresh Main Retrieval 1+1+1]
+    chatFollow1[Follow-up Stage1 final_chunks rerank]
+    chatExpand{expand to candidate_pool}
+    chatFollow2[Follow-up Stage2 candidate_pool rerank]
     chatGap[GapStepMax1]
     chatAgent[AgentStepOptional]
     chatFuse[FinalFuseWriteTopK]
     chatAnswer[Answer]
-    chatPre --> chatMain --> chatGap --> chatAgent --> chatFuse --> chatAnswer
+    chatPre --> chatRoute
+    chatRoute -->|fresh| chatMain --> chatGap
+    chatRoute -->|reuse_and_search / deepen| chatFollow1 --> chatExpand
+    chatExpand -->|yes| chatFollow2 --> chatGap
+    chatExpand -->|no| chatAnswer
+    chatGap --> chatAgent --> chatFuse --> chatAnswer
 ```
 
 Chat 当前行为：
 
 - 可选 pre-research / preliminary knowledge 预处理。
-- 主检索使用 `1+1+1` 结构化查询。
+- **fresh 路径**主检索使用 `1+1+1` 结构化查询。
 - **Local 主检索**（`mode=local`）：dense + sparse 各自召回 → 应用层加权 RRF 融合 → 返回原始 RRF 候选池（**无 BGE rerank**）。web 模式各 provider 同样以 `pool_only=True` 形式返回原始候选，BGE rerank 统一延迟至最终融合步骤。
+- **follow-up 路径**（仅 `reuse_and_search` 与 `/deepen`）当前真实行为：
+  - 优先使用会话证据缓存，而不是 fresh 主检索。
+  - `SessionStore.recent_evidence_cache` 每轮同时保存 `final_chunks` 与 `candidate_pool`；旧缓存只有 `chunks` 时，读取时映射为 `final_chunks`。
+  - Stage 1 仅读最近 2 轮 `final_chunks`，按新 query 单池 rerank；若未触发扩池，则直接回答，**不跑完整 sufficiency**。
+  - Stage 2 将 Stage 1 候选与最近若干轮 `candidate_pool` 合并，按 `step_top_k` 单池 rerank；只有 Stage 2 后仍不足，才进入后续 gap / agent 补强。
 - 证据不足时最多生成 `1-3` 组 gap query，并行补搜；gap 子查询以 `pool_only=True` 返回原始候选池，**不在子查询内部做任何 rerank**，结果暂存为 `chat_gap_candidates_hits`。
 - **单次最终 BGE rerank**（§5¾ 步骤，Phase `chat_pre_agent_fusion`）：在系统提示组装前，将 main pool（RRF 原始）+ gap pool（raw hits）送入 `_fuse_chat_main_gap_agent_candidates`，执行**全流程唯一一次**联合 BGE rerank，输出 `write_top_k` 条作为 `pack.chunks` 与 `context_str`。gap 保护比例 `chat_gap_ratio=0.2` 在此生效。
 - Agent （可选）补搜结果：agent 在 §5¾ `context_str` 的基础上调用 LLM，LLM 通过工具检索产生 `agent_extra_chunks`（§5¾ 时不存在的新 chunks）。若 `agent_extra_chunks` 非空，再做**一次** agent 追加融合（`_fuse_chat_main_gap_agent_candidates`，`gap_candidate_hits=[]`，agent 受 `chat_agent_ratio=0.1` 保护）。两次 rerank 池组成不同，不冗余；`pack.chunks` 已含 gap，gap 不得重传。若 agent 未触发或工具无新 chunk，整条路径仅 1 次 BGE rerank。
+- **Agent regen 保护**：当 `agent_extra_chunks` 非空时，进入 regen 路径生成最终答案。系统通过 `_regen_succeeded` 标志跟踪 regen 是否真正产生了有效文本。若 regen 返回空（LLM 异常等极端情况），`_regen_succeeded=False`，此时 citations 解析和 Graphic Abstract 生成均跳过，避免用未融合新证据的初稿做引文匹配或图片生成。正常路径（regen 成功）行为不变。
 - Chat 主检索在调用前会对 `step_top_k` 进行 1.2 倍软放大：`chat_effective_step_top_k = max(step_k, ceil(step_k * 1.2))`，目的是为 Main/Gap/Agent 三池融合提供充足的高质量候选缓冲。融合重排后再由 `write_top_k` 或原始 `step_top_k` 严格截断进入 LLM。
+- follow-up 的充分性当前也分两层：
+  - Stage 1 直答时跳过完整 LLM sufficiency。
+  - Stage 2 后恢复现有 sufficiency / `evidence_scarce -> assist/agent/gap` 后备链路。
+- follow-up 的数量兜底当前是感知问题类型的：
+  - broad follow-up 仍沿用 `<3 chunks 或 <2 distinct_docs`。
+  - 定向追问与 `/deepen` 允许单文献内多条证据构成充分回答，当前只要求 Stage 2 后 `chunks >= 2`。
+- **follow-up agent 跳过逻辑**：`assist` 模式下，agent 是否触发由 `skip_assist_agent_for_sufficient_context` 决定。该条件同时覆盖首次检索（`do_retrieval=True`）和 follow-up 复用缓存（`followup_mode=reuse_and_search`）两条路径——只要 `context_str` 非空且 `evidence_scarce=False`，均跳过 agent，日志显示 `reason=sufficient_context`。
 
 ## 6. Deep Research 当前真实流程
 

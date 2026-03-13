@@ -39,3 +39,51 @@ def test_find_enriched_json_prefers_bound_library(monkeypatch, tmp_path):
     hit = routes_graph._find_enriched_json_by_paper_id("paper_x", user_id="u1", collection="deepsea_ocean")
     assert hit is not None
     assert "DeepSea_symbiosis" in str(hit)
+
+
+def test_graph_chunk_detail_uses_parsed_fallback_for_missing_bbox(monkeypatch):
+    class DummyMilvusClient:
+        @staticmethod
+        def list_collections():
+            return ["deepsea_ocean"]
+
+    monkeypatch.setattr(
+        routes_graph,
+        "_query_chunk_in_collection",
+        lambda collection, chunk_id: {
+            "collection": collection,
+            "chunk_id": chunk_id,
+            "paper_id": "paper_x",
+            "content": "milvus content",
+            "section_path": "Intro",
+            "page": 0,
+            "content_type": "text",
+            "chunk_type": "paragraph",
+            "bbox": None,
+        },
+    )
+    monkeypatch.setattr(
+        routes_graph,
+        "_query_chunk_from_parsed",
+        lambda paper_id, chunk_id, user_id=None, collection=None: {
+            "collection": "parsed_fallback",
+            "chunk_id": chunk_id,
+            "paper_id": paper_id,
+            "content": "parsed content",
+            "section_path": "Intro > Detail",
+            "page": 2,
+            "content_type": "text",
+            "chunk_type": "paragraph",
+            "bbox": [10, 20, 30, 40],
+        },
+    )
+    monkeypatch.setattr(routes_graph, "_get_hippo", lambda: None)
+    monkeypatch.setattr(routes_graph, "settings", SimpleNamespace(collection=SimpleNamespace(all=lambda: ["deepsea_ocean"])))
+    monkeypatch.setattr("src.indexing.milvus_ops.milvus", SimpleNamespace(client=DummyMilvusClient()))
+
+    detail = routes_graph.graph_chunk_detail("chunk-1", collection="deepsea_ocean", paper_id="paper_x", user_id="u1")
+
+    assert detail["chunk_id"] == "chunk-1"
+    assert detail["bbox"] == [10, 20, 30, 40]
+    assert detail["content"] == "parsed content"
+    assert detail["page"] == 3

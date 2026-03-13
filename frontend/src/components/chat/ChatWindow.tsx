@@ -4,7 +4,7 @@ import { MessageSquare, FileSearch, Copy, Download, ExternalLink, FileText, User
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useChatStore, useConfigStore, useToastStore, useCompareStore, useScholarStore } from '../../stores';
-import type { Source, DeepResearchJobInfo, ResearchDashboardData } from '../../types';
+import type { Source, DeepResearchJobInfo, ResearchDashboardData, CitationAnchor } from '../../types';
 import { cancelDeepResearchJob, getDeepResearchJob, streamDeepResearchEvents, listDeepResearchJobs } from '../../api/chat';
 import { DEEP_RESEARCH_JOB_KEY } from '../workflow/deep-research/types';
 import { getChunkDetail } from '../../api/graph';
@@ -14,6 +14,8 @@ import { AgentDebugPanel } from './AgentDebugPanel';
 import { ResearchProgressPanel } from '../research/ResearchProgressPanel';
 import { PdfViewerModal } from '../ui/PdfViewerModal';
 import { ScholarLibrarySelectModal } from '../scholar/ScholarLibrarySelectModal';
+import { logger } from '../../utils/logger';
+import { transformMarkdownMediaUrl } from '../../utils/mediaUrl';
 
 /** 格式化消息时间，便于查找：同天只显示时分，否则显示日期+时分 */
 function formatMessageTime(iso?: string | null): string {
@@ -53,14 +55,16 @@ function MiniPieChart({ data, size = 48 }: { data: { label: string; value: numbe
   const cx = r;
   const cy = r;
   const ir = r * 0.55;
-  let cumAngle = -Math.PI / 2;
-
-  const paths = data.map((d) => {
+  const paths = data.map((d, idx) => {
+    const startAngle = data
+      .slice(0, idx)
+      .reduce((sum, item) => sum + (item.value / total) * 2 * Math.PI, -Math.PI / 2);
     const angle = (d.value / total) * 2 * Math.PI;
-    const startOuter = { x: cx + r * Math.cos(cumAngle), y: cy + r * Math.sin(cumAngle) };
-    const endOuter = { x: cx + r * Math.cos(cumAngle + angle), y: cy + r * Math.sin(cumAngle + angle) };
-    const startInner = { x: cx + ir * Math.cos(cumAngle + angle), y: cy + ir * Math.sin(cumAngle + angle) };
-    const endInner = { x: cx + ir * Math.cos(cumAngle), y: cy + ir * Math.sin(cumAngle) };
+    const endAngle = startAngle + angle;
+    const startOuter = { x: cx + r * Math.cos(startAngle), y: cy + r * Math.sin(startAngle) };
+    const endOuter = { x: cx + r * Math.cos(endAngle), y: cy + r * Math.sin(endAngle) };
+    const startInner = { x: cx + ir * Math.cos(endAngle), y: cy + ir * Math.sin(endAngle) };
+    const endInner = { x: cx + ir * Math.cos(startAngle), y: cy + ir * Math.sin(startAngle) };
     const large = angle > Math.PI ? 1 : 0;
     const path = [
       `M ${startOuter.x} ${startOuter.y}`,
@@ -69,7 +73,6 @@ function MiniPieChart({ data, size = 48 }: { data: { label: string; value: numbe
       `A ${ir} ${ir} 0 ${large} 0 ${endInner.x} ${endInner.y}`,
       'Z',
     ].join(' ');
-    cumAngle += angle;
     return <path key={d.label} d={path} fill={d.color} opacity={0.85} />;
   });
 
@@ -123,7 +126,9 @@ function SourceBreakdownBar({ sources, providerStats }: {
 }) {
   if (!sources || sources.length === 0) return null;
 
-  const citeCounts: Record<string, number> = providerStats?.citation_level || {};
+  const citeCounts: Record<string, number> = providerStats?.citation_level
+    ? { ...providerStats.citation_level }
+    : {};
   if (!providerStats?.citation_level) {
     for (const s of sources) {
       const p = s.provider || (s.url ? 'web' : 'local');
@@ -141,6 +146,35 @@ function SourceBreakdownBar({ sources, providerStats }: {
       <ProviderRow label="Citations (Articles / Pages)" counts={citeCounts} pieSize={38} />
     </div>
   );
+}
+
+function getSourceAnchors(source: Source): CitationAnchor[] {
+  const seen = new Set<string>();
+  const anchors: CitationAnchor[] = [];
+  for (const anchor of source.anchors || []) {
+    const chunkId = String(anchor?.chunk_id || '').trim();
+    if (!chunkId || seen.has(chunkId)) continue;
+    seen.add(chunkId);
+    anchors.push({
+      chunk_id: chunkId,
+      page_num: anchor?.page_num ?? null,
+      bbox: Array.isArray(anchor?.bbox) ? anchor.bbox : null,
+      snippet: typeof anchor?.snippet === 'string' ? anchor.snippet : null,
+    });
+  }
+  if (anchors.length === 0 && source.chunk_id) {
+    anchors.push({
+      chunk_id: source.chunk_id,
+      page_num: source.page_num ?? null,
+      bbox: Array.isArray(source.bbox) ? source.bbox : null,
+      snippet: null,
+    });
+  }
+  return anchors;
+}
+
+function getPrimaryAnchor(source: Source): CitationAnchor | null {
+  return getSourceAnchors(source)[0] || null;
 }
 
 export function ChatWindow() {
@@ -300,7 +334,7 @@ export function ChatWindow() {
         }
       } catch (err) {
         if (!ac.signal.aborted && !cancelled) {
-          console.debug('[ChatWindow] Background job SSE ended:', err);
+          logger.ui.debug('[ChatWindow] Background job SSE ended', err);
           clearState();
         }
       }
@@ -310,7 +344,7 @@ export function ChatWindow() {
       cancelled = true;
       ac.abort();
     };
-  }, []);
+  }, [setStreamingStep]);
 
   const handleCopy = (content: string) => {
     navigator.clipboard.writeText(content);
@@ -387,7 +421,7 @@ export function ChatWindow() {
         }
       }
     } catch (e) {
-      console.debug('[ChatWindow] list jobs for wake failed:', e);
+      logger.ui.debug('[ChatWindow] list jobs for wake failed', e);
     }
     setShowDeepResearchDialog(true);
   }, [sessionId, setDeepResearchTopic, setSessionId, setCanvasId, setResearchDashboard, setShowDeepResearchDialog]);
@@ -399,26 +433,30 @@ export function ChatWindow() {
     return `${authors[0]} et al.`;
   };
 
-  const handleOpenPdfTrace = useCallback(async (src: Source) => {
+  const handleOpenPdfTrace = useCallback(async (src: Source, anchor?: CitationAnchor | null) => {
     if (!src.doc_id) return;
+    const targetAnchor = anchor || getPrimaryAnchor(src);
     try {
       // 先尝试从 source 本身获取 bbox/page，如已有则直接使用
-      let bbox = src.bbox;
-      let page = src.page_num ?? undefined;
+      let bbox = targetAnchor?.bbox ?? src.bbox;
+      let page = targetAnchor?.page_num ?? src.page_num ?? undefined;
+      const chunkId = targetAnchor?.chunk_id || src.chunk_id || String(src.id);
 
-      // 若 source 上没有 bbox，通过 chunk API 补取
-      if (!bbox || bbox.length < 4) {
-        const chunkId = String(src.id);
+      // 若锚点缺少 bbox 或 page，通过 chunk API 补取
+      if ((!bbox || bbox.length < 4 || !page) && chunkId) {
         const detail = await getChunkDetail({
           chunk_id: chunkId,
+          collection: currentCollection || undefined,
           paper_id: src.doc_id,
         });
         const rawBbox = detail.bbox;
-        if (Array.isArray(rawBbox) && rawBbox.length >= 4) {
-          if (typeof rawBbox[0] === 'number') {
-            bbox = rawBbox as number[];
-          } else if (Array.isArray(rawBbox[0])) {
+        if (Array.isArray(rawBbox) && rawBbox.length > 0) {
+          if (Array.isArray(rawBbox[0]) && (rawBbox[0] as number[]).length >= 4) {
+            // nested format: [[x0,y0,x1,y1], ...]
             bbox = rawBbox[0] as number[];
+          } else if (typeof rawBbox[0] === 'number' && rawBbox.length >= 4) {
+            // flat format: [x0,y0,x1,y1]
+            bbox = rawBbox as number[];
           }
         }
         page = detail.page ?? undefined;
@@ -436,7 +474,17 @@ export function ChatWindow() {
         title: src.title || src.doc_id,
       });
     } catch {
-      addToast('PDF 溯源失败：无法获取 chunk 信息', 'error');
+      const apiBase = import.meta.env.VITE_API_BASE_URL || '/api';
+      const collectionQuery = currentCollection ? `?collection=${encodeURIComponent(currentCollection)}` : '';
+      const pdfUrl = `${apiBase}/graph/pdf/${encodeURIComponent(src.doc_id)}${collectionQuery}`;
+      setPdfModal({
+        open: true,
+        pdfUrl,
+        pageNumber: (targetAnchor?.page_num || src.page_num || 1),
+        bbox: targetAnchor?.bbox || src.bbox || undefined,
+        title: src.title || src.doc_id,
+      });
+      addToast('未获取到精确 chunk 坐标，已打开原文 PDF', 'info');
     }
   }, [addToast, currentCollection]);
 
@@ -682,7 +730,10 @@ export function ChatWindow() {
                 prose-pre:bg-slate-950/80 prose-pre:border prose-pre:border-slate-800 prose-pre:shadow-inner
                 prose-blockquote:border-l-sky-500/50 prose-blockquote:bg-slate-800/20 prose-blockquote:py-1 prose-blockquote:px-4
                 prose-table:border-collapse prose-th:border-b prose-th:border-slate-700 prose-td:border-b prose-td:border-slate-800/50">
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                <ReactMarkdown 
+                  remarkPlugins={[remarkGfm]}
+                  urlTransform={transformMarkdownMediaUrl}
+                >
                   {displayContent}
                 </ReactMarkdown>
               </div>
@@ -732,14 +783,17 @@ export function ChatWindow() {
                 </div>
                 <SourceBreakdownBar sources={msg.sources} providerStats={msg.providerStats} />
                 <div className="space-y-2">
-                  {msg.sources.map((src) => (
-                    <div
-                      key={src.id}
-                      onClick={() => handleOpenSource(src)}
-                      className="bg-slate-800/40 hover:bg-slate-700/60 border border-slate-700/50 hover:border-sky-500/30 rounded-lg p-3 transition-all cursor-pointer group/ref relative overflow-hidden"
-                    >
-                      {/* Glow effect on hover */}
-                      <div className="absolute inset-0 bg-gradient-to-r from-transparent via-sky-500/5 to-transparent -translate-x-full group-hover/ref:translate-x-full transition-transform duration-1000 pointer-events-none"></div>
+                  {msg.sources.map((src) => {
+                    const anchors = getSourceAnchors(src);
+                    const primaryAnchor = anchors[0] || null;
+                    return (
+                      <div
+                        key={src.id}
+                        onClick={() => handleOpenSource(src)}
+                        className="bg-slate-800/40 hover:bg-slate-700/60 border border-slate-700/50 hover:border-sky-500/30 rounded-lg p-3 transition-all cursor-pointer group/ref relative overflow-hidden"
+                      >
+                        {/* Glow effect on hover */}
+                        <div className="absolute inset-0 bg-gradient-to-r from-transparent via-sky-500/5 to-transparent -translate-x-full group-hover/ref:translate-x-full transition-transform duration-1000 pointer-events-none"></div>
 
                       {/* 第一行：cite_key + provider badge + 链接图标 */}
                       <div className="flex items-start justify-between gap-2 mb-1">
@@ -798,6 +852,24 @@ export function ChatWindow() {
                           </span>
                         )}
                       </div>
+                      {src.type === 'local' && src.doc_id && anchors.length >= 1 && (
+                        <div className="mt-2 flex flex-wrap gap-2">
+                          {anchors.map((anchor, anchorIdx) => (
+                            <button
+                              key={anchor.chunk_id}
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleOpenPdfTrace(src, anchor);
+                              }}
+                              className="px-2 py-1 rounded-md border border-amber-500/30 bg-amber-500/10 text-[10px] text-amber-200 hover:bg-amber-500/20 transition-colors"
+                              title={anchor.snippet || undefined}
+                            >
+                              {anchors.length > 1 ? `片段 ${anchorIdx + 1}` : '原文定位'}{anchor.page_num ? ` · P${anchor.page_num}` : ''}
+                            </button>
+                          ))}
+                        </div>
+                      )}
                       {/* 操作栏：溯源原文 + 加入对比 */}
                       <div className="mt-2 pt-2 border-t border-slate-700/30 flex justify-end gap-3">
                         {/* 溯源原文：仅本地文档且有 doc_id 时可用 */}
@@ -806,7 +878,7 @@ export function ChatWindow() {
                             type="button"
                             onClick={(e) => {
                               e.stopPropagation();
-                              handleOpenPdfTrace(src);
+                              handleOpenPdfTrace(src, primaryAnchor);
                             }}
                             className="text-xs text-amber-500 hover:text-amber-300 flex items-center gap-1 font-medium transition-colors"
                           >
@@ -831,8 +903,9 @@ export function ChatWindow() {
                           {t('chat.addToCompare')}
                         </button>
                       </div>
-                    </div>
-                  ))}
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
             )}
@@ -843,6 +916,7 @@ export function ChatWindow() {
 
       {/* PDF 溯源 Modal */}
       <PdfViewerModal
+        key={`${pdfModal.pdfUrl}|${pdfModal.pageNumber}|${pdfModal.bbox?.join(',') || ''}`}
         open={pdfModal.open}
         onClose={() => setPdfModal((prev) => ({ ...prev, open: false }))}
         pdfUrl={pdfModal.pdfUrl}

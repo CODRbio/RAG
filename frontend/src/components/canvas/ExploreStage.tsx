@@ -8,6 +8,7 @@ import {
   DEEP_RESEARCH_JOB_KEY,
   DEEP_RESEARCH_ARCHIVED_JOBS_KEY,
 } from '../workflow/deep-research/types';
+import { logger } from '../../utils/logger';
 
 interface ExploreStageProps {
   canvas: Canvas;
@@ -62,7 +63,7 @@ export function ExploreStage({ canvas }: ExploreStageProps) {
       requestSessionListRefresh();
       addToast(`已提交阶段重启：${phase}`, 'success');
     } catch (err) {
-      console.error('[ExploreStage] restart phase failed:', err);
+      logger.ui.error('[ExploreStage] restart phase failed', err);
       addToast('阶段重启失败，请重试', 'error');
     } finally {
       setRestarting(false);

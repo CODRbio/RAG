@@ -87,6 +87,10 @@ class ChatRequest(BaseModel):
         None,
         description="LLM 提供商: deepseek | openai | gemini | claude | kimi 等，None 表示使用配置默认值",
     )
+    intent_provider: Optional[str] = Field(
+        None,
+        description="意图判断专用 LLM 提供商；可单独指定本地 OpenAI-compatible 小模型，优先级高于 ultra_lite_provider / llm_provider",
+    )
     ultra_lite_provider: Optional[str] = Field(
         None,
         description="专门用于长文本压缩等超轻量任务的 LLM 提供商 (如 openai-mini, gemini-flash, deepseek 等)",
@@ -161,7 +165,7 @@ class ChatRequest(BaseModel):
         description="前端调试面板开启时传 true，本请求期间后端临时提升相关 logger 为 DEBUG 便于追踪。",
     )
     enable_graphic_abstract: Optional[bool] = Field(False, description="是否在末尾生成图文摘要")
-    graphic_abstract_model: Optional[str] = Field(None, description="画图使用的模型提供商 (gemini, openai, kimi)")
+    graphic_abstract_model: Optional[str] = Field(None, description="图文摘要使用的图像模型标识")
 
 
 class EvidenceSummary(BaseModel):
@@ -193,10 +197,20 @@ class EvidenceSummary(BaseModel):
     )
 
 
+class CitationAnchor(BaseModel):
+    """引用锚点（真实引用 chunk 的定位信息）。"""
+
+    chunk_id: str = Field(..., description="真实 chunk_id")
+    page_num: Optional[int] = Field(None, description="PDF 页码（1-based）")
+    bbox: Optional[List[float]] = Field(None, description="高亮框 [x0,y0,x1,y1]")
+    snippet: Optional[str] = Field(None, description="该 chunk 的简短片段")
+
+
 class ChatCitation(BaseModel):
     """对话引用项（轻量版）"""
 
     cite_key: str = ""
+    chunk_id: Optional[str] = Field(None, description="主锚点的真实 chunk ID")
     title: str = ""
     authors: List[str] = Field(default_factory=list)
     year: Optional[int] = None
@@ -205,7 +219,8 @@ class ChatCitation(BaseModel):
     pdf_url: Optional[str] = None
     doi: Optional[str] = None
     bbox: Optional[List[float]] = Field(None, description="Docling bbox 坐标 [x0,y0,x1,y1]")
-    page_num: Optional[int] = Field(None, description="证据所在页码")
+    page_num: Optional[int] = Field(None, description="主锚点所在页码（1-based）")
+    anchors: List[CitationAnchor] = Field(default_factory=list, description="该文献实际命中的 chunk 锚点列表")
     provider: Optional[str] = Field(None, description="来源 provider: local | tavily | scholar | semantic | ncbi | google")
 
 
@@ -499,6 +514,10 @@ class IntentDetectRequest(BaseModel):
     session_id: Optional[str] = Field(None, description="会话 ID，用于获取历史上下文")
     current_stage: str = Field("explore", description="当前工作流阶段")
     llm_provider: Optional[str] = Field(None, description="LLM 提供商，用于意图解析；无则使用 config 默认")
+    intent_provider: Optional[str] = Field(
+        None,
+        description="意图判断专用 LLM 提供商；可单独指定本地 OpenAI-compatible 小模型",
+    )
 
 
 class IntentDetectResponse(BaseModel):
@@ -752,7 +771,7 @@ class DeepResearchStartRequest(BaseModel):
         description="Sonar 检索工具模型（仅当 web_providers 含 sonar 时生效）: sonar | sonar-pro 等，默认 sonar-pro",
     )
     enable_graphic_abstract: Optional[bool] = Field(False, description="是否在末尾生成图文摘要")
-    graphic_abstract_model: Optional[str] = Field(None, description="画图使用的模型提供商 (gemini, openai, kimi)")
+    graphic_abstract_model: Optional[str] = Field(None, description="图文摘要使用的图像模型标识")
 
 class DeepResearchStartResponse(BaseModel):
     """Deep Research 第一阶段响应（保留，内部用）"""
@@ -803,7 +822,7 @@ class DeepResearchConfirmRequest(BaseModel):
     depth: str = Field(
         "comprehensive",
         description=(
-            "研究深度: lite（快速探索，~3-10 min）| comprehensive（全面学术综述，~15-40 min）。"
+            "研究深度: lite（快速探索，~3-10 min）| comprehensive（全面学术综述，~15-40 min）| expert（专家级穷尽综述，~60-180 min）。"
             "控制每章研究轮次、覆盖度阈值、搜索量和审核超时等全部循环上限。"
         ),
     )
@@ -891,7 +910,7 @@ class DeepResearchConfirmRequest(BaseModel):
     )
     max_sections: int = Field(4, ge=2, le=9, description="最大章节数")
     enable_graphic_abstract: Optional[bool] = Field(False, description="是否在末尾生成图文摘要")
-    graphic_abstract_model: Optional[str] = Field(None, description="画图使用的模型提供商 (gemini, openai, kimi)")
+    graphic_abstract_model: Optional[str] = Field(None, description="图文摘要使用的图像模型标识")
 
 
 class DeepResearchSubmitResponse(BaseModel):

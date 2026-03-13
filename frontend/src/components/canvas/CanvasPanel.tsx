@@ -21,6 +21,7 @@ import { DraftingStage } from './DraftingStage';
 import { RefineStage } from './RefineStage';
 import type { CanvasStage, DeepResearchJobInfo } from '../../types';
 import { DEEP_RESEARCH_JOB_KEY } from '../workflow/deep-research/types';
+import { logger } from '../../utils/logger';
 
 interface CanvasPanelProps {
   onStartResize: () => void;
@@ -134,7 +135,7 @@ export function CanvasPanel({ onStartResize }: CanvasPanelProps) {
       downloadBlob(blob, 'references.ris');
       addToast(t('canvas.exportedRis'), 'success');
     } catch (err) {
-      console.error('[CanvasPanel] Export failed:', err);
+      logger.ui.error('[CanvasPanel] Export failed', err);
       addToast(t('canvas.exportFailed'), 'error');
     }
   };
@@ -153,7 +154,7 @@ export function CanvasPanel({ onStartResize }: CanvasPanelProps) {
         addToast(t('canvas.canvasCreated'), 'success');
       }
     } catch (err) {
-      console.error('[CanvasPanel] Create canvas failed:', err);
+      logger.ui.error('[CanvasPanel] Create canvas failed', err);
       addToast(t('canvas.createFailed'), 'error');
     } finally {
       setIsCreating(false);

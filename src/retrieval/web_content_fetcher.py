@@ -288,6 +288,7 @@ class WebContentFetcher:
     captcha_detect_extra_seconds: int = 90  # 检测到验证码后额外给予的时间
     captcha_solving_extra_seconds: int = 120  # 调用解码 API 后额外给予的时间
     captcha_token_extra_seconds: int = 45   # token 应用后额外给予的时间
+    brightdata_timeout_seconds: int = 120   # BrightData REST API 独立超时，不受 effective_timeout_seconds 影响
     cache_enabled: bool = True
     cache_ttl_seconds: int = 3600
     disk_cache_enabled: bool = True
@@ -356,6 +357,7 @@ class WebContentFetcher:
                     captcha_detect_extra_seconds=int(getattr(cfg, "captcha_detect_extra_seconds", 90)),
                     captcha_solving_extra_seconds=int(getattr(cfg, "captcha_solving_extra_seconds", 120)),
                     captcha_token_extra_seconds=int(getattr(cfg, "captcha_token_extra_seconds", 45)),
+                    brightdata_timeout_seconds=int(getattr(cfg, "brightdata_timeout_seconds", 120)),
                     cache_enabled=getattr(cfg, "cache_enabled", True),
                     cache_ttl_seconds=getattr(cfg, "cache_ttl_seconds", 3600),
                     disk_cache_enabled=getattr(cfg, "disk_cache_enabled", True),
@@ -423,9 +425,10 @@ class WebContentFetcher:
 
     async def _fetch_brightdata(self, url: str) -> Optional[str]:
         """
-        使用 BrightData Web Unlocker API 抓取。
+        使用 BrightData Web Unlocker REST API 抓取。
 
-        适合反爬站点，需要配置 brightdata_api_key。
+        适合反爬站点，需要配置 brightdata_api_key（Bearer token）。
+        使用 REST API 方式（POST api.brightdata.com/request），与 paper_downloader 保持一致。
         """
         if not self.brightdata_api_key:
             return None
@@ -437,20 +440,38 @@ class WebContentFetcher:
             import trafilatura
 
             zone = self.brightdata_zone or "web_unlocker1"
-            proxy_url = f"https://brd-customer-{self.brightdata_api_key}-zone-{zone}:@brd.superproxy.io:33335"
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.brightdata_api_key}",
+            }
+            payload = {"zone": zone, "url": url, "format": "raw"}
+            timeout = aiohttp.ClientTimeout(total=self.brightdata_timeout_seconds)
 
+            html: Optional[str] = None
             async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    url,
-                    proxy=proxy_url,
-                    timeout=aiohttp.ClientTimeout(total=self.effective_timeout_seconds),
-                    headers={"User-Agent": "Mozilla/5.0 (compatible; DeepSeaRAG/1.0)"},
-                    ssl=False,
-                ) as resp:
-                    if resp.status != 200:
-                        logger.debug(f"BrightData 返回 {resp.status}: {url}")
-                        return None
-                    html = await resp.text()
+                for attempt in range(1, 4):  # 最多 3 次，应对 200 空响应
+                    async with session.post(
+                        "https://api.brightdata.com/request",
+                        headers=headers,
+                        json=payload,
+                        timeout=timeout,
+                    ) as resp:
+                        if resp.status != 200:
+                            logger.warning(
+                                "BrightData 返回 %d (attempt %d): %s", resp.status, attempt, url
+                            )
+                            return None
+                        body = await resp.read()
+                        if not body:
+                            logger.warning(
+                                "BrightData 返回空内容 (attempt %d/3): %s", attempt, url
+                            )
+                            if attempt < 3:
+                                await asyncio.sleep(float(attempt))
+                                continue
+                            return None
+                        html = body.decode("utf-8", errors="replace")
+                        break
 
             if not html or len(html) < 200:
                 return None
@@ -467,17 +488,20 @@ class WebContentFetcher:
                 ),
             )
             if text and len(text.strip()) > 100:
-                logger.debug(f"BrightData 成功: {url} ({len(text)} chars)")
+                logger.info("BrightData 成功: %s (%d chars)", url, len(text))
                 return text.strip()
+            logger.warning(
+                "BrightData 内容获取成功但正文提取失败: %s (html=%d chars)", url, len(html)
+            )
             return None
         except asyncio.TimeoutError:
-            logger.debug(f"BrightData 超时: {url}")
+            logger.warning("BrightData 超时 (%ds): %s", self.brightdata_timeout_seconds, url)
             return None
         except ImportError as e:
-            logger.debug(f"BrightData 依赖缺失: {e}")
+            logger.debug("BrightData 依赖缺失: %s", e)
             return None
         except Exception as e:
-            logger.debug(f"BrightData 失败: {url} - {e}")
+            logger.warning("BrightData 失败: %s - %s", url, e)
             return None
 
     # --------------------------------------------------------

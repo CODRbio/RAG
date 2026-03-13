@@ -6,7 +6,6 @@ Rebuilds automatically when the workbook file changes (mtime/size/hash).
 from __future__ import annotations
 
 import hashlib
-import logging
 import re
 import time
 from pathlib import Path
@@ -17,8 +16,9 @@ from sqlmodel import Session, select
 
 from src.db.engine import get_engine
 from src.db.models import ImpactFactorIndexMeta, ImpactFactorJournal
+from src.log import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Default path relative to project root
 PROJECT_ROOT = Path(__file__).resolve().parents[2]

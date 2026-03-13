@@ -27,20 +27,35 @@
 - clarification: context_status=needs_clarification 时用与用户**相同语言**写一个简短追问，其他情况留空
 
 ### 4. followup_mode / topic_relevance（追问复用策略）
-- **followup_mode=fresh**: 新主题、低相关，或必须重新检索才能回答
-- **followup_mode=reuse_and_search**: 与最近主题高度相关，优先复用最近证据；是否补充新检索由后续证据缺口/Agent 决定
-- **followup_mode=reuse_only**: 明确是“重写/整理/总结/翻译/改写已有内容”，不新增检索
-- **topic_relevance**: low / medium / high，表示当前消息与最近主题相关度
-- **target_span**: 简短描述所指对象（如“上一轮第2点”“最近关于X的证据”）；无法明确则留空
 
-判定规则（必须执行）：
-- 当用户要求“重写、润色、整理、压缩、翻译、提纲化、改成表格、总结、重新总结、再总结、重新概括、帮我总结一下”且目标明显是已有回答/已有材料时，优先 `reuse_only`
-  - 典型信号：消息极短（≤10字）、含“再/重新/重写”前缀、或含“上面/刚才/之前”指代词，且最近对话已有实质性内容
-  - 示例：「重新总结」「帮我再总结一遍」「能不能重新概括一下」「总结一下上面的内容」→ `reuse_only`
-- 当是追问且与最近主题高相关（例如“继续展开刚才第二点”“对比上面提到的两篇论文”），优先 `reuse_and_search`
-- 相关性低或新主题时使用 `fresh`
-- **注意区分**：「总结这个领域的最新进展」（新的检索目标）→ `fresh` 或 `reuse_and_search`；「重新总结/把上面的总结一下」（针对已有回答/材料）→ `reuse_only`
-- 不确定时默认：`action=rag`，`followup_mode=fresh`，`topic_relevance=low`
+**followup_mode 判定（严格按优先级执行）：**
+
+**reuse_only（最高优先级）** — 明确是"对已有回答/已有材料"的改写、整理、格式调整，无需新信息：
+- 信号词：重写、润色、整理、压缩、翻译、改写、提纲化、改成表格、总结、重新总结、再总结、重新概括、换一种说法
+- 典型触发：消息极短（≤10字）且含"再/重新"前缀；含"上面/刚才/之前的内容"指代词且要求格式转换
+- 示例：「重新总结」「帮我再总结一遍」「改成要点列表」「总结一下上面的内容」→ reuse_only
+
+**reuse_and_search（次高优先级）** — 与最近对话主题高度相关的追问、补充、延伸，可能需补充新检索：
+- 信号：提及上文已出现的具体概念/实体/文献；要求对比已提到的内容；继续展开某点；对已引用证据追问
+- 示例：「继续展开刚才第二点」「继续展开」「再说说」「能详细讲吗」（上下文已有实质内容）
+         「对比上面提到的两篇论文」「你引用的那篇文章还提到了什么？」→ reuse_and_search
+- **注意**：「继续展开」「详细说说」在上下文有实质内容时 → reuse_and_search，NOT fresh
+
+**fresh（默认）** — 新主题、低相关，或必须重新检索才能完整回答
+
+**topic_relevance 判定（保守原则）：**
+- 消息明显与上一轮主题无关 → low
+- 不确定时 → **medium（保守默认，避免误判为 low 丢失上下文）**
+- 消息明显是上一轮主题的延续或深化 → high
+- followup_mode=reuse_only 或 reuse_and_search 时，topic_relevance 至少为 medium
+
+**区分要点（防误判）：**
+- 「总结这个领域的最新进展」（检索目标）→ fresh 或 reuse_and_search（看上下文是否已有该领域内容）
+- 「重新总结/把上面的总结一下」（针对已有回答）→ reuse_only
+- 「继续展开」「详细说说」（上下文已有实质内容）→ reuse_and_search，NOT fresh
+- 无上下文时的「继续展开」→ fresh（无内容可展开）
+
+- **target_span**: 简短描述所指对象（如"上一轮第2点""最近关于X的证据"）；无法明确则留空
 
 只输出 JSON，无其他文字：
 {{"action":"chat/rag/deep_research","context_status":"self_contained/resolved/needs_clarification","rewritten_query":"","clarification":"","followup_mode":"fresh/reuse_only/reuse_and_search","topic_relevance":"low/medium/high","target_span":""}}

@@ -3,6 +3,7 @@ import { Plus, Trash2, GripVertical, Loader2, Paperclip } from 'lucide-react';
 import { useToastStore } from '../../../stores';
 import { extractDeepResearchContextFiles } from '../../../api/chat';
 import type { InitialStats, BriefDraft } from './types';
+import { logger } from '../../../utils/logger';
 
 interface ModelOption {
   value: string;
@@ -24,8 +25,8 @@ interface ConfirmPhaseProps {
   stepModelStrict: boolean;
   onStepModelStrictChange: (v: boolean) => void;
   modelOptions: ModelOption[];
-  depth: 'lite' | 'comprehensive';
-  onDepthChange: (v: 'lite' | 'comprehensive') => void;
+  depth: 'lite' | 'comprehensive' | 'expert';
+  onDepthChange: (v: 'lite' | 'comprehensive' | 'expert') => void;
   skipDraftReview: boolean;
   onSkipDraftReviewChange: (v: boolean) => void;
   skipRefineReview: boolean;
@@ -104,7 +105,7 @@ export function ConfirmPhase({
       onTempDocumentsChange(merged.slice(0, 10));
       addToast(`已添加 ${docs.length} 份临时材料`, 'success');
     } catch (err) {
-      console.error('[DeepResearch] context extract failed:', err);
+      logger.ui.error('[DeepResearch] context extract failed', err);
       addToast('临时材料提取失败，请重试', 'error');
     } finally {
       setIsExtractingContextFiles(false);
@@ -276,7 +277,7 @@ export function ConfirmPhase({
       {/* Research Depth */}
       <div className="bg-gray-50 border border-gray-200 rounded-lg p-3 space-y-2">
         <div className="text-sm font-medium text-gray-700">Research Depth (研究深度)</div>
-        <div className="grid grid-cols-2 gap-2">
+        <div className="grid grid-cols-3 gap-2">
           <button
             type="button"
             onClick={() => onDepthChange('lite')}
@@ -288,7 +289,7 @@ export function ConfirmPhase({
           >
             <span className="text-xs font-semibold text-gray-800">Lite</span>
             <span className="text-[10px] text-gray-500 leading-tight mt-0.5">
-              Quick but academically usable, ~5-15 min. 4 queries/section (recall+precision), tiered top_k 18/10/10, coverage &ge; 60%.
+              ~5-15 min. 4 queries/section, coverage &ge; 60%.
             </span>
           </button>
           <button
@@ -302,7 +303,21 @@ export function ConfirmPhase({
           >
             <span className="text-xs font-semibold text-gray-800">Comprehensive</span>
             <span className="text-[10px] text-gray-500 leading-tight mt-0.5">
-              Thorough academic review, ~20-60 min. 8 queries/section (recall+precision), tiered top_k 30/15/12, coverage &ge; 80%.
+              ~20-60 min. 8 queries/section, coverage &ge; 80%.
+            </span>
+          </button>
+          <button
+            type="button"
+            onClick={() => onDepthChange('expert')}
+            className={`flex flex-col items-start p-2.5 rounded-lg border text-left transition-all ${
+              depth === 'expert'
+                ? 'border-purple-400 bg-purple-50 ring-1 ring-purple-300'
+                : 'border-gray-200 bg-white hover:border-gray-300'
+            }`}
+          >
+            <span className="text-xs font-semibold text-gray-800">Expert</span>
+            <span className="text-[10px] text-gray-500 leading-tight mt-0.5">
+              ~60-180 min. 12 queries/section, coverage &ge; 90%.
             </span>
           </button>
         </div>

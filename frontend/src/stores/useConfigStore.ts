@@ -99,6 +99,22 @@ const normalizeOptionalYear = (value: unknown): number | null => {
   return n;
 };
 
+const normalizeGraphicAbstractModel = (value: unknown): string => {
+  const normalized = typeof value === 'string' ? value.trim() : '';
+  if (!normalized) return 'nanobanana 2';
+
+  const legacyMap: Record<string, string> = {
+    gemini: 'nanobanana 2',
+    openai: 'gpt-image-1.5',
+    qwen: 'qwen-image-2.0',
+  };
+  const lowered = normalized.toLowerCase();
+  if (legacyMap[lowered]) return legacyMap[lowered];
+  if (lowered === 'kimi-k2.5' || lowered.startsWith('kimi-')) return 'nanobanana 2';
+
+  return normalized;
+};
+
 export const useConfigStore = create<ConfigState>()(
   persist(
     (set) => ({
@@ -158,6 +174,7 @@ export const useConfigStore = create<ConfigState>()(
         skipClaimGeneration: false,
         maxSections: 4,
         gapQueryIntent: 'broad',
+        intent_provider: null as string | null | undefined,
         ultra_lite_provider: null as string | null | undefined,
         stepModels: {
           scope: 'sonar::sonar-pro',
@@ -212,7 +229,13 @@ export const useConfigStore = create<ConfigState>()(
 
       updateRagConfig: (update) =>
         set((state) => ({
-          ragConfig: { ...state.ragConfig, ...update },
+          ragConfig: {
+            ...state.ragConfig,
+            ...update,
+            graphicAbstractModel: normalizeGraphicAbstractModel(
+              update.graphicAbstractModel ?? state.ragConfig.graphicAbstractModel,
+            ),
+          },
         })),
 
       setSelectedProvider: (provider) => set({ selectedProvider: provider, selectedModel: '' }),
@@ -353,7 +376,7 @@ export const useConfigStore = create<ConfigState>()(
             maxIterations: (persisted.ragConfig as any)?.maxIterations ?? 2,
             agentDebugMode: persisted.ragConfig?.agentDebugMode ?? false,
             enableGraphicAbstract: persisted.ragConfig?.enableGraphicAbstract ?? false,
-            graphicAbstractModel: persisted.ragConfig?.graphicAbstractModel ?? 'nanobanana 2',
+            graphicAbstractModel: normalizeGraphicAbstractModel(persisted.ragConfig?.graphicAbstractModel),
           },
           webSearchConfig: {
             ...currentState.webSearchConfig,
@@ -395,6 +418,7 @@ export const useConfigStore = create<ConfigState>()(
               ...currentState.deepResearchDefaults.stepModels,
               ...(persisted.deepResearchDefaults?.stepModels || {}),
             },
+            intent_provider: (persisted.deepResearchDefaults as any)?.intent_provider ?? currentState.deepResearchDefaults.intent_provider,
             ultra_lite_provider: (persisted.deepResearchDefaults as any)?.ultra_lite_provider ?? currentState.deepResearchDefaults.ultra_lite_provider,
           },
           scholarDownloaderDefaults: {

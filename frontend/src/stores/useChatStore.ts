@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import type { ActiveResponseState, Message, WorkflowStep, EvidenceSummary, Source, ClarifyQuestion, ResearchDashboardData, ToolTraceItem, AgentDebugData } from '../types';
 import { getSession } from '../api/chat';
+import { chatCitationToSource } from '../utils/citations';
 
 interface ChatState {
   sessionId: string | null;
@@ -281,20 +282,9 @@ export const useChatStore = create<ChatState>((set) => ({
       const sessionInfo = await getSession(sessionId);
       const turns = Array.isArray(sessionInfo.turns) ? sessionInfo.turns : [];
       const messages: Message[] = turns.map((turn, index) => {
-        const sources: Source[] = (Array.isArray(turn.sources) ? turn.sources : []).map((s, sIndex) => ({
-          id: s.cite_key || `${sessionId}-${index}-${sIndex}`,
-          cite_key: s.cite_key || '',
-          title: s.title || '',
-          authors: s.authors || [],
-          year: s.year,
-          doc_id: s.doc_id,
-          url: s.url,
-          doi: s.doi,
-          bbox: s.bbox,
-          page_num: s.page_num,
-          type: s.url ? 'web' : 'local',
-          provider: s.provider || (s.url ? 'web' : 'local'),
-        }));
+        const sources: Source[] = (Array.isArray(turn.sources) ? turn.sources : []).map((s, sIndex) =>
+          chatCitationToSource(s, s.chunk_id || s.cite_key || `${sessionId}-${index}-${sIndex}`)
+        );
         // 兼容后端返回的 timestamp：字符串(ISO) 或数字(unix ms)，刷新后加载会话时必须有时间便于查找
         let timestamp: string | undefined;
         if (typeof turn.timestamp === 'string' && turn.timestamp) {

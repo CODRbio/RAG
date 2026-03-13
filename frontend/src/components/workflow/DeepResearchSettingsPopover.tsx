@@ -155,25 +155,29 @@ export function DeepResearchSettingsPopover({ open, onClose }: Props) {
         <div>
           <label className="flex items-center gap-1 text-[11px] font-medium text-gray-600 mb-1.5">
             Research Depth
-            <Tip content="Lite: faster, fewer iterations, lower coverage threshold (~60%). Comprehensive: thorough academic review, more queries per section, higher coverage (~80%).">
+            <Tip content="Lite: faster, fewer iterations, lower coverage threshold (~60%). Comprehensive: thorough academic review, more queries per section, higher coverage (~80%). Expert: exhaustive expert-level synthesis, maximum queries and iterations, coverage >= 90%.">
               <HelpCircle size={11} />
             </Tip>
           </label>
-          <div className="grid grid-cols-2 gap-2">
-            {(['lite', 'comprehensive'] as const).map((d) => (
+          <div className="grid grid-cols-3 gap-2">
+            {(['lite', 'comprehensive', 'expert'] as const).map((d) => (
               <button
                 key={d}
                 type="button"
                 onClick={() => updateDeepResearchDefaults({ depth: d })}
                 className={`px-2.5 py-1.5 rounded-lg border text-left transition-all text-[11px] ${
                   deepResearchDefaults.depth === d
-                    ? 'border-indigo-400 bg-indigo-50 ring-1 ring-indigo-200 font-semibold text-indigo-700'
+                    ? d === 'expert'
+                      ? 'border-purple-400 bg-purple-50 ring-1 ring-purple-200 font-semibold text-purple-700'
+                      : 'border-indigo-400 bg-indigo-50 ring-1 ring-indigo-200 font-semibold text-indigo-700'
                     : 'border-gray-200 bg-white hover:border-gray-300 text-gray-600'
                 }`}
               >
-                <div className="font-medium">{d === 'lite' ? 'Lite' : 'Comprehensive'}</div>
+                <div className="font-medium">
+                  {d === 'lite' ? 'Lite' : d === 'comprehensive' ? 'Comprehensive' : 'Expert'}
+                </div>
                 <div className="text-[9px] text-gray-400 leading-tight mt-0.5">
-                  {d === 'lite' ? '~5-15 min, coverage >= 60%' : '~20-60 min, coverage >= 80%'}
+                  {d === 'lite' ? '~5-15 min, >= 60%' : d === 'comprehensive' ? '~20-60 min, >= 80%' : '~60-180 min, >= 90%'}
                 </div>
               </button>
             ))}

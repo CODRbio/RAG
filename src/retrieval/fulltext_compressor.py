@@ -6,11 +6,11 @@ are compressed via a cheap LLM to <= max_output_words. Short texts pass through 
 Rerank happens before compression so we only compress hits that will enter the context.
 """
 
-import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger(__name__)
+from src.log import get_logger
+logger = get_logger(__name__)
 
 WORD_THRESHOLD_DEFAULT = 900
 CHAR_THRESHOLD_DEFAULT = 5500

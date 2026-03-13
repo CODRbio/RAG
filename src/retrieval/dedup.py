@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
 import re
 from collections import OrderedDict, defaultdict
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -18,7 +17,8 @@ from urllib.error import URLError
 from urllib.parse import quote, unquote, urlparse, urlencode
 from urllib.request import Request, urlopen
 
-logger = logging.getLogger(__name__)
+from src.log import get_logger
+logger = get_logger(__name__)
 
 _LRU_MAX = 512
 

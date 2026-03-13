@@ -323,6 +323,26 @@
       "cache_ttl_seconds": 1800
     }
   },
+  "storage": {
+    "max_age_days": 30,
+    "max_size_gb": 5,
+    "cleanup_on_startup": true,
+    "cleanup_batch_size": 100,
+    "media": {
+      "backend": "local",
+      "public_base_url": "",
+      "local": {
+        "root": "data/media"
+      },
+      "s3": {
+        "bucket": "",
+        "region": "",
+        "endpoint": "",
+        "key_prefix": "",
+        "public_base_url": ""
+      }
+    }
+  },
   "tool_execution": {
     "_comment": "run_code 默认关闭。只有在受信任环境中才建议开启；开启后仍仅限受限 Python 计算。",
     "run_code_enabled": false,

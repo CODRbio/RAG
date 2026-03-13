@@ -22,7 +22,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import re
 import threading
 from pathlib import Path
@@ -32,8 +31,9 @@ from sqlmodel import Session, select, and_
 
 from src.db.engine import get_engine
 from src.db.models import CrossrefCache, CrossrefCacheByDoi, PaperMetadata
+from src.log import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _JSON_PATH = Path("data/paper_metadata.json")
 

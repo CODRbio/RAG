@@ -6,6 +6,7 @@ import { getTaskQueue, cancelTask } from '../../api/chat';
 import { listIngestJobs } from '../../api/ingest';
 import type { TaskQueueResponse } from '../../types';
 import type { IngestJobInfo } from '../../api/ingest';
+import { logger } from '../../utils/logger';
 
 interface TaskCenterProps {
   open: boolean;
@@ -30,7 +31,7 @@ export function TaskCenter({ open, onClose, anchor }: TaskCenterProps) {
       setSnap(data);
       setIngestJobs([...runningIngest, ...pendingIngest]);
     } catch (e) {
-      console.error('[TaskCenter] refresh failed:', e);
+      logger.ui.error('[TaskCenter] refresh failed', e);
     } finally {
       setLoading(false);
     }
@@ -56,7 +57,7 @@ export function TaskCenter({ open, onClose, anchor }: TaskCenterProps) {
       await refresh();
       useChatStore.getState().clearStreamingTask(taskId);
     } catch (e) {
-      console.error('[TaskCenter] cancel failed:', e);
+      logger.ui.error('[TaskCenter] cancel failed', e);
     } finally {
       setCancellingId(null);
     }

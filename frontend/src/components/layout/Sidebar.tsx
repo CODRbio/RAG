@@ -31,6 +31,7 @@ import { exportCanvas, getCanvas } from '../../api/canvas';
 import { toggleDebug } from '../../api/debug';
 import type { SessionListItem, DeepResearchJobInfo, ResearchDashboardData } from '../../types';
 import { DEEP_RESEARCH_JOB_KEY } from '../workflow/deep-research/types';
+import { logger } from '../../utils/logger';
 
 interface SidebarProps {
   onStartResize: () => void;
@@ -151,7 +152,7 @@ export function Sidebar({ onStartResize }: SidebarProps) {
     { value: 'sonar', label: 'Sonar (fast)' },
     { value: 'sonar-pro', label: 'Sonar Pro (balanced)' },
     { value: 'sonar-reasoning-pro', label: 'Reasoning Pro (deep)' },
-    { value: 'sonar-deep-research', label: 'Deep Research' },
+    { value: 'sonar-deep-research', label: 'Deep Research (standard, high-cost)' },
   ]);
 
   // 加载 Pre-Research 可选模型（与 Header LLM 选择同源：perplexity/sonar provider 的 models）
@@ -171,9 +172,11 @@ export function Sidebar({ onStartResize }: SidebarProps) {
             'sonar-reasoning-pro': t('sidebar.sonarStrengthReasoningPro', 'Reasoning Pro (deep)'),
             'sonar-deep-research': t('sidebar.sonarStrengthDeepResearch', 'Deep Research'),
           };
-          const next = Array.isArray(liveModels)
-            ? liveModels.map((id) => ({ value: id, label: labelMap[id] ?? id }))
-            : [];
+          const knownIds = ['sonar', 'sonar-pro', 'sonar-reasoning-pro', 'sonar-deep-research'];
+          const apiIds: string[] = Array.isArray(liveModels) ? liveModels : [];
+          // Merge: API-returned models first, then append any known models missing from API response
+          const mergedIds = [...apiIds, ...knownIds.filter((id) => !apiIds.includes(id))];
+          const next = mergedIds.map((id) => ({ value: id, label: labelMap[id] ?? id }));
           setSonarModelOptions((prev) => (next.length > 0 ? next : prev));
         }).catch(() => {});
       })
@@ -195,7 +198,7 @@ export function Sidebar({ onStartResize }: SidebarProps) {
       });
       setBackgroundJobs(sorted);
     } catch (error) {
-      console.error('[Sidebar] Failed to load background jobs:', error);
+      logger.ui.error('[Sidebar] Failed to load background jobs', error);
     } finally {
       setIsLoadingJobs(false);
     }
@@ -234,7 +237,7 @@ export function Sidebar({ onStartResize }: SidebarProps) {
         const sessions = await listSessions(50);
         setChatHistory(sessions);
       } catch (error) {
-        console.error('Failed to load sessions:', error);
+        logger.ui.error('[Sidebar] Failed to load sessions', error);
       } finally {
         setIsLoadingSessions(false);
       }
@@ -273,7 +276,7 @@ export function Sidebar({ onStartResize }: SidebarProps) {
           if (canvasData) setCanvas(canvasData);
           if (exportResp?.content) setCanvasContent(exportResp.content);
         } catch (err) {
-          console.error('[Sidebar] Failed to load canvas:', err);
+          logger.ui.error('[Sidebar] Failed to load canvas', err);
         } finally {
           setCanvasLoading(false);
         }
@@ -314,7 +317,7 @@ export function Sidebar({ onStartResize }: SidebarProps) {
             }
             if (exportResp?.content) setCanvasContent(exportResp.content);
           } catch (err) {
-            console.error('[Sidebar] Failed to load canvas for job:', err);
+            logger.ui.error('[Sidebar] Failed to load canvas for job', err);
           } finally {
             setCanvasLoading(false);
           }
@@ -337,7 +340,7 @@ export function Sidebar({ onStartResize }: SidebarProps) {
             }
             if (exportResp?.content) setCanvasContent(exportResp.content);
           } catch (err) {
-            console.error('[Sidebar] Failed to load canvas for job:', err);
+            logger.ui.error('[Sidebar] Failed to load canvas for job', err);
           } finally {
             setCanvasLoading(false);
           }
@@ -354,7 +357,7 @@ export function Sidebar({ onStartResize }: SidebarProps) {
       );
     } catch (error) {
       addToast(t('sidebar.bgJobRestoreFailed'), 'error');
-      console.error('[Sidebar] Restore background job failed:', error);
+      logger.ui.error('[Sidebar] Restore background job failed', error);
     }
   };
 

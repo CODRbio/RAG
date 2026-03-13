@@ -26,6 +26,8 @@ def _mk_chunk(
     authors=None,
     year: int | None = 2024,
     url: str | None = None,
+    page_num: int | None = None,
+    bbox=None,
 ) -> EvidenceChunk:
     return EvidenceChunk(
         chunk_id=chunk_id,
@@ -37,12 +39,14 @@ def _mk_chunk(
         authors=authors or ["Smith, John"],
         year=year,
         url=url,
+        page_num=page_num,
+        bbox=bbox,
     )
 
 
 def test_same_document_multiple_hashes_resolve_to_one_citation():
-    c1 = _mk_chunk(chunk_id="chunk-a", doc_id="doc-1", title="Paper A")
-    c2 = _mk_chunk(chunk_id="chunk-b", doc_id="doc-1", title="Paper A")
+    c1 = _mk_chunk(chunk_id="chunk-a", doc_id="doc-1", title="Paper A", page_num=2, bbox=[10, 20, 30, 40])
+    c2 = _mk_chunk(chunk_id="chunk-b", doc_id="doc-1", title="Paper A", page_num=5, bbox=[11, 22, 33, 44])
     c3 = _mk_chunk(chunk_id="chunk-c", doc_id="doc-2", title="Paper B", authors=["Jones, Amy"], year=2023)
 
     raw = f"Claim X [{c1.ref_hash}] and supporting Y [{c2.ref_hash}]. Compare Z [{c3.ref_hash}]."
@@ -58,6 +62,11 @@ def test_same_document_multiple_hashes_resolve_to_one_citation():
     assert f"[{c3.ref_hash}]" not in resolved
     assert resolved.count(f"[{ref_map[c1.ref_hash]}]") == 2
     assert resolved.count(f"[{ref_map[c3.ref_hash]}]") == 1
+    assert citations[0].chunk_id == "chunk-a"
+    assert citations[0].page_num == 3
+    assert citations[0].bbox == [10, 20, 30, 40]
+    assert [anchor.chunk_id for anchor in citations[0].anchors] == ["chunk-a", "chunk-b"]
+    assert [anchor.page_num for anchor in citations[0].anchors] == [3, 6]
 
 
 def test_cross_stage_reuse_keeps_stable_numeric_keys():
