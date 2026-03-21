@@ -129,11 +129,25 @@ def _ensure_schema_updates() -> None:
         ("scholar_libraries", "folder_path", "TEXT"),
         ("scholar_library_papers", "venue", "TEXT NOT NULL DEFAULT ''"),
         ("scholar_library_papers", "normalized_journal_name", "TEXT NOT NULL DEFAULT ''"),
+        ("scholar_library_papers", "paper_uid", "TEXT NOT NULL DEFAULT ''"),
+        ("paper_metadata", "paper_uid", "TEXT NOT NULL DEFAULT ''"),
+        ("papers", "paper_uid", "TEXT NOT NULL DEFAULT ''"),
+    ]
+    _create_index_if_missing = [
+        "CREATE INDEX IF NOT EXISTS idx_pm_paper_uid ON paper_metadata (paper_uid)",
+        "CREATE INDEX IF NOT EXISTS idx_scholar_lib_papers_paper_uid ON scholar_library_papers (paper_uid)",
+        "CREATE INDEX IF NOT EXISTS idx_papers_paper_uid ON papers (paper_uid)",
     ]
     with engine.connect() as conn:
         for table, col, col_type in _add_column_if_missing:
             try:
                 conn.execute(sa.text(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}"))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+        for stmt in _create_index_if_missing:
+            try:
+                conn.execute(sa.text(stmt))
                 conn.commit()
             except Exception:
                 conn.rollback()

@@ -26,8 +26,10 @@ from src.api.routes_models import router as models_router
 from src.api.routes_ingest import router as ingest_router
 from src.api.routes_graph import router as graph_router
 from src.api.routes_compare import router as compare_router
+from src.api.routes_academic_assistant import router as academic_assistant_router
 from src.api.routes_config import router as config_router
 from src.api.routes_debug import router as debug_router
+from src.api.routes_resources import router as resources_router
 from src.api.routes_scholar import router as scholar_router
 from src.api.routes_tasks import router as tasks_router
 from src.log import get_logger
@@ -145,6 +147,12 @@ async def lifespan(app: FastAPI):
         await wait_scholar_background_tasks_or_timeout(timeout)
     except Exception as e:
         logger.warning("scholar shutdown wait failed: %s", e)
+    try:
+        from src.api.routes_academic_assistant import wait_academic_assistant_background_tasks_or_timeout
+        timeout = getattr(settings.tasks, "graceful_shutdown_timeout_seconds", 30)
+        await wait_academic_assistant_background_tasks_or_timeout(timeout)
+    except Exception as e:
+        logger.warning("academic assistant shutdown wait failed: %s", e)
     worker_task.cancel()
     try:
         await worker_task
@@ -195,7 +203,9 @@ app.include_router(models_router)
 app.include_router(ingest_router)
 app.include_router(graph_router)
 app.include_router(compare_router)
+app.include_router(academic_assistant_router)
 app.include_router(debug_router)
+app.include_router(resources_router)
 app.include_router(scholar_router)
 
 # Static files: Graphic Abstract 生成的图片

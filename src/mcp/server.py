@@ -133,6 +133,34 @@ def explore_graph(entity_name: str, depth: int = 1) -> str:
 
 
 @mcp.tool()
+def explore_academic_graph(
+    graph_type: str,
+    scope_type: str = "collection",
+    scope_key: str = "",
+    paper_uid: str = "",
+    node_id: str = "",
+    depth: int = 1,
+    question: str = "",
+) -> str:
+    """统一学术图探索，支持 citation / author / institution 图，并按 collection -> bound library -> global 回退。"""
+    try:
+        from src.llm.tools import _handle_explore_academic_graph, set_tool_user_id
+
+        set_tool_user_id("default")
+        return _handle_explore_academic_graph(
+            graph_type=graph_type,
+            scope_type=scope_type,
+            scope_key=scope_key,
+            paper_uid=paper_uid,
+            node_id=node_id,
+            depth=depth,
+            question=question,
+        )
+    except Exception as e:
+        return f"学术图查询失败: {e}"
+
+
+@mcp.tool()
 def canvas(action: str, canvas_id: str = "", topic: str = "", content: str = "") -> str:
     """操作研究画布：创建(create)、获取(get)、更新(update)画布内容。"""
     from src.collaboration.canvas.canvas_manager import create_canvas, get_canvas, update_canvas
@@ -195,6 +223,121 @@ def compare_papers(paper_ids: list, aspects: Optional[list] = None) -> str:
         return "\n".join(parts) if parts else "对比结果为空"
     except Exception as e:
         return f"论文对比失败: {e}"
+
+
+@mcp.tool()
+def summarize_paper(
+    paper_uid: str = "",
+    paper_id: str = "",
+    collection: str = "",
+    question: str = "",
+) -> str:
+    """单篇论文精读总结，可结合论文中的图片解析和已有标注。"""
+    try:
+        from src.services.reference_assistant_service import get_reference_assistant_service
+
+        service = get_reference_assistant_service()
+        resp = service.summarize_paper(
+            {
+                "paper_uid": (paper_uid or "").strip(),
+                "paper_id": (paper_id or "").strip(),
+                "collection": (collection or "").strip(),
+            },
+            user_id="default",
+            question=(question or "").strip() or None,
+        )
+        return str(resp.get("summary_md") or "").strip() or "论文总结为空"
+    except Exception as e:
+        return f"论文精读失败: {e}"
+
+
+@mcp.tool()
+def ask_paper(
+    question: str,
+    paper_uid: str = "",
+    paper_id: str = "",
+    collection: str = "",
+) -> str:
+    """针对单篇论文做定向问答。"""
+    try:
+        from src.services.reference_assistant_service import get_reference_assistant_service
+
+        service = get_reference_assistant_service()
+        resp = service.ask_paper(
+            {
+                "paper_uid": (paper_uid or "").strip(),
+                "paper_id": (paper_id or "").strip(),
+                "collection": (collection or "").strip(),
+            },
+            user_id="default",
+            question=(question or "").strip(),
+        )
+        return str(resp.get("answer_md") or "").strip() or "论文问答结果为空"
+    except Exception as e:
+        return f"论文问答失败: {e}"
+
+
+@mcp.tool()
+def analyze_paper_media(
+    paper_uids: list,
+    scope_type: str = "collection",
+    scope_key: str = "",
+    force_reparse: bool = False,
+) -> str:
+    """补充论文图片解析，并增量写入向量库。"""
+    try:
+        from src.services.reference_assistant_service import get_reference_assistant_service
+
+        service = get_reference_assistant_service()
+        resp = service.analyze_paper_media(
+            [str(item).strip() for item in (paper_uids or []) if str(item).strip()],
+            user_id="default",
+            scope={"scope_type": scope_type or "collection", "scope_key": (scope_key or "").strip()},
+            force_reparse=bool(force_reparse),
+            upsert_vectors_enabled=True,
+        )
+        return str(resp.get("summary_md") or "").strip() or "图片解析结果为空"
+    except Exception as e:
+        return f"图片解析失败: {e}"
+
+
+@mcp.tool()
+def discover_academic_resources(
+    mode: str,
+    paper_uids: Optional[list] = None,
+    node_ids: Optional[list] = None,
+    scope_type: str = "collection",
+    scope_key: str = "",
+    question: str = "",
+    limit: int = 10,
+) -> str:
+    """执行 Missing Core / Forward Tracking / 学者 / 机构发现。"""
+    try:
+        from src.services.reference_assistant_service import get_reference_assistant_service
+
+        service = get_reference_assistant_service()
+        resp = service.discover(
+            mode=(mode or "").strip(),
+            user_id="default",
+            seeds={
+                "paper_uids": [str(item).strip() for item in (paper_uids or []) if str(item).strip()],
+                "node_ids": [str(item).strip() for item in (node_ids or []) if str(item).strip()],
+            },
+            scope={"scope_type": scope_type or "collection", "scope_key": (scope_key or "").strip()},
+            options={"question": (question or "").strip(), "limit": int(limit or 10)},
+        )
+        parts = []
+        if resp.get("summary_md"):
+            parts.append(str(resp["summary_md"]).strip())
+        items = resp.get("items") or []
+        if items:
+            parts.append("")
+            parts.append("Items:")
+            for item in items[:10]:
+                parts.append(f"- {json.dumps(item, ensure_ascii=False)}")
+        return "\n".join(parts).strip() or "发现结果为空"
+    except Exception as e:
+        return f"学术发现失败: {e}"
 
 
 @mcp.tool()

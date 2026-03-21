@@ -15,6 +15,7 @@ class TaskKind(str, Enum):
     chat = "chat"
     dr = "dr"
     scholar = "scholar"
+    academic_assistant = "academic_assistant"
 
 
 class TaskStatus(str, Enum):

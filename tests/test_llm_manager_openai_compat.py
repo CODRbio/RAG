@@ -1,7 +1,10 @@
 from unittest.mock import patch, MagicMock
 
+from config.settings import settings
+from src.llm import llm_manager as llm_manager_mod
 from src.llm.llm_manager import HTTPChatClient, OpenAICompatProvider, ProviderConfig
 from src.llm.tools import has_tool_calls, parse_tool_calls
+from src.utils.cache import TTLCache
 
 
 def _make_client(name: str, base_url: str, default_model: str = "gpt-5.2") -> HTTPChatClient:
@@ -64,8 +67,35 @@ def test_gemini_openai_compat_normalizes_minimal_reasoning_effort():
         tools=None,
     )
     assert payload.get("_api_mode") == "gemini_native"
-    assert payload.get("generationConfig", {}).get("thinkingConfig") == {"thinkingLevel": "low"}
+    assert payload.get("generationConfig", {}).get("thinkingConfig") == {"thinkingBudget": 512}
     assert payload.get("_fallback_payload", {}).get("reasoning_effort") == "low"
+
+
+def test_openai_prompt_cache_fields_are_injected():
+    client = _make_client("openai", "https://api.openai.com/v1")
+    payload = client._build_openai_payload(
+        messages=[{"role": "user", "content": "hello"}],
+        model="gpt-5.4",
+        params={},
+        cache_policy=client._resolve_cache_policy(
+            {"cache": {"scope": "global_template", "key": "query_family", "retention": "24h"}},
+            "gpt-5.4",
+        ),
+    )
+    assert payload["prompt_cache_key"] == "query_family"
+    assert payload["prompt_cache_retention"] == "24h"
+
+
+def test_openai_does_not_inject_prompt_cache_fields_without_explicit_cache_config():
+    client = _make_client("openai", "https://api.openai.com/v1")
+    payload = client._build_openai_payload(
+        messages=[{"role": "user", "content": "hello"}],
+        model="gpt-5.4",
+        params={},
+        cache_policy=client._resolve_cache_policy({}, "gpt-5.4"),
+    )
+    assert "prompt_cache_key" not in payload
+    assert "prompt_cache_retention" not in payload
 
 
 def test_openai_responses_payload_converts_tool_loop_messages():
@@ -156,6 +186,70 @@ class _MockStreamProvider:
             yield item
 
 
+class _MockRequestProvider:
+    def __init__(self):
+        self.calls = 0
+
+    def request(self, payload, timeout=None):
+        _ = payload, timeout
+        self.calls += 1
+        return {
+            "choices": [{"message": {"content": "cached answer"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 2},
+        }
+
+    def request_stream(self, payload, timeout=None):
+        _ = payload, timeout
+        raise NotImplementedError
+
+
+class _CaptureRequestProvider:
+    def __init__(self, raw_response=None):
+        self.calls = 0
+        self.last_payload = None
+        self._raw_response = raw_response or {
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 1},
+        }
+
+    def request(self, payload, timeout=None):
+        _ = timeout
+        self.calls += 1
+        self.last_payload = payload
+        return self._raw_response
+
+    def request_stream(self, payload, timeout=None):
+        _ = payload, timeout
+        raise NotImplementedError
+
+
+class _MetricRecorder:
+    def __init__(self):
+        self.events = []
+
+    def labels(self, **labels):
+        recorder = self
+
+        class _Handle:
+            def inc(self, value=1):
+                recorder.events.append(("inc", labels, value))
+
+            def observe(self, value):
+                recorder.events.append(("observe", labels, value))
+
+        return _Handle()
+
+
+class _FakeMetrics:
+    def __init__(self):
+        self.llm_requests_total = _MetricRecorder()
+        self.llm_duration_seconds = _MetricRecorder()
+        self.llm_errors_total = _MetricRecorder()
+        self.llm_tokens_used = _MetricRecorder()
+        self.llm_cached_tokens_total = _MetricRecorder()
+        self.llm_cache_events_total = _MetricRecorder()
+
+
 def test_openai_stream_chat_normalizes_chat_completions_deltas():
     cfg = ProviderConfig(
         name="openai",
@@ -179,7 +273,161 @@ def test_openai_stream_chat_normalizes_chat_completions_deltas():
     assert events[1] == {"type": "text_delta", "delta": "lo"}
     assert events[-1]["type"] == "completed"
     assert events[-1]["response"]["final_text"] == "Hello"
-    assert events[-1]["response"]["meta"]["usage"] == {"prompt_tokens": 1, "completion_tokens": 2}
+    usage = events[-1]["response"]["meta"]["usage"]
+    assert usage["prompt_tokens"] == 1
+    assert usage["completion_tokens"] == 2
+    assert usage["cached_input_tokens"] == 0
+    assert usage["cache_hit"] is False
+
+
+def test_http_chat_client_app_cache_reuses_buffered_response():
+    cfg = ProviderConfig(
+        name="openai",
+        api_key="test-key",
+        base_url="https://api.openai.com/v1",
+        default_model="gpt-4o-mini",
+        platform="openai",
+        models={},
+        params={},
+    )
+    provider = _MockRequestProvider()
+    client = HTTPChatClient(cfg, provider, app_cache=TTLCache(maxsize=8, ttl_seconds=60))
+
+    with patch.object(settings.perf_llm, "cache_enabled", True):
+        first = client.chat(
+            [{"role": "user", "content": "hi"}],
+            cache={"mode": "provider_plus_app", "scope": "global_template"},
+        )
+        second = client.chat(
+            [{"role": "user", "content": "hi"}],
+            cache={"mode": "provider_plus_app", "scope": "global_template"},
+        )
+
+    assert provider.calls == 1
+    assert first["final_text"] == "cached answer"
+    assert second["meta"]["cache"]["source"] == "app"
+    assert second["meta"]["cache"]["hit"] is True
+
+
+def test_http_chat_client_omits_provider_cache_without_explicit_config():
+    cfg = ProviderConfig(
+        name="openai",
+        api_key="test-key",
+        base_url="https://api.openai.com/v1",
+        default_model="gpt-5.4",
+        platform="openai",
+        models={},
+        params={},
+    )
+    provider = _CaptureRequestProvider()
+    client = HTTPChatClient(cfg, provider)
+
+    result = client.chat([{"role": "user", "content": "hi"}])
+
+    assert provider.calls == 1
+    assert "prompt_cache_key" not in provider.last_payload
+    assert "prompt_cache_retention" not in provider.last_payload
+    assert result["meta"]["cache"]["provider_enabled"] is False
+    assert result["meta"]["cache"]["mode"] == "off"
+
+
+def test_http_chat_client_strips_internal_cache_keys_from_provider_payload():
+    cfg = ProviderConfig(
+        name="openai",
+        api_key="test-key",
+        base_url="https://api.openai.com/v1",
+        default_model="gpt-5.4",
+        platform="openai",
+        models={},
+        params={},
+    )
+    provider = _CaptureRequestProvider()
+    client = HTTPChatClient(cfg, provider)
+
+    client.chat(
+        [{"role": "user", "content": "hi"}],
+        cache={
+            "mode": "provider_only",
+            "scope": "global_template",
+            "key": "stable-key",
+            "retention": "24h",
+        },
+        cache_mode="provider_only",
+        cache_scope="section",
+        enable_prompt_cache=True,
+        gemini_cached_content="cachedContents/abc",
+    )
+
+    assert provider.last_payload["prompt_cache_key"] == "stable-key"
+    assert provider.last_payload["prompt_cache_retention"] == "24h"
+    assert "cache" not in provider.last_payload
+    assert "cache_mode" not in provider.last_payload
+    assert "cache_scope" not in provider.last_payload
+    assert "enable_prompt_cache" not in provider.last_payload
+    assert "gemini_cached_content" not in provider.last_payload
+
+
+def test_http_chat_client_app_cache_respects_request_ttl_override():
+    cfg = ProviderConfig(
+        name="openai",
+        api_key="test-key",
+        base_url="https://api.openai.com/v1",
+        default_model="gpt-4o-mini",
+        platform="openai",
+        models={},
+        params={},
+    )
+    provider = _MockRequestProvider()
+    client = HTTPChatClient(cfg, provider, app_cache=TTLCache(maxsize=8, ttl_seconds=60))
+    messages = [{"role": "user", "content": "hi"}]
+    cache = {"mode": "provider_plus_app", "scope": "global_template", "ttl_seconds": 1}
+
+    with patch.object(settings.perf_llm, "cache_enabled", True):
+        client.chat(messages, cache=cache)
+        cache_key = client._build_app_cache_key(
+            resolved_model="gpt-4o-mini",
+            messages=messages,
+            params={},
+            tools=None,
+            response_model=None,
+            is_anthropic=False,
+        )
+        client._app_cache.set(
+            cache_key,
+            {
+                "expires_at": 0.0,
+                "result": client._app_cache.get(cache_key)["result"],
+            },
+        )
+        client.chat(messages, cache=cache)
+
+    assert provider.calls == 2
+
+
+def test_http_chat_client_records_provider_cache_unknown_without_usage():
+    cfg = ProviderConfig(
+        name="openai",
+        api_key="test-key",
+        base_url="https://api.openai.com/v1",
+        default_model="gpt-5.4",
+        platform="openai",
+        models={},
+        params={},
+    )
+    provider = _CaptureRequestProvider(
+        raw_response={"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
+    )
+    client = HTTPChatClient(cfg, provider)
+    fake_metrics = _FakeMetrics()
+
+    with patch.object(llm_manager_mod, "_obs_metrics", fake_metrics):
+        client.chat(
+            [{"role": "user", "content": "hi"}],
+            cache={"mode": "provider_only", "scope": "global_template", "key": "stable-key"},
+        )
+
+    cache_events = fake_metrics.llm_cache_events_total.events
+    assert ("inc", {"provider": "openai", "model": "gpt-5.4", "source": "provider", "result": "unknown"}, 1) in cache_events
 
 
 def test_openai_stream_chat_normalizes_responses_api_deltas():
@@ -207,7 +455,11 @@ def test_openai_stream_chat_normalizes_responses_api_deltas():
 
     assert [e["delta"] for e in events if e["type"] == "text_delta"] == ["A", "B"]
     assert events[-1]["response"]["final_text"] == "AB"
-    assert events[-1]["response"]["meta"]["usage"] == {"prompt_tokens": 3, "completion_tokens": 4}
+    usage = events[-1]["response"]["meta"]["usage"]
+    assert usage["prompt_tokens"] == 3
+    assert usage["completion_tokens"] == 4
+    assert usage["cached_input_tokens"] == 0
+    assert usage["cache_hit"] is False
 
 
 def test_stream_chat_falls_back_to_buffered_chunks_when_native_stream_unavailable():

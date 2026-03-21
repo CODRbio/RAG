@@ -51,6 +51,54 @@ def test_claude_adaptive_thinking_gets_default_effort():
     assert payload["max_tokens"] == 64000
 
 
+def test_claude_auto_prompt_cache_sets_top_level_cache_control():
+    client = _make_claude_client(default_model="claude-sonnet-4-6")
+    policy = client._resolve_cache_policy(
+        {"cache": {"mode": "provider_only", "strategy": "auto"}},
+        "claude-sonnet-4-6",
+    )
+    payload = client._build_anthropic_payload(
+        messages=[{"role": "system", "content": "sys"}, {"role": "user", "content": "hello"}],
+        model="claude-sonnet-4-6",
+        params={},
+        tools=None,
+        cache_policy=policy,
+    )
+    assert payload["cache_control"] == {"type": "ephemeral"}
+    assert payload["system"] == "sys"
+
+
+def test_claude_explicit_prompt_cache_marks_system_and_first_user():
+    client = _make_claude_client(default_model="claude-sonnet-4-6")
+    policy = client._resolve_cache_policy(
+        {"cache": {"mode": "provider_only", "strategy": "explicit", "scope": "section"}},
+        "claude-sonnet-4-6",
+    )
+    payload = client._build_anthropic_payload(
+        messages=[{"role": "system", "content": "sys"}, {"role": "user", "content": "hello"}],
+        model="claude-sonnet-4-6",
+        params={},
+        tools=None,
+        cache_policy=policy,
+    )
+    assert payload["system"][0]["cache_control"] == {"type": "ephemeral"}
+    assert payload["messages"][0]["content"][0]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_claude_enable_prompt_cache_alias_keeps_backward_compatible_behavior():
+    client = _make_claude_client(default_model="claude-sonnet-4-6")
+    policy = client._resolve_cache_policy({"enable_prompt_cache": True}, "claude-sonnet-4-6")
+    payload = client._build_anthropic_payload(
+        messages=[{"role": "system", "content": "sys"}, {"role": "user", "content": "hello"}],
+        model="claude-sonnet-4-6",
+        params={},
+        tools=None,
+        cache_policy=policy,
+    )
+    assert policy.provider_enabled is True
+    assert payload["system"][0]["cache_control"] == {"type": "ephemeral"}
+
+
 class _MockAnthropicStreamProvider:
     def request(self, payload, timeout=None):
         _ = payload, timeout

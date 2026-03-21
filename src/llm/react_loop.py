@@ -180,6 +180,12 @@ def react_loop(
     result = ReactResult()
 
     is_anthropic = getattr(getattr(llm_client, "config", None), "is_anthropic", lambda: False)()
+    provider_supports_platform_tools = bool(getattr(llm_client, "supports_platform_tool_calls", True))
+    if tools and not provider_supports_platform_tools:
+        provider_name = getattr(getattr(llm_client, "config", None), "name", type(llm_client).__name__)
+        raise ValueError(
+            f"Provider '{provider_name}' does not support the platform ReAct tool loop."
+        )
 
     supports_fc = True
     working_messages = list(messages)
@@ -271,6 +277,13 @@ def react_loop(
             result.final_text = f"[LLM 调用失败: {e}]"
             break
         llm_elapsed_ms = round((time.perf_counter() - t_llm) * 1000)
+
+        # Codex app-server: same logical thread must be passed on subsequent iterations
+        # (each llm_client.chat() starts a short-lived subprocess).
+        if isinstance(resp, dict):
+            _codex_tid = (resp.get("meta") or {}).get("codex_thread_id")
+            if _codex_tid:
+                llm_kwargs["codex_thread_id"] = str(_codex_tid)
 
         raw = resp.get("raw", {})
         result.raw_response = resp

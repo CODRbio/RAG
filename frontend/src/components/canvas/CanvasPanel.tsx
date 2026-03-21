@@ -41,13 +41,11 @@ export function CanvasPanel({ onStartResize }: CanvasPanelProps) {
   const {
     workflowStep,
     sessionId,
-    canvasId: chatCanvasId,
     setCanvasId,
     setShowDeepResearchDialog,
     setDeepResearchTopic,
     setDeepResearchActive,
     setSessionId,
-    setResearchDashboard,
     deepResearchActive,
   } = useChatStore();
   const { canvasWidth, setCanvasOpen, requestSessionListRefresh } = useUIStore();

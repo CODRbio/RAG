@@ -1,4 +1,12 @@
 import client from './client';
+import type {
+  GraphScopePayload,
+  GraphSnapshotItem,
+  GraphType,
+  TypedGraphStats,
+  TypedGraphSubgraph,
+  TypedGraphSummary,
+} from '../types';
 
 export interface GraphStats {
   available: boolean;
@@ -81,5 +89,74 @@ export async function getChunkDetail(params: {
   const res = await client.get<ChunkDetail>(`/graph/chunk/${encodeURIComponent(chunk_id)}`, {
     params: { collection, paper_id },
   });
+  return res.data;
+}
+
+export async function getTypedGraphStats(
+  graphType: Exclude<GraphType, 'entity'>,
+  scope: GraphScopePayload,
+): Promise<TypedGraphStats> {
+  const res = await client.get<TypedGraphStats>(`/graph/${encodeURIComponent(graphType)}/stats`, {
+    params: {
+      scope_type: scope.scope_type,
+      scope_key: scope.scope_key,
+    },
+  });
+  return res.data;
+}
+
+export async function queryTypedGraphSubgraph(
+  graphType: Exclude<GraphType, 'entity'>,
+  body: {
+    scope: GraphScopePayload;
+    seed_node_ids?: string[];
+    paper_uids?: string[];
+    depth?: number;
+    limit?: number;
+    snapshot_version?: number | null;
+  },
+): Promise<TypedGraphSubgraph> {
+  const res = await client.post<TypedGraphSubgraph>(`/graph/${encodeURIComponent(graphType)}/subgraph`, body);
+  return res.data;
+}
+
+export async function summarizeTypedGraph(
+  graphType: Exclude<GraphType, 'entity'>,
+  body: {
+    subgraph_request: {
+      scope: GraphScopePayload;
+      seed_node_ids?: string[];
+      paper_uids?: string[];
+      depth?: number;
+      limit?: number;
+      snapshot_version?: number | null;
+    };
+    question?: string;
+    max_items?: number;
+    format?: 'markdown';
+  },
+): Promise<TypedGraphSummary> {
+  const res = await client.post<TypedGraphSummary>(`/graph/${encodeURIComponent(graphType)}/summary`, body);
+  return res.data;
+}
+
+export async function listTypedGraphSnapshots(
+  graphType: Exclude<GraphType, 'entity'>,
+  scope: GraphScopePayload,
+): Promise<{ items: GraphSnapshotItem[] }> {
+  const res = await client.get<{ items: GraphSnapshotItem[] }>(`/graph/${encodeURIComponent(graphType)}/snapshots`, {
+    params: {
+      scope_type: scope.scope_type,
+      scope_key: scope.scope_key,
+    },
+  });
+  return res.data;
+}
+
+export async function rebuildTypedGraphSnapshot(
+  graphType: Exclude<GraphType, 'entity'>,
+  scope: GraphScopePayload,
+): Promise<GraphSnapshotItem> {
+  const res = await client.post<GraphSnapshotItem>(`/graph/${encodeURIComponent(graphType)}/snapshots/rebuild`, scope);
   return res.data;
 }

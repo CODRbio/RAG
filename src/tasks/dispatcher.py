@@ -527,6 +527,7 @@ async def process_download_and_ingest(
         "url": paper_info.get("url"),
         "pdf_url": paper_info.get("pdf_url"),
         "arxiv_id": paper_info.get("arxiv_id"),
+        "pmid": paper_info.get("pmid"),
     }
     ingest_job_id = _trigger_ingest_pipeline(
         filepath=filepath,

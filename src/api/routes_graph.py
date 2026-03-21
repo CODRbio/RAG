@@ -8,16 +8,48 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
 
 from config.settings import settings
-from src.api.routes_auth import get_optional_user_id
+from src.api.routes_auth import get_current_user_id, get_optional_user_id
 from src.log import get_logger
 from src.services.collection_library_binding_service import resolve_bound_library_for_collection
+from src.services.global_graph_service import get_global_graph_service
 from src.utils.path_manager import PathManager
 
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/graph", tags=["graph"])
+
+
+class GraphScopePayload(BaseModel):
+    scope_type: str = Field(default="global", description="global | collection | library")
+    scope_key: str = Field(default="global", description="global 使用 global；collection 使用集合名；library 使用库 ID")
+    user_id: Optional[str] = Field(default=None, description="保留字段；HTTP 接口会以当前登录用户为准")
+
+
+class GraphSubgraphRequest(BaseModel):
+    scope: GraphScopePayload = Field(default_factory=GraphScopePayload)
+    seed_node_ids: Optional[List[str]] = Field(default=None, description="节点 ID 列表")
+    paper_uids: Optional[List[str]] = Field(default=None, description="论文 paper_uid 列表")
+    depth: int = Field(default=1, ge=1, le=3, description="扩展深度")
+    limit: int = Field(default=50, ge=1, le=300, description="最大节点数")
+    snapshot_version: Optional[int] = Field(default=None, description="指定快照版本")
+
+
+class GraphSummaryRequest(BaseModel):
+    subgraph_request: GraphSubgraphRequest
+    question: Optional[str] = Field(default=None, description="面向 LLM 的图问题")
+    max_items: Optional[int] = Field(default=8, ge=1, le=20, description="摘要中展示的最大条目数")
+    format: str = Field(default="markdown", description="当前仅支持 markdown")
+
+
+def _scope_payload_to_dict(scope: GraphScopePayload, user_id: str) -> Dict[str, Any]:
+    return {
+        "user_id": user_id,
+        "scope_type": (scope.scope_type or "global").strip().lower(),
+        "scope_key": (scope.scope_key or "global").strip() or "global",
+    }
 
 
 def _has_bbox(bbox: Any) -> bool:
@@ -324,6 +356,123 @@ def graph_neighbors(
         "nodes": nodes,
         "edges": edges,
     }
+
+
+@router.get("/{graph_type}/stats")
+def graph_type_stats(
+    graph_type: str,
+    scope_type: str = Query("global", description="global | collection | library"),
+    scope_key: str = Query("global", description="scope key"),
+    user_id: str = Depends(get_current_user_id),
+) -> Dict[str, Any]:
+    try:
+        svc = get_global_graph_service()
+        return svc.graph_stats(
+            graph_type=graph_type,
+            scope={"user_id": user_id, "scope_type": scope_type, "scope_key": scope_key},
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.warning("graph_type_stats failed graph_type=%s scope=%s:%s err=%s", graph_type, scope_type, scope_key, e)
+        raise HTTPException(status_code=500, detail=f"图统计失败: {e}")
+
+
+@router.post("/{graph_type}/subgraph")
+def graph_type_subgraph(
+    graph_type: str,
+    body: GraphSubgraphRequest,
+    user_id: str = Depends(get_current_user_id),
+) -> Dict[str, Any]:
+    try:
+        svc = get_global_graph_service()
+        return svc.query_subgraph(
+            graph_type=graph_type,
+            scope=_scope_payload_to_dict(body.scope, user_id),
+            seeds={
+                "node_ids": body.seed_node_ids or [],
+                "paper_uids": body.paper_uids or [],
+            },
+            depth=body.depth,
+            limit=body.limit,
+            snapshot_version=body.snapshot_version,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.warning("graph_type_subgraph failed graph_type=%s body=%s err=%s", graph_type, body.model_dump(), e)
+        raise HTTPException(status_code=500, detail=f"子图查询失败: {e}")
+
+
+@router.post("/{graph_type}/summary")
+def graph_type_summary(
+    graph_type: str,
+    body: GraphSummaryRequest,
+    user_id: str = Depends(get_current_user_id),
+) -> Dict[str, Any]:
+    if (body.format or "markdown").strip().lower() != "markdown":
+        raise HTTPException(status_code=400, detail="仅支持 markdown 摘要格式")
+    try:
+        svc = get_global_graph_service()
+        return svc.summarize_subgraph(
+            graph_type=graph_type,
+            scope=_scope_payload_to_dict(body.subgraph_request.scope, user_id),
+            seeds={
+                "node_ids": body.subgraph_request.seed_node_ids or [],
+                "paper_uids": body.subgraph_request.paper_uids or [],
+            },
+            depth=body.subgraph_request.depth,
+            question=body.question,
+            max_items=body.max_items,
+            snapshot_version=body.subgraph_request.snapshot_version,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.warning("graph_type_summary failed graph_type=%s body=%s err=%s", graph_type, body.model_dump(), e)
+        raise HTTPException(status_code=500, detail=f"图摘要失败: {e}")
+
+
+@router.get("/{graph_type}/snapshots")
+def graph_type_snapshots(
+    graph_type: str,
+    scope_type: str = Query("global", description="global | collection | library"),
+    scope_key: str = Query("global", description="scope key"),
+    user_id: str = Depends(get_current_user_id),
+) -> Dict[str, Any]:
+    try:
+        svc = get_global_graph_service()
+        return {
+            "items": svc.list_snapshots(
+                graph_type=graph_type,
+                scope={"user_id": user_id, "scope_type": scope_type, "scope_key": scope_key},
+            )
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.warning("graph_type_snapshots failed graph_type=%s scope=%s:%s err=%s", graph_type, scope_type, scope_key, e)
+        raise HTTPException(status_code=500, detail=f"图快照查询失败: {e}")
+
+
+@router.post("/{graph_type}/snapshots/rebuild")
+def graph_type_rebuild_snapshot(
+    graph_type: str,
+    body: GraphScopePayload,
+    user_id: str = Depends(get_current_user_id),
+) -> Dict[str, Any]:
+    try:
+        svc = get_global_graph_service()
+        return svc.ensure_snapshot(
+            graph_type=graph_type,
+            scope=_scope_payload_to_dict(body, user_id),
+            refresh=True,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.warning("graph_type_rebuild_snapshot failed graph_type=%s body=%s err=%s", graph_type, body.model_dump(), e)
+        raise HTTPException(status_code=500, detail=f"图快照重建失败: {e}")
 
 
 @router.get("/chunk/{chunk_id}")

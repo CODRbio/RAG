@@ -397,7 +397,11 @@ export async function* streamIngestJobEvents(
       const aid = lastEventId || initialAfter;
       return `${BASE_URL}/ingest/jobs/${encodeURIComponent(jobId)}/events?after_id=${encodeURIComponent(aid)}`;
     },
-    getHeaders: () => (token ? { Authorization: `Bearer ${token}` } : {}),
+    getHeaders: () => {
+      const headers: Record<string, string> = {};
+      if (token) headers.Authorization = `Bearer ${token}`;
+      return headers;
+    },
     terminalEvents: [...INGEST_TERMINAL_EVENTS],
     signal,
     maxRetries: 5,

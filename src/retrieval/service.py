@@ -228,6 +228,8 @@ def _parse_paper_id(paper_id: str) -> Tuple[Optional[int], Optional[List[str]], 
 
 def _hit_to_chunk(hit: Dict[str, Any], source_type: str, query: str) -> EvidenceChunk:
     """将 hybrid 或 web 的 hit 转为 EvidenceChunk"""
+    from src.retrieval.dedup import compute_paper_uid
+
     meta = hit.get("metadata") or {}
     content = (hit.get("content") or "").strip()
     chunk_id = meta.get("chunk_id") or hit.get("chunk_id") or meta.get("doc_id") or meta.get("url") or str(id(hit))
@@ -257,6 +259,10 @@ def _hit_to_chunk(hit: Dict[str, Any], source_type: str, query: str) -> Evidence
     title = meta.get("title")
 
     doi = meta.get("doi")
+    pmid = meta.get("pmid")
+    url = meta.get("url")
+    pdf_url = meta.get("pdf_url")
+    paper_uid = meta.get("paper_uid")
 
     # 本地检索结果常只有 paper_id/chunk_id；从 paper_metadata 回填 DOI/标题/作者/年份，
     # 让本地库结果和 scholar/web 结果的关键字段保持一致。
@@ -266,6 +272,7 @@ def _hit_to_chunk(hit: Dict[str, Any], source_type: str, query: str) -> Evidence
         except Exception:
             pm = None
         if pm:
+            extra = pm.get("extra") or {}
             if not doi and pm.get("doi"):
                 doi = pm.get("doi")
             if authors is None and pm.get("authors"):
@@ -274,6 +281,14 @@ def _hit_to_chunk(hit: Dict[str, Any], source_type: str, query: str) -> Evidence
                 year = pm.get("year")
             if title is None and pm.get("title"):
                 title = pm.get("title")
+            if not pmid and extra.get("pmid"):
+                pmid = extra.get("pmid")
+            if not url and extra.get("url"):
+                url = extra.get("url")
+            if not pdf_url and extra.get("pdf_url"):
+                pdf_url = extra.get("pdf_url")
+            if not paper_uid and pm.get("paper_uid"):
+                paper_uid = pm.get("paper_uid")
 
     # 如果缺少 authors/year/title，尝试从 paper_id（文件名）解析
     if (authors is None or year is None or title is None) and doc_id:
@@ -284,6 +299,16 @@ def _hit_to_chunk(hit: Dict[str, Any], source_type: str, query: str) -> Evidence
             year = parsed_year
         if title is None and parsed_title:
             title = parsed_title
+
+    if not paper_uid and (doi or title or pmid):
+        paper_uid = compute_paper_uid(
+            doi=doi,
+            title=title,
+            authors=authors,
+            year=year,
+            url=url,
+            pmid=pmid,
+        )
 
     # 提取 bbox（Docling 物理坐标列表）
     raw_bbox = meta.get("bbox")
@@ -319,9 +344,11 @@ def _hit_to_chunk(hit: Dict[str, Any], source_type: str, query: str) -> Evidence
         doc_title=title,
         authors=authors,
         year=year,
-        url=meta.get("url"),
-        pdf_url=meta.get("pdf_url"),
+        url=url,
+        pdf_url=pdf_url,
         doi=doi,
+        pmid=pmid,
+        paper_uid=paper_uid,
         page_num=meta.get("page") if isinstance(meta.get("page"), int) else None,
         section_title=meta.get("section_path"),
         bbox=bbox,

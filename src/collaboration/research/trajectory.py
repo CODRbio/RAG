@@ -26,7 +26,7 @@ logger = get_logger(__name__)
 class SearchAction:
     """一次搜索动作的记录"""
     query: str
-    tool: str  # search_local / search_web / search_scholar / explore_graph
+    tool: str  # search_local / search_web / search_scholar / explore_graph / explore_academic_graph
     result_summary: str  # 压缩后的结果摘要
     source_count: int = 0
     timestamp: float = field(default_factory=time.time)

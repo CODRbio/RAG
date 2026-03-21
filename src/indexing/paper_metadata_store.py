@@ -30,7 +30,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from sqlmodel import Session, select, and_
 
 from src.db.engine import get_engine
-from src.db.models import CrossrefCache, CrossrefCacheByDoi, PaperMetadata
+from src.db.models import CrossrefCache, CrossrefCacheByDoi, Paper, PaperMetadata, ScholarLibrary, ScholarLibraryPaper
 from src.log import get_logger
 
 logger = get_logger(__name__)
@@ -48,6 +48,89 @@ def _normalize_title(title: Optional[str]) -> str:
     """Delegate to dedup.normalize_title for consistency with dedup/crossref paths."""
     from src.retrieval.dedup import normalize_title
     return normalize_title(title or "")
+
+
+def _decode_extra(extra: Optional[Any]) -> Dict[str, Any]:
+    if isinstance(extra, dict):
+        return dict(extra)
+    if isinstance(extra, str) and extra.strip():
+        try:
+            decoded = json.loads(extra)
+            if isinstance(decoded, dict):
+                return decoded
+        except Exception:
+            pass
+    return {}
+
+
+def _paper_uid_inputs(
+    doi: Optional[str],
+    title: Optional[str],
+    authors: Optional[List[str]],
+    year: Optional[int],
+    extra: Optional[Any],
+) -> Dict[str, Any]:
+    aux = _decode_extra(extra)
+    url = (aux.get("url") or aux.get("pdf_url") or "").strip()
+    arxiv_id = (aux.get("arxiv_id") or aux.get("arxiv") or "").strip()
+    if not url and arxiv_id:
+        url = f"https://arxiv.org/abs/{arxiv_id}"
+    pmid = (aux.get("pmid") or "").strip()
+    return {
+        "doi": doi,
+        "title": title,
+        "authors": authors,
+        "year": year,
+        "url": url or None,
+        "pmid": pmid or None,
+    }
+
+
+def _mark_related_graph_scopes_stale(paper_id: str, paper_uid: str) -> None:
+    try:
+        from src.services.global_graph_service import mark_graph_scope_stale
+    except Exception:
+        return
+
+    affected: set[tuple[str, str, str]] = set()
+    with Session(get_engine()) as session:
+        paper_rows = list(
+            session.exec(select(Paper).where(Paper.paper_id == paper_id)).all()
+        )
+        if paper_uid:
+            paper_rows.extend(
+                list(session.exec(select(Paper).where(Paper.paper_uid == paper_uid)).all())
+            )
+        for row in paper_rows:
+            affected.add((getattr(row, "user_id", "default") or "default", "collection", row.collection))
+            library_id = getattr(row, "library_id", None)
+            if library_id is not None:
+                affected.add((getattr(row, "user_id", "default") or "default", "library", str(int(library_id))))
+
+        library_rows = list(
+            session.exec(select(ScholarLibraryPaper).where(ScholarLibraryPaper.collection_paper_id == paper_id)).all()
+        )
+        if paper_uid:
+            library_rows.extend(
+                list(session.exec(select(ScholarLibraryPaper).where(ScholarLibraryPaper.paper_uid == paper_uid)).all())
+            )
+        for row in library_rows:
+            lib = session.get(ScholarLibrary, row.library_id)
+            owner = getattr(lib, "user_id", "default") if lib is not None else "default"
+            affected.add((owner or "default", "library", str(int(row.library_id))))
+            if (row.collection_name or "").strip():
+                affected.add((owner or "default", "collection", row.collection_name))
+
+    for user_id, scope_type, scope_key in affected:
+        try:
+            mark_graph_scope_stale(
+                user_id=user_id,
+                scope_type=scope_type,
+                scope_key=scope_key,
+                reason="paper_metadata_updated",
+            )
+        except Exception:
+            pass
 
 
 class PaperMetadataStore:
@@ -102,21 +185,23 @@ class PaperMetadataStore:
         extra: Optional[Dict[str, Any]] = None,
     ) -> None:
         """插入或更新一条论文元数据。"""
+        from src.retrieval.dedup import compute_paper_uid
         existing = self.get(paper_id)
         doi = doi or (existing.get("doi") if existing else "") or ""
         title = title or (existing.get("title") if existing else "") or ""
+        existing_authors = existing.get("authors") if existing else None
+        authors_list = authors if authors is not None else existing_authors
         authors_str = (
-            json.dumps(authors, ensure_ascii=False)
-            if authors
+            json.dumps(authors_list, ensure_ascii=False)
+            if authors_list
             else (existing.get("authors_raw") if existing else "") or ""
         )
         yr = year or (existing.get("year") if existing else None)
         src = source or (existing.get("source") if existing else "") or ""
-        ext = (
-            json.dumps(extra or {}, ensure_ascii=False)
-            if extra
-            else (existing.get("extra_raw") if existing else "{}") or "{}"
-        )
+        extra_dict = _decode_extra(existing.get("extra_raw") if existing else None)
+        extra_dict.update(_decode_extra(extra))
+        ext = json.dumps(extra_dict, ensure_ascii=False)
+        uid = compute_paper_uid(**_paper_uid_inputs(doi=doi, title=title, authors=authors_list, year=yr, extra=extra_dict))
 
         with Session(get_engine()) as session:
             row = session.get(PaperMetadata, paper_id)
@@ -131,6 +216,7 @@ class PaperMetadataStore:
                     year=yr,
                     source=src,
                     extra=ext,
+                    paper_uid=uid,
                 )
                 session.add(row)
             else:
@@ -142,11 +228,14 @@ class PaperMetadataStore:
                 row.year = yr
                 row.source = src
                 row.extra = ext
+                row.paper_uid = uid
                 session.add(row)
             session.commit()
+        _mark_related_graph_scopes_stale(paper_id, uid)
 
     def upsert_batch(self, records: List[Tuple[str, Dict[str, Any]]]) -> int:
         """批量 upsert [(paper_id, {doi, title, authors, year, source}), ...]。"""
+        from src.retrieval.dedup import compute_paper_uid
         with Session(get_engine()) as session:
             count = 0
             for paper_id, meta in records:
@@ -156,6 +245,9 @@ class PaperMetadataStore:
                 authors_str = json.dumps(authors, ensure_ascii=False) if authors else ""
                 year = meta.get("year")
                 source = meta.get("source") or ""
+                extra = _decode_extra(meta.get("extra"))
+                yr = int(year) if year else None
+                uid = compute_paper_uid(**_paper_uid_inputs(doi=doi, title=title, authors=authors, year=yr, extra=extra))
                 row = session.get(PaperMetadata, paper_id)
                 if row is None:
                     row = PaperMetadata(
@@ -165,9 +257,10 @@ class PaperMetadataStore:
                         title=title,
                         normalized_title=_normalize_title(title),
                         authors=authors_str,
-                        year=int(year) if year else None,
+                        year=yr,
                         source=source,
-                        extra="{}",
+                        extra=json.dumps(extra, ensure_ascii=False),
+                        paper_uid=uid,
                     )
                     session.add(row)
                 else:
@@ -176,11 +269,22 @@ class PaperMetadataStore:
                     row.title = title
                     row.normalized_title = _normalize_title(title)
                     row.authors = authors_str
-                    row.year = int(year) if year else None
+                    row.year = yr
                     row.source = source
+                    row.extra = json.dumps(extra, ensure_ascii=False)
+                    row.paper_uid = uid
                     session.add(row)
                 count += 1
             session.commit()
+        for paper_id, meta in records:
+            doi = meta.get("doi") or ""
+            title = meta.get("title") or ""
+            authors = meta.get("authors")
+            year = meta.get("year")
+            extra = _decode_extra(meta.get("extra"))
+            yr = int(year) if year else None
+            uid = compute_paper_uid(**_paper_uid_inputs(doi=doi, title=title, authors=authors, year=yr, extra=extra))
+            _mark_related_graph_scopes_stale(paper_id, uid)
         return count
 
     # ── 查询 ──────────────────────────────────────────────────────────────────
@@ -276,6 +380,8 @@ class PaperMetadataStore:
             "authors": authors,
             "year": row.year,
             "source": row.source,
+            "paper_uid": row.paper_uid,
+            "extra": _decode_extra(row.extra),
             "authors_raw": row.authors,
             "extra_raw": row.extra,
         }

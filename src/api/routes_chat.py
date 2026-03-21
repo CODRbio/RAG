@@ -68,13 +68,13 @@ from src.collaboration.intent import (
     build_search_query_from_context,
     check_query_collection_scope,
     is_deep_research,
-    resolve_intent_provider_name,
 )
 from src.collaboration.intent.commands import allocate_collection_quotas
 from src.collaboration.graphic_abstract import (
     GRAPHIC_ABSTRACT_FAILURE_MD,
     render_graphic_abstract_markdown,
     resolve_graphic_abstract_model,
+    should_generate_graphic_abstract,
 )
 from src.collaboration.memory.session_memory import (
     SessionStore,
@@ -84,7 +84,7 @@ from src.collaboration.memory.session_memory import (
 from src.collaboration.memory.working_memory import get_or_generate_working_memory
 from src.collaboration.memory.persistent_store import get_user_profile
 from src.collaboration.workflow import run_workflow
-from src.llm.llm_manager import get_manager, _timeout_for_model, _stream_and_collect
+from src.llm.llm_manager import get_manager, _timeout_for_model, _stream_and_collect, build_cache_hint
 from src.llm.react_loop import react_loop
 from src.llm.tools import (
     CORE_TOOLS,
@@ -92,6 +92,7 @@ from src.llm.tools import (
     start_agent_chunk_collector,
     drain_agent_chunks,
     set_tool_collection,
+    set_tool_user_id,
     set_tool_step_top_k,
     set_agent_sonar_model,
 )
@@ -123,6 +124,47 @@ from src.tasks.task_state import TaskKind, TaskStatus
 router = APIRouter(tags=["chat"])
 
 _CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "rag_config.json"
+
+
+def _provider_platform_for_name(manager: Any, provider_name: Optional[str]) -> str:
+    """Return `llm.providers.<name>.platform` from manager config (empty if unknown)."""
+    pname = provider_name or manager.config.default
+    pcfg = manager.config.providers.get(pname or "")
+    return str(getattr(pcfg, "platform", "") if pcfg else "") or ""
+
+
+def _is_codex_app_server_provider(manager: Any, provider_name: Optional[str]) -> bool:
+    return _provider_platform_for_name(manager, provider_name) == "codex_app_server"
+
+
+def _codex_thread_id_from_session_meta(store: SessionStore, session_id: str) -> Optional[str]:
+    meta = store.get_session_meta(session_id) or {}
+    prefs = meta.get("preferences") or {}
+    raw = prefs.get("codex_thread_id")
+    if raw is None or raw == "":
+        return None
+    s = str(raw).strip()
+    return s or None
+
+
+def _persist_codex_thread_from_response(
+    store: SessionStore,
+    session_id: str,
+    manager: Any,
+    provider_name: Optional[str],
+    resp: Optional[dict],
+) -> None:
+    """Persist Codex thread id from chat response meta into session preferences."""
+    if not session_id or not resp or not _is_codex_app_server_provider(manager, provider_name):
+        return
+    tid = (resp.get("meta") or {}).get("codex_thread_id")
+    if tid:
+        store.update_session_meta(
+            session_id,
+            {"preferences": {"codex_thread_id": str(tid)}},
+        )
+
+
 _DEEP_RESEARCH_CANCEL_EVENTS: dict[str, threading.Event] = {}
 _DEEP_RESEARCH_CANCEL_LOCK = threading.Lock()
 _DEEP_RESEARCH_PAUSE_EVENTS: dict[str, threading.Event] = {}
@@ -158,13 +200,15 @@ def _ensure_session_access(session_id: str, current_user_id: str) -> dict[str, A
 
 
 def _get_intent_client(manager, body: ChatRequest | IntentDetectRequest):
-    provider_name = resolve_intent_provider_name(
-        intent_provider=getattr(body, "intent_provider", None),
-        configured_intent_provider=getattr(settings.llm, "intent_provider", None),
-        ultra_lite_provider=getattr(body, "ultra_lite_provider", None),
-        llm_provider=getattr(body, "llm_provider", None),
+    explicit_provider = (
+        str(getattr(body, "intent_provider", None) or getattr(settings.llm, "intent_provider", None) or "").strip()
+        or None
     )
-    return manager.get_lite_client(provider_name)
+    return manager.get_auxiliary_lite_client(
+        explicit_provider=explicit_provider,
+        requested_provider=getattr(body, "llm_provider", None),
+        fallback_provider=getattr(body, "ultra_lite_provider", None),
+    )
 
 
 _DEEP_RESEARCH_SUSPENDED: dict[str, dict[str, Any]] = {}
@@ -588,6 +632,11 @@ def _classify_query(message: str, history_turns: list, llm_client) -> bool:
                 {"role": "system", "content": _ROUTE_SYSTEM},
                 {"role": "user", "content": prompt},
             ],
+            cache=build_cache_hint(
+                scope="conversation",
+                name="chat_route_classify",
+                parts=[msg[:256], history_block[:512]],
+            ),
         )
         # 取 final_text；某些 thinking 模型答案可能在 reasoning_text 里
         raw_answer = (resp.get("final_text") or "").strip().lower()
@@ -1047,6 +1096,11 @@ def _evaluate_chat_evidence_sufficiency(
             ],
             model=model_override,
             response_model=_ChatSufficiencyResponse,
+            cache=build_cache_hint(
+                scope="section",
+                name="chat_evidence_sufficiency",
+                parts=[query[:256], ctx[:1024]],
+            ),
         )
         parsed = resp.get("parsed_object")
         if parsed is None:
@@ -1121,6 +1175,11 @@ def _generate_chat_gap_queries(
             ],
             model=model_override,
             response_model=_ChatGapQueriesResponse,
+            cache=build_cache_hint(
+                scope="section",
+                name="chat_gap_queries",
+                parts=[query[:256], ctx[:1024]],
+            ),
         )
         parsed = resp.get("parsed_object")
         if parsed is None:
@@ -1535,12 +1594,23 @@ def _run_chat_impl(
         if step_callback:
             step_callback(step_id, label or "")
 
-    def _stream_llm_text(chat_client, stream_messages, *, model_override=None) -> str:
+    def _stream_llm_text(
+        chat_client,
+        stream_messages,
+        *,
+        model_override=None,
+        **llm_extras,
+    ) -> tuple[str, Optional[dict[str, Any]]]:
         final_result: dict[str, Any] | None = None
         text_parts: list[str] = []
-        for ev in chat_client.stream_chat(stream_messages, model=model_override, max_tokens=None):
+        for ev in chat_client.stream_chat(
+            stream_messages,
+            model=model_override,
+            max_tokens=None,
+            **llm_extras,
+        ):
             if ev.get("type") == "text_delta":
-                delta = str(ev.get("delta") or "")
+                delta = str(ev.get("delta") or ev.get("text") or "")
                 if not delta:
                     continue
                 text_parts.append(delta)
@@ -1551,8 +1621,8 @@ def _run_chat_impl(
                 if isinstance(maybe_result, dict):
                     final_result = maybe_result
         if final_result is not None:
-            return str(final_result.get("final_text") or "")
-        return "".join(text_parts)
+            return str(final_result.get("final_text") or ""), final_result
+        return "".join(text_parts), None
 
     t_start = _time.perf_counter()
 
@@ -1601,8 +1671,26 @@ def _run_chat_impl(
     current_stage = store.get_session_stage(session_id)
     manager = get_manager(str(_CONFIG_PATH))
     client = manager.get_client(body.llm_provider or None)
+    provider_supports_platform_tools = bool(getattr(client, "supports_platform_tool_calls", True))
+    codex_chat_kw: Dict[str, Any] = {}
+    if _is_codex_app_server_provider(manager, body.llm_provider):
+        _stored_ctid = _codex_thread_id_from_session_meta(store, session_id)
+        if _stored_ctid:
+            codex_chat_kw["codex_thread_id"] = _stored_ctid
     intent_client = _get_intent_client(manager, body)
-    lite_client = manager.get_lite_client(body.llm_provider or None)
+    lite_client = manager.get_auxiliary_lite_client(
+        requested_provider=body.llm_provider or None,
+        fallback_provider=getattr(body, "ultra_lite_provider", None),
+    )
+    if _is_codex_app_server_provider(manager, body.llm_provider):
+        _chat_logger.info(
+            "[chat] codex auxiliary routing | main=%s | intent=%s | helper=%s | explicit_intent=%s | ultra_lite=%s",
+            body.llm_provider or manager.config.default,
+            getattr(getattr(intent_client, "config", None), "name", "(unknown)"),
+            getattr(getattr(lite_client, "config", None), "name", "(unknown)"),
+            getattr(body, "intent_provider", None) or getattr(settings.llm, "intent_provider", None) or "",
+            getattr(body, "ultra_lite_provider", None) or "",
+        )
     history_for_intent = memory.get_context_window(n=6)
 
     agent_debug_data: dict | None = None
@@ -1615,6 +1703,13 @@ def _run_chat_impl(
     else:
         _legacy_agent = body.use_agent if hasattr(body, "use_agent") and body.use_agent is not None else False
         agent_mode = "assist" if _legacy_agent else "standard"
+    if agent_mode != "standard" and not provider_supports_platform_tools:
+        _chat_logger.info(
+            "[chat] provider=%s does not support platform tools; agent_mode downgraded: %s -> standard",
+            body.llm_provider or manager.config.default,
+            agent_mode,
+        )
+        agent_mode = "standard"
 
     # ── 1. 请求概览 ──
     _chat_logger.info(
@@ -1764,6 +1859,12 @@ def _run_chat_impl(
         svc = AutoCompleteService(llm_client=client, max_sections=max_sections, include_abstract=True)
         user_id = optional_user_id or body.user_id or ""
         use_agent_flag = getattr(body, "use_agent", None) or False
+        if use_agent_flag and not provider_supports_platform_tools:
+            _chat_logger.info(
+                "[deep-research] provider=%s does not support platform tools; use_agent forced to false",
+                body.llm_provider or manager.config.default,
+            )
+            use_agent_flag = False
         result = svc.complete(
             topic=topic,
             canvas_id=canvas_id or None,
@@ -2978,12 +3079,14 @@ def _run_chat_impl(
 
     t_llm = _time.perf_counter()
     _regen_succeeded = True   # 默认：未走 regen 路径，答案是权威最终结果
+    last_codex_llm_response: Optional[dict[str, Any]] = None
     try:
         if use_agent:
             _step("agent", "Agent reasoning")
             start_agent_chunk_collector()
             # For multi-collection, pass the full list so agent tools can search across all
             set_tool_collection(target_collection, collections=target_collections if _is_multi_collection else None)
+            set_tool_user_id(current_user_id)
             set_tool_step_top_k(
                 _chat_effective_step_top_k(body.step_top_k or body.local_top_k or 20)
             )
@@ -3004,7 +3107,9 @@ def _run_chat_impl(
                 prompt_budget_min_output_tokens=_AGENT_MIN_OUTPUT_TOKENS,
                 prompt_budget_safety_margin=_CHAT_PROMPT_SAFETY_MARGIN,
                 max_tokens=None,
+                **codex_chat_kw,
             )
+            last_codex_llm_response = react_result.raw_response
             agent_extra_chunks = drain_agent_chunks()
             if agent_extra_chunks:
                 cache_candidate_pool_chunks = _dedup_chunk_list(
@@ -3104,15 +3209,25 @@ def _run_chat_impl(
                 _step("answering", "Writing answer")
                 t_regen = _time.perf_counter()
                 if delta_callback:
-                    _regen_text = (_stream_llm_text(
+                    _regen_text, _regen_stream_resp = _stream_llm_text(
                         client,
                         regen_messages,
                         model_override=body.model_override or None,
-                    ) or "").strip()
+                        **codex_chat_kw,
+                    )
+                    _regen_text = (_regen_text or "").strip()
+                    if _regen_stream_resp:
+                        last_codex_llm_response = _regen_stream_resp
                     _regen_succeeded = bool(_regen_text)
                     response_text = _regen_text or response_text
                 else:
-                    regen_resp = client.chat(regen_messages, model=body.model_override or None, max_tokens=None)
+                    regen_resp = client.chat(
+                        regen_messages,
+                        model=body.model_override or None,
+                        max_tokens=None,
+                        **codex_chat_kw,
+                    )
+                    last_codex_llm_response = regen_resp
                     _regen_text = (regen_resp.get("final_text") or "").strip()
                     _regen_succeeded = bool(_regen_text)
                     response_text = _regen_text or response_text
@@ -3131,14 +3246,27 @@ def _run_chat_impl(
             _step("answering", "Writing answer")
             react_result = None
             if delta_callback:
-                response_text = (_stream_llm_text(
+                _stream_txt, _stream_resp = _stream_llm_text(
                     client,
                     messages,
                     model_override=body.model_override or None,
-                ) or "").strip()
-                resp = {"meta": {"usage": None}}
+                    **codex_chat_kw,
+                )
+                response_text = (_stream_txt or "").strip()
+                last_codex_llm_response = _stream_resp or last_codex_llm_response
+                resp = (
+                    _stream_resp
+                    if isinstance(_stream_resp, dict)
+                    else {"meta": {"usage": None}}
+                )
             else:
-                resp = client.chat(messages, model=body.model_override or None, max_tokens=None)
+                resp = client.chat(
+                    messages,
+                    model=body.model_override or None,
+                    max_tokens=None,
+                    **codex_chat_kw,
+                )
+                last_codex_llm_response = resp
                 response_text = (resp.get("final_text") or "").strip()
             llm_ms = (_time.perf_counter() - t_llm) * 1000
             usage = resp.get("meta", {}).get("usage") or resp.get("usage") or {}
@@ -3156,6 +3284,9 @@ def _run_chat_impl(
                 message_count=len(messages),
                 prompt_budget=_prompt_budget_diag,
             )
+        _persist_codex_thread_from_response(
+            store, session_id, manager, body.llm_provider, last_codex_llm_response,
+        )
     except Exception as llm_err:
         _step(None, "")
         react_result = None
@@ -3206,7 +3337,19 @@ def _run_chat_impl(
     cited_from_agent_count = 0
     non_retrieval_tools_ok = 0
     if use_agent and react_result and react_result.tool_trace:
-        _non_retrieval = {"run_code", "explore_graph", "canvas", "get_citations", "compare_papers", "summarize_quantitative"}
+        _non_retrieval = {
+            "run_code",
+            "explore_graph",
+            "explore_academic_graph",
+            "canvas",
+            "get_citations",
+            "compare_papers",
+            "summarize_paper",
+            "ask_paper",
+            "analyze_paper_media",
+            "discover_academic_resources",
+            "summarize_quantitative",
+        }
         for entry in react_result.tool_trace:
             if entry["tool"] in _non_retrieval and not entry.get("is_error"):
                 non_retrieval_tools_ok += 1
@@ -3276,39 +3419,42 @@ def _run_chat_impl(
         ga_model_raw = getattr(body, "graphic_abstract_model", None)
         ga_provider, ga_model = resolve_graphic_abstract_model(ga_model_raw)
 
-        _step("graphic_abstract", f"Drawing Graphic Abstract ({ga_model})")
-        _chat_logger.info(
-            "[chat] 🎨 开始生成 Graphic Abstract, requested_model=%s, provider=%s, resolved_model=%s",
-            ga_model_raw,
-            ga_provider,
-            ga_model,
-        )
-        try:
-            # Predict the turn_id for the assistant message (current_count + 1)
-            assistant_turn_id = (store.get_turn_count(session_id) or 0) + 1
-            ga_result = render_graphic_abstract_markdown(
-                response_text,
-                model_raw=ga_model_raw,
-                content_kind="chat",
-                heading="### Graphic Abstract",
-                session_id=session_id,
-                turn_id=assistant_turn_id,
-            )
+        if not should_generate_graphic_abstract(response_text, lite_client, content_kind="chat"):
+            _chat_logger.info("[chat] 🎨 Graphic Abstract skipped by agent judgment")
+        else:
+            _step("graphic_abstract", f"Drawing Graphic Abstract ({ga_model})")
             _chat_logger.info(
-                "[chat] Graphic Abstract stored, backend=%s, key=%s, content_type=%s, url=%s",
-                ga_result.storage_backend,
-                ga_result.asset_key,
-                ga_result.content_type,
-                ga_result.image_url,
+                "[chat] 🎨 开始生成 Graphic Abstract, requested_model=%s, provider=%s, resolved_model=%s",
+                ga_model_raw,
+                ga_provider,
+                ga_model,
             )
-            if delta_callback:
-                delta_callback(ga_result.markdown)
-            response_text += ga_result.markdown
-        except Exception as e:
-            _chat_logger.error("[chat] Graphic Abstract 生成失败: %s", e, exc_info=True)
-            if delta_callback:
-                delta_callback(GRAPHIC_ABSTRACT_FAILURE_MD)
-            response_text += GRAPHIC_ABSTRACT_FAILURE_MD
+            try:
+                # Predict the turn_id for the assistant message (current_count + 1)
+                assistant_turn_id = (store.get_turn_count(session_id) or 0) + 1
+                ga_result = render_graphic_abstract_markdown(
+                    response_text,
+                    model_raw=ga_model_raw,
+                    content_kind="chat",
+                    heading="### Graphic Abstract",
+                    session_id=session_id,
+                    turn_id=assistant_turn_id,
+                )
+                _chat_logger.info(
+                    "[chat] Graphic Abstract stored, backend=%s, key=%s, content_type=%s, url=%s",
+                    ga_result.storage_backend,
+                    ga_result.asset_key,
+                    ga_result.content_type,
+                    ga_result.image_url,
+                )
+                if delta_callback:
+                    delta_callback(ga_result.markdown)
+                response_text += ga_result.markdown
+            except Exception as e:
+                _chat_logger.error("[chat] Graphic Abstract 生成失败: %s", e, exc_info=True)
+                if delta_callback:
+                    delta_callback(GRAPHIC_ABSTRACT_FAILURE_MD)
+                response_text += GRAPHIC_ABSTRACT_FAILURE_MD
 
     # ── 10. 写入 Memory ──
     memory.add_turn("user", message)
@@ -3780,13 +3926,21 @@ def clarify_for_deep_research(
             model_used or "(default)",
             len(prompt),
         )
+        codex_clarify_kw: Dict[str, Any] = {}
+        if _is_codex_app_server_provider(manager, body.llm_provider):
+            _clarify_tid = _codex_thread_id_from_session_meta(store, session_id)
+            if _clarify_tid:
+                codex_clarify_kw["codex_thread_id"] = _clarify_tid
         resp = client.chat(
             [
                 {"role": "system", "content": _pm.render("chat_deep_research_system.txt")},
                 {"role": "user", "content": prompt},
             ],
             model=body.model_override or None,
-
+            **codex_clarify_kw,
+        )
+        _persist_codex_thread_from_response(
+            store, session_id, manager, body.llm_provider, resp,
         )
         _chat_logger.info(
             "[deep-research/clarify] main LLM done | elapsed_ms=%.0f final_text_len=%d",

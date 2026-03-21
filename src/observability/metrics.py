@@ -60,6 +60,16 @@ class _Metrics:
             "LLM token 消耗",
             ["provider", "model", "direction"],  # direction: input / output
         )
+        self.llm_cached_tokens_total = Counter(
+            "rag_llm_cached_tokens_total",
+            "LLM 缓存相关 token 统计",
+            ["provider", "model", "kind"],  # kind: cached_input / cache_read / cache_write
+        )
+        self.llm_cache_events_total = Counter(
+            "rag_llm_cache_events_total",
+            "LLM 缓存事件总数",
+            ["provider", "model", "source", "result"],  # source: provider / app, result: hit / miss / write
+        )
         self.llm_errors_total = Counter(
             "rag_llm_errors_total",
             "LLM 调用失败数",

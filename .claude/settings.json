@@ -5,7 +5,19 @@
       "Read(//^def synthesize_node/,/^def [a-z_]/**)",
       "Bash(/tmp/audit_summary.txt:*)",
       "Read(//tmp/**)",
-      "Bash(conda run:*)"
+      "Bash(conda run:*)",
+      "Bash(python -c \"from src.db.models import PaperMetadata, ScholarLibraryPaper; print\\(''PaperMetadata fields:'', [f for f in PaperMetadata.__fields__ if ''uid'' in f]\\); print\\(''ScholarLibraryPaper fields:'', [f for f in ScholarLibraryPaper.__fields__ if ''uid'' in f]\\)\")",
+      "Bash(python scripts/28_backfill_paper_uid.py --dry-run --table paper_metadata)",
+      "Bash(python -c \":*)",
+      "Bash(find /Users/wangminxiao/Desktop/RAG -name *backfill* -o -name *sync* -o -name *migrate*)",
+      "Bash(grep -E \"\\\\.\\(py|sh\\)$\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''scripts/29_upgrade_framework_consistency.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
+      "Bash(find /Users/wangminxiao/Desktop/RAG -name *backfill* -type f)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/retrieval/dedup.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''config/settings.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
+      "Bash(python -c \"import json; d=json.load\\(open\\(''config/rag_config.local.json''\\)\\); print\\(list\\(d.keys\\(\\)\\)\\)\")",
+      "Bash(python -m alembic current)",
+      "Bash(python -m py_compile src/services/global_graph_service.py)"
     ]
   }
 }

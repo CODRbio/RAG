@@ -25,10 +25,12 @@ from langgraph.types import interrupt
 from pydantic import BaseModel, Field
 
 from config.settings import settings
+from src.llm.llm_manager import build_cache_hint
 from src.collaboration.graphic_abstract import (
     GRAPHIC_ABSTRACT_FAILURE_MD,
     render_graphic_abstract_markdown,
     resolve_graphic_abstract_model,
+    should_generate_graphic_abstract,
 )
 from src.collaboration.research.dashboard import (
     ResearchBrief,
@@ -286,7 +288,11 @@ def _repair_queries_with_llm(
                 {"role": "user", "content": prompt},
             ],
             model=model_override,
-
+            cache=build_cache_hint(
+                scope="section",
+                name="research_repair_queries",
+                parts=[topic[:256], section.title, target, payload[:1024]],
+            ),
         )
         raw = (resp.get("final_text") or "").strip()
         repaired: List[str] = []
@@ -1225,7 +1231,10 @@ def _resolve_step_lite_client(state: DeepResearchState, step: str) -> Tuple[Any,
         if step_val and "::" in step_val:
             provider_name = step_val.split("::")[0].strip()
         if provider_name:
-            lite_client = manager.get_lite_client(provider_name)
+            lite_client = manager.get_auxiliary_lite_client(
+                requested_provider=provider_name,
+                fallback_provider=(state.get("filters") or {}).get("ultra_lite_provider"),
+            )
             return lite_client, model_override
     except Exception:
         pass
@@ -1893,7 +1902,11 @@ def _generate_refined_queries(
                 {"role": "user", "content": prompt},
             ],
             model=model_override,
-
+            cache=build_cache_hint(
+                scope="section",
+                name="research_generate_refined_queries",
+                parts=[topic[:256], section.title, gaps_block[:512], evidence_summary[:1024]],
+            ),
         )
         raw = (resp.get("final_text") or "").strip()
         parsed: List[str] = []
@@ -1998,6 +2011,11 @@ def _generate_engine_gap_queries(
                 {"role": "user", "content": prompt},
             ],
             model=model_override,
+            cache=build_cache_hint(
+                scope="section",
+                name="research_generate_gap_queries",
+                parts=[topic[:256], section.title, gap[:512], intent],
+            ),
         )
         raw = (resp.get("final_text") or "").strip()
         if raw.startswith("```"):
@@ -2153,7 +2171,11 @@ def _generate_section_queries(
                     {"role": "user", "content": prompt},
                 ],
                 model=model_override,
-
+                cache=build_cache_hint(
+                    scope="section",
+                    name="research_generate_section_queries",
+                    parts=[topic[:256], section.title, gaps_block[:512], temp_block[:512]],
+                ),
             )
             raw = (resp.get("final_text") or "").strip()
             current_bucket: Optional[str] = None
@@ -2612,7 +2634,11 @@ def plan_node(state: DeepResearchState) -> DeepResearchState:
                 {"role": "user", "content": prompt},
             ],
             model=model_override,
-
+            cache=build_cache_hint(
+                scope="global_template",
+                name="research_plan_outline",
+                parts=[dashboard.brief.topic[:256], dashboard.brief.scope[:256], context_for_prompt[:1024]],
+            ),
         )
         # Use final_text; fall back to reasoning_text for thinking models that
         # may produce an empty final_text when the answer is in the reasoning field.
@@ -3257,7 +3283,7 @@ def research_node(state: DeepResearchState) -> DeepResearchState:
             search_mode=state.get("search_mode", "hybrid"),
             allowed_web_providers=ui_providers,
         )
-        if routed_tools:
+        if routed_tools and bool(getattr(client, "supports_platform_tool_calls", True)):
             supplement_prompt = (
                 f"Topic: {dashboard.brief.topic}\n"
                 f"Section: {section.title}\n"
@@ -3291,6 +3317,11 @@ def research_node(state: DeepResearchState) -> DeepResearchState:
                     "chunks": len(agent_supplement_chunks),
                     "tools": [t.name for t in routed_tools],
                 })
+        elif routed_tools:
+            logger.info(
+                "[research] provider=%s does not support platform tool loop; skip section supplement agent",
+                getattr(getattr(client, "config", None), "name", type(client).__name__),
+            )
     except Exception as e:
         logger.debug("section agent supplement skipped: %s", e)
 
@@ -3839,7 +3870,7 @@ def write_node(state: DeepResearchState) -> DeepResearchState:
                 },
                 {"role": "user", "content": prompt},
             ]
-            if has_structured_numeric_data:
+            if has_structured_numeric_data and bool(getattr(client, "supports_platform_tool_calls", True)):
                 from src.llm.react_loop import react_loop
                 from src.llm.tools import get_tools_by_names
 
@@ -3858,6 +3889,11 @@ def write_node(state: DeepResearchState) -> DeepResearchState:
                     )
                     section_text = (resp.get("final_text") or "").strip()
             else:
+                if has_structured_numeric_data:
+                    logger.info(
+                        "[research] provider=%s does not support platform tool loop; skip numeric tool assist",
+                        getattr(getattr(client, "config", None), "name", type(client).__name__),
+                    )
                 resp = client.chat(
                     messages=messages,
                     model=model_override,
@@ -4708,7 +4744,7 @@ def synthesize_node(state: DeepResearchState) -> DeepResearchState:
             search_mode=state.get("search_mode", "hybrid"),
             allowed_web_providers=(state.get("filters") or {}).get("web_providers"),
         )
-        if routed_tools:
+        if routed_tools and bool(getattr(client, "supports_platform_tool_calls", True)):
             supplement_prompt = (
                 f"Topic: {state.get('topic', '')}\n"
                 f"Open gaps: {', '.join(aggregated_open_gaps[:8]) or '(none)'}\n"
@@ -4739,6 +4775,11 @@ def synthesize_node(state: DeepResearchState) -> DeepResearchState:
                         "tools": [t.name for t in routed_tools],
                     },
                 )
+        elif routed_tools:
+            logger.info(
+                "[research] provider=%s does not support platform tool loop; skip final synthesis supplement agent",
+                getattr(getattr(client, "config", None), "name", type(client).__name__),
+            )
     except Exception:
         logger.debug("final synthesize agent supplement skipped", exc_info=True)
 
@@ -5003,6 +5044,11 @@ def synthesize_node(state: DeepResearchState) -> DeepResearchState:
                     ],
                     model=model_override,
                     max_tokens=output_budget,
+                    cache=build_cache_hint(
+                        scope="section",
+                        name="research_coherence_refine_single_pass",
+                        parts=[str(state.get("topic") or "")[:256], assembled[:2048]],
+                    ),
                 )
                 refined_body = (resp_coherence.get("final_text") or "").strip()
                 if refined_body:
@@ -5112,6 +5158,11 @@ def synthesize_node(state: DeepResearchState) -> DeepResearchState:
                         ],
                         model=model_override,
                         max_tokens=win_budget,
+                        cache=build_cache_hint(
+                            scope="section",
+                            name="research_coherence_refine_window",
+                            parts=[topic_str[:256], heading, current_section_text[:2048], idx, n_sections],
+                        ),
                     )
                     refined_sec = (resp_win.get("final_text") or "").strip()
                     refined_sections.append(refined_sec if refined_sec else current_section_text)
@@ -5194,29 +5245,32 @@ def synthesize_node(state: DeepResearchState) -> DeepResearchState:
         ga_model_raw = dr_filters.get("graphic_abstract_model")
         ga_provider, ga_model = resolve_graphic_abstract_model(ga_model_raw)
 
-        _emit_progress(state, "synthesize_graphic_abstract", {"message": f"正在生成 Graphic Abstract ({ga_model})..."})
-        try:
-            ga_result = render_graphic_abstract_markdown(
-                final_markdown,
-                model_raw=ga_model_raw,
-                content_kind="deep_research",
-                heading="## **Graphic Abstract**",
-                session_id=state.get("session_id"),
-            )
-            logger.info(
-                "[research] Graphic Abstract generated, requested_model=%s, provider=%s, resolved_model=%s, backend=%s, key=%s, content_type=%s, url=%s",
-                ga_model_raw,
-                ga_provider,
-                ga_model,
-                ga_result.storage_backend,
-                ga_result.asset_key,
-                ga_result.content_type,
-                ga_result.image_url,
-            )
-            final_markdown += ga_result.markdown
-        except Exception as e:
-            logger.error(f"[research] Graphic Abstract 生成失败: {e}", exc_info=True)
-            final_markdown += GRAPHIC_ABSTRACT_FAILURE_MD
+        if not should_generate_graphic_abstract(final_markdown, client, content_kind="deep_research"):
+            logger.info("[research] 🎨 Graphic Abstract skipped by agent judgment")
+        else:
+            _emit_progress(state, "synthesize_graphic_abstract", {"message": f"正在生成 Graphic Abstract ({ga_model})..."})
+            try:
+                ga_result = render_graphic_abstract_markdown(
+                    final_markdown,
+                    model_raw=ga_model_raw,
+                    content_kind="deep_research",
+                    heading="## **Graphic Abstract**",
+                    session_id=state.get("session_id"),
+                )
+                logger.info(
+                    "[research] Graphic Abstract generated, requested_model=%s, provider=%s, resolved_model=%s, backend=%s, key=%s, content_type=%s, url=%s",
+                    ga_model_raw,
+                    ga_provider,
+                    ga_model,
+                    ga_result.storage_backend,
+                    ga_result.asset_key,
+                    ga_result.content_type,
+                    ga_result.image_url,
+                )
+                final_markdown += ga_result.markdown
+            except Exception as e:
+                logger.error(f"[research] Graphic Abstract 生成失败: {e}", exc_info=True)
+                final_markdown += GRAPHIC_ABSTRACT_FAILURE_MD
 
     state["markdown_parts"] = [final_markdown]
 

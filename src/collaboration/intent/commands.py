@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Set
 
 from .parser import ParsedIntent
+from src.llm.llm_manager import build_cache_hint
 from src.utils.prompt_manager import PromptManager
 from src.log import get_logger
 
@@ -66,6 +67,11 @@ def analyze_chat_context(
                 {"role": "system", "content": _pm.render("chat_context_analyze_system.txt")},
                 {"role": "user", "content": prompt},
             ],
+            cache=build_cache_hint(
+                scope="conversation",
+                name="chat_context_analyze",
+                parts=[message[:256], rolling_summary[:256], history_block[:512]],
+            ),
         )
         raw = (resp.get("final_text") or "").strip()
     except Exception as exc:
@@ -169,6 +175,11 @@ def allocate_collection_quotas(
                 {"role": "system", "content": _pm.render("chat_collection_quota_allocate_system.txt")},
                 {"role": "user", "content": prompt},
             ],
+            cache=build_cache_hint(
+                scope="global_template",
+                name="chat_collection_quota_allocate",
+                parts=[query[:256], collection_names],
+            ),
         )
         raw = (resp.get("final_text") or "").strip()
         # Strip markdown fences if present
@@ -232,6 +243,11 @@ def check_query_collection_scope(
                 {"role": "system", "content": _pm.render("chat_local_scope_check_system.txt")},
                 {"role": "user", "content": prompt},
             ],
+            cache=build_cache_hint(
+                scope="global_template",
+                name="chat_local_scope_check",
+                parts=[collection_name, query[:256]],
+            ),
         )
         raw = (resp.get("final_text") or "").strip().lower()
     except Exception:

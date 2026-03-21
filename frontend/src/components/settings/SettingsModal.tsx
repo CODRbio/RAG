@@ -139,9 +139,11 @@ export function SettingsModal() {
 
   const formatIntentProviderLabel = (provider: LLMProviderInfo): string => {
     const platform = (provider.platform || '').trim();
-    if (provider.label && provider.label !== provider.id) return `${provider.label} (${provider.id})`;
-    if (platform) return `${provider.id} (${platform})`;
-    return provider.id;
+    const isCodex = platform === 'codex_app_server' || provider.id === 'codex';
+    const experimentalSuffix = isCodex ? ` [${t('settings.codexExperimentalBadge')}]` : '';
+    if (provider.label && provider.label !== provider.id) return `${provider.label} (${provider.id})${experimentalSuffix}`;
+    if (platform) return `${provider.id} (${platform})${experimentalSuffix}`;
+    return `${provider.id}${experimentalSuffix}`;
   };
 
   return (

@@ -7,6 +7,7 @@ Used by: Chat Round 2, Research plan_node background retrieval.
 import re
 from typing import Any, Dict, List, Optional
 
+from src.llm.llm_manager import build_cache_hint
 from src.utils.prompt_manager import PromptManager
 
 _pm = PromptManager()
@@ -63,6 +64,11 @@ def generate_structured_queries_1plus1plus1(
         resp = llm_client.chat(
             [{"role": "user", "content": prompt}],
             model=model_override or None,
+            cache=build_cache_hint(
+                scope="global_template",
+                name="chat_generate_queries",
+                parts=[query_stripped[:256], evidence_context[:512]],
+            ),
         )
         text = (resp.get("final_text") or "").strip()
         if not text:

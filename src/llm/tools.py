@@ -56,6 +56,16 @@ def set_tool_collection(collection: Optional[str], collections: Optional[List[st
     )
 
 
+def set_tool_user_id(user_id: Optional[str]) -> None:
+    """Set the request-scoped user id for tools that need SQL-backed context."""
+    _agent_chunks_local.user_id = (user_id or "default").strip() or "default"
+
+
+def get_tool_user_id() -> str:
+    """Return the request-scoped user id, defaulting to the local default user."""
+    return getattr(_agent_chunks_local, "user_id", None) or "default"
+
+
 def set_tool_step_top_k(step_top_k: Optional[int]) -> None:
     """Set request-scoped step_top_k for agent retrieval tools."""
     try:
@@ -807,6 +817,45 @@ _EXPLORE_GRAPH_SCHEMA = {
     "required": ["entity_name"],
 }
 
+_EXPLORE_ACADEMIC_GRAPH_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "graph_type": {
+            "type": "string",
+            "enum": ["citation", "author", "institution"],
+            "description": "学术图类型",
+        },
+        "scope_type": {
+            "type": "string",
+            "enum": ["global", "collection", "library"],
+            "description": "图 scope 类型；默认优先使用当前 collection",
+            "default": "collection",
+        },
+        "scope_key": {
+            "type": "string",
+            "description": "scope 标识；collection 传集合名，library 传库 ID，global 可省略",
+        },
+        "paper_uid": {
+            "type": "string",
+            "description": "论文 paper_uid，适合 citation 图或从论文出发的 author/institution 图",
+        },
+        "node_id": {
+            "type": "string",
+            "description": "显式节点 ID，如 author:alice 或 institution:mit",
+        },
+        "depth": {
+            "type": "integer",
+            "description": "扩展深度 (1-3)",
+            "default": 1,
+        },
+        "question": {
+            "type": "string",
+            "description": "希望图摘要回答的具体问题（可选）",
+        },
+    },
+    "required": ["graph_type"],
+}
+
 _CANVAS_SCHEMA = {
     "type": "object",
     "properties": {
@@ -844,6 +893,70 @@ _COMPARE_SCHEMA = {
         },
     },
     "required": ["paper_ids"],
+}
+
+_SUMMARIZE_PAPER_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "paper_uid": {"type": "string", "description": "目标论文的 paper_uid"},
+        "paper_id": {"type": "string", "description": "兼容旧路径的 paper_id"},
+        "collection": {"type": "string", "description": "当只给 paper_id 时可补 collection"},
+        "question": {"type": "string", "description": "可选的精读聚焦问题"},
+    },
+}
+
+_ASK_PAPER_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "paper_uid": {"type": "string", "description": "目标论文的 paper_uid"},
+        "paper_id": {"type": "string", "description": "兼容旧路径的 paper_id"},
+        "collection": {"type": "string", "description": "当只给 paper_id 时可补 collection"},
+        "question": {"type": "string", "description": "要回答的问题"},
+    },
+    "required": ["question"],
+}
+
+_ANALYZE_PAPER_MEDIA_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "paper_uids": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "需要补图像解析的论文 paper_uid 列表",
+            "minItems": 1,
+            "maxItems": 10,
+        },
+        "scope_type": {"type": "string", "enum": ["collection", "library", "global"], "default": "collection"},
+        "scope_key": {"type": "string", "description": "collection 名称或 library id"},
+        "force_reparse": {"type": "boolean", "default": False},
+    },
+    "required": ["paper_uids"],
+}
+
+_DISCOVER_ACADEMIC_RESOURCES_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "mode": {
+            "type": "string",
+            "enum": ["missing_core", "forward_tracking", "experts", "institutions"],
+            "description": "发现模式",
+        },
+        "paper_uids": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "作为种子的论文 paper_uid 列表",
+        },
+        "node_ids": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "可选图节点种子",
+        },
+        "scope_type": {"type": "string", "enum": ["collection", "library", "global"], "default": "collection"},
+        "scope_key": {"type": "string", "description": "collection 名称或 library id"},
+        "question": {"type": "string", "description": "可选的发现问题"},
+        "limit": {"type": "integer", "default": 10},
+    },
+    "required": ["mode"],
 }
 
 _RUN_CODE_SCHEMA = {
@@ -1075,6 +1188,95 @@ def _handle_explore_graph(entity_name: str, depth: int = 1, **_) -> str:
         return f"图谱查询失败: {e}"
 
 
+def _handle_explore_academic_graph(
+    graph_type: str,
+    scope_type: str = "collection",
+    scope_key: str = "",
+    paper_uid: str = "",
+    node_id: str = "",
+    depth: int = 1,
+    question: str = "",
+    **_,
+) -> str:
+    try:
+        from src.services.global_graph_service import get_global_graph_service
+        from src.services.collection_library_binding_service import resolve_bound_library_for_collection
+
+        requested_scope_type = (scope_type or "collection").strip().lower() or "collection"
+        requested_scope_key = (scope_key or "").strip()
+        current_collection = getattr(_agent_chunks_local, "collection", None)
+        user_id = get_tool_user_id()
+
+        def _candidate_scopes() -> List[Dict[str, str]]:
+            if requested_scope_type == "global":
+                return [{"user_id": user_id, "scope_type": "global", "scope_key": "global"}]
+            if requested_scope_type == "library":
+                if requested_scope_key:
+                    return [{"user_id": user_id, "scope_type": "library", "scope_key": requested_scope_key}]
+                if current_collection:
+                    bound = resolve_bound_library_for_collection(user_id, current_collection, auto_create=False)
+                    if bound and getattr(bound, "id", None) is not None:
+                        return [{"user_id": user_id, "scope_type": "library", "scope_key": str(int(bound.id))}]
+                return [{"user_id": user_id, "scope_type": "global", "scope_key": "global"}]
+
+            # Default assistant order: collection -> bound library -> global.
+            scopes: List[Dict[str, str]] = []
+            effective_collection = requested_scope_key or (current_collection or "")
+            if effective_collection:
+                scopes.append(
+                    {
+                        "user_id": user_id,
+                        "scope_type": "collection",
+                        "scope_key": effective_collection,
+                    }
+                )
+                bound = resolve_bound_library_for_collection(user_id, effective_collection, auto_create=False)
+                if bound and getattr(bound, "id", None) is not None:
+                    scopes.append(
+                        {
+                            "user_id": user_id,
+                            "scope_type": "library",
+                            "scope_key": str(int(bound.id)),
+                        }
+                    )
+            scopes.append({"user_id": user_id, "scope_type": "global", "scope_key": "global"})
+            deduped: List[Dict[str, str]] = []
+            seen = set()
+            for item in scopes:
+                key = (item["scope_type"], item["scope_key"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(item)
+            return deduped
+
+        seeds = {
+            "node_ids": [node_id] if (node_id or "").strip() else [],
+            "paper_uids": [paper_uid] if (paper_uid or "").strip() else [],
+        }
+        svc = get_global_graph_service()
+        last_result: Optional[Dict[str, Any]] = None
+        for candidate_scope in _candidate_scopes():
+            result = svc.summarize_subgraph(
+                graph_type=graph_type,
+                scope=candidate_scope,
+                seeds=seeds,
+                depth=depth,
+                question=(question or "").strip() or None,
+                max_items=8,
+            )
+            last_result = result
+            subgraph = result.get("subgraph") or {}
+            if (subgraph.get("nodes") or []) or (subgraph.get("edges") or []):
+                return str(result.get("summary") or "").strip() or "图摘要为空"
+        if last_result is None:
+            return "图摘要为空"
+        result = last_result
+        return str(result.get("summary") or "").strip() or "图摘要为空"
+    except Exception as e:
+        return f"学术图查询失败: {e}"
+
+
 def _handle_canvas(action: str, canvas_id: str = "", topic: str = "", content: str = "", **_) -> str:
     from src.collaboration.canvas.canvas_manager import create_canvas, get_canvas, update_canvas
     if action == "create":
@@ -1125,6 +1327,121 @@ def _handle_compare(paper_ids: List[str], aspects: Optional[List[str]] = None, *
         return "\n".join(parts) if parts else "对比结果为空"
     except Exception as e:
         return f"论文对比失败: {e}"
+
+
+def _handle_summarize_paper(
+    paper_uid: str = "",
+    paper_id: str = "",
+    collection: str = "",
+    question: str = "",
+    **_,
+) -> str:
+    try:
+        from src.services.reference_assistant_service import get_reference_assistant_service
+
+        service = get_reference_assistant_service()
+        locator = {
+            "paper_uid": (paper_uid or "").strip(),
+            "paper_id": (paper_id or "").strip(),
+            "collection": (collection or getattr(_agent_chunks_local, "collection", None) or "").strip(),
+        }
+        resp = service.summarize_paper(
+            locator,
+            user_id=get_tool_user_id(),
+            question=(question or "").strip() or None,
+        )
+        return str(resp.get("summary_md") or "").strip() or "论文总结为空"
+    except Exception as e:
+        return f"论文精读失败: {e}"
+
+
+def _handle_ask_paper(
+    question: str,
+    paper_uid: str = "",
+    paper_id: str = "",
+    collection: str = "",
+    **_,
+) -> str:
+    try:
+        from src.services.reference_assistant_service import get_reference_assistant_service
+
+        service = get_reference_assistant_service()
+        locator = {
+            "paper_uid": (paper_uid or "").strip(),
+            "paper_id": (paper_id or "").strip(),
+            "collection": (collection or getattr(_agent_chunks_local, "collection", None) or "").strip(),
+        }
+        resp = service.ask_paper(
+            locator,
+            user_id=get_tool_user_id(),
+            question=(question or "").strip(),
+        )
+        return str(resp.get("answer_md") or "").strip() or "论文问答结果为空"
+    except Exception as e:
+        return f"论文问答失败: {e}"
+
+
+def _handle_analyze_paper_media(
+    paper_uids: List[str],
+    scope_type: str = "collection",
+    scope_key: str = "",
+    force_reparse: bool = False,
+    **_,
+) -> str:
+    try:
+        from src.services.reference_assistant_service import get_reference_assistant_service
+
+        service = get_reference_assistant_service()
+        effective_scope_key = (scope_key or getattr(_agent_chunks_local, "collection", None) or "").strip()
+        resp = service.analyze_paper_media(
+            [str(item).strip() for item in (paper_uids or []) if str(item).strip()],
+            user_id=get_tool_user_id(),
+            scope={"scope_type": scope_type or "collection", "scope_key": effective_scope_key},
+            force_reparse=bool(force_reparse),
+            upsert_vectors_enabled=True,
+        )
+        return str(resp.get("summary_md") or "").strip() or "图片解析结果为空"
+    except Exception as e:
+        return f"图片解析失败: {e}"
+
+
+def _handle_discover_academic_resources(
+    mode: str,
+    paper_uids: Optional[List[str]] = None,
+    node_ids: Optional[List[str]] = None,
+    scope_type: str = "collection",
+    scope_key: str = "",
+    question: str = "",
+    limit: int = 10,
+    **_,
+) -> str:
+    try:
+        from src.services.reference_assistant_service import get_reference_assistant_service
+
+        service = get_reference_assistant_service()
+        effective_scope_key = (scope_key or getattr(_agent_chunks_local, "collection", None) or "").strip()
+        resp = service.discover(
+            mode=(mode or "").strip().lower().replace("-", "_"),
+            user_id=get_tool_user_id(),
+            seeds={
+                "paper_uids": [str(item).strip() for item in (paper_uids or []) if str(item).strip()],
+                "node_ids": [str(item).strip() for item in (node_ids or []) if str(item).strip()],
+            },
+            scope={"scope_type": scope_type or "collection", "scope_key": effective_scope_key},
+            options={"question": (question or "").strip(), "limit": int(limit or 10)},
+        )
+        parts = []
+        if resp.get("summary_md"):
+            parts.append(str(resp["summary_md"]).strip())
+        items = resp.get("items") or []
+        if items:
+            parts.append("")
+            parts.append("Items:")
+            for item in items[:10]:
+                parts.append(f"- {json.dumps(item, ensure_ascii=False)}")
+        return "\n".join(part for part in parts if part).strip() or "发现结果为空"
+    except Exception as e:
+        return f"学术发现失败: {e}"
 
 
 def _handle_search_ncbi(query: str, limit: int = 5, **_) -> str:
@@ -1405,6 +1722,12 @@ CORE_TOOLS: List[ToolDef] = [
         handler=_handle_explore_graph,
     ),
     ToolDef(
+        name="explore_academic_graph",
+        description="学术图谱探索，查看 citation / author / institution 图中的关键关系，并返回结构化摘要。",
+        parameters=_EXPLORE_ACADEMIC_GRAPH_SCHEMA,
+        handler=_handle_explore_academic_graph,
+    ),
+    ToolDef(
         name="canvas",
         description="操作研究画布：创建(create)、获取(get)、更新(update)画布内容。",
         parameters=_CANVAS_SCHEMA,
@@ -1421,6 +1744,30 @@ CORE_TOOLS: List[ToolDef] = [
         description="多文档对比：选择 2-5 篇论文，自动生成结构化对比矩阵和分析。",
         parameters=_COMPARE_SCHEMA,
         handler=_handle_compare,
+    ),
+    ToolDef(
+        name="summarize_paper",
+        description="单篇论文精读总结，可结合论文中的图片解析和已有标注。",
+        parameters=_SUMMARIZE_PAPER_SCHEMA,
+        handler=_handle_summarize_paper,
+    ),
+    ToolDef(
+        name="ask_paper",
+        description="针对单篇论文做定向问答，优先使用论文正文、图像解释和本地标注。",
+        parameters=_ASK_PAPER_SCHEMA,
+        handler=_handle_ask_paper,
+    ),
+    ToolDef(
+        name="analyze_paper_media",
+        description="对论文中的 figure/image 做补充解析，并增量写入向量库。",
+        parameters=_ANALYZE_PAPER_MEDIA_SCHEMA,
+        handler=_handle_analyze_paper_media,
+    ),
+    ToolDef(
+        name="discover_academic_resources",
+        description="执行 Missing Core / Forward Tracking / 学者 / 机构发现。",
+        parameters=_DISCOVER_ACADEMIC_RESOURCES_SCHEMA,
+        handler=_handle_discover_academic_resources,
     ),
     ToolDef(
         name="run_code",
@@ -1467,9 +1814,9 @@ _TOOL_REGISTRY: Dict[str, ToolDef] = {t.name: t for t in CORE_TOOLS}
 _GROUP_SEARCH_LOCAL = frozenset({"search_local"})
 _GROUP_WEB = frozenset({"search_web", "search_scholar", "search_ncbi"})
 _GROUP_SONAR = frozenset({"search_sonar"})
-_GROUP_ANALYSIS = frozenset({"compare_papers", "summarize_quantitative"})
+_GROUP_ANALYSIS = frozenset({"compare_papers", "summarize_quantitative", "summarize_paper", "ask_paper", "discover_academic_resources"})
 _GROUP_ANALYSIS_OPTIONAL = frozenset({"run_code"})
-_GROUP_GRAPH = frozenset({"explore_graph"})
+_GROUP_GRAPH = frozenset({"explore_graph", "explore_academic_graph"})
 _GROUP_COLLAB = frozenset({"canvas", "get_citations"})
 
 _WEB_PROVIDER_TO_TOOL: Dict[str, str] = {
@@ -1530,7 +1877,7 @@ def get_routed_skills(
        from pre-research; model set via agent_sonar_model).
     4. Analysis group (compare_papers / run_code):
        keyword-triggered by comparison / statistics / code mentions
-    5. Graph group (explore_graph):
+    5. Graph group (explore_graph / explore_academic_graph):
        keyword-triggered by relationship / graph / network mentions
     6. Collab group (canvas / get_citations):
        stage-triggered (drafting / refine) or keyword-triggered

@@ -9,6 +9,8 @@ export interface ScholarResultMetadata {
   authors: string[];
   year: number | null;
   doi: string | null;
+  paper_uid?: string | null;
+  paper_id?: string | null;
   pdf_url?: string | null;
   url?: string | null;
   downloadable?: boolean;
@@ -106,6 +108,7 @@ export interface ScholarLibraryPaper {
   authors: string[];
   year: number | null;
   doi: string | null;
+  paper_uid?: string | null;
   pdf_url: string | null;
   url: string | null;
   source: string;
@@ -611,7 +614,11 @@ export async function* streamScholarTaskEvents(
       const aid = lastEventId || afterId;
       return `${BASE_URL}/scholar/task/${encodeURIComponent(taskId)}/stream?after_id=${encodeURIComponent(aid || '-')}`;
     },
-    getHeaders: () => (token ? { Authorization: `Bearer ${token}` } : {}),
+    getHeaders: () => {
+      const headers: Record<string, string> = {};
+      if (token) headers.Authorization = `Bearer ${token}`;
+      return headers;
+    },
     terminalEvents: [...SCHOLAR_TERMINAL_EVENTS],
     signal,
     maxRetries: 5,

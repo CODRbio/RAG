@@ -35,31 +35,39 @@
       "qwen": {
         "api_key": "sk-xxx",
         "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1"
+      },
+      "codex_app_server": {
+        "_note": "OpenAI Codex CLI App Server (experimental). 默认走服务器本机 `codex login` / ChatGPT 登录态；仅在显式填写 api_key 时才走 API Key 认证。不会继承 OPENAI_API_KEY。base_url 留空（走 stdio subprocess）。",
+        "api_key": "",
+        "base_url": ""
       }
     },
     "_providers_note": "模型列表由前端实时从平台 API 拉取。default_model 仅在无 UI 选择时托底。params 用于 thinking 等参数注入。",
     "_models_latest": "各 provider 当前默认模型：OpenAI gpt-5.4 | DeepSeek deepseek-chat/reasoner | Gemini gemini-3.1-pro-preview | Claude claude-sonnet-4-6 / haiku-4-5 | Kimi kimi-k2.5 | Sonar sonar-pro | Qwen qwen3.5-plus",
     "providers": {
-      "openai":           { "platform": "openai",     "default_model": "gpt-5.4"                },
-      "openai-thinking":  { "platform": "openai",     "default_model": "gpt-5.4",               "params": { "reasoning_effort": "high" } },
+      "openai":           { "platform": "openai",     "default_model": "gpt-5.4",                "params": { "cache": { "mode": "provider_only", "scope": "conversation", "retention": "in_memory" } } },
+      "openai-thinking":  { "platform": "openai",     "default_model": "gpt-5.4",               "params": { "reasoning_effort": "high", "cache": { "mode": "provider_only", "scope": "conversation", "retention": "24h" } } },
       "openai-mini":      { "platform": "openai",     "default_model": "gpt-5-mini"            },
       "deepseek":         { "platform": "deepseek",   "default_model": "deepseek-chat"          },
       "deepseek-thinking":{ "platform": "deepseek",   "default_model": "deepseek-reasoner",     "params": { "thinking": { "type": "enabled" } } },
-      "gemini":           { "platform": "gemini",     "default_model": "gemini-3.1-pro-preview" },
-      "gemini-thinking":  { "platform": "gemini",     "default_model": "gemini-3.1-pro-preview","params": { "reasoning_effort": "high" } },
+      "gemini":           { "platform": "gemini",     "default_model": "gemini-3.1-pro-preview", "params": { "cache": { "mode": "provider_only", "scope": "section" } } },
+      "gemini-thinking":  { "platform": "gemini",     "default_model": "gemini-3.1-pro-preview","params": { "reasoning_effort": "high", "cache": { "mode": "provider_only", "scope": "section" } } },
       "gemini-vision":    { "platform": "gemini",     "default_model": "gemini-3.1-pro-preview","params": { "temperature": 0.2 } },
       "gemini-flash":     { "platform": "gemini",     "default_model": "gemini-flash-latest"   },
       "gemini-flash-lite":{ "platform": "gemini",     "default_model": "gemini-flash-lite-latest" },
-      "claude":           { "platform": "claude",     "default_model": "claude-sonnet-4-6",     "params": { "enable_prompt_cache": true } },
-      "claude-thinking":  { "platform": "claude",     "default_model": "claude-sonnet-4-6",     "params": { "thinking": { "type": "enabled", "budget_tokens": 10000 }, "enable_prompt_cache": true } },
-      "claude-haiku":     { "platform": "claude",     "default_model": "claude-haiku-4-5",      "params": { "enable_prompt_cache": true } },
+      "claude":           { "platform": "claude",     "default_model": "claude-sonnet-4-6",     "params": { "cache": { "mode": "provider_only", "scope": "conversation", "strategy": "auto" }, "enable_prompt_cache": true } },
+      "claude-thinking":  { "platform": "claude",     "default_model": "claude-sonnet-4-6",     "params": { "thinking": { "type": "enabled", "budget_tokens": 10000 }, "cache": { "mode": "provider_only", "scope": "conversation", "strategy": "auto" }, "enable_prompt_cache": true } },
+      "claude-haiku":     { "platform": "claude",     "default_model": "claude-haiku-4-5",      "params": { "cache": { "mode": "provider_only", "scope": "conversation", "strategy": "auto" }, "enable_prompt_cache": true } },
       "kimi":             { "platform": "kimi",       "default_model": "kimi-k2.5"              },
       "kimi-vision":      { "platform": "kimi",       "default_model": "kimi-k2.5"              },
       "kimi-thinking":    { "platform": "kimi",       "default_model": "kimi-k2.5",             "params": { "thinking": { "type": "enabled" } } },
       "sonar":            { "platform": "perplexity", "default_model": "sonar-pro"               },
       "qwen":             { "platform": "qwen",       "default_model": "qwen3.5-plus"            },
       "qwen-vision":      { "platform": "qwen",       "default_model": "qwen3.5-plus"            },
-      "qwen-thinking":    { "platform": "qwen",       "default_model": "qwen3.5-plus",           "params": { "enable_thinking": true } }
+      "qwen-thinking":    { "platform": "qwen",       "default_model": "qwen3.5-plus",           "params": { "enable_thinking": true } },
+      "codex":            { "platform": "codex_app_server", "default_model": "gpt-5.4",
+                            "_note": "Experimental Codex agent provider. 需要服务器安装 codex CLI: npm i -g @openai/codex",
+                            "params": { "effort": "medium", "summary": "concise", "timeout": 180 } }
     }
   },
   "parser": {
@@ -201,6 +209,14 @@
     "cache_ttl_seconds": 3600,
     "cache_maxsize": 256
   },
+  "openalex": {
+    "_comment": "OpenAlex 学术元数据 API（免费；api_key 填注册邮箱用于 polite pool 100k req/day；若有 Bearer token 也填此处）。作为 CrossRef 的 fallback 源，自动提升 DOI 与元数据覆盖率。",
+    "enabled": true,
+    "api_key": "",
+    "base_url": "https://api.openalex.org",
+    "timeout_seconds": 10,
+    "max_results": 3
+  },
   "content_fetcher": {
     "enabled": false,
     "only_academic": false,
@@ -301,8 +317,10 @@
       "timeout_seconds": 180,
       "max_retries": 2,
       "retry_backoff": 1.5,
+      "_cache_comment": "performance.llm.cache_* 仅控制应用层精确命中缓存；provider 原生缓存由 llm.providers.<name>.params.cache 控制",
       "cache_enabled": false,
       "cache_ttl_seconds": 3600,
+      "cache_max_entries": 1024,
       "max_concurrent_per_provider": 5
     },
     "web_search": {

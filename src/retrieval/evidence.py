@@ -33,6 +33,8 @@ class EvidenceChunk:
     url: Optional[str] = None
     pdf_url: Optional[str] = None
     doi: Optional[str] = None
+    pmid: Optional[str] = None
+    paper_uid: Optional[str] = None
     page_num: Optional[int] = None
     section_title: Optional[str] = None
     evidence_type: Optional[str] = None  # finding | method | interpretation | background | summary

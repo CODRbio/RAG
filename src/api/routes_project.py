@@ -11,6 +11,7 @@ from src.collaboration.memory.session_memory import get_session_store
 from src.collaboration.memory.working_memory import delete_working_memory
 from src.collaboration.memory.persistent_store import delete_user_project
 from src.collaboration.research.job_store import delete_jobs_by_canvas_id
+from src.services.resource_state_service import get_resource_state_service
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
@@ -22,8 +23,22 @@ def list_projects(
 ) -> list[dict]:
     """列出当前用户的项目（含存档状态）。"""
     store = get_canvas_store()
-    items = store.list_by_user(user_id, include_archived=include_archived)
-    return items
+    items = store.list_by_user(user_id, include_archived=True)
+    service = get_resource_state_service()
+    state_map = service.get_user_state_map(
+        user_id=user_id,
+        resource_type="canvas",
+        resource_ids=[item["id"] for item in items],
+    )
+    out = []
+    for item in items:
+        state = state_map.get(item["id"]) or {}
+        archived = bool(state.get("archived")) if state else bool(item.get("archived"))
+        item_out = dict(item)
+        item_out["archived"] = archived
+        if include_archived or not archived:
+            out.append(item_out)
+    return out
 
 
 @router.post("/{canvas_id}/archive")
@@ -38,6 +53,13 @@ def archive_project(
         raise HTTPException(status_code=404, detail="project not found")
     if owner != user_id:
         raise HTTPException(status_code=403, detail="not your project")
+    service = get_resource_state_service()
+    service.upsert_user_state(
+        user_id=user_id,
+        resource_type="project",
+        resource_id=canvas_id,
+        archived=True,
+    )
     if not store.archive(canvas_id):
         raise HTTPException(status_code=404, detail="project not found")
     return {"canvas_id": canvas_id, "archived": True}
@@ -55,6 +77,13 @@ def unarchive_project(
         raise HTTPException(status_code=404, detail="project not found")
     if owner != user_id:
         raise HTTPException(status_code=403, detail="not your project")
+    service = get_resource_state_service()
+    service.upsert_user_state(
+        user_id=user_id,
+        resource_type="project",
+        resource_id=canvas_id,
+        archived=False,
+    )
     if not store.unarchive(canvas_id):
         raise HTTPException(status_code=404, detail="project not found")
     return {"canvas_id": canvas_id, "archived": False}
@@ -72,10 +101,15 @@ def delete_project(
         raise HTTPException(status_code=404, detail="project not found")
     if owner != user_id:
         raise HTTPException(status_code=403, detail="not your project")
-    # Check if archived - require unarchive first
+    service = get_resource_state_service()
+    current_state = service.get_user_state(
+        user_id=user_id,
+        resource_type="project",
+        resource_id=canvas_id,
+    )
     items = store.list_by_user(user_id, include_archived=True)
     current = next((x for x in items if x["id"] == canvas_id), None)
-    if current and current.get("archived"):
+    if current_state.get("archived") or bool((current or {}).get("archived")):
         raise HTTPException(
             status_code=400,
             detail="archived project must be unarchived before deletion",
@@ -87,4 +121,22 @@ def delete_project(
     delete_user_project(user_id, canvas_id)
     if not store.delete(canvas_id):
         raise HTTPException(status_code=404, detail="project not found")
+    # Clean up resource-level overlays (user_state / tag / note) and annotations
+    service.delete_resource_overlays(
+        user_id=user_id,
+        resource_type="canvas",
+        resource_id=canvas_id,
+    )
+    try:
+        from src.indexing.assistant_artifact_store import delete_resource_annotations_for_resource
+        delete_resource_annotations_for_resource(
+            user_id=user_id,
+            resource_type="canvas",
+            resource_id=canvas_id,
+        )
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning(
+            "delete_project annotation cleanup failed canvas_id=%s: %s", canvas_id, exc
+        )
     return {"canvas_id": canvas_id, "deleted": True}

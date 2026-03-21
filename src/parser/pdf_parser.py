@@ -1679,7 +1679,7 @@ class PDFProcessor:
         # 4. Extract figures
         figure_blocks = [
             b for b in blocks
-            if b.block_type == BlockType.FIGURE and b.figure_data and b.figure_data.caption
+            if b.block_type == BlockType.FIGURE and b.figure_data
         ]
         extractor = FigureExtractor(self.config)
         extractor.extract_figures(pdf_path, figure_blocks, out)

@@ -6687,26 +6687,9 @@ class PaperDownloader:
 
     # 添加缺失的函数定义
     def _generate_paper_hash(self, title: str, authors: List[str]) -> str:
-        """根据论文标题和作者生成唯一哈希值
-        
-        Args:
-            title: 论文标题
-            authors: 作者列表
-            
-        Returns:
-            str: 论文的唯一哈希值
-        """
-        # 标准化标题和作者
-        normalized_title = title.lower().strip() if title else ""
-        normalized_authors = [a.lower().strip() for a in authors if a]
-        
-        # 组合标题和第一作者（如果有）
-        hash_input = normalized_title
-        if normalized_authors:
-            hash_input += "_" + normalized_authors[0]
-            
-        # 生成哈希
-        return hashlib.md5(hash_input.encode('utf-8')).hexdigest()
+        """根据论文标题和作者生成唯一哈希值（统一调用 compute_paper_uid，符合 ref_tools 零号规范）。"""
+        from src.retrieval.dedup import compute_paper_uid
+        return compute_paper_uid(title=title, authors=authors)
 
     def _record_download_success(self, filepath: str, url: str,
                                  title: Optional[str] = None,

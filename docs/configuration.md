@@ -2,7 +2,7 @@
 
 本文档描述配置文件与环境变量的加载逻辑、关键配置块和推荐实践。
 
-更新时间：2026-02-19
+更新时间：2026-03-20
 
 ## 一、配置来源与优先级
 
@@ -56,6 +56,39 @@ LLM 统一调度配置。
   - `claude` / `claude-thinking`
   - `kimi` / `kimi-thinking` / `kimi-vision`
   - `sonar`
+  - `codex`（**实验性**，见下）
+
+#### OpenAI Codex（App Server，experimental）
+
+- **定位**：独立 experimental provider，通过本机 `codex app-server` 子进程（stdio JSON-RPC）接入，**不替代**主链路 HTTP LLM（OpenAI/Claude/Gemini 等）。
+- **配置**：
+  - 在 `llm.platforms` 中定义 `codex_app_server`（`base_url` 可留空；走 subprocess）。
+  - 在 `llm.providers` 中定义具体条目（如 `codex`），`platform` 设为 `codex_app_server`。
+- **鉴权**（二选一）：
+  - **默认推荐：本机 ChatGPT 登录态**。保持 `llm.platforms.codex_app_server.api_key` 为空，在运行后端的机器上执行 `codex login` 或 `codex login --device-auth`。应用会复用本机登录态；`GET /llm/models` 与 `GET /llm/providers/codex/models` 在 Codex 上允许空 key，其它 provider 仍要求有效 key。
+  - **显式 API Key 模式**：仅在你明确希望 Codex 走 key 鉴权时，才在 `llm.platforms.codex_app_server.api_key` 中填写 key，或设置环境变量 `RAG_LLM__CODEX_APP_SERVER__API_KEY`；此时走 `account/login/start(type=apiKey)`。
+  - **注意**：Codex **不会**再继承 `OPENAI_API_KEY`，避免应用启动时把已有的 ChatGPT 登录态覆盖成 API key 登录。
+- **会话连续性**：服务端在同一会话内将 `codex_thread_id` 写入 `session.preferences`，后续 Chat / ReAct 轮次会透传并在响应中更新，便于跨轮复用 Codex thread。
+- **CLI**：需安装 Codex CLI（例如 `npm i -g @openai/codex`），并确保 `codex` 在服务器 `PATH` 中。
+- **推荐检查**：执行 `codex login status`，确认看到 `Logged in using ChatGPT` 后再启动后端。
+
+#### Provider 原生缓存
+
+`llm.providers.<name>.params.cache` 用于声明 provider 原生缓存策略；当前由 `src/llm/llm_manager.py` 统一解释并映射到各平台 API。
+
+推荐字段：
+
+- `mode`：`off | provider_only | provider_plus_app`
+- `scope`：`conversation | section | global_template`
+- `retention`：provider 专属保留策略；当前主要用于 OpenAI（`in_memory` / `24h`）
+- `strategy`：当前主要用于 Anthropic（`auto` / `explicit`）
+- `cached_content`：当前主要用于 Gemini native `cachedContent`
+
+说明：
+
+- `provider_only`：只用平台原生 prompt/context cache，不做应用层响应缓存。
+- `provider_plus_app`：在 provider 原生缓存之外，再叠加进程内精确命中缓存。
+- 旧字段 `enable_prompt_cache` 仍兼容，但建议迁移到 `params.cache`。
 
 #### 模型入口映射
 
@@ -98,6 +131,20 @@ PDF 解析相关配置。
 - `caption_pattern` / `table_caption_pattern`：图表标题正则
 - `llm_text_provider` / `llm_vision_provider`：解析增强使用的 LLM provider
 - `enrich_tables` / `enrich_figures`：表格/图表 LLM 增强开关
+
+Phase 3 补充约束：
+
+- `enrich_figures` 仍然是 ingest 阶段的底层能力开关
+- 学术助手新增的 `/academic-assistant/media-analysis/start` 默认走“手动触发 + 后台回填”路径
+- 也就是说：**media-analysis 不要求所有 ingest 默认开启**，但会复用同一组 parser / vision 配置
+- 图片解析结果仍写回 `enriched.json`，不会单独新增第二份 media 真相存储
+
+当需要精读阶段补图像解析时，优先检查以下配置：
+
+- `parser.llm_vision_provider`
+- `parser.llm_vision_model`
+- `parser.llm_vision_concurrency`
+- `parser.enrich_figures`
 
 ### `chunk`
 
@@ -422,6 +469,52 @@ Deep Research 配置。
 
 以上默认值以 `config/settings.py` 及 `config/rag_config.json` 为准；若需覆盖，在 `performance` / `content_fetcher` 对应块中增加或修改键即可。
 
+### `performance.llm`（应用层 LLM 缓存与重试）
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `timeout_seconds` | `180` | 单次 LLM 请求读超时。 |
+| `max_retries` | `2` | 传输层重试次数；不改变业务 prompt。 |
+| `retry_backoff` | `1.5` | 指数退避基础倍率。 |
+| `cache_enabled` | `false` | 进程内精确命中 response cache 开关。仅对 `cache.mode=provider_plus_app` 的调用生效。 |
+| `cache_ttl_seconds` | `3600` | 应用层 response cache TTL（秒）。 |
+| `cache_max_entries` | `1024` | 应用层 response cache 最大条目数。 |
+| `max_concurrent_per_provider` | `5` | 单 provider 并发信号量上限。 |
+
+注意：
+
+- `performance.llm.cache_*` 不会自动开启 OpenAI / Anthropic / Gemini 的 provider 原生缓存。
+- provider 原生缓存由 `llm.providers.<name>.params.cache` 或单次 `client.chat(..., cache=...)` override 决定。
+- 流式响应不做应用层 response cache；原生 provider 缓存仍可能命中。
+
+### LLM Usage 归一化
+
+`llm_manager.normalize_response()` 会把各 provider 的 usage 归一为统一字段：
+
+- `prompt_tokens`
+- `completion_tokens`
+- `total_tokens`
+- `reasoning_tokens`
+- `cached_input_tokens`
+- `cache_read_tokens`
+- `cache_write_tokens`
+- `cache_hit`
+
+provider 映射：
+
+- OpenAI：读取 `usage.prompt_tokens_details.cached_tokens`
+- Anthropic：读取 `cache_read_input_tokens` / `cache_creation_input_tokens`
+- Gemini native：读取 `cachedContentTokenCount`
+
+### Provider 缓存兼容矩阵
+
+| Provider | 当前支持 | 映射方式 |
+|---|---|---|
+| OpenAI | Prompt caching | 注入 `prompt_cache_key`、`prompt_cache_retention`；平台自动做前缀缓存 |
+| Anthropic | Prompt caching | 顶层 `cache_control`（auto）或 block 级 `cache_control`（explicit） |
+| Gemini native | Context caching / implicit caching | 支持透传 `cachedContent`；隐式缓存由平台自动处理 |
+| 其他 OpenAI-compatible 平台 | 不强制注入 | 默认避免传 OpenAI 专属缓存字段，防止兼容性问题 |
+
 ## 三、重要环境变量
 
 ### API Key 注入（推荐）
@@ -429,7 +522,9 @@ Deep Research 配置。
 - `RAG_LLM__{PROVIDER}__API_KEY`：覆盖对应 provider key
   - 示例：`RAG_LLM__OPENAI__API_KEY`、`RAG_LLM__DEEPSEEK__API_KEY`
 - `RAG_LLM__SONAR__API_KEY`：Perplexity Sonar key
+- `RAG_LLM__CODEX_APP_SERVER__API_KEY`：Codex 的显式 API Key 模式；未设置时，Codex 默认走本机 `codex login` / ChatGPT 登录态
 - 兼容旧变量：`OPENAI_API_KEY`、`DEEPSEEK_API_KEY`、`GEMINI_API_KEY`、`ANTHROPIC_API_KEY`
+- 注意：`OPENAI_API_KEY` 只用于普通 OpenAI provider，不再驱动 Codex 登录
 
 ### 服务配置
 

@@ -349,3 +349,52 @@ def test_s3_media_store_uploads_with_content_type_and_public_url():
     assert asset.key == "prod/graphic-abstract/anon/turn_3.png"
     assert asset.url == "https://cdn.example.com/assets/prod/graphic-abstract/anon/turn_3.png"
     assert asset.backend == "s3"
+
+
+def test_should_generate_graphic_abstract_accepts_yes_first_token():
+    from src.collaboration.graphic_abstract import should_generate_graphic_abstract
+
+    class _Client:
+        def chat(self, *_args, **_kwargs):
+            return {"final_text": "YES"}
+
+    assert should_generate_graphic_abstract("Final synthesis with findings.", _Client()) is True
+
+
+def test_should_generate_graphic_abstract_rejects_no_first_token():
+    from src.collaboration.graphic_abstract import should_generate_graphic_abstract
+
+    class _Client:
+        def chat(self, *_args, **_kwargs):
+            return {"final_text": "NO"}
+
+    assert should_generate_graphic_abstract("Hi, can you help me?", _Client()) is False
+
+
+def test_should_generate_graphic_abstract_defaults_false_on_ambiguous_output():
+    from src.collaboration.graphic_abstract import should_generate_graphic_abstract
+
+    class _Client:
+        def chat(self, *_args, **_kwargs):
+            return {"final_text": "Maybe"}
+
+    assert should_generate_graphic_abstract("Some answer text", _Client()) is False
+
+
+def test_should_generate_graphic_abstract_defaults_false_on_exception():
+    from src.collaboration.graphic_abstract import should_generate_graphic_abstract
+
+    class _Client:
+        def chat(self, *_args, **_kwargs):
+            raise RuntimeError("boom")
+
+    assert should_generate_graphic_abstract("Some answer text", _Client()) is False
+
+
+def test_should_generate_graphic_abstract_skips_empty_text_without_llm_call():
+    from src.collaboration.graphic_abstract import should_generate_graphic_abstract
+
+    mock_client = MagicMock()
+
+    assert should_generate_graphic_abstract("   ", mock_client) is False
+    mock_client.chat.assert_not_called()

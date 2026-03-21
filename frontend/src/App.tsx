@@ -1,10 +1,10 @@
 import { useEffect, useCallback, useRef } from 'react';
+import { Navigate, Route, Routes, useLocation } from 'react-router-dom';
 import { useAuthStore, useUIStore } from './stores';
 import { LoginPage } from './pages/LoginPage';
 import { ChatPage } from './pages/ChatPage';
 import { IngestPage } from './pages/IngestPage';
 import { AdminPage } from './pages/AdminPage';
-import { GraphExplorer } from './components/graph/GraphExplorer';
 import { CompareView } from './components/compare/CompareView';
 import { ScholarPage } from './pages/ScholarPage';
 import { Sidebar } from './components/layout/Sidebar';
@@ -14,16 +14,22 @@ import { SettingsModal } from './components/settings/SettingsModal';
 import { DeepResearchDialog } from './components/workflow/DeepResearchDialog';
 import { LocalDbChoiceDialog } from './components/chat/LocalDbChoiceDialog';
 import { ToastContainer } from './components/ui/Toast';
+import { PaperWorkspacePage } from './pages/PaperWorkspacePage';
+import { AnalysisWorkspacePage } from './pages/AnalysisWorkspacePage';
+import { GraphWorkspacePage } from './pages/GraphWorkspacePage';
+import { pathToActiveTab } from './utils/appRoutes';
 
 function App() {
   const user = useAuthStore((s) => s.user);
   const logout = useAuthStore((s) => s.logout);
+  const location = useLocation();
 
   const {
-    activeTab,
     isCanvasOpen,
     setSidebarWidth,
     setCanvasWidth,
+    activeTab,
+    setActiveTab,
   } = useUIStore();
 
   // 监听全局登出事件
@@ -70,6 +76,13 @@ function App() {
     };
   }, [resize, stopResizing]);
 
+  useEffect(() => {
+    const nextTab = pathToActiveTab(location.pathname);
+    if (activeTab !== nextTab) {
+      setActiveTab(nextTab);
+    }
+  }, [activeTab, location.pathname, setActiveTab]);
+
   // 未登录显示登录页
   if (!user) {
     return (
@@ -79,26 +92,6 @@ function App() {
       </>
     );
   }
-
-  // 渲染当前 Tab 页面
-  const renderContent = () => {
-    switch (activeTab) {
-      case 'chat':
-        return <ChatPage />;
-      case 'ingest':
-        return <IngestPage />;
-      case 'users':
-        return <AdminPage />;
-      case 'graph':
-        return <GraphExplorer />;
-      case 'compare':
-        return <CompareView />;
-      case 'scholar':
-        return <ScholarPage />;
-      default:
-        return <ChatPage />;
-    }
-  };
 
   return (
     <div className="flex h-screen bg-[var(--bg-app)] text-[var(--text-primary)] font-sans overflow-hidden bg-cover bg-fixed">
@@ -113,7 +106,22 @@ function App() {
         <Header />
         <div className="flex-1 flex min-h-0 relative">
           <div className="flex-1 flex flex-col min-h-0 overflow-y-auto scrollbar-thin">
-            {renderContent()}
+            <Routes>
+              <Route path="/" element={<Navigate to="/chat" replace />} />
+              <Route path="/chat" element={<ChatPage />} />
+              <Route path="/ingest" element={<IngestPage />} />
+              <Route path="/scholar" element={<ScholarPage />} />
+              <Route path="/papers/:paperUid" element={<PaperWorkspacePage />} />
+              <Route path="/analysis" element={<AnalysisWorkspacePage />} />
+              <Route path="/workspace/graph" element={<GraphWorkspacePage />} />
+              <Route path="/graph" element={<Navigate to="/workspace/graph" replace />} />
+              <Route path="/compare" element={<CompareView />} />
+              <Route
+                path="/users"
+                element={user.role === 'admin' ? <AdminPage /> : <Navigate to="/chat" replace />}
+              />
+              <Route path="*" element={<Navigate to="/chat" replace />} />
+            </Routes>
           </div>
         </div>
       </div>

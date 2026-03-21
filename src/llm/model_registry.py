@@ -212,6 +212,37 @@ class ClaudeProvider(ModelProvider):
         return results
 
 
+class CodexProvider(ModelProvider):
+    """
+    OpenAI Codex App Server — 优先 live 拉取 model/list，失败时返回静态 fallback。
+    model/list 通过短暂 spawn 一个 app-server 进程实现，有 20s 超时保护。
+    """
+
+    meta = ProviderMeta(
+        name="codex",
+        label="OpenAI Codex (App Server, Experimental)",
+        default_base_url="",        # 无 HTTP base_url，走 stdio subprocess
+        supports_image=False,
+        env_key_hint="RAG_LLM__CODEX_APP_SERVER__API_KEY",
+    )
+
+    _FALLBACK_MODELS = ["gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex"]
+
+    def fetch_models(self) -> List[ModelInfo]:
+        try:
+            from src.llm.codex_app_server import fetch_codex_models, _find_codex_bin
+            ids = fetch_codex_models(
+                api_key=self.api_key or "",
+                cli_path=_find_codex_bin(),
+                timeout=20.0,
+            )
+            if ids:
+                return [ModelInfo(id=m, owned_by="openai") for m in ids]
+        except Exception as exc:
+            _log.info("CodexProvider: live model/list failed (%s), using fallback", exc)
+        return [ModelInfo(id=m, owned_by="openai") for m in self._FALLBACK_MODELS]
+
+
 class GeminiProvider(ModelProvider):
     meta = ProviderMeta(
         name="gemini",
@@ -266,6 +297,7 @@ _PROVIDER_CLASSES: Dict[str, Type[ModelProvider]] = {
     "perplexity": PerplexityProvider,
     "claude": ClaudeProvider,
     "gemini": GeminiProvider,
+    "codex": CodexProvider,
 }
 
 
@@ -367,6 +399,9 @@ class ModelRegistry:
             return config_provider_name.lower()
         if config_provider_name.lower().startswith("sonar"):
             return "perplexity"
+        # codex_app_server platform maps to the "codex" registry key
+        if "codex" in config_provider_name.lower():
+            return "codex"
         return None
 
 

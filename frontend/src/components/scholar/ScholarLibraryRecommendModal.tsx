@@ -37,7 +37,6 @@ export function ScholarLibraryRecommendModal({
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<LibraryRecommendResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [taskId, setTaskId] = useState<string | null>(null);
   const [progressLogs, setProgressLogs] = useState<string[]>([]);
   const abortRef = useRef<AbortController | null>(null);
 
@@ -77,7 +76,6 @@ export function ScholarLibraryRecommendModal({
     setError(null);
     setResult(null);
     setProgressLogs([]);
-    setTaskId(null);
     try {
       const startRes = await submitRecommendTask(libraryId, {
         question: question.trim(),
@@ -86,7 +84,6 @@ export function ScholarLibraryRecommendModal({
         top_k: 10,
       });
       const tid = startRes.task_id;
-      setTaskId(tid);
       setProgressLogs((prev) => [...prev, t('scholar.recommendProgressStarted', '任务已提交，正在检索…')]);
 
       for await (const { event, data } of streamScholarTaskEvents(
@@ -128,7 +125,6 @@ export function ScholarLibraryRecommendModal({
       setError(msg);
     } finally {
       setLoading(false);
-      setTaskId(null);
       abortRef.current = null;
     }
   };

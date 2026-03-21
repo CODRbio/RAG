@@ -7,3 +7,6 @@ export { useProjectsStore } from './useProjectsStore';
 export { useToastStore } from './useToastStore';
 export { useUIStore } from './useUIStore';
 export { useScholarStore } from './useScholarStore';
+export { useAcademicAssistantStore } from './useAcademicAssistantStore';
+export { useResourceStore } from './useResourceStore';
+export { useAnalysisPoolStore } from './useAnalysisPoolStore';

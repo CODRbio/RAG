@@ -37,7 +37,7 @@ def test_gemini_simple_text_uses_native_payload():
     assert payload.get("_fallback_payload") is not None
     assert payload.get("systemInstruction", {}).get("parts")
     assert payload.get("contents")[0]["role"] == "user"
-    assert payload.get("generationConfig", {}).get("thinkingConfig") == {"thinkingLevel": "high"}
+    assert payload.get("generationConfig", {}).get("thinkingConfig") == {"thinkingBudget": 24576}
 
 
 def test_gemini_native_tools_and_tool_response_are_encoded():
@@ -68,6 +68,21 @@ def test_gemini_native_tools_and_tool_response_are_encoded():
     parts = [part for item in payload.get("contents", []) for part in item.get("parts", [])]
     assert any("functionCall" in part for part in parts)
     assert any("functionResponse" in part for part in parts)
+
+
+def test_gemini_native_cached_content_passthrough():
+    client = _make_gemini_client()
+    payload = client._build_openai_payload(
+        messages=[{"role": "user", "content": "hello"}],
+        model="gemini-3.1-pro-preview",
+        params={},
+        tools=None,
+        cache_policy=client._resolve_cache_policy(
+            {"cache": {"cached_content": "cachedContents/test-cache"}},
+            "gemini-3.1-pro-preview",
+        ),
+    )
+    assert payload.get("cachedContent") == "cachedContents/test-cache"
 
 
 def test_gemini_structured_output_falls_back_to_compat_payload():

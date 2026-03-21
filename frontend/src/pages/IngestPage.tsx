@@ -120,7 +120,7 @@ export function IngestPage() {
   const [isCancelling, setIsCancelling] = useState(false);
   const [globalProgress, setGlobalProgress] = useState('');
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
-  const [enrichLogs, setEnrichLogs] = useState<Record<string, string[]>>({});
+  const [, setEnrichLogs] = useState<Record<string, string[]>>({});
   const [autoDownloadMissingScholarPdfs, setAutoDownloadMissingScholarPdfs] = useState(false);
 
   // Upload PDFs to library (import to selected base's library)
@@ -579,10 +579,10 @@ export function IngestPage() {
         enrich_figures: enrichment.enrich_figures,
         llm_text_provider: enrichment.llm_text_provider,
         llm_text_model: enrichment.llm_text_model,
-        llm_text_concurrency: enrichment.llm_text_concurrency,
+        llm_text_concurrency: enrichment.llm_text_concurrency ?? undefined,
         llm_vision_provider: enrichment.llm_vision_provider,
         llm_vision_model: enrichment.llm_vision_model,
-        llm_vision_concurrency: enrichment.llm_vision_concurrency,
+        llm_vision_concurrency: enrichment.llm_vision_concurrency ?? undefined,
       });
       if (!res?.job_id) {
         throw new Error('未返回 job_id');
@@ -766,10 +766,10 @@ export function IngestPage() {
         enrich_figures: enrichment.enrich_figures,
         llm_text_provider: enrichment.llm_text_provider,
         llm_text_model: enrichment.llm_text_model,
-        llm_text_concurrency: enrichment.llm_text_concurrency,
+        llm_text_concurrency: enrichment.llm_text_concurrency ?? undefined,
         llm_vision_provider: enrichment.llm_vision_provider,
         llm_vision_model: enrichment.llm_vision_model,
-        llm_vision_concurrency: enrichment.llm_vision_concurrency,
+        llm_vision_concurrency: enrichment.llm_vision_concurrency ?? undefined,
       });
       if (!res?.job_id) throw new Error('未返回 job_id');
       setActiveJobId(res.job_id);

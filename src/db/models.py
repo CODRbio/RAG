@@ -287,6 +287,7 @@ class Paper(SQLModel, table=True):
     __table_args__ = (
         UniqueConstraint("collection", "paper_id", name="uq_papers_collection_paper"),
         Index("idx_papers_collection", "collection"),
+        Index("idx_papers_paper_uid", "paper_uid"),
         Index("idx_papers_user_id", "user_id"),
     )
 
@@ -313,6 +314,8 @@ class Paper(SQLModel, table=True):
     library_id: Optional[int] = Field(default=None, sa_column=Column(Integer, nullable=True))
     library_paper_id: Optional[int] = Field(default=None, sa_column=Column(Integer, nullable=True))
     source: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    # 全局唯一论文标识符（paper_uid 规范）；paper_id 只负责 collection 内文件身份
+    paper_uid: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -604,6 +607,7 @@ class PaperMetadata(SQLModel, table=True):
     __table_args__ = (
         Index("idx_pm_ndoi", "normalized_doi"),
         Index("idx_pm_ntitle", "normalized_title"),
+        Index("idx_pm_paper_uid", "paper_uid"),
     )
 
     paper_id: str = Field(primary_key=True)
@@ -615,6 +619,8 @@ class PaperMetadata(SQLModel, table=True):
     year: Optional[int] = Field(default=None, sa_column=Column(Integer, nullable=True))
     source: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
     extra: str = Field(default="{}", sa_column=Column(Text, nullable=False, server_default="{}"))
+    # 全局唯一论文标识符（ref_tools 零号规范），由 dedup.compute_paper_uid() 生成
+    paper_uid: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
 
 
 class CrossrefCache(SQLModel, table=True):
@@ -718,7 +724,10 @@ class ScholarLibraryPaper(SQLModel, table=True):
     """A paper saved in a scholar library (candidate for download)."""
 
     __tablename__ = "scholar_library_papers"
-    __table_args__ = (Index("idx_scholar_lib_papers_library_id", "library_id"),)
+    __table_args__ = (
+        Index("idx_scholar_lib_papers_library_id", "library_id"),
+        Index("idx_scholar_lib_papers_paper_uid", "paper_uid"),
+    )
 
     id: Optional[int] = Field(default=None, primary_key=True)
     library_id: int = Field(foreign_key="scholar_libraries.id")
@@ -738,6 +747,8 @@ class ScholarLibraryPaper(SQLModel, table=True):
     # Link back to collection when this library paper was ingested into a collection
     collection_name: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
     collection_paper_id: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    # 全局唯一论文标识符（ref_tools 零号规范），由 dedup.compute_paper_uid() 生成
+    paper_uid: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
 
     library: Optional[ScholarLibrary] = Relationship(back_populates="papers")
 
@@ -749,7 +760,206 @@ class ScholarLibraryPaper(SQLModel, table=True):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 12. Impact Factor index  (from docs/impact_factor.xlsx, rebuilt on file change)
+# 12. Global graph facts / snapshots
+# ──────────────────────────────────────────────────────────────────────────────
+
+class GraphFact(SQLModel, table=True):
+    """Persistent graph fact edge used by the global graph service."""
+
+    __tablename__ = "graph_facts"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "scope_type",
+            "scope_key",
+            "graph_type",
+            "src_node_id",
+            "relation_type",
+            "dst_node_id",
+            name="uq_graph_facts_scope_edge",
+        ),
+        Index("idx_graph_facts_scope_graph", "user_id", "scope_type", "scope_key", "graph_type"),
+        Index("idx_graph_facts_src", "graph_type", "src_node_id"),
+        Index("idx_graph_facts_dst", "graph_type", "dst_node_id"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: str = Field(default="default", sa_column=Column(Text, nullable=False, server_default="default"))
+    scope_type: str = Field(default="global", sa_column=Column(Text, nullable=False, server_default="global"))
+    scope_key: str = Field(default="global", sa_column=Column(Text, nullable=False, server_default="global"))
+    graph_type: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    src_node_id: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    src_node_type: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    src_label: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    relation_type: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    dst_node_id: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    dst_node_type: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    dst_label: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    weight: float = Field(default=1.0, sa_column=Column(Float, nullable=False, server_default="1"))
+    provenance_json: str = Field(default="{}", sa_column=Column(Text, nullable=False, server_default="{}"))
+    created_at: str = Field(default_factory=_now_iso, sa_column=Column(Text, nullable=False))
+    updated_at: str = Field(default_factory=_now_iso, sa_column=Column(Text, nullable=False))
+
+    def get_provenance(self) -> Dict[str, Any]:
+        try:
+            return json.loads(self.provenance_json or "{}")
+        except Exception:
+            return {}
+
+
+class GraphSnapshot(SQLModel, table=True):
+    """Build metadata for serialized graph snapshots."""
+
+    __tablename__ = "graph_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "scope_type",
+            "scope_key",
+            "graph_type",
+            "snapshot_version",
+            name="uq_graph_snapshots_scope_version",
+        ),
+        Index("idx_graph_snapshots_scope_graph", "user_id", "scope_type", "scope_key", "graph_type"),
+        Index("idx_graph_snapshots_status", "status", "updated_at"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: str = Field(default="default", sa_column=Column(Text, nullable=False, server_default="default"))
+    scope_type: str = Field(default="global", sa_column=Column(Text, nullable=False, server_default="global"))
+    scope_key: str = Field(default="global", sa_column=Column(Text, nullable=False, server_default="global"))
+    graph_type: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    snapshot_version: int = Field(default=1, sa_column=Column(Integer, nullable=False, server_default="1"))
+    status: str = Field(default="building", sa_column=Column(Text, nullable=False, server_default="building"))
+    storage_path: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    node_count: int = Field(default=0, sa_column=Column(Integer, nullable=False, server_default="0"))
+    edge_count: int = Field(default=0, sa_column=Column(Integer, nullable=False, server_default="0"))
+    built_from_revision: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    error_message: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    created_at: str = Field(default_factory=_now_iso, sa_column=Column(Text, nullable=False))
+    updated_at: str = Field(default_factory=_now_iso, sa_column=Column(Text, nullable=False))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 13. Resource annotations
+# ──────────────────────────────────────────────────────────────────────────────
+
+class ResourceAnnotation(SQLModel, table=True):
+    """User-authored annotation tied to a stable resource and optional paper_uid."""
+
+    __tablename__ = "resource_annotations"
+    __table_args__ = (
+        Index("idx_resource_annotations_user_resource", "user_id", "resource_type", "resource_id"),
+        Index("idx_resource_annotations_paper_uid", "paper_uid"),
+        Index("idx_resource_annotations_target_kind", "target_kind"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: str = Field(default="default", sa_column=Column(Text, nullable=False, server_default="default"))
+    resource_type: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    resource_id: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    paper_uid: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    target_kind: str = Field(default="chunk", sa_column=Column(Text, nullable=False, server_default="chunk"))
+    target_locator_json: str = Field(default="{}", sa_column=Column(Text, nullable=False, server_default="{}"))
+    target_text: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    directive: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    status: str = Field(default="active", sa_column=Column(Text, nullable=False, server_default="active"))
+    created_at: str = Field(default_factory=_now_iso, sa_column=Column(Text, nullable=False))
+    updated_at: str = Field(default_factory=_now_iso, sa_column=Column(Text, nullable=False))
+
+    def get_target_locator(self) -> Dict[str, Any]:
+        try:
+            return json.loads(self.target_locator_json or "{}")
+        except Exception:
+            return {}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 14. Resource user state / tags / notes
+# ──────────────────────────────────────────────────────────────────────────────
+
+class ResourceUserState(SQLModel, table=True):
+    """Per-user overlay state for a logical resource."""
+
+    __tablename__ = "resource_user_states"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "resource_type",
+            "resource_id",
+            name="uq_resource_user_states_user_resource",
+        ),
+        Index(
+            "idx_resource_user_states_user_type_archived",
+            "user_id",
+            "resource_type",
+            "archived",
+            "updated_at",
+        ),
+        Index(
+            "idx_resource_user_states_user_type_favorite",
+            "user_id",
+            "resource_type",
+            "favorite",
+            "updated_at",
+        ),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: str = Field(default="default", sa_column=Column(Text, nullable=False, server_default="default"))
+    resource_type: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    resource_id: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    favorite: int = Field(default=0, sa_column=Column(Integer, nullable=False, server_default="0"))
+    archived: int = Field(default=0, sa_column=Column(Integer, nullable=False, server_default="0"))
+    read_status: str = Field(default="unread", sa_column=Column(Text, nullable=False, server_default="unread"))
+    last_opened_at: Optional[str] = Field(default=None, sa_column=Column(Text, nullable=True))
+    created_at: str = Field(default_factory=_now_iso, sa_column=Column(Text, nullable=False))
+    updated_at: str = Field(default_factory=_now_iso, sa_column=Column(Text, nullable=False))
+
+
+class ResourceTag(SQLModel, table=True):
+    """Free-form user tag attached to a logical resource."""
+
+    __tablename__ = "resource_tags"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "resource_type",
+            "resource_id",
+            "normalized_tag",
+            name="uq_resource_tags_user_resource_tag",
+        ),
+        Index("idx_resource_tags_user_resource", "user_id", "resource_type", "resource_id"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: str = Field(default="default", sa_column=Column(Text, nullable=False, server_default="default"))
+    resource_type: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    resource_id: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    tag: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    normalized_tag: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    created_at: str = Field(default_factory=_now_iso, sa_column=Column(Text, nullable=False))
+
+
+class ResourceNote(SQLModel, table=True):
+    """Resource-level Markdown note."""
+
+    __tablename__ = "resource_notes"
+    __table_args__ = (
+        Index("idx_resource_notes_user_resource", "user_id", "resource_type", "resource_id", "updated_at"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: str = Field(default="default", sa_column=Column(Text, nullable=False, server_default="default"))
+    resource_type: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    resource_id: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    note_md: str = Field(default="", sa_column=Column(Text, nullable=False, server_default=""))
+    created_at: str = Field(default_factory=_now_iso, sa_column=Column(Text, nullable=False))
+    updated_at: str = Field(default_factory=_now_iso, sa_column=Column(Text, nullable=False))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 15. Impact Factor index  (from docs/impact_factor.xlsx, rebuilt on file change)
 # ──────────────────────────────────────────────────────────────────────────────
 
 class ImpactFactorJournal(SQLModel, table=True):

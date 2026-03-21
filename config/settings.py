@@ -247,6 +247,16 @@ class NCBIConfig:
 
 
 @dataclass
+class OpenAlexConfig:
+    """OpenAlex 学术元数据 API（mailto/Bearer 认证）"""
+    enabled: bool = True
+    api_key: str = ""          # 邮箱（mailto=）或 Bearer token
+    base_url: str = "https://api.openalex.org"
+    timeout_seconds: int = 10
+    max_results: int = 3
+
+
+@dataclass
 class ContentFetcherConfig:
     """WebContentFetcher 全文抓取配置。取值优先级：UI/请求入参（若有）> config > 本处默认。"""
     enabled: bool = False
@@ -607,6 +617,10 @@ def _ncbi_from_config() -> Dict[str, Any]:
     return (_RAW_CONFIG.get("ncbi") or {})
 
 
+def _openalex_from_config() -> Dict[str, Any]:
+    return (_RAW_CONFIG.get("openalex") or {})
+
+
 def _content_fetcher_from_config() -> Dict[str, Any]:
     return (_RAW_CONFIG.get("content_fetcher") or {})
 
@@ -654,12 +668,18 @@ class RetrievalPerfSettings:
 
 @dataclass
 class LLMPerfSettings:
-    """LLM：超时、重试、并发限流、缓存"""
+    """LLM：超时、重试、并发限流、缓存。
+
+    这里的 `cache_*` 仅控制应用层精确命中缓存（进程内 response cache），
+    不控制 OpenAI / Anthropic / Gemini 的 provider 原生 prompt/context cache。
+    provider 原生缓存由 `llm.providers.<name>.params.cache` 或单次请求 override 决定。
+    """
     timeout_seconds: int = 180  # 单次 API 读超时（秒），可在 config 的 performance.llm.timeout_seconds 中修改
     max_retries: int = 2
     retry_backoff: float = 1.5
     cache_enabled: bool = False
     cache_ttl_seconds: int = 3600
+    cache_max_entries: int = 1024
     max_concurrent_per_provider: int = 5
 
 
@@ -918,6 +938,14 @@ class Settings:
             cache_ttl_seconds=int(nc.get("cache_ttl_seconds", 3600)),
             cache_maxsize=int(nc.get("cache_maxsize", 256)),
         )
+        oa = _openalex_from_config()
+        self.openalex = OpenAlexConfig(
+            enabled=bool(oa.get("enabled", True)),
+            api_key=(oa.get("api_key") or "").strip(),
+            base_url=(oa.get("base_url") or "https://api.openalex.org").strip(),
+            timeout_seconds=int(oa.get("timeout_seconds", 10)),
+            max_results=min(int(oa.get("max_results", 3)), 10),
+        )
         cf = _content_fetcher_from_config()
         capsolver_cfg = _capsolver_from_config()
         capsolver_key = (cf.get("capsolver_api_key") or capsolver_cfg.get("api_key") or "").strip()
@@ -986,6 +1014,7 @@ class Settings:
             retry_backoff=float(lp.get("retry_backoff", 1.5)),
             cache_enabled=bool(lp.get("cache_enabled", False)),
             cache_ttl_seconds=int(lp.get("cache_ttl_seconds", 3600)),
+            cache_max_entries=int(lp.get("cache_max_entries", 1024)),
             max_concurrent_per_provider=int(lp.get("max_concurrent_per_provider", 5)),
         )
         self.perf_web_search = WebSearchPerfSettings(

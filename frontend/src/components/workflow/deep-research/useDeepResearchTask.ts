@@ -50,7 +50,7 @@ export type ConfirmAndRunParams = GeneratePlanParams & {
   userContext: string;
   userContextMode: 'supporting' | 'direct_injection';
   tempDocuments: Array<{ name: string; content: string }>;
-  depth: 'lite' | 'comprehensive';
+  depth: 'lite' | 'comprehensive' | 'expert';
   skipDraftReview: boolean;
   skipRefineReview: boolean;
   skipClaimGeneration: boolean;

@@ -716,6 +716,294 @@ export interface Project {
 }
 
 // ============================================================
+// Resource Overlay
+// ============================================================
+
+export type ResourceType = 'canvas' | 'project' | 'paper' | 'scholar_library_paper' | 'resource_annotation';
+export type ResourceReadStatus = 'unread' | 'reading' | 'read';
+
+export interface ResourceRef {
+  resource_type: ResourceType;
+  resource_id: string;
+}
+
+export interface ResourceUserState extends ResourceRef {
+  favorite: boolean;
+  archived: boolean;
+  read_status: ResourceReadStatus;
+  last_opened_at?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface ResourceUserStateUpsert extends ResourceRef {
+  favorite?: boolean;
+  archived?: boolean;
+  read_status?: ResourceReadStatus;
+  last_opened_at?: string | null;
+}
+
+export interface ResourceTag extends ResourceRef {
+  id: number;
+  tag: string;
+  normalized_tag: string;
+  created_at?: string | null;
+}
+
+export interface ResourceTagUpsert extends ResourceRef {
+  tag: string;
+}
+
+export interface ResourceNote extends ResourceRef {
+  id: number;
+  note_md: string;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface ResourceNoteCreate extends ResourceRef {
+  note_md: string;
+}
+
+export interface ResourceNoteUpdate {
+  note_md: string;
+}
+
+// ============================================================
+// Academic Assistant
+// ============================================================
+
+export type AssistantScopeType = 'global' | 'collection' | 'library';
+
+export interface AssistantScope {
+  scope_type: AssistantScopeType;
+  scope_key: string;
+}
+
+export interface PaperLocator {
+  paper_uid?: string;
+  paper_id?: string;
+  collection?: string;
+}
+
+export interface AssistantPaperCard {
+  paper_id: string;
+  paper_uid?: string | null;
+  title: string;
+  authors?: string[];
+  year?: number | null;
+  doi?: string | null;
+  collection?: string | null;
+}
+
+export interface AssistantEvidenceChunk {
+  chunk_id: string;
+  paper_id?: string | null;
+  paper_uid?: string | null;
+  content_type?: string | null;
+  page?: number | null;
+  bbox?: number[] | null;
+  snippet?: string | null;
+  section_path?: string | null;
+}
+
+export interface AssistantCitation {
+  cite_key: string;
+  chunk_id?: string | null;
+  title: string;
+  authors: string[];
+  year?: number | null;
+  doc_id?: string | null;
+  url?: string | null;
+  pdf_url?: string | null;
+  doi?: string | null;
+  bbox?: number[] | null;
+  page_num?: number | null;
+  anchors?: CitationAnchor[];
+  provider?: string | null;
+}
+
+export interface PaperSummaryResult {
+  paper_card: AssistantPaperCard;
+  summary_md: string;
+  citations: AssistantCitation[];
+  evidence_summary?: EvidenceSummary;
+  evidence_chunks?: AssistantEvidenceChunk[];
+  used_llm?: string | null;
+}
+
+export interface PaperQaResult {
+  paper_card: AssistantPaperCard;
+  answer_md: string;
+  citations: AssistantCitation[];
+  evidence_summary?: EvidenceSummary;
+  evidence_chunks?: AssistantEvidenceChunk[];
+  used_llm?: string | null;
+}
+
+export interface PaperCompareResult {
+  papers: AssistantPaperCard[];
+  comparison_matrix: Record<string, Record<string, string>>;
+  narrative: string;
+  citations: AssistantCitation[];
+  evidence_summary?: EvidenceSummary;
+  used_llm?: string | null;
+}
+
+export type DiscoveryMode = 'missing-core' | 'forward-tracking' | 'experts' | 'institutions';
+
+export interface AcademicAssistantTaskStartResponse {
+  task_id: string;
+  status: string;
+  message: string;
+}
+
+export interface AcademicAssistantTaskInfo {
+  task_id: string;
+  status: string;
+  error_message?: string | null;
+  payload?: Record<string, unknown>;
+  started_at?: number | null;
+  finished_at?: number | null;
+}
+
+export interface ResourceAnnotation {
+  id: number;
+  user_id?: string;
+  resource_type: string;
+  resource_id: string;
+  paper_uid?: string | null;
+  target_kind: string;
+  target_locator: Record<string, unknown>;
+  target_text: string;
+  directive: string;
+  status: string;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface ResourceAnnotationUpsert {
+  annotation_id?: number;
+  resource_type: string;
+  resource_id: string;
+  paper_uid?: string | null;
+  target_kind: 'chunk' | 'figure' | 'page_region' | 'canvas_section' | string;
+  target_locator: Record<string, unknown>;
+  target_text: string;
+  directive: string;
+  status?: string;
+  collection?: string | null;
+}
+
+export interface AcademicAssistantDiscoveryResult {
+  mode: string;
+  items: Array<Record<string, unknown>>;
+  summary_md: string;
+  citations: AssistantCitation[];
+  provenance: Array<Record<string, unknown> | string>;
+}
+
+export interface AcademicAssistantMediaAnalysisResult extends AcademicAssistantDiscoveryResult {}
+
+export interface AcademicAssistantTaskState {
+  task_id: string;
+  status: 'submitted' | 'running' | 'completed' | 'error' | 'cancelled' | 'timeout';
+  task_type: string;
+  mode?: string | null;
+  message?: string | null;
+  result?: AcademicAssistantDiscoveryResult | AcademicAssistantMediaAnalysisResult | Record<string, unknown> | null;
+  error_message?: string | null;
+  updated_at: number;
+}
+
+// ============================================================
+// Typed Graph
+// ============================================================
+
+export type GraphType = 'entity' | 'citation' | 'author' | 'institution';
+export type GraphScopeType = 'global' | 'collection' | 'library';
+
+export interface GraphScopePayload {
+  scope_type: GraphScopeType;
+  scope_key: string;
+  user_id?: string | null;
+}
+
+export interface TypedGraphStats {
+  available: boolean;
+  graph_type: GraphType;
+  scope: {
+    user_id?: string;
+    scope_type: GraphScopeType;
+    scope_key: string;
+  };
+  fact_count: number;
+  total_nodes: number;
+  total_edges: number;
+  relation_counts: Record<string, number>;
+  snapshot_version?: number | null;
+  snapshot_status?: string | null;
+}
+
+export interface TypedGraphNode {
+  id: string;
+  type?: string;
+  label?: string;
+  pagerank?: number;
+  degree?: number;
+  is_seed?: boolean;
+  [key: string]: unknown;
+}
+
+export interface TypedGraphEdge {
+  source: string;
+  target: string;
+  relation?: string;
+  weight?: number;
+  [key: string]: unknown;
+}
+
+export interface TypedGraphMetrics {
+  node_count?: number;
+  edge_count?: number;
+  top_nodes?: Array<{ id: string; score?: number }>;
+  bridge_nodes?: string[];
+  [key: string]: unknown;
+}
+
+export interface TypedGraphSubgraph {
+  nodes: TypedGraphNode[];
+  edges: TypedGraphEdge[];
+  metrics: TypedGraphMetrics;
+  snapshot_version?: number | null;
+  provenance?: Array<Record<string, unknown> | string>;
+}
+
+export interface TypedGraphSummary {
+  summary: string;
+  snapshot_version?: number | null;
+  provenance?: Array<Record<string, unknown> | string>;
+  subgraph: TypedGraphSubgraph;
+}
+
+export interface GraphSnapshotItem {
+  graph_type: GraphType;
+  scope_type: GraphScopeType;
+  scope_key: string;
+  snapshot_version: number;
+  status: string;
+  storage_path?: string | null;
+  node_count?: number;
+  edge_count?: number;
+  built_from_revision?: string | null;
+  /** @deprecated use built_from_revision */
+  source_revision?: string | null;
+  error_message?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+// ============================================================
 // Config
 // ============================================================
 

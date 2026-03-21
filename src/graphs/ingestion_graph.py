@@ -113,13 +113,22 @@ def _chunk_embed_upsert_one_doc(state: IngestionState, *, config: RunnableConfig
         )
         chunks = chunk_blocks(content_flow, doc_id=doc_id, config=ccfg)
 
+        # 从 paper_metadata_store 取 paper_uid（若已通过 ingest 元数据写入）
+        _paper_uid = ""
+        try:
+            from src.indexing.paper_metadata_store import paper_meta_store
+            pm = paper_meta_store.get(doc_id)
+            _paper_uid = (pm or {}).get("paper_uid") or ""
+        except Exception:
+            pass
+
         rows = []
         for c in chunks:
             text = _truncate(c.text)
             meta = c.meta or {}
             page_range = meta.get("page_range", [0, 0])
             page = page_range[0] if isinstance(page_range, (list, tuple)) else meta.get("page", 0)
-            rows.append({
+            row = {
                 "paper_id": doc_id,
                 "chunk_id": c.chunk_id,
                 "content": text,
@@ -130,7 +139,10 @@ def _chunk_embed_upsert_one_doc(state: IngestionState, *, config: RunnableConfig
                 "section_path": str(meta.get("section_path", ""))[:512],
                 "page": int(page) if isinstance(page, (int, float)) else 0,
                 "_text_for_embed": text,
-            })
+            }
+            if _paper_uid:
+                row["paper_uid"] = _paper_uid
+            rows.append(row)
 
         if not rows:
             return out

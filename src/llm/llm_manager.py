@@ -15,10 +15,12 @@ from __future__ import annotations
 
 import os
 import json
+import shutil
 import threading
 import time
 import hashlib
 import base64
+import copy
 
 from src.log import get_logger as _get_logger
 _log = _get_logger(__name__)
@@ -38,6 +40,7 @@ from typing import Dict, Any, Iterator, List, Optional
 from abc import ABC, abstractmethod
 
 import requests
+from src.utils.cache import TTLCache
 
 try:
     from config.settings import settings
@@ -91,6 +94,34 @@ class LLMConfig:
     dry_run: bool
     platforms: Dict[str, PlatformConfig] = field(default_factory=dict)
     providers: Dict[str, ProviderConfig] = field(default_factory=dict)
+
+
+@dataclass
+class CachePolicy:
+    """Unified cache policy for provider prompt cache and optional app response cache."""
+    mode: str = "provider_only"
+    scope: str = "conversation"
+    key: str = ""
+    retention: Optional[str] = None
+    strategy: str = "auto"
+    provider_enabled: bool = False
+    app_enabled: bool = False
+    ttl_seconds: int = 0
+    cached_content: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def as_meta(self) -> Dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "scope": self.scope,
+            "key": self.key or None,
+            "retention": self.retention,
+            "strategy": self.strategy,
+            "provider_enabled": self.provider_enabled,
+            "app_enabled": self.app_enabled,
+            "ttl_seconds": self.ttl_seconds,
+            "cached_content": self.cached_content,
+        }
 
 
 # ============================================================
@@ -154,6 +185,27 @@ def provider_env_var(provider_name: str) -> str:
     return f"RAG_LLM__{normalized}__API_KEY"
 
 
+_LEGACY_PROVIDER_ENV_VARS = {
+    "openai": "OPENAI_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "claude": "ANTHROPIC_API_KEY",
+    "kimi": "KIMI_API_KEY",
+    "qwen": "QWEN_API_KEY",
+    "perplexity": "PERPLEXITY_API_KEY",
+    "sonar": "PERPLEXITY_API_KEY",
+}
+
+
+def provider_legacy_env_var(provider_name: str) -> Optional[str]:
+    direct = _LEGACY_PROVIDER_ENV_VARS.get(provider_name)
+    if direct:
+        return direct
+    if "-" in provider_name:
+        return _LEGACY_PROVIDER_ENV_VARS.get(provider_name.split("-")[0])
+    return None
+
+
 def now_iso() -> str:
     """返回 ISO 格式的当前时间戳"""
     return datetime.now().isoformat()
@@ -207,6 +259,161 @@ def _qwen_responses_url(base_url: str) -> str:
         prefix = root[: -len("/compatible-mode/v1")]
         return f"{prefix}/api/v2/apps/protocols/compatible-mode/v1/responses"
     return f"{root}/responses"
+
+
+_CACHE_MODE_VALUES = {"off", "provider_only", "provider_plus_app"}
+_CACHE_SCOPE_VALUES = {"conversation", "section", "global_template"}
+_CACHE_INTERNAL_KEYS = {
+    "cache",
+    "cache_mode",
+    "cache_scope",
+    "cache_key",
+    "cache_retention",
+    "cache_strategy",
+    "cache_enabled",
+    "cache_ttl_seconds",
+    "cache_control",
+    "enable_prompt_cache",
+    "cached_content",
+    "gemini_cached_content",
+}
+
+
+def _stable_json_dumps(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    except Exception:
+        return repr(value)
+
+
+def _stable_hash(*parts: Any) -> str:
+    blob = "|".join(_stable_json_dumps(p) for p in parts).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
+def _provider_cache_family(config: ProviderConfig) -> str:
+    if config.is_anthropic():
+        return "anthropic"
+    if _is_openai_api(config.base_url):
+        return "openai"
+    if _is_gemini_api(config.base_url):
+        return "gemini"
+    return "none"
+
+
+def _normalize_usage(usage: Any, *, family: str) -> Dict[str, Any] | None:
+    if not isinstance(usage, dict):
+        return None
+
+    raw = dict(usage)
+    prompt_tokens = raw.get("prompt_tokens")
+    completion_tokens = raw.get("completion_tokens")
+    total_tokens = raw.get("total_tokens")
+    reasoning_tokens = raw.get("reasoning_tokens")
+    cached_input_tokens = raw.get("cached_input_tokens")
+    cache_write_tokens = raw.get("cache_write_tokens")
+    cache_read_tokens = raw.get("cache_read_tokens")
+
+    if family == "anthropic":
+        prompt_tokens = prompt_tokens if prompt_tokens is not None else raw.get("input_tokens")
+        completion_tokens = completion_tokens if completion_tokens is not None else raw.get("output_tokens")
+        reasoning_tokens = reasoning_tokens if reasoning_tokens is not None else raw.get("thinking_tokens")
+        cache_write_tokens = (
+            cache_write_tokens
+            if cache_write_tokens is not None
+            else raw.get("cache_creation_input_tokens")
+        )
+        cache_read_tokens = (
+            cache_read_tokens
+            if cache_read_tokens is not None
+            else raw.get("cache_read_input_tokens")
+        )
+        cached_input_tokens = (
+            cached_input_tokens if cached_input_tokens is not None else cache_read_tokens
+        )
+        if total_tokens is None:
+            total_tokens = sum(
+                int(v or 0)
+                for v in (prompt_tokens, completion_tokens, cache_write_tokens, cache_read_tokens)
+            ) or None
+    else:
+        details = raw.get("prompt_tokens_details") or {}
+        cached_input_tokens = (
+            cached_input_tokens
+            if cached_input_tokens is not None
+            else details.get("cached_tokens")
+        )
+        if family == "gemini":
+            cached_input_tokens = (
+                cached_input_tokens
+                if cached_input_tokens is not None
+                else raw.get("cached_content_token_count")
+            )
+            reasoning_tokens = reasoning_tokens if reasoning_tokens is not None else raw.get("thoughts_token_count")
+        cache_read_tokens = cache_read_tokens if cache_read_tokens is not None else cached_input_tokens
+        cache_write_tokens = cache_write_tokens if cache_write_tokens is not None else 0
+
+    normalized = dict(raw)
+    normalized["prompt_tokens"] = prompt_tokens
+    normalized["completion_tokens"] = completion_tokens
+    normalized["total_tokens"] = total_tokens
+    normalized["reasoning_tokens"] = reasoning_tokens
+    normalized["cached_input_tokens"] = int(cached_input_tokens or 0)
+    normalized["cache_write_tokens"] = int(cache_write_tokens or 0)
+    normalized["cache_read_tokens"] = int(cache_read_tokens or 0)
+    normalized["cache_hit"] = bool(normalized["cached_input_tokens"] or normalized["cache_read_tokens"])
+    return normalized
+
+
+def _anthropic_payload_uses_cache(payload: Dict[str, Any]) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if isinstance(payload.get("cache_control"), dict):
+        return True
+    system = payload.get("system")
+    if isinstance(system, list):
+        for block in system:
+            if isinstance(block, dict) and isinstance(block.get("cache_control"), dict):
+                return True
+    for msg in payload.get("messages") or []:
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and isinstance(block.get("cache_control"), dict):
+                    return True
+    return False
+
+
+def build_cache_hint(
+    *,
+    scope: str,
+    name: str,
+    parts: Optional[List[Any]] = None,
+    mode: str = "provider_only",
+    retention: Optional[str] = None,
+    strategy: str = "auto",
+    cached_content: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build a stable per-call cache hint for LLMManager clients."""
+    normalized_scope = scope if scope in _CACHE_SCOPE_VALUES else "conversation"
+    key = f"{name}:{_stable_hash(normalized_scope, parts or [])[:16]}"
+    out: Dict[str, Any] = {
+        "mode": mode if mode in _CACHE_MODE_VALUES else "provider_only",
+        "scope": normalized_scope,
+        "key": key,
+        "strategy": strategy,
+    }
+    if retention:
+        out["retention"] = retention
+    if cached_content:
+        out["cached_content"] = cached_content
+    return out
+
+
+def _cache_entry_expiry(ttl_seconds: int) -> Optional[float]:
+    if ttl_seconds <= 0:
+        return None
+    return time.time() + ttl_seconds
 
 
 def _is_openai_reasoning_model(model: Optional[str]) -> bool:
@@ -819,7 +1026,7 @@ class AnthropicProvider(Provider):
             "x-api-key": self.config.api_key,
             "anthropic-version": ANTHROPIC_VERSION,
         }
-        if self.config.params.get("enable_prompt_cache"):
+        if _anthropic_payload_uses_cache(payload):
             headers["anthropic-beta"] = "prompt-caching-2024-07-31"
         timeout = _normalize_timeout(timeout)
         resp = _request_with_retry(
@@ -837,7 +1044,7 @@ class AnthropicProvider(Provider):
             "x-api-key": self.config.api_key,
             "anthropic-version": ANTHROPIC_VERSION,
         }
-        if self.config.params.get("enable_prompt_cache"):
+        if _anthropic_payload_uses_cache(stream_payload):
             headers["anthropic-beta"] = "prompt-caching-2024-07-31"
         timeout = _normalize_timeout(timeout)
         with _request_stream_no_retry(
@@ -901,12 +1108,19 @@ class GeminiNativeProvider(Provider):
                     )
         return {
             "_api_mode": "gemini_native",
-            "usage": {
-                "prompt_tokens": usage_meta.get("promptTokenCount") or usage_meta.get("prompt_token_count"),
-                "completion_tokens": usage_meta.get("candidatesTokenCount") or usage_meta.get("candidates_token_count"),
-                "total_tokens": usage_meta.get("totalTokenCount") or usage_meta.get("total_token_count"),
-                "reasoning_tokens": usage_meta.get("thoughtsTokenCount") or usage_meta.get("thoughts_token_count"),
-            },
+            "usage": _normalize_usage(
+                {
+                    "prompt_tokens": usage_meta.get("promptTokenCount") or usage_meta.get("prompt_token_count"),
+                    "completion_tokens": usage_meta.get("candidatesTokenCount") or usage_meta.get("candidates_token_count"),
+                    "total_tokens": usage_meta.get("totalTokenCount") or usage_meta.get("total_token_count"),
+                    "reasoning_tokens": usage_meta.get("thoughtsTokenCount") or usage_meta.get("thoughts_token_count"),
+                    "cached_content_token_count": (
+                        usage_meta.get("cachedContentTokenCount")
+                        or usage_meta.get("cached_content_token_count")
+                    ),
+                },
+                family="gemini",
+            ),
             "choices": [
                 {
                     "finish_reason": "tool_calls" if tool_calls else finish_reason,
@@ -951,12 +1165,6 @@ class GeminiNativeProvider(Provider):
             return adapted
         except requests.exceptions.HTTPError as e:
             status = getattr(e.response, "status_code", None)
-            if fallback_payload:
-                _log.warning(
-                    "Gemini native request failed (HTTP %s), falling back to compat mode: %s",
-                    status, e,
-                )
-                return self._fallback.request(fallback_payload, timeout=timeout)
             if status is not None and 400 <= status < 500 and status != 429:
                 try:
                     _err_body = e.response.text[:500] if e.response is not None else ""
@@ -969,6 +1177,12 @@ class GeminiNativeProvider(Provider):
                 )
                 _log.warning("%s", msg)
                 raise RuntimeError(msg) from e
+            if fallback_payload:
+                _log.warning(
+                    "Gemini native request failed (HTTP %s), falling back to compat mode: %s",
+                    status, e,
+                )
+                return self._fallback.request(fallback_payload, timeout=timeout)
             raise
         except Exception as e:
             if fallback_payload:
@@ -1003,6 +1217,17 @@ class GeminiNativeProvider(Provider):
             ) as resp:
                 for item in _iter_sse_events(resp):
                     yield {**item, "_api_mode": api_mode or "gemini_native"}
+        except requests.exceptions.HTTPError as e:
+            status = getattr(e.response, "status_code", None)
+            if status is not None and 400 <= status < 500 and status != 429:
+                raise RuntimeError(
+                    f"Gemini native stream API error (no fallback): {status} for model={model!r}"
+                ) from e
+            if fallback_payload:
+                _log.warning("Gemini native stream failed, falling back to compat mode: %s", e)
+                yield from self._fallback.request_stream(fallback_payload, timeout=timeout)
+                return
+            raise
         except Exception as e:
             if fallback_payload:
                 _log.warning("Gemini native stream failed, falling back to compat mode: %s", e)
@@ -1051,6 +1276,12 @@ def normalize_response(provider_name: str, raw: Dict[str, Any], is_anthropic: bo
         # 容错：抽取失败不抛异常，raw 已保存
         pass
 
+    usage = result.get("usage") or {}
+    result["cached_input_tokens"] = int((usage or {}).get("cached_input_tokens") or 0)
+    result["cache_write_tokens"] = int((usage or {}).get("cache_write_tokens") or 0)
+    result["cache_read_tokens"] = int((usage or {}).get("cache_read_tokens") or 0)
+    result["cache_hit"] = bool((usage or {}).get("cache_hit"))
+
     return result
 
 
@@ -1076,7 +1307,7 @@ def _normalize_openai_compat(raw: Dict[str, Any]) -> Dict[str, Any]:
     }
 
     # usage
-    result["usage"] = raw.get("usage")
+    result["usage"] = _normalize_usage(raw.get("usage"), family="gemini" if raw.get("_api_mode") == "gemini_native" else "openai")
 
     # Perplexity API: top-level citations (URLs) and search_results (title, url, date, snippet)
     citations = raw.get("citations")
@@ -1160,7 +1391,7 @@ def _normalize_anthropic(raw: Dict[str, Any]) -> Dict[str, Any]:
     result = {"final_text": None, "reasoning_text": None, "usage": None, "refusal": None}
 
     # usage
-    result["usage"] = raw.get("usage")
+    result["usage"] = _normalize_usage(raw.get("usage"), family="anthropic")
 
     # stop_reason 检测
     stop_reason = raw.get("stop_reason")
@@ -1338,11 +1569,153 @@ class HTTPChatClient(BaseChatClient):
         provider: Provider,
         log_store: Optional[RawLogStore] = None,
         semaphore: Optional[threading.Semaphore] = None,
+        app_cache: Optional[TTLCache] = None,
     ):
         self.config = config
         self.provider = provider
         self.log_store = log_store
         self._semaphore = semaphore
+        self._app_cache = app_cache
+
+    def _resolve_cache_policy(self, params: Dict[str, Any], model: str) -> CachePolicy:
+        family = _provider_cache_family(self.config)
+        raw_cache = params.get("cache") if isinstance(params.get("cache"), dict) else {}
+        raw_cache = dict(raw_cache or {})
+        has_explicit_cache_config = bool(raw_cache)
+        if "cache_mode" in params:
+            raw_cache.setdefault("mode", params.get("cache_mode"))
+        if "cache_scope" in params:
+            raw_cache.setdefault("scope", params.get("cache_scope"))
+        if "cache_key" in params:
+            raw_cache.setdefault("key", params.get("cache_key"))
+        if "cache_retention" in params:
+            raw_cache.setdefault("retention", params.get("cache_retention"))
+        if "cache_strategy" in params:
+            raw_cache.setdefault("strategy", params.get("cache_strategy"))
+        if "cached_content" in params:
+            raw_cache.setdefault("cached_content", params.get("cached_content"))
+        if "gemini_cached_content" in params:
+            raw_cache.setdefault("cached_content", params.get("gemini_cached_content"))
+        if "enable_prompt_cache" in params:
+            has_explicit_cache_config = True
+            raw_cache.setdefault("enabled", bool(params.get("enable_prompt_cache")))
+            raw_cache.setdefault("strategy", "explicit")
+            raw_cache.setdefault("mode", "provider_only")
+
+        default_mode = "provider_only" if has_explicit_cache_config else "off"
+        mode = str(raw_cache.get("mode") or default_mode).strip().lower()
+        if mode not in _CACHE_MODE_VALUES:
+            mode = default_mode
+        explicit_enabled = raw_cache.get("enabled")
+        if explicit_enabled is False:
+            mode = "off"
+        provider_enabled = mode != "off" and family in {"openai", "anthropic", "gemini"}
+        perf_app_enabled = bool(
+            settings and hasattr(settings, "perf_llm") and getattr(settings.perf_llm, "cache_enabled", False)
+        )
+        ttl_seconds = int(
+            raw_cache.get("ttl_seconds")
+            or (getattr(settings.perf_llm, "cache_ttl_seconds", 3600) if settings and hasattr(settings, "perf_llm") else 3600)
+            or 3600
+        )
+        app_enabled = bool(provider_enabled and mode == "provider_plus_app" and perf_app_enabled and self._app_cache)
+        scope = str(raw_cache.get("scope") or "conversation").strip().lower()
+        if scope not in _CACHE_SCOPE_VALUES:
+            scope = "conversation"
+        retention = raw_cache.get("retention")
+        if retention is None and family == "openai" and provider_enabled:
+            retention = "in_memory"
+        strategy = str(raw_cache.get("strategy") or "auto").strip().lower()
+        if strategy not in {"auto", "explicit"}:
+            strategy = "auto"
+        key = str(raw_cache.get("key") or "").strip()
+        cached_content = str(raw_cache.get("cached_content") or "").strip() or None
+        return CachePolicy(
+            mode=mode,
+            scope=scope,
+            key=key,
+            retention=str(retention).strip() if retention else None,
+            strategy=strategy,
+            provider_enabled=provider_enabled,
+            app_enabled=app_enabled,
+            ttl_seconds=max(0, ttl_seconds),
+            cached_content=cached_content,
+            metadata={"family": family},
+        )
+
+    def _strip_internal_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        return {k: v for k, v in params.items() if k not in _CACHE_INTERNAL_KEYS}
+
+    def _build_app_cache_key(
+        self,
+        *,
+        resolved_model: str,
+        messages: List[Dict[str, Any]],
+        params: Dict[str, Any],
+        tools: Optional[List],
+        response_model: Optional[Any],
+        is_anthropic: bool,
+    ) -> str:
+        response_schema = None
+        if response_model is not None:
+            try:
+                response_schema = response_model.model_json_schema()
+            except Exception:
+                response_schema = getattr(response_model, "__name__", str(response_model))
+        return _stable_hash(
+            "llm_response_cache",
+            self.config.name,
+            self.config.base_url,
+            resolved_model,
+            is_anthropic,
+            messages,
+            params,
+            tools or [],
+            response_schema,
+        )
+
+    def _observe_usage_metrics(self, provider_name: str, model: str, usage: Dict[str, Any] | None) -> None:
+        if not _obs_metrics or not usage:
+            return
+        if usage.get("prompt_tokens"):
+            _obs_metrics.llm_tokens_used.labels(provider=provider_name, model=model, direction="input").inc(usage["prompt_tokens"])
+        if usage.get("completion_tokens"):
+            _obs_metrics.llm_tokens_used.labels(provider=provider_name, model=model, direction="output").inc(usage["completion_tokens"])
+        if usage.get("cached_input_tokens"):
+            _obs_metrics.llm_cached_tokens_total.labels(provider=provider_name, model=model, kind="cached_input").inc(usage["cached_input_tokens"])
+        if usage.get("cache_read_tokens"):
+            _obs_metrics.llm_cached_tokens_total.labels(provider=provider_name, model=model, kind="cache_read").inc(usage["cache_read_tokens"])
+        if usage.get("cache_write_tokens"):
+            _obs_metrics.llm_cached_tokens_total.labels(provider=provider_name, model=model, kind="cache_write").inc(usage["cache_write_tokens"])
+
+    def _observe_provider_cache_event(
+        self,
+        provider_name: str,
+        model: str,
+        cache_policy: CachePolicy,
+        usage: Dict[str, Any] | None,
+    ) -> None:
+        if not _obs_metrics or not cache_policy.provider_enabled:
+            return
+        if usage is None:
+            result = "unknown"
+        else:
+            result = "hit" if usage.get("cache_hit") else "miss"
+        _obs_metrics.llm_cache_events_total.labels(
+            provider=provider_name,
+            model=model,
+            source="provider",
+            result=result,
+        ).inc()
+
+    def _mark_app_cache_event(self, provider_name: str, model: str, result: str) -> None:
+        if _obs_metrics:
+            _obs_metrics.llm_cache_events_total.labels(
+                provider=provider_name,
+                model=model,
+                source="app",
+                result=result,
+            ).inc()
 
     @traceable(run_type="llm", name="llm.chat")
     def chat(
@@ -1365,28 +1738,84 @@ class HTTPChatClient(BaseChatClient):
                 timeout_override = None
         merged_params = deep_merge(self.config.params, overrides)
         is_anthropic = self.config.is_anthropic()
+        cache_policy = self._resolve_cache_policy(merged_params, resolved_model)
+        api_params = self._strip_internal_params(merged_params)
 
         # 结构化输出：为 OpenAI-compat 协议注入 JSON 模式
         if response_model is not None and not is_anthropic:
             is_perplexity = "api.perplexity.ai" in (self.config.base_url or "")
             if is_perplexity:
-                merged_params.setdefault("response_format", {
+                api_params.setdefault("response_format", {
                     "type": "json_schema",
                     "json_schema": {"schema": response_model.model_json_schema()},
                 })
             else:
-                merged_params.setdefault("response_format", {"type": "json_object"})
+                api_params.setdefault("response_format", {"type": "json_object"})
+
+        app_cache_key = None
+        if cache_policy.app_enabled and not tools:
+            app_cache_key = self._build_app_cache_key(
+                resolved_model=resolved_model,
+                messages=messages,
+                params=api_params,
+                tools=tools,
+                response_model=response_model,
+                is_anthropic=is_anthropic,
+            )
+            cached_entry = self._app_cache.get(app_cache_key) if self._app_cache else None
+            cached_result = None
+            if isinstance(cached_entry, dict) and "result" in cached_entry:
+                expires_at = cached_entry.get("expires_at")
+                if expires_at is not None and time.time() >= float(expires_at):
+                    if self._app_cache:
+                        self._app_cache.delete(app_cache_key)
+                else:
+                    cached_result = cached_entry.get("result")
+            elif cached_entry is not None:
+                cached_result = cached_entry
+            if cached_result is not None:
+                self._mark_app_cache_event(self.config.name, resolved_model, "hit")
+                result = copy.deepcopy(cached_result)
+                meta = dict(result.get("meta") or {})
+                meta["latency_ms"] = 0
+                meta["cache"] = {**cache_policy.as_meta(), "source": "app", "hit": True}
+                result["meta"] = meta
+                if _obs_metrics:
+                    _obs_metrics.llm_requests_total.labels(provider=self.config.name, model=resolved_model).inc()
+                    _obs_metrics.llm_duration_seconds.labels(provider=self.config.name, model=resolved_model).observe(0.0)
+                if self.log_store:
+                    self.log_store.write({
+                        "timestamp": now_iso(),
+                        "provider": self.config.name,
+                        "model": resolved_model,
+                        "params": merged_params,
+                        "messages_digest": messages_digest(messages),
+                        "final_text": result.get("final_text"),
+                        "reasoning_text": result.get("reasoning_text"),
+                        "raw_response": result.get("raw") or {},
+                        "meta": meta,
+                        "error": None,
+                    })
+                return result
+            self._mark_app_cache_event(self.config.name, resolved_model, "miss")
 
         # 构建请求 payload
         if is_anthropic:
-            payload = self._build_anthropic_payload(messages, resolved_model, merged_params, tools=tools)
+            payload = self._build_anthropic_payload(
+                messages,
+                resolved_model,
+                api_params,
+                tools=tools,
+                cache_policy=cache_policy,
+            )
         else:
             payload = self._build_openai_payload(
                 messages,
                 resolved_model,
-                merged_params,
+                api_params,
                 tools=tools,
                 response_model=response_model,
+                cache_policy=cache_policy,
             )
 
         # 发送请求（可选并发限流）
@@ -1420,13 +1849,10 @@ class HTTPChatClient(BaseChatClient):
                 _obs_metrics.llm_duration_seconds.labels(provider=_prov, model=_mod).observe(latency_ms / 1000.0)
                 if error:
                     _obs_metrics.llm_errors_total.labels(provider=_prov, model=_mod).inc()
-                # token 计量
                 _norm = normalize_response(self.config.name, raw, is_anthropic) if raw else {}
                 _usage = _norm.get("usage") or {}
-                if _usage.get("prompt_tokens"):
-                    _obs_metrics.llm_tokens_used.labels(provider=_prov, model=_mod, direction="input").inc(_usage["prompt_tokens"])
-                if _usage.get("completion_tokens"):
-                    _obs_metrics.llm_tokens_used.labels(provider=_prov, model=_mod, direction="output").inc(_usage["completion_tokens"])
+                self._observe_usage_metrics(_prov, _mod, _usage)
+                self._observe_provider_cache_event(_prov, _mod, cache_policy, _usage if _usage else None)
 
             # 记录日志
             if self.log_store:
@@ -1444,6 +1870,7 @@ class HTTPChatClient(BaseChatClient):
                         "usage": normalized.get("usage"),
                         "latency_ms": latency_ms,
                         "refusal": normalized.get("refusal"),
+                        "cache": {**cache_policy.as_meta(), "source": "provider", "hit": bool(normalized.get("cache_hit"))},
                     },
                     "error": error,
                 })
@@ -1463,6 +1890,7 @@ class HTTPChatClient(BaseChatClient):
                 "usage": normalized["usage"],
                 "latency_ms": latency_ms,
                 "refusal": normalized["refusal"],
+                "cache": {**cache_policy.as_meta(), "source": "provider", "hit": bool(normalized.get("cache_hit"))},
             },
         }
 
@@ -1489,14 +1917,21 @@ class HTTPChatClient(BaseChatClient):
                     )},
                 ]
                 retry_payload = (
-                    self._build_anthropic_payload(retry_msgs, resolved_model, merged_params, tools=tools)
+                    self._build_anthropic_payload(
+                        retry_msgs,
+                        resolved_model,
+                        api_params,
+                        tools=tools,
+                        cache_policy=cache_policy,
+                    )
                     if is_anthropic
                     else self._build_openai_payload(
                         retry_msgs,
                         resolved_model,
-                        merged_params,
+                        api_params,
                         tools=tools,
                         response_model=response_model,
+                        cache_policy=cache_policy,
                     )
                 )
                 try:
@@ -1513,11 +1948,26 @@ class HTTPChatClient(BaseChatClient):
                     result["meta"]["usage"] = retry_norm.get("usage")
                     result["meta"]["refusal"] = retry_norm.get("refusal")
                     result["meta"]["latency_ms"] = int((time.time() - start_time) * 1000)
+                    result["meta"]["cache"] = {
+                        **cache_policy.as_meta(),
+                        "source": "provider",
+                        "hit": bool(retry_norm.get("cache_hit")),
+                    }
                     result["parsed_object"] = response_model.model_validate_json(retry_text)
                     _log.debug("Structured output validation succeeded on retry")
                 except Exception as retry_err:
                     _log.warning("Structured output retry failed: %s", retry_err)
                     result["parsed_object"] = None
+
+        if app_cache_key and self._app_cache and not tools:
+            self._app_cache.set(
+                app_cache_key,
+                {
+                    "expires_at": _cache_entry_expiry(cache_policy.ttl_seconds),
+                    "result": copy.deepcopy(result),
+                },
+            )
+            self._mark_app_cache_event(self.config.name, resolved_model, "write")
 
         return result
 
@@ -1553,6 +2003,8 @@ class HTTPChatClient(BaseChatClient):
                 pass
         merged_params = deep_merge(self.config.params, overrides)
         is_anthropic = self.config.is_anthropic()
+        cache_policy = self._resolve_cache_policy(merged_params, resolved_model)
+        api_params = self._strip_internal_params(merged_params)
 
         if response_model is not None:
             final_result = self.chat(
@@ -1569,14 +2021,21 @@ class HTTPChatClient(BaseChatClient):
             return
 
         if is_anthropic:
-            payload = self._build_anthropic_payload(messages, resolved_model, merged_params, tools=tools)
+            payload = self._build_anthropic_payload(
+                messages,
+                resolved_model,
+                api_params,
+                tools=tools,
+                cache_policy=cache_policy,
+            )
         else:
             payload = self._build_openai_payload(
                 messages,
                 resolved_model,
-                merged_params,
+                api_params,
                 tools=tools,
                 response_model=response_model,
+                cache_policy=cache_policy,
             )
 
         start_time = time.time()
@@ -1643,10 +2102,8 @@ class HTTPChatClient(BaseChatClient):
                 _obs_metrics.llm_duration_seconds.labels(provider=_prov, model=_mod).observe(latency_ms / 1000.0)
                 if error:
                     _obs_metrics.llm_errors_total.labels(provider=_prov, model=_mod).inc()
-                if usage and usage.get("prompt_tokens"):
-                    _obs_metrics.llm_tokens_used.labels(provider=_prov, model=_mod, direction="input").inc(usage["prompt_tokens"])
-                if usage and usage.get("completion_tokens"):
-                    _obs_metrics.llm_tokens_used.labels(provider=_prov, model=_mod, direction="output").inc(usage["completion_tokens"])
+                self._observe_usage_metrics(_prov, _mod, usage)
+                self._observe_provider_cache_event(_prov, _mod, cache_policy, usage if usage else None)
             if self.log_store:
                 self.log_store.write({
                     "timestamp": now_iso(),
@@ -1661,6 +2118,7 @@ class HTTPChatClient(BaseChatClient):
                         "usage": usage,
                         "latency_ms": latency_ms,
                         "refusal": refusal,
+                        "cache": {**cache_policy.as_meta(), "source": "provider", "hit": bool((usage or {}).get("cache_hit"))},
                     },
                     "error": error,
                 })
@@ -1677,6 +2135,7 @@ class HTTPChatClient(BaseChatClient):
                     "usage": usage,
                     "latency_ms": int((time.time() - start_time) * 1000),
                     "refusal": refusal,
+                    "cache": {**cache_policy.as_meta(), "source": "provider", "hit": bool((usage or {}).get("cache_hit"))},
                 },
             },
         }
@@ -1713,12 +2172,19 @@ class HTTPChatClient(BaseChatClient):
             candidates = data.get("candidates") or []
             usage_meta = data.get("usageMetadata") or data.get("usage_metadata")
             if usage_meta:
-                usage = {
-                    "prompt_tokens": usage_meta.get("promptTokenCount") or usage_meta.get("prompt_token_count"),
-                    "completion_tokens": usage_meta.get("candidatesTokenCount") or usage_meta.get("candidates_token_count"),
-                    "total_tokens": usage_meta.get("totalTokenCount") or usage_meta.get("total_token_count"),
-                    "reasoning_tokens": usage_meta.get("thoughtsTokenCount") or usage_meta.get("thoughts_token_count"),
-                }
+                usage = _normalize_usage(
+                    {
+                        "prompt_tokens": usage_meta.get("promptTokenCount") or usage_meta.get("prompt_token_count"),
+                        "completion_tokens": usage_meta.get("candidatesTokenCount") or usage_meta.get("candidates_token_count"),
+                        "total_tokens": usage_meta.get("totalTokenCount") or usage_meta.get("total_token_count"),
+                        "reasoning_tokens": usage_meta.get("thoughtsTokenCount") or usage_meta.get("thoughts_token_count"),
+                        "cached_content_token_count": (
+                            usage_meta.get("cachedContentTokenCount")
+                            or usage_meta.get("cached_content_token_count")
+                        ),
+                    },
+                    family="gemini",
+                )
 
             for cand in candidates:
                 content = cand.get("content") or {}
@@ -1786,7 +2252,7 @@ class HTTPChatClient(BaseChatClient):
             final_raw = dict(data)
             choices = data.get("choices") or []
             if data.get("usage"):
-                usage = data.get("usage")
+                usage = _normalize_usage(data.get("usage"), family="openai")
             for choice in choices:
                 delta = choice.get("delta") or {}
                 content = delta.get("content")
@@ -1839,11 +2305,11 @@ class HTTPChatClient(BaseChatClient):
             elif name == "message_start":
                 message = data.get("message") or {}
                 if isinstance(message, dict):
-                    usage = message.get("usage") or usage
+                    usage = _normalize_usage(message.get("usage"), family="anthropic") or usage
                     final_raw = dict(message)
             elif name == "message_delta":
                 if isinstance(data.get("usage"), dict):
-                    usage = data.get("usage")
+                    usage = _normalize_usage(data.get("usage"), family="anthropic") or usage
             elif name == "message_stop":
                 completed = True
                 normalized = normalize_response(self.config.name, final_raw, True) if final_raw else {}
@@ -1869,6 +2335,7 @@ class HTTPChatClient(BaseChatClient):
         model: str,
         params: Dict[str, Any],
         tools: Optional[List] = None,
+        cache_policy: Optional[CachePolicy] = None,
     ) -> Dict[str, Any]:
         def _to_text(v: Any) -> str:
             if v is None:
@@ -1986,6 +2453,12 @@ class HTTPChatClient(BaseChatClient):
             cap = int(payload.get("max_output_tokens") or 65_536)
             payload["thinking_budget"] = max(25_000, cap - 8_000)
 
+        if _is_openai_api(self.config.base_url) and cache_policy and cache_policy.provider_enabled:
+            if cache_policy.key:
+                payload["prompt_cache_key"] = cache_policy.key
+            if cache_policy.retention:
+                payload["prompt_cache_retention"] = cache_policy.retention
+
         return payload
 
     def _build_gemini_native_payload(
@@ -1996,6 +2469,7 @@ class HTTPChatClient(BaseChatClient):
         tools: Optional[List] = None,
         *,
         fallback_payload: Optional[Dict[str, Any]] = None,
+        cache_policy: Optional[CachePolicy] = None,
     ) -> Dict[str, Any]:
         def _to_text(v: Any) -> str:
             if v is None:
@@ -2078,6 +2552,8 @@ class HTTPChatClient(BaseChatClient):
             payload["_fallback_payload"] = fallback_payload
         if system_parts:
             payload["systemInstruction"] = {"parts": system_parts}
+        if cache_policy and cache_policy.provider_enabled and cache_policy.cached_content:
+            payload["cachedContent"] = cache_policy.cached_content
 
         generation_config: Dict[str, Any] = {}
         if params.get("temperature") is not None:
@@ -2139,6 +2615,7 @@ class HTTPChatClient(BaseChatClient):
         model: str,
         params: Dict[str, Any],
         tools: Optional[List] = None,
+        cache_policy: Optional[CachePolicy] = None,
     ) -> Dict[str, Any]:
         """Build OpenAI-compatible chat/completions payload."""
         def _to_text(v: Any) -> str:
@@ -2274,6 +2751,12 @@ class HTTPChatClient(BaseChatClient):
         if is_openai and "max_tokens" in payload and "max_completion_tokens" not in payload:
             payload["max_completion_tokens"] = payload.pop("max_tokens")
 
+        if is_openai and cache_policy and cache_policy.provider_enabled:
+            if cache_policy.key:
+                payload["prompt_cache_key"] = cache_policy.key
+            if cache_policy.retention:
+                payload["prompt_cache_retention"] = cache_policy.retention
+
         return payload
 
     def _build_openai_payload(
@@ -2283,6 +2766,7 @@ class HTTPChatClient(BaseChatClient):
         params: Dict[str, Any],
         tools: Optional[List] = None,
         response_model: Optional[Any] = None,
+        cache_policy: Optional[CachePolicy] = None,
     ) -> Dict[str, Any]:
         """构建 OpenAI-compatible 请求 payload"""
         if _can_use_gemini_native_api(
@@ -2290,13 +2774,21 @@ class HTTPChatClient(BaseChatClient):
             messages=messages,
             response_model=response_model,
         ):
-            fallback_payload = self._build_openai_compat_chat_payload(messages, model, params, tools=tools)
+            fallback_params = {k: v for k, v in params.items() if k not in {"cached_content", "gemini_cached_content"}}
+            fallback_payload = self._build_openai_compat_chat_payload(
+                messages,
+                model,
+                fallback_params,
+                tools=tools,
+                cache_policy=cache_policy,
+            )
             return self._build_gemini_native_payload(
                 messages,
                 model,
                 params,
                 tools=tools,
                 fallback_payload=fallback_payload,
+                cache_policy=cache_policy,
             )
         if _should_use_openai_responses_api(
             base_url=self.config.base_url,
@@ -2305,15 +2797,33 @@ class HTTPChatClient(BaseChatClient):
             params=params,
             response_model=response_model,
         ):
-            return self._build_openai_responses_payload(messages, model, params, tools=tools)
+            return self._build_openai_responses_payload(
+                messages,
+                model,
+                params,
+                tools=tools,
+                cache_policy=cache_policy,
+            )
         if _should_use_qwen_responses_api(
             base_url=self.config.base_url,
             has_tools=bool(tools),
             params=params,
             response_model=response_model,
         ):
-            return self._build_openai_responses_payload(messages, model, params, tools=tools)
-        return self._build_openai_compat_chat_payload(messages, model, params, tools=tools)
+            return self._build_openai_responses_payload(
+                messages,
+                model,
+                params,
+                tools=tools,
+                cache_policy=cache_policy,
+            )
+        return self._build_openai_compat_chat_payload(
+            messages,
+            model,
+            params,
+            tools=tools,
+            cache_policy=cache_policy,
+        )
 
     def _build_anthropic_payload(
         self,
@@ -2321,6 +2831,7 @@ class HTTPChatClient(BaseChatClient):
         model: str,
         params: Dict[str, Any],
         tools: Optional[List] = None,
+        cache_policy: Optional[CachePolicy] = None,
     ) -> Dict[str, Any]:
         """构建 Anthropic 请求 payload"""
         # 分离 system 消息
@@ -2338,18 +2849,35 @@ class HTTPChatClient(BaseChatClient):
             "messages": user_messages,
         }
 
+        use_prompt_cache = bool(cache_policy and cache_policy.provider_enabled)
         if system_content:
-            if params.get("enable_prompt_cache"):
-                # Anthropic prompt caching: system 作为带 cache_control 的 content 数组
+            if use_prompt_cache and cache_policy and cache_policy.strategy == "explicit":
                 payload["system"] = [{"type": "text", "text": system_content, "cache_control": {"type": "ephemeral"}}]
             else:
                 payload["system"] = system_content
+        if use_prompt_cache and cache_policy and cache_policy.strategy == "auto":
+            payload["cache_control"] = {"type": "ephemeral"}
 
         # 合并参数（注意排除非 API 参数）
-        _NON_API_PARAMS = {"enable_prompt_cache"}
+        _NON_API_PARAMS = _CACHE_INTERNAL_KEYS
         for key, value in params.items():
             if key not in _NON_API_PARAMS:
                 payload[key] = value
+
+        if use_prompt_cache and cache_policy and cache_policy.strategy == "explicit" and payload.get("messages"):
+            first_msg = payload["messages"][0]
+            if isinstance(first_msg, dict) and first_msg.get("role") == "user":
+                first_content = first_msg.get("content")
+                if isinstance(first_content, str) and first_content.strip() and cache_policy.scope in {"section", "global_template"}:
+                    first_msg = dict(first_msg)
+                    first_msg["content"] = [
+                        {
+                            "type": "text",
+                            "text": first_content,
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ]
+                    payload["messages"][0] = first_msg
 
         thinking_cfg = payload.get("thinking") or {}
         thinking_type = str(thinking_cfg.get("type") or "").strip().lower()
@@ -2423,12 +2951,39 @@ class LLMManager:
     - 解析模型别名
     """
 
+    _AUXILIARY_PROVIDER_PREFERENCE: tuple[str, ...] = (
+        "openai-mini",
+        "gemini-flash-lite",
+        "gemini-flash",
+        "deepseek",
+        "openai",
+        "qwen",
+        "kimi",
+        "claude-haiku",
+        "claude",
+    )
+    _AUXILIARY_AVOID_PLATFORMS: frozenset[str] = frozenset({"codex_app_server"})
+
     def __init__(self, config: LLMConfig, log_store: Optional[RawLogStore] = None):
         self.config = config
         self.log_store = log_store or RawLogStore()
         self._clients: Dict[str, BaseChatClient] = {}
         self._semaphores: Dict[str, threading.Semaphore] = {}
         self._sem_lock = threading.Lock()
+        perf_cache_enabled = bool(
+            settings and hasattr(settings, "perf_llm") and getattr(settings.perf_llm, "cache_enabled", False)
+        )
+        perf_cache_ttl = int(
+            getattr(settings.perf_llm, "cache_ttl_seconds", 3600) if settings and hasattr(settings, "perf_llm") else 3600
+        )
+        perf_cache_max_entries = int(
+            getattr(settings.perf_llm, "cache_max_entries", 1024) if settings and hasattr(settings, "perf_llm") else 1024
+        )
+        self._response_cache: Optional[TTLCache] = (
+            TTLCache(maxsize=max(1, perf_cache_max_entries), ttl_seconds=max(0, perf_cache_ttl))
+            if perf_cache_enabled
+            else None
+        )
 
     @classmethod
     def from_json(cls, path: str | Path) -> "LLMManager":
@@ -2452,7 +3007,12 @@ class LLMManager:
         platforms: Dict[str, PlatformConfig] = {}
         for pname, pcfg in platforms_raw.items():
             env_var = provider_env_var(pname)
-            api_key = os.getenv(env_var) or pcfg.get("api_key", "")
+            legacy_env_var = provider_legacy_env_var(pname)
+            api_key = (
+                os.getenv(env_var)
+                or (os.getenv(legacy_env_var) if legacy_env_var else "")
+                or pcfg.get("api_key", "")
+            )
             platforms[pname] = PlatformConfig(
                 name=pname,
                 api_key=api_key,
@@ -2469,7 +3029,12 @@ class LLMManager:
             # api_key 解析优先级:
             #   provider 级环境变量 > provider 级 JSON > platform 环境变量 > platform JSON
             env_var = provider_env_var(name)
-            api_key = os.getenv(env_var) or pcfg.get("api_key", "")
+            legacy_env_var = provider_legacy_env_var(name)
+            api_key = (
+                os.getenv(env_var)
+                or (os.getenv(legacy_env_var) if legacy_env_var else "")
+                or pcfg.get("api_key", "")
+            )
             if not api_key and platform:
                 api_key = platform.api_key
 
@@ -2497,6 +3062,81 @@ class LLMManager:
     def get_provider_names(self) -> List[str]:
         """获取所有可用的 provider 名称列表"""
         return list(self.config.providers.keys())
+
+    def _provider_platform(self, provider: Optional[str]) -> str:
+        provider_name = str(provider or "").strip()
+        pcfg = self.config.providers.get(provider_name)
+        return str(getattr(pcfg, "platform", "") if pcfg else "") or ""
+
+    def resolve_auxiliary_provider(
+        self,
+        *,
+        explicit_provider: Optional[str] = None,
+        requested_provider: Optional[str] = None,
+        fallback_provider: Optional[str] = None,
+        avoid_platforms: Optional[set[str] | frozenset[str]] = None,
+    ) -> Optional[str]:
+        """
+        Resolve a provider for internal lightweight/helper tasks.
+
+        Auxiliary tasks should prefer standard low-latency providers and avoid
+        inheriting experimental app-server providers from the main chat provider
+        unless the caller explicitly requested them.
+        """
+        avoided = set(avoid_platforms or self._AUXILIARY_AVOID_PLATFORMS)
+
+        def _normalize(candidate: Optional[str]) -> Optional[str]:
+            value = str(candidate or "").strip()
+            if not value or value not in self.config.providers:
+                return None
+            return value
+
+        def _allowed(candidate: Optional[str]) -> bool:
+            normalized = _normalize(candidate)
+            if not normalized:
+                return False
+            return self._provider_platform(normalized) not in avoided
+
+        explicit = _normalize(explicit_provider)
+        requested = _normalize(requested_provider) or _normalize(self.config.default)
+        fallback = _normalize(fallback_provider)
+        default_provider = _normalize(self.config.default)
+
+        if explicit:
+            return explicit
+        if _allowed(requested):
+            return requested
+        if _allowed(fallback):
+            return fallback
+        if _allowed(default_provider):
+            return default_provider
+
+        for candidate in self._AUXILIARY_PROVIDER_PREFERENCE:
+            if _allowed(candidate) and self.is_available(candidate):
+                return candidate
+        for candidate in self.config.providers:
+            if _allowed(candidate) and self.is_available(candidate):
+                return candidate
+        for candidate in self.config.providers:
+            if _allowed(candidate):
+                return candidate
+
+        return explicit or requested or fallback or default_provider
+
+    def get_auxiliary_lite_client(
+        self,
+        *,
+        explicit_provider: Optional[str] = None,
+        requested_provider: Optional[str] = None,
+        fallback_provider: Optional[str] = None,
+        api_key: Optional[str] = None,
+    ) -> BaseChatClient:
+        provider_name = self.resolve_auxiliary_provider(
+            explicit_provider=explicit_provider,
+            requested_provider=requested_provider,
+            fallback_provider=fallback_provider,
+        )
+        return self.get_lite_client(provider_name, api_key=api_key)
 
     def get_client(
         self,
@@ -2535,7 +3175,12 @@ class LLMManager:
         if self.config.dry_run:
             return DryRunChatClient(pcfg, self.log_store)
 
-        # 检查 api_key
+        # ── Codex App Server: subprocess provider，允许空 api_key（走本机登录）──
+        if pcfg.platform == "codex_app_server":
+            from src.llm.codex_app_server import CodexAppServerChatClient
+            return CodexAppServerChatClient(pcfg, self.log_store)
+
+        # 检查 api_key（非 codex 平台必须有有效 key）
         if not pcfg.api_key or pcfg.api_key in ("sk-xxx", "sk-ant-xxx", "AIzxxx"):
             raise ValueError(
                 f"Invalid or missing API key for provider '{provider_name}'. "
@@ -2559,7 +3204,13 @@ class LLMManager:
                     self._semaphores[provider_name] = threading.Semaphore(max_conc)
                 semaphore = self._semaphores[provider_name]
 
-        return HTTPChatClient(pcfg, http_provider, self.log_store, semaphore=semaphore)
+        return HTTPChatClient(
+            pcfg,
+            http_provider,
+            self.log_store,
+            semaphore=semaphore,
+            app_cache=self._response_cache,
+        )
 
     # ── Thinking → Base provider mapping ──
     # "openai-thinking" → "openai", "claude-thinking" → "claude", etc.
@@ -2643,6 +3294,8 @@ class LLMManager:
         if provider not in self.config.providers:
             return False
         pcfg = self.config.providers[provider]
+        if pcfg.platform == "codex_app_server":
+            return shutil.which("codex") is not None
         key = pcfg.api_key
         return bool(key and key not in ("sk-xxx", "sk-ant-xxx", "AIzxxx", ""))
 

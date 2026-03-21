@@ -36,6 +36,11 @@
       "qwen": {
         "api_key": "sk-xxx",
         "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1"
+      },
+      "codex_app_server": {
+        "_note": "OpenAI Codex CLI App Server (experimental). 默认走服务器本机 `codex login` / ChatGPT 登录态；仅在显式填写 api_key 时才走 API Key 认证。不会继承 OPENAI_API_KEY。base_url 留空（走 stdio subprocess）。",
+        "api_key": "",
+        "base_url": ""
       }
     },
     "_providers_note": "模型列表由前端实时从平台 API 拉取。default_model 仅在无 UI 选择时托底。params 用于 thinking 等参数注入。",
@@ -60,7 +65,10 @@
       "sonar":            { "platform": "perplexity", "default_model": "sonar-pro"               },
       "qwen":             { "platform": "qwen",       "default_model": "qwen3.5-plus"            },
       "qwen-vision":      { "platform": "qwen",       "default_model": "qwen3.5-plus"            },
-      "qwen-thinking":    { "platform": "qwen",       "default_model": "qwen3.5-plus",           "params": { "enable_thinking": true } }
+      "qwen-thinking":    { "platform": "qwen",       "default_model": "qwen3.5-plus",           "params": { "enable_thinking": true } },
+      "codex":            { "platform": "codex_app_server", "default_model": "gpt-5.4",
+                            "_note": "Experimental Codex agent provider. 需要服务器安装 codex CLI: npm i -g @openai/codex",
+                            "params": { "effort": "medium", "summary": "concise", "timeout": 180 } }
     }
   },
   "parser": {

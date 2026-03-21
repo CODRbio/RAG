@@ -544,7 +544,178 @@ AI 辅助编辑（扩写/缩写/润色/引文插入）。
 
 ---
 
-## 7. 多文档比较（`/compare`）
+## 7. 学术助手（`/academic-assistant`）
+
+### POST /academic-assistant/papers/summary
+
+单篇论文精读总结。
+
+**请求体**：
+```json
+{
+  "locator": {
+    "paper_uid": "doi:10.1000/example"
+  },
+  "scope": {
+    "scope_type": "collection",
+    "scope_key": "reef"
+  },
+  "question": "重点说明图像和实验结果"
+}
+```
+
+**响应重点字段**：
+
+- `paper_card`
+- `summary_md`
+- `citations`
+- `evidence_summary`
+
+### POST /academic-assistant/papers/qa
+
+针对单篇论文做定向问答。输出结构与 summary 类似，但正文字段为 `answer_md`。
+
+### POST /academic-assistant/papers/compare
+
+按 `paper_uid` 做多篇论文对比，返回：
+
+- `papers`
+- `comparison_matrix`
+- `narrative`
+- `citations`
+- `evidence_summary`
+
+### POST /academic-assistant/media-analysis/start
+
+手动触发论文图片解析回填任务。
+
+**请求体**：
+```json
+{
+  "paper_uids": ["doi:10.1000/example"],
+  "scope": {
+    "scope_type": "collection",
+    "scope_key": "reef"
+  },
+  "force_reparse": false,
+  "upsert_vectors": true
+}
+```
+
+说明：
+
+- 成功后会回写 `enriched.json`
+- 同时增量 upsert `image_caption` / `image_analysis` 向量行
+
+### POST /academic-assistant/discovery/{mode}/start
+
+异步发现任务统一入口，`mode` 取值：
+
+- `missing_core`
+- `forward_tracking`
+- `experts`
+- `institutions`
+
+### POST /academic-assistant/annotations
+
+写入或更新标注。
+
+**请求体重点字段**：
+
+- `resource_type`
+- `resource_id`
+- `paper_uid`
+- `target_kind`：`chunk | figure | page_region | canvas_section`
+- `target_locator`
+- `target_text`
+- `directive`
+- `status`
+
+### GET /academic-assistant/annotations
+
+按 `paper_uid / resource_type / resource_id / target_kind / status` 过滤查询标注。
+
+### GET /academic-assistant/task/{task_id}
+
+查询 academic assistant 异步任务状态。
+
+### GET /academic-assistant/task/{task_id}/stream
+
+订阅 academic assistant 异步任务 SSE。
+
+**SSE 事件类型**：
+
+- `progress`
+- `heartbeat`
+- `done`
+- `error`
+- `cancelled`
+
+---
+
+## 8. 通用资源状态（`/resources`）
+
+### GET /resources/state
+
+读取单个资源的用户态覆盖信息。
+
+**查询参数**：
+
+- `resource_type`
+- `resource_id`
+
+### PATCH /resources/state
+
+写入或更新用户态覆盖信息。
+
+**请求体**：
+```json
+{
+  "resource_type": "project",
+  "resource_id": "canvas-123",
+  "archived": true,
+  "favorite": true,
+  "read_status": "reading"
+}
+```
+
+说明：
+
+- `project` 只是 API 别名，后端会规范化为 `canvas`
+- `paper.resource_id` 固定使用 `paper_uid`
+- `resource_annotation` 不支持该接口
+
+### GET /resources/tags
+
+列出某个资源的自由标签。
+
+### POST /resources/tags
+
+给资源新增一个 tag；重复 tag 会按规范化结果去重。
+
+### DELETE /resources/tags
+
+删除某个 tag。
+
+### GET /resources/notes
+
+列出某个资源的资源级 Markdown 笔记。
+
+### POST /resources/notes
+
+创建资源级 Markdown 笔记。
+
+### PATCH /resources/notes/{note_id}
+
+更新指定笔记。
+
+### DELETE /resources/notes/{note_id}
+
+删除指定笔记。
+
+---
+
+## 9. 多文档比较（`/compare`）
 
 ### POST /compare/start
 
@@ -573,15 +744,19 @@ AI 辅助编辑（扩写/缩写/润色/引文插入）。
 
 ---
 
-## 8. 项目管理（`/projects`）
+## 10. 项目管理（`/projects`）
 
 ### GET /projects
 
-列出所有项目/集合。
+列出当前用户项目；返回字段中的 `archived` 已由通用资源态覆盖。
 
-### POST /projects
+### POST /projects/{canvas_id}/archive
 
-创建项目。
+将项目归档。内部兼容写入 `resource_user_states`，并保持旧 `Canvas.archived` 双写。
+
+### POST /projects/{canvas_id}/unarchive
+
+取消项目归档。
 
 ### DELETE /projects/{project_id}
 
@@ -589,7 +764,7 @@ AI 辅助编辑（扩写/缩写/润色/引文插入）。
 
 ---
 
-## 9. 系统管理（`/admin`）
+## 11. 系统管理（`/admin`）
 
 ### GET /admin/users
 

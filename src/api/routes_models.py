@@ -28,6 +28,18 @@ router = APIRouter(tags=["models"])
 _CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "rag_config.json"
 
 
+def _fetch_codex_live_models(api_key: str = "", timeout: float = 20.0) -> list:
+    from src.llm.codex_app_server import fetch_codex_models, _find_codex_bin
+    from src.llm.model_registry import ModelInfo
+
+    ids = fetch_codex_models(
+        api_key=api_key or "",
+        cli_path=_find_codex_bin(),
+        timeout=timeout,
+    )
+    return [ModelInfo(id=mid, owned_by="openai") for mid in ids]
+
+
 @router.get("/models/status", response_model=ModelStatusResponse)
 def get_model_status() -> dict:
     items = check_models()
@@ -160,30 +172,44 @@ def list_all_live_models(
     # 而 model listing 需要原生 API 端点（如 Gemini 用 /v1beta 而非 /v1beta/openai）。
     platforms_to_fetch: dict[str, dict] = {}
     for pname, pcfg in manager.config.platforms.items():
-        if not pcfg.api_key or pcfg.api_key in ("sk-xxx", "sk-ant-xxx", "AIzxxx", ""):
-            continue
         rk = registry.resolve_provider_for_config(pname)
         if not rk:
             continue
+        # codex_app_server 允许空 api_key（走本机登录态），其余平台必须有有效 key
+        if rk != "codex":
+            if not pcfg.api_key or pcfg.api_key in ("sk-xxx", "sk-ant-xxx", "AIzxxx", ""):
+                continue
         platforms_to_fetch[pname] = {
             "api_key": pcfg.api_key,
             "registry_key": rk,
         }
 
+    # codex app-server 需要较长时间启动，给予独立超时
     PER_PLATFORM_TIMEOUT = 12  # seconds
+    CODEX_PLATFORM_TIMEOUT = 25  # seconds (spawn + handshake + model/list)
 
     def _fetch(pname: str, info: dict) -> tuple[str, list[ModelInfo] | None, str | None]:
         try:
-            models = registry.fetch_models(
-                info["registry_key"],
-                info["api_key"],
-                use_cache=not no_cache,
-            )
+            if info["registry_key"] == "codex":
+                models = _fetch_codex_live_models(
+                    api_key=info["api_key"] or "",
+                    timeout=CODEX_PLATFORM_TIMEOUT,
+                )
+            else:
+                models = registry.fetch_models(
+                    info["registry_key"],
+                    info["api_key"],
+                    use_cache=not no_cache,
+                )
             return pname, models, None
         except Exception as exc:
             return pname, None, str(exc)
 
     results: dict[str, dict] = {}
+
+    # Overall timeout: max of per-platform + buffer; codex may need more time
+    has_codex = any(v["registry_key"] == "codex" for v in platforms_to_fetch.values())
+    overall_timeout = (CODEX_PLATFORM_TIMEOUT if has_codex else PER_PLATFORM_TIMEOUT) + 3
 
     with ThreadPoolExecutor(max_workers=len(platforms_to_fetch) or 1) as pool:
         futures = {
@@ -191,7 +217,7 @@ def list_all_live_models(
             for pname, info in platforms_to_fetch.items()
         }
         try:
-            for future in as_completed(futures, timeout=PER_PLATFORM_TIMEOUT + 2):
+            for future in as_completed(futures, timeout=overall_timeout):
                 pname, models, error = future.result()
                 if models is not None:
                     results[pname] = {
@@ -345,9 +371,11 @@ def fetch_provider_models(
                         if resolved_api_key:
                             break
 
-            # 3) 直接查 platform
+            # 3) 直接查 platform（codex 注册表 key 为 codex，配置平台名为 codex_app_server）
             if not resolved_api_key:
                 plat = manager.config.platforms.get(registry_key)
+                if not plat and registry_key == "codex":
+                    plat = manager.config.platforms.get("codex_app_server")
                 if plat and plat.api_key:
                     resolved_api_key = plat.api_key
                     if not resolved_base_url:
@@ -355,7 +383,8 @@ def fetch_provider_models(
         except Exception:
             pass
 
-    if not resolved_api_key:
+    # OpenAI Codex app-server：允许空 api_key，走本机 `codex login` 会话拉 model/list
+    if registry_key != "codex" and not resolved_api_key:
         raise HTTPException(
             status_code=400,
             detail=f"No API key found for provider '{provider_name}'. "
@@ -363,12 +392,18 @@ def fetch_provider_models(
         )
 
     try:
-        models = registry.fetch_models(
-            registry_key,
-            resolved_api_key,
-            base_url=resolved_base_url,
-            use_cache=not no_cache,
-        )
+        if registry_key == "codex":
+            models = _fetch_codex_live_models(
+                api_key=resolved_api_key or "",
+                timeout=20.0,
+            )
+        else:
+            models = registry.fetch_models(
+                registry_key,
+                resolved_api_key or "",
+                base_url=resolved_base_url,
+                use_cache=not no_cache,
+            )
     except Exception as e:
         _log.warning("Failed to fetch models for %s: %s", provider_name, e)
         raise HTTPException(status_code=502, detail=f"Failed to fetch models: {e}")

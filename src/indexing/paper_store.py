@@ -34,6 +34,7 @@ def _with_persisted_metadata(payload: dict, paper_id: str) -> dict:
                 extra = {}
         payload.update(
             {
+                "paper_uid": meta.get("paper_uid") or payload.get("paper_uid") or "",
                 "doi": meta.get("doi") or None,
                 "title": meta.get("title") or None,
                 "authors": meta.get("authors") or None,
@@ -47,6 +48,34 @@ def _with_persisted_metadata(payload: dict, paper_id: str) -> dict:
     except Exception as e:
         logger.debug("paper_store metadata merge failed for %s: %s", paper_id, e)
     return payload
+
+
+def _mark_graph_scopes_for_paper(user_id: str, collection: str, library_id: Optional[int], reason: str) -> None:
+    try:
+        from src.services.global_graph_service import mark_graph_scope_stale
+
+        if collection:
+            mark_graph_scope_stale(
+                user_id=user_id or "default",
+                scope_type="collection",
+                scope_key=collection,
+                reason=reason,
+            )
+        if library_id is not None:
+            mark_graph_scope_stale(
+                user_id=user_id or "default",
+                scope_type="library",
+                scope_key=str(int(library_id)),
+                reason=reason,
+            )
+    except Exception as e:
+        logger.debug(
+            "mark graph scopes for paper failed user=%s collection=%s library_id=%s err=%s",
+            user_id,
+            collection,
+            library_id,
+            e,
+        )
 
 
 # ── 写入 ──────────────────────────────────────────────────────────────────────
@@ -72,8 +101,17 @@ def upsert_paper(
     library_id: Optional[int] = None,
     library_paper_id: Optional[int] = None,
     source: Optional[str] = None,
+    paper_uid: Optional[str] = None,
 ) -> None:
     """插入或更新 paper 记录。可选 library_id/library_paper_id/source 用于关联文献库。"""
+    if not paper_uid:
+        try:
+            from src.indexing.paper_metadata_store import paper_meta_store
+
+            meta = paper_meta_store.get(paper_id)
+            paper_uid = (meta or {}).get("paper_uid") or ""
+        except Exception:
+            paper_uid = ""
     now = time.time()
     with Session(get_engine()) as session:
         stmt = select(Paper).where(
@@ -103,6 +141,7 @@ def upsert_paper(
                 library_id=library_id,
                 library_paper_id=library_paper_id,
                 source=source or "",
+                paper_uid=paper_uid or "",
             )
             session.add(row)
         else:
@@ -131,8 +170,11 @@ def upsert_paper(
                 row.library_paper_id = library_paper_id
             if source is not None:
                 row.source = source
+            if paper_uid:
+                row.paper_uid = paper_uid
             session.add(row)
         session.commit()
+    _mark_graph_scopes_for_paper(user_id=user_id, collection=collection, library_id=library_id, reason="paper_upserted")
 
 
 # ── 查询 ──────────────────────────────────────────────────────────────────────
@@ -165,6 +207,7 @@ def list_papers(collection: str, user_id: Optional[str] = None) -> List[dict]:
             "library_id": getattr(r, "library_id", None),
             "library_paper_id": getattr(r, "library_paper_id", None),
             "source": getattr(r, "source", "") or "",
+            "paper_uid": getattr(r, "paper_uid", "") or "",
         }, r.paper_id)
         for r in rows
     ]
@@ -182,6 +225,7 @@ def get_paper_by_id(paper_id: str) -> Optional[dict]:
         "file_path": row.file_path or "",
         "collection": row.collection or "",
         "filename": row.filename or "",
+        "paper_uid": getattr(row, "paper_uid", "") or "",
     }
 
 
@@ -196,6 +240,7 @@ def get_paper_by_library_paper_id(library_paper_id: int) -> Optional[dict]:
         "paper_id": row.paper_id,
         "collection": row.collection or "",
         "file_path": row.file_path or "",
+        "paper_uid": getattr(row, "paper_uid", "") or "",
     }
 
 
@@ -222,6 +267,7 @@ def list_papers_linked_to_library(
             "paper_id": r.paper_id,
             "library_id": getattr(r, "library_id", None),
             "library_paper_id": getattr(r, "library_paper_id", None),
+            "paper_uid": getattr(r, "paper_uid", "") or "",
         }
         for r in rows
     ]
@@ -255,6 +301,7 @@ def get_paper(collection: str, paper_id: str) -> Optional[dict]:
         "library_id": getattr(row, "library_id", None),
         "library_paper_id": getattr(row, "library_paper_id", None),
         "source": getattr(row, "source", "") or "",
+        "paper_uid": getattr(row, "paper_uid", "") or "",
     }, row.paper_id)
 
 
@@ -291,9 +338,35 @@ def delete_paper(collection: str, paper_id: str) -> bool:
         row = session.exec(stmt).first()
         if not row:
             return False
+        user_id = getattr(row, "user_id", "default") or "default"
+        library_id = getattr(row, "library_id", None)
+        paper_uid = getattr(row, "paper_uid", "") or ""
         _delete_paper_files(row.file_path)
         session.delete(row)
         session.commit()
+    try:
+        from src.indexing.assistant_artifact_store import cleanup_assistant_artifacts_for_paper
+
+        cleanup_assistant_artifacts_for_paper(
+            user_id=user_id,
+            collection=collection,
+            paper_id=paper_id,
+            paper_uid=paper_uid,
+        )
+    except Exception as e:
+        logger.warning("assistant artifact cleanup failed for %s/%s: %s", collection, paper_id, e)
+    if paper_uid:
+        try:
+            from src.services.resource_state_service import get_resource_state_service
+
+            get_resource_state_service().delete_resource_overlays(
+                user_id=user_id,
+                resource_type="paper",
+                resource_id=paper_uid,
+            )
+        except Exception as e:
+            logger.warning("resource state cleanup failed for paper=%s uid=%s: %s", paper_id, paper_uid, e)
+    _mark_graph_scopes_for_paper(user_id=user_id, collection=collection, library_id=library_id, reason="paper_deleted")
     return True
 
 
@@ -303,8 +376,49 @@ def delete_collection_papers(collection: str) -> int:
         stmt = select(Paper).where(Paper.collection == collection)
         rows = session.exec(stmt).all()
         count = len(rows)
+        affected_scopes = {
+            (
+                getattr(row, "user_id", "default") or "default",
+                getattr(row, "library_id", None),
+            )
+            for row in rows
+        }
         for row in rows:
             _delete_paper_files(row.file_path)
             session.delete(row)
         session.commit()
+    try:
+        from src.indexing.assistant_artifact_store import cleanup_assistant_artifacts_for_paper
+
+        for row in rows:
+            cleanup_assistant_artifacts_for_paper(
+                user_id=getattr(row, "user_id", "default") or "default",
+                collection=collection,
+                paper_id=row.paper_id,
+                paper_uid=getattr(row, "paper_uid", "") or "",
+            )
+    except Exception as e:
+        logger.warning("assistant artifact cleanup failed for collection=%s: %s", collection, e)
+    try:
+        from src.services.resource_state_service import get_resource_state_service
+
+        service = get_resource_state_service()
+        for row in rows:
+            paper_uid = getattr(row, "paper_uid", "") or ""
+            if not paper_uid:
+                continue
+            service.delete_resource_overlays(
+                user_id=getattr(row, "user_id", "default") or "default",
+                resource_type="paper",
+                resource_id=paper_uid,
+            )
+    except Exception as e:
+        logger.warning("resource state cleanup failed for collection=%s: %s", collection, e)
+    for user_id, library_id in affected_scopes:
+        _mark_graph_scopes_for_paper(
+            user_id=user_id,
+            collection=collection,
+            library_id=library_id,
+            reason="collection_papers_deleted",
+        )
     return count

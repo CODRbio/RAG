@@ -7,7 +7,7 @@ interface ClarifyPhaseProps {
   onAnswerChange: (id: string, value: string) => void;
   isClarifying: boolean;
   onRegenerate: () => void;
-  depth: 'lite' | 'comprehensive';
+  depth: 'lite' | 'comprehensive' | 'expert';
   scopeModel: string;
   outputLanguage: string;
   topic: string;

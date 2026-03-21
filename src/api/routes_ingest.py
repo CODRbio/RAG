@@ -882,7 +882,7 @@ def _run_ingest_job(job_id: str, cfg: dict) -> None:
                 if total == 1 and isinstance(cfg.get("metadata"), dict):
                     merged_job_meta.update(cfg["metadata"])
                 if merged_job_meta:
-                    for key in ("title", "doi", "authors", "year", "venue", "url", "pdf_url", "arxiv_id", "source"):
+                    for key in ("title", "doi", "authors", "year", "venue", "url", "pdf_url", "arxiv_id", "pmid", "source"):
                         if key in merged_job_meta and merged_job_meta[key] is not None and (not doc_metadata.get(key)):
                             doc_metadata[key] = merged_job_meta[key]
 
@@ -1072,6 +1072,7 @@ def _run_ingest_job(job_id: str, cfg: dict) -> None:
                             or (cfg.get("metadata") or {}).get("source")
                             or ""
                         ),
+                        paper_uid=doc_metadata.get("paper_uid"),
                     )
                 except Exception as pe:
                     logger.warning("paper_store write failed: %s", pe)
@@ -1088,6 +1089,8 @@ def _run_ingest_job(job_id: str, cfg: dict) -> None:
                                 if row is not None:
                                     row.collection_name = collection_name
                                     row.collection_paper_id = doc_id
+                                    if doc_metadata.get("paper_uid"):
+                                        row.paper_uid = doc_metadata["paper_uid"]
                                     session.add(row)
                                     session.commit()
                         except Exception as le:
@@ -1116,6 +1119,7 @@ def _run_ingest_job(job_id: str, cfg: dict) -> None:
                             error_message=str(e),
                             content_hash=content_hashes.get(fpath, ""),
                             user_id=user_id,
+                            paper_uid=doc_metadata.get("paper_uid"),
                         )
                     except Exception:
                         pass
@@ -1422,7 +1426,7 @@ def _update_paper_metadata(doc_id: str, doc_metadata: dict) -> None:
         extra = doc_metadata.get("extra")
         if not isinstance(extra, dict):
             extra = {}
-        for key in ("venue", "url", "pdf_url", "arxiv_id"):
+        for key in ("venue", "url", "pdf_url", "arxiv_id", "pmid"):
             if doc_metadata.get(key) is not None and doc_metadata.get(key) != "":
                 extra[key] = doc_metadata[key]
         existing = paper_meta_store.get(doc_id)
@@ -1442,6 +1446,9 @@ def _update_paper_metadata(doc_id: str, doc_metadata: dict) -> None:
             source=source,
             extra=extra or None,
         )
+        stored = paper_meta_store.get(doc_id)
+        if stored and stored.get("paper_uid"):
+            doc_metadata["paper_uid"] = stored["paper_uid"]
     except Exception as e:
         logger.warning("Failed to update paper_metadata store: %s", e)
 
@@ -1504,6 +1511,9 @@ def _build_rows(chunks, doc_id: str, collection_name: str = "",
             row["doi"] = doi
         if doc_title:
             row["doc_title"] = doc_title
+        paper_uid = dm.get("paper_uid") or ""
+        if paper_uid:
+            row["paper_uid"] = paper_uid
         rows.append(row)
     return rows
 

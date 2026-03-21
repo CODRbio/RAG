@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import logging
+import re
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from src.llm.llm_manager import get_manager
 from src.services.media_store import detect_image_media_details, get_media_store
+
+_logger = logging.getLogger(__name__)
 
 GRAPHIC_ABSTRACT_DEFAULT_MODEL = "nanobanana 2"
 GRAPHIC_ABSTRACT_FAILURE_MD = "\n> *Graphic abstract generation failed.*"
@@ -139,3 +143,78 @@ def render_graphic_abstract_markdown(
         content_type=asset.content_type,
         storage_backend=asset.backend,
     )
+
+
+# ── Agent-style judgment: is this response worth visualizing? ──────────────
+
+_JUDGE_PROMPT = """\
+You are deciding whether a research response is suitable for generating a Graphic Abstract — a scientific infographic summarizing findings.
+
+Answer YES only if the response:
+- Contains a substantive, concluded research answer, synthesis, or literature summary
+- Has identifiable findings, conclusions, or structured scientific content
+
+Answer NO if the response:
+- Is casual conversation, a greeting, or a clarification exchange
+- Is a short or intermediate answer (e.g. "Sure, I'll look into that")
+- Is a work-in-progress fragment, an error message, or purely procedural text
+- Is too short or too sparse to summarize meaningfully
+
+If uncertain, reply NO.
+
+Reply with exactly one word: YES or NO.
+
+Response to evaluate:
+\"\"\"
+{text}
+\"\"\"
+"""
+
+
+def _parse_yes_no_decision(raw: str) -> Optional[bool]:
+    """Parse the first alphabetical token as YES/NO decision."""
+    tokens = re.findall(r"[A-Za-z]+", (raw or "").strip().upper())
+    if not tokens:
+        return None
+    if tokens[0] == "YES":
+        return True
+    if tokens[0] == "NO":
+        return False
+    return None
+
+
+def should_generate_graphic_abstract(
+    response_text: str,
+    llm_client: Any,
+    content_kind: str = "chat",
+) -> bool:
+    """Ask a lightweight LLM whether this response warrants a Graphic Abstract.
+
+    Returns True (generate) or False (skip). On any error, defaults to False
+    to avoid accidental over-triggering.
+    """
+    text = (response_text or "").strip()
+    if not text:
+        return False
+
+    try:
+        prompt = (
+            "Content kind hint: "
+            f"{content_kind}\n\n"
+            + _JUDGE_PROMPT.format(text=text[:4000])
+        )
+        resp: Dict[str, Any] = llm_client.chat(
+            [{"role": "user", "content": prompt}],
+            max_tokens=8,
+        )
+        answer = str(resp.get("final_text") or resp.get("reasoning_text") or "").strip()
+        parsed = _parse_yes_no_decision(answer)
+        if parsed is None:
+            _logger.info("[graphic_abstract] ambiguous decision, skip generation (raw=%r)", answer)
+            return False
+        decision = parsed
+        _logger.info("[graphic_abstract] agent decision=%s (raw=%r)", "YES" if decision else "NO", answer)
+        return decision
+    except Exception as exc:
+        _logger.warning("[graphic_abstract] judgment call failed (%s), defaulting to False", exc)
+        return False

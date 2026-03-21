@@ -91,7 +91,7 @@ def get_session() -> Generator[Session, None, None]:
 
 ## 4. 完整表清单
 
-ORM 定义文件：`src/db/models.py`（794 行，约 49 个类定义）
+ORM 定义文件：`src/db/models.py`
 
 ### 4.1 画布系统（Canvas）
 
@@ -171,7 +171,18 @@ ORM 定义文件：`src/db/models.py`（794 行，约 49 个类定义）
 | `crossref_cache` | `normalized_title` (str) | `result_json`, `created_at` | Crossref 按标题查询缓存 |
 | `crossref_cache_by_doi` | `normalized_doi` (str) | `result_json`, `created_at` | Crossref 按 DOI 查询缓存 |
 
-### 4.9 影响因子索引
+### 4.9 全局图与学术助手
+
+| 表名 | 主键 | 主要字段 | 说明 |
+|------|------|----------|------|
+| `graph_facts` | `id` | `user_id`, `scope_type`, `scope_key`, `graph_type`, `src_node_id`, `relation_type`, `dst_node_id` | GlobalGraphService 的持久事实边 |
+| `graph_snapshots` | `id` | `user_id`, `scope_type`, `scope_key`, `graph_type`, `snapshot_version`, `status`, `storage_path` | 图快照元数据；快照 payload 落文件 |
+| `resource_annotations` | `id` | `user_id`, `resource_type`, `resource_id`, `paper_uid`, `target_kind`, `target_locator_json`, `target_text`, `directive`, `status` | Phase 3 通用标注真相表 |
+| `resource_user_states` | `id` | `user_id`, `resource_type`, `resource_id`, `favorite`, `archived`, `read_status`, `last_opened_at` | Phase 4 用户态覆盖真相；唯一键是 `(user_id, resource_type, resource_id)` |
+| `resource_tags` | `id` | `user_id`, `resource_type`, `resource_id`, `tag`, `normalized_tag` | Phase 4 自由标签；按规范化 tag 去重 |
+| `resource_notes` | `id` | `user_id`, `resource_type`, `resource_id`, `note_md`, `updated_at` | Phase 4 资源级 Markdown 笔记，可多条 |
+
+### 4.10 影响因子索引
 
 | 表名 | 主键 | 主要字段 | 说明 |
 |------|------|----------|------|
@@ -213,6 +224,9 @@ with Session(get_engine()) as session:
 | 深度研究 | `src/collaboration/research/job_store.py` | deep_research_* 全部7张表 |
 | 文献库绑定 | `src/services/collection_library_binding_service.py` | scholar_libraries, scholar_library_papers, collection_library_bindings |
 | 论文元数据 | `src/indexing/paper_metadata_store.py` | paper_metadata, crossref_cache, crossref_cache_by_doi |
+| 全局图服务 | `src/services/global_graph_service.py` | graph_facts, graph_snapshots |
+| 学术助手标注 | `src/indexing/assistant_artifact_store.py` | resource_annotations |
+| 通用资源态 | `src/services/resource_state_service.py` | resource_user_states, resource_tags, resource_notes |
 
 ### 5.3 认证设计（JWT + 最小 DB 负载）
 
@@ -241,6 +255,42 @@ JWT Token 本身无状态，DB 只存**吊销记录**：
 - 每文件、每阶段（parse/chunk/embed/index）独立状态
 - Upsert 语义：重复提交幂等
 - 启动时清理：完成/报错的 Job 对应 Checkpoint 立即删除；孤立 Checkpoint > 7d 则清理
+
+### 5.6 Milvus 统一 paper collection 扩展
+
+Phase 3 没有新开 media / annotation 专用 collection，而是在现有 paper collection v2 上扩展 `content_type`：
+
+- `text`
+- `table`
+- `image_caption`
+- `image_analysis`
+- `annotation`
+
+对应动态字段补充：
+
+- `paper_uid`
+- `figure_id`
+- `image_path`
+- `bbox`
+- `page`
+- `resource_type`
+- `annotation_id`
+
+边界说明：
+
+- `enriched.json` 仍是图片解析真相源
+- Milvus 中的 `image_analysis` / `annotation` 只是向量影子，用于检索和 rerank
+- `resource_user_states / resource_tags / resource_notes` 全部只落 PostgreSQL，不进入 Milvus
+
+### 5.7 通用资源态规范化
+
+Phase 4 对外允许多种资源语义，但落库统一做 canonicalization：
+
+- `project`：API 别名，落库统一写成 `canvas`
+- `canvas`：`resource_id = canvas_id`
+- `paper`：`resource_id = paper_uid`
+- `scholar_library_paper`：`resource_id = str(row.id)`
+- `resource_annotation`：只允许 `tag/note`，不进入 `resource_user_states`
 
 ---
 

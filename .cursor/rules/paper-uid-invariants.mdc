@@ -1,0 +1,36 @@
+---
+description: Global paper UID invariants and ID-generation guardrails
+alwaysApply: true
+---
+
+# Global `paper_uid` Invariants
+
+This rule is grounded in `docs/paper_uid_invariants.md` and is a project-wide base constraint.
+
+## Core Requirement
+
+- Every paper must use one stable, unique cross-module identifier: `paper_uid`.
+- When a feature, API, model, store, binding, or workflow needs to identify a paper across modules, use `paper_uid`.
+- Do not treat `paper_id`, `cite_key`, or chunk fingerprints as cross-module paper identity.
+
+## Canonical Generation
+
+- The only authoritative implementation is `src.retrieval.dedup.compute_paper_uid`.
+- Never reimplement paper-level ID generation logic in any module.
+- Never construct cross-module paper reference keys without `compute_paper_uid()`.
+- `normalized_doi` must be normalized through `dedup.normalize_doi()` before identity decisions.
+
+## Priority Chain
+
+- Use this deterministic priority order:
+- `doi:{normalized_doi}`
+- `arxiv:{yymm.nnnnn}` without version suffix
+- `pmid:{pmid}`
+- `sha:{sha256(norm_title + "|" + first_author_last_lower + "|" + str(year or ""))[:16]}`
+
+## Upgrade and Storage Rules
+
+- The result must be deterministic: same paper, same `paper_uid`.
+- If DOI is later discovered, recompute `paper_uid` and upgrade references from `sha:*` to `doi:*`.
+- Do not maintain a second paper dedup or identity truth table inside another module.
+- Keep shared SQL / existing metadata services as the source of truth rather than ad hoc per-module identity state.

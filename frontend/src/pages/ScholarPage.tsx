@@ -1,4 +1,5 @@
 import { useEffect, useCallback, useMemo, useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import {
   Search,
   Download,
@@ -25,12 +26,18 @@ import {
   PanelLeftOpen,
   PanelLeftClose,
   Layers,
+  Archive,
+  Star,
+  Tag,
+  MessageSquare,
+  ArrowRight,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useScholarStore } from '../stores/useScholarStore';
 import { useConfigStore } from '../stores/useConfigStore';
 import { useToastStore } from '../stores/useToastStore';
 import { useAuthStore } from '../stores/useAuthStore';
+import { useAcademicAssistantStore, useAnalysisPoolStore, useResourceStore } from '../stores';
 import { login as apiLogin } from '../api/auth';
 import { Modal } from '../components/ui/Modal';
 import { PdfViewerModal } from '../components/ui/PdfViewerModal';
@@ -54,6 +61,8 @@ import type {
   HeadedBrowserWindowState,
   LibraryImportPdfSummary,
 } from '../api/scholar';
+import type { ResourceRef } from '../types';
+import { buildPaperWorkspacePath } from '../utils/appRoutes';
 
 const SOURCE_OPTIONS: { value: ScholarSource; labelKey: string }[] = [
   { value: 'google_scholar', labelKey: 'scholar.sourceGoogleScholar' },
@@ -115,11 +124,19 @@ function saveScholarQueryHistory(history: string[]) {
 
 export function ScholarPage() {
   const { t } = useTranslation();
+  const navigate = useNavigate();
   const currentCollection = useConfigStore((s) => s.currentCollection);
   const collectionInfos = useConfigStore((s) => s.collectionInfos);
   const scholarDownloaderDefaults = useConfigStore((s) => s.scholarDownloaderDefaults);
   const addToast = useToastStore((s) => s.addToast);
   const user = useAuthStore((s) => s.user);
+  const resourceStates = useResourceStore((s) => s.states);
+  const loadResourceState = useResourceStore((s) => s.loadState);
+  const upsertResourceState = useResourceStore((s) => s.upsertState);
+  const restoreAssistantTasks = useAcademicAssistantStore((s) => s.restoreActiveTasks);
+  const streamAssistantTask = useAcademicAssistantStore((s) => s.streamTask);
+  const analysisPoolItems = useAnalysisPoolStore((s) => s.items);
+  const addAnalysisPoolItems = useAnalysisPoolStore((s) => s.addItems);
 
   const {
     query,
@@ -211,6 +228,7 @@ export function ScholarPage() {
   const [, setUploadFailures] = useState<Record<number, string>>({});
   const [deletingPdfId, setDeletingPdfId] = useState<number | null>(null);
   const [redownloadingId, setRedownloadingId] = useState<number | null>(null);
+  const [selectedLibraryPaperIds, setSelectedLibraryPaperIds] = useState<number[]>([]);
   const resultsLayoutRef = useRef<HTMLDivElement | null>(null);
   const importLibraryInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -505,6 +523,38 @@ export function ScholarPage() {
   }, [applyScholarDownloaderDefaults, scholarDownloaderDefaults]);
 
   useEffect(() => {
+    void restoreAssistantTasks()
+      .then((taskIds) => {
+        taskIds.forEach((taskId) => {
+          void streamAssistantTask(taskId).catch(() => {});
+        });
+      })
+      .catch(() => {});
+  }, [restoreAssistantTasks, streamAssistantTask]);
+
+  useEffect(() => {
+    setSelectedLibraryPaperIds((prev) =>
+      prev.filter((paperId) => libraryPapers.some((paper) => paper.id === paperId)),
+    );
+  }, [libraryPapers]);
+
+  useEffect(() => {
+    const refs = filteredLibraryPapers
+      .slice(0, 20)
+      .map((paper) => {
+        if (activeLibraryId == null || activeLibraryId < 0 || paper.id <= 0) return null;
+        return {
+          resource_type: 'scholar_library_paper' as const,
+          resource_id: String(paper.id),
+        };
+      })
+      .filter((ref): ref is { resource_type: 'scholar_library_paper'; resource_id: string } => ref != null);
+    refs.forEach((ref) => {
+      void loadResourceState(ref).catch(() => {});
+    });
+  }, [activeLibraryId, filteredLibraryPapers, loadResourceState]);
+
+  useEffect(() => {
     if (!openPdfAfterDownload) return;
     const url =
       openPdfAfterDownload.libId != null
@@ -544,6 +594,144 @@ export function ScholarPage() {
     },
     []
   );
+
+  const getResourceRefForLibraryPaper = useCallback(
+    (paper: ScholarLibraryPaper): ResourceRef | null => {
+      if (activeLibraryId == null || activeLibraryId < 0 || paper.id <= 0) return null;
+      return {
+        resource_type: 'scholar_library_paper',
+        resource_id: String(paper.id),
+      };
+    },
+    [activeLibraryId],
+  );
+
+  const getLibraryPaperForResult = useCallback(
+    (item: ScholarSearchResult): ScholarLibraryPaper | null => {
+      const doi = (item.metadata.doi || '').trim().toLowerCase();
+      const title = (item.metadata.title || '').trim().toLowerCase();
+      return (
+        libraryPapers.find((paper) => {
+          const paperDoi = (paper.doi || '').trim().toLowerCase();
+          if (doi && paperDoi) return paperDoi === doi;
+          return paper.title.trim().toLowerCase() === title;
+        }) || null
+      );
+    },
+    [libraryPapers],
+  );
+
+  const selectedLibraryPoolItems = useMemo(
+    () =>
+      selectedLibraryPaperIds
+        .map((paperId) => libraryPapers.find((paper) => paper.id === paperId) || null)
+        .filter((paper): paper is ScholarLibraryPaper => paper != null && Boolean(paper.paper_uid))
+        .map((paper) => ({
+          paper_uid: paper.paper_uid || '',
+          title: paper.title,
+          subtitle: [paper.authors?.join(', '), paper.year != null ? String(paper.year) : '', paper.venue || '']
+            .filter(Boolean)
+            .join(' · '),
+          paper_id: paper.collection_paper_id || null,
+          collection: currentCollection || null,
+          library_id: activeLibraryId,
+          resource_ref: getResourceRefForLibraryPaper(paper),
+        })),
+    [activeLibraryId, currentCollection, getResourceRefForLibraryPaper, libraryPapers, selectedLibraryPaperIds],
+  );
+
+  const allFilteredLibrarySelected = useMemo(
+    () =>
+      filteredLibraryPapers.length > 0 &&
+      filteredLibraryPapers.every((paper) => selectedLibraryPaperIds.includes(paper.id)),
+    [filteredLibraryPapers, selectedLibraryPaperIds],
+  );
+
+  const handleQuickToggleResourceState = useCallback(
+    async (ref: ResourceRef | null, field: 'favorite' | 'archived') => {
+      if (!ref) return;
+      const stateKey = `${ref.resource_type}:${ref.resource_id}`;
+      const currentValue = resourceStates[stateKey]?.[field] ?? false;
+      try {
+        await upsertResourceState({
+          resource_type: ref.resource_type,
+          resource_id: ref.resource_id,
+          [field]: !currentValue,
+        });
+      } catch (error) {
+        addToast((error as Error)?.message || t('academicAssistant.actionFailed', 'Operation failed'), 'error');
+      }
+    },
+    [addToast, resourceStates, t, upsertResourceState],
+  );
+
+  const handleOpenWorkspaceForLibraryPaper = useCallback(
+    (paper: ScholarLibraryPaper, tab?: 'summary' | 'notes') => {
+      if (!paper.paper_uid) {
+        addToast(t('paperWorkspace.requiresPaperUid', 'This paper does not have a stable paper_uid yet. Refresh metadata or save it again before opening the workspace.'), 'info');
+        return;
+      }
+      navigate(
+        buildPaperWorkspacePath(paper.paper_uid, {
+          libraryId: activeLibraryId,
+          tab: tab || 'summary',
+        }),
+      );
+    },
+    [activeLibraryId, addToast, navigate, t],
+  );
+
+  const handleOpenWorkspaceForResult = useCallback(
+    (item: ScholarSearchResult, tab?: 'summary' | 'notes') => {
+      const matched = getLibraryPaperForResult(item);
+      if (!matched) {
+        addToast(t('academicAssistant.saveToLibraryFirst', 'Save this paper to the current library first.'), 'info');
+        return;
+      }
+      handleOpenWorkspaceForLibraryPaper(matched, tab);
+    },
+    [addToast, getLibraryPaperForResult, handleOpenWorkspaceForLibraryPaper, t],
+  );
+
+  const handleAddLibraryPaperToAnalysisPool = useCallback(
+    (paper: ScholarLibraryPaper) => {
+      if (!paper.paper_uid) {
+        addToast(t('analysisWorkspace.missingPaperUid', 'Only papers with a stable paper_uid can enter the analysis pool.'), 'info');
+        return;
+      }
+      addAnalysisPoolItems({
+        paper_uid: paper.paper_uid,
+        title: paper.title,
+        subtitle: [paper.authors?.join(', '), paper.year != null ? String(paper.year) : '', paper.venue || '']
+          .filter(Boolean)
+          .join(' · '),
+        paper_id: paper.collection_paper_id || null,
+        collection: currentCollection || null,
+        library_id: activeLibraryId,
+        resource_ref: getResourceRefForLibraryPaper(paper),
+      });
+      addToast(t('analysisWorkspace.addedToPool', 'Added to analysis pool'), 'success');
+    },
+    [activeLibraryId, addAnalysisPoolItems, addToast, currentCollection, getResourceRefForLibraryPaper, t],
+  );
+
+  const handleAddResultToAnalysisPool = useCallback(
+    (item: ScholarSearchResult) => {
+      const matched = getLibraryPaperForResult(item);
+      if (!matched) {
+        addToast(t('academicAssistant.saveToLibraryFirst', 'Save this paper to the current library first.'), 'info');
+        return;
+      }
+      handleAddLibraryPaperToAnalysisPool(matched);
+    },
+    [addToast, getLibraryPaperForResult, handleAddLibraryPaperToAnalysisPool, t],
+  );
+
+  const toggleLibrarySelection = useCallback((paperId: number) => {
+    setSelectedLibraryPaperIds((prev) =>
+      prev.includes(paperId) ? prev.filter((id) => id !== paperId) : [...prev, paperId],
+    );
+  }, []);
 
   const taskIds = Object.keys(downloadTasks);
   const activeTaskCount = taskIds.length;
@@ -769,6 +957,29 @@ export function ScholarPage() {
         onChange={handleLibraryPdfImportChange}
       />
       <div className="flex-shrink-0 p-3 space-y-2">
+        <div className="rounded-xl border border-teal-500/20 bg-teal-500/10 px-4 py-3 text-sm text-slate-200">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <div className="text-[11px] uppercase tracking-[0.18em] text-teal-300/80">
+                Scholar Workspace
+              </div>
+              <div className="mt-1 text-sm text-slate-300">
+                {t('scholar.workspaceHint', 'Use Scholar to search, save, and route papers into dedicated workspaces.')}
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => navigate('/analysis')}
+              className="inline-flex items-center gap-2 rounded-lg border border-teal-400/30 bg-slate-900/40 px-3 py-1.5 text-xs text-teal-200 hover:bg-slate-900/70"
+            >
+              <ArrowRight size={13} />
+              {t('scholar.openAnalysisWorkspace', {
+                defaultValue: 'Analysis Workspace ({{count}})',
+                count: analysisPoolItems.length,
+              })}
+            </button>
+          </div>
+        </div>
         {/* Search bar area with dynamic font sizing */}
         <div className="rounded-xl border border-slate-700/60 bg-slate-800/30 p-3 space-y-3 text-[10px] sm:text-xs 2xl:text-sm">
           {/* Row 1: Search Inputs */}
@@ -1399,6 +1610,43 @@ export function ScholarPage() {
                       )}
                     </div>
                   )}
+                  {filteredLibraryPapers.length > 0 && (
+                    <div className="flex items-center justify-between gap-2 border-b border-slate-700/60 bg-slate-900/30 px-3 py-2 text-xs">
+                      <div className="flex items-center gap-2 text-slate-300">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setSelectedLibraryPaperIds(
+                              allFilteredLibrarySelected ? [] : filteredLibraryPapers.map((paper) => paper.id),
+                            )
+                          }
+                          className="rounded p-1 text-slate-400 hover:text-sky-300"
+                          title={allFilteredLibrarySelected ? t('scholar.clearSelection') : t('scholar.selectAll')}
+                        >
+                          {allFilteredLibrarySelected ? <CheckSquare size={16} /> : <Square size={16} />}
+                        </button>
+                        <span>
+                          {selectedLibraryPaperIds.length > 0
+                            ? t('scholar.selectedCount', { count: selectedLibraryPaperIds.length })
+                            : t('academicAssistant.selectLibraryPapers', 'Select library papers')}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          disabled={selectedLibraryPoolItems.length === 0}
+                          onClick={() => {
+                            if (selectedLibraryPoolItems.length === 0) return;
+                            addAnalysisPoolItems(selectedLibraryPoolItems);
+                            navigate('/analysis');
+                          }}
+                          className="rounded-lg border border-slate-700 px-2 py-1 text-slate-200 hover:bg-slate-800 disabled:opacity-40"
+                        >
+                          {t('analysisWorkspace.sendToPool', 'Send to analysis')}
+                        </button>
+                      </div>
+                    </div>
+                  )}
                   <div className="flex-1 overflow-y-auto p-2 min-h-0">
                     {libraryLoading ? (
                       <div className="flex items-center justify-center py-8">
@@ -1410,11 +1658,29 @@ export function ScholarPage() {
                       <p className="text-slate-500 text-sm py-6 text-center">{t('scholar.noMatchFilters')}</p>
                     ) : (
                       <ul className="space-y-2">
-                        {filteredLibraryPapers.map((p) => (
+                        {filteredLibraryPapers.map((p) => {
+                          const paperResourceRef = getResourceRefForLibraryPaper(p);
+                          const paperState = paperResourceRef
+                            ? resourceStates[`${paperResourceRef.resource_type}:${paperResourceRef.resource_id}`]
+                            : null;
+                          const isSelected = selectedLibraryPaperIds.includes(p.id);
+                          return (
                           <li
                             key={p.id}
-                            className="flex items-start gap-2 rounded-lg border border-slate-600/60 bg-slate-800/50 p-2 text-sm group"
+                            className={`flex items-start gap-2 rounded-lg border p-2 text-sm group ${
+                              isSelected
+                                ? 'border-sky-500/50 bg-sky-950/20'
+                                : 'border-slate-600/60 bg-slate-800/50'
+                            }`}
                           >
+                            <button
+                              type="button"
+                              onClick={() => toggleLibrarySelection(p.id)}
+                              className="mt-1 rounded p-1 text-slate-400 hover:text-sky-300"
+                              title={isSelected ? t('scholar.clearSelection') : t('scholar.selectAll')}
+                            >
+                              {isSelected ? <CheckSquare size={16} /> : <Square size={16} />}
+                            </button>
                             <div className="flex-1 min-w-0">
                               {p.url ? (
                                 <a
@@ -1442,6 +1708,71 @@ export function ScholarPage() {
                                     : (p.venue ? ` · IF ${t('scholar.impactFactorNA')}` : '')}
                                 </p>
                               )}
+                              <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                                <button
+                                  type="button"
+                                  onClick={() => handleOpenWorkspaceForLibraryPaper(p, 'summary')}
+                                  className={`inline-flex items-center gap-1 rounded px-2 py-1 text-[10px] font-medium ${
+                                    p.collection_paper_id || p.in_collection
+                                      ? 'bg-sky-500/20 text-sky-200 hover:bg-sky-500/30'
+                                      : 'bg-slate-700/60 text-slate-400 hover:bg-slate-700'
+                                  }`}
+                                  title={t('paperWorkspace.openWorkspace', 'Open in Paper Workspace')}
+                                >
+                                  <BookOpen size={11} />
+                                  {t('paperWorkspace.openWorkspaceShort', 'Workspace')}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleAddLibraryPaperToAnalysisPool(p)}
+                                  disabled={!p.paper_uid}
+                                  className="inline-flex items-center gap-1 rounded bg-teal-500/15 px-2 py-1 text-[10px] font-medium text-teal-200 hover:bg-teal-500/25 disabled:opacity-40"
+                                  title={t('analysisWorkspace.addToPool', 'Add to analysis pool')}
+                                >
+                                  <Layers size={11} />
+                                  {t('analysisWorkspace.addToPoolShort', 'To pool')}
+                                </button>
+                                {paperResourceRef && (
+                                  <>
+                                    <button
+                                      type="button"
+                                      onClick={() => void handleQuickToggleResourceState(paperResourceRef, 'favorite')}
+                                      className={`rounded p-1 ${
+                                        paperState?.favorite ? 'text-amber-300' : 'text-slate-500 hover:text-amber-300'
+                                      }`}
+                                      title={t('academicAssistant.favorite', 'Favorite')}
+                                    >
+                                      <Star size={13} />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => void handleQuickToggleResourceState(paperResourceRef, 'archived')}
+                                      className={`rounded p-1 ${
+                                        paperState?.archived ? 'text-slate-100' : 'text-slate-500 hover:text-slate-200'
+                                      }`}
+                                      title={t('academicAssistant.archive', 'Archive')}
+                                    >
+                                      <Archive size={13} />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleOpenWorkspaceForLibraryPaper(p, 'notes')}
+                                      className="rounded p-1 text-slate-500 hover:text-sky-300"
+                                      title={t('academicAssistant.tagsAndNotes', 'Tags and notes')}
+                                    >
+                                      <Tag size={13} />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleOpenWorkspaceForLibraryPaper(p, 'notes')}
+                                      className="rounded p-1 text-slate-500 hover:text-sky-300"
+                                      title={t('academicAssistant.notes', 'Notes')}
+                                    >
+                                      <MessageSquare size={13} />
+                                    </button>
+                                  </>
+                                )}
+                              </div>
                               <div className="flex flex-wrap items-center gap-1.5 mt-1">
                                 {p.in_collection && (
                                   <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-emerald-600/50 text-emerald-200" title={p.collection_paper_id ?? undefined}>
@@ -1630,7 +1961,7 @@ export function ScholarPage() {
                               <Trash2 size={14} />
                             </button>
                           </li>
-                        ))}
+                        );})}
                       </ul>
                     )}
                   </div>
@@ -1874,7 +2205,7 @@ export function ScholarPage() {
                         <th className="py-2 px-3 font-medium w-28">{t('scholar.colJournal')}</th>
                         <th className="py-2 px-3 font-medium w-20">{t('scholar.colImpactFactor')}</th>
                         <th className="py-2 px-3 font-medium w-24">{t('scholar.colSource')}</th>
-                        <th className="py-2 px-3 font-medium w-28">{t('scholar.colActions')}</th>
+                        <th className="py-2 px-3 font-medium w-44">{t('scholar.colActions')}</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -1882,6 +2213,11 @@ export function ScholarPage() {
                         const m = item.metadata;
                         const selected = selectedIndices.includes(index);
                         const isDownloading = downloadingIndex === index;
+                        const matchedLibraryPaper = getLibraryPaperForResult(item);
+                        const resultResourceRef = matchedLibraryPaper ? getResourceRefForLibraryPaper(matchedLibraryPaper) : null;
+                        const resultState = resultResourceRef
+                          ? resourceStates[`${resultResourceRef.resource_type}:${resultResourceRef.resource_id}`]
+                          : null;
                         return (
                           <tr
                             key={`${m.title}-${index}`}
@@ -1940,7 +2276,7 @@ export function ScholarPage() {
                             </td>
                             <td className="py-2 px-3 text-slate-500 text-xs">{m.source}</td>
                             <td className="py-2 px-3">
-                              <div className="flex items-center gap-1">
+                              <div className="flex items-center gap-1 flex-wrap">
                                 {activeLibraryId != null && (
                                   <button
                                     onClick={() => handleAddOneToLibrary(index)}
@@ -1958,6 +2294,64 @@ export function ScholarPage() {
                                       <BookmarkPlus size={16} />
                                     )}
                                   </button>
+                                )}
+                                <button
+                                  type="button"
+                                  onClick={() => handleOpenWorkspaceForResult(item, 'summary')}
+                                  disabled={!matchedLibraryPaper}
+                                  className="p-1.5 rounded-lg text-slate-400 hover:bg-sky-500/20 hover:text-sky-300 disabled:opacity-40"
+                                  title={matchedLibraryPaper ? t('paperWorkspace.openWorkspace', 'Open in Paper Workspace') : t('academicAssistant.saveToLibraryFirst', 'Save this paper to the current library first.')}
+                                >
+                                  <BookOpen size={16} />
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleAddResultToAnalysisPool(item)}
+                                  disabled={!matchedLibraryPaper}
+                                  className="p-1.5 rounded-lg text-slate-400 hover:bg-teal-500/20 hover:text-teal-300 disabled:opacity-40"
+                                  title={matchedLibraryPaper ? t('analysisWorkspace.addToPool', 'Add to analysis pool') : t('academicAssistant.saveToLibraryFirst', 'Save this paper to the current library first.')}
+                                >
+                                  <Layers size={16} />
+                                </button>
+                                {resultResourceRef && (
+                                  <>
+                                    <button
+                                      type="button"
+                                      onClick={() => void handleQuickToggleResourceState(resultResourceRef, 'favorite')}
+                                      className={`p-1.5 rounded-lg ${
+                                        resultState?.favorite ? 'text-amber-300' : 'text-slate-400 hover:text-amber-300'
+                                      }`}
+                                      title={t('academicAssistant.favorite', 'Favorite')}
+                                    >
+                                      <Star size={16} />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => void handleQuickToggleResourceState(resultResourceRef, 'archived')}
+                                      className={`p-1.5 rounded-lg ${
+                                        resultState?.archived ? 'text-slate-200' : 'text-slate-400 hover:text-slate-200'
+                                      }`}
+                                      title={t('academicAssistant.archive', 'Archive')}
+                                    >
+                                      <Archive size={16} />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleOpenWorkspaceForResult(item, 'notes')}
+                                      className="p-1.5 rounded-lg text-slate-400 hover:bg-slate-700/60 hover:text-sky-300"
+                                      title={t('academicAssistant.tagsAndNotes', 'Tags and notes')}
+                                    >
+                                      <Tag size={16} />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleOpenWorkspaceForResult(item, 'notes')}
+                                      className="p-1.5 rounded-lg text-slate-400 hover:bg-slate-700/60 hover:text-sky-300"
+                                      title={t('academicAssistant.notes', 'Notes')}
+                                    >
+                                      <MessageSquare size={16} />
+                                    </button>
+                                  </>
                                 )}
                                 <button
                                   onClick={() => handleDownloadOne(index)}
@@ -1992,6 +2386,11 @@ export function ScholarPage() {
                       const m = item.metadata;
                       const selected = selectedIndices.includes(index);
                       const isDownloading = downloadingIndex === index;
+                      const matchedLibraryPaper = getLibraryPaperForResult(item);
+                      const resultResourceRef = matchedLibraryPaper ? getResourceRefForLibraryPaper(matchedLibraryPaper) : null;
+                      const resultState = resultResourceRef
+                        ? resourceStates[`${resultResourceRef.resource_type}:${resultResourceRef.resource_id}`]
+                        : null;
                       return (
                         <div key={`${m.title}-${index}`} className="p-4 hover:bg-slate-800/50">
                           <div className="flex gap-2">
@@ -2040,6 +2439,60 @@ export function ScholarPage() {
                                     )}
                                     {t('scholar.libraryAddOne')}
                                   </button>
+                                )}
+                                <button
+                                  type="button"
+                                  onClick={() => handleOpenWorkspaceForResult(item, 'summary')}
+                                  disabled={!matchedLibraryPaper}
+                                  className="inline-flex items-center gap-1 rounded border border-slate-600 px-2 py-1 text-xs text-slate-300 disabled:opacity-40"
+                                >
+                                  <BookOpen size={12} />
+                                  {t('paperWorkspace.openWorkspaceShort', 'Workspace')}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleAddResultToAnalysisPool(item)}
+                                  disabled={!matchedLibraryPaper}
+                                  className="inline-flex items-center gap-1 rounded border border-slate-600 px-2 py-1 text-xs text-slate-300 disabled:opacity-40"
+                                >
+                                  <Layers size={12} />
+                                  {t('analysisWorkspace.addToPoolShort', 'To pool')}
+                                </button>
+                                {resultResourceRef && (
+                                  <>
+                                    <button
+                                      type="button"
+                                      onClick={() => void handleQuickToggleResourceState(resultResourceRef, 'favorite')}
+                                      className={`rounded p-1 ${resultState?.favorite ? 'text-amber-300' : 'text-slate-400'}`}
+                                      title={t('academicAssistant.favorite', 'Favorite')}
+                                    >
+                                      <Star size={12} />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => void handleQuickToggleResourceState(resultResourceRef, 'archived')}
+                                      className={`rounded p-1 ${resultState?.archived ? 'text-slate-200' : 'text-slate-400'}`}
+                                      title={t('academicAssistant.archive', 'Archive')}
+                                    >
+                                      <Archive size={12} />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleOpenWorkspaceForResult(item, 'notes')}
+                                      className="rounded p-1 text-slate-400"
+                                      title={t('academicAssistant.tagsAndNotes', 'Tags and notes')}
+                                    >
+                                      <Tag size={12} />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleOpenWorkspaceForResult(item, 'notes')}
+                                      className="rounded p-1 text-slate-400"
+                                      title={t('academicAssistant.notes', 'Notes')}
+                                    >
+                                      <MessageSquare size={12} />
+                                    </button>
+                                  </>
                                 )}
                                 <button
                                   onClick={() => handleDownloadOne(index)}

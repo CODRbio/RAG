@@ -19,12 +19,14 @@ import {
   BookOpen,
 } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useAuthStore, useConfigStore, useChatStore, useUIStore, useToastStore } from '../../stores';
 import { checkHealth } from '../../api/health';
 import { listLLMProviders, listAllLiveModels, type LLMProviderInfo } from '../../api/ingest';
 import { TaskCenter } from '../tasks/TaskCenter';
 import { logger } from '../../utils/logger';
+import { TAB_PATHS } from '../../utils/appRoutes';
 
 const LLM_PROVIDER_CACHE_KEY = 'llm_provider_cache_v1';
 const LLM_PROVIDER_BOOTSTRAP_FLAG = 'llm_provider_bootstrap_refreshed_v1';
@@ -52,6 +54,7 @@ const GROUP_COLORS: Record<string, string> = {
   qwen: 'text-rose-400',
   perplexity: 'text-teal-400',
   sonar: 'text-teal-400',
+  codex: 'text-orange-400',
 };
 
 function baseProviderName(id: string): string {
@@ -69,6 +72,7 @@ function groupLabel(id: string): string {
     qwen: 'Qwen',
     perplexity: 'Perplexity',
     sonar: 'Perplexity',
+    codex: 'Codex',
   };
   return labels[base] || id;
 }
@@ -190,6 +194,7 @@ function _classifyApiError(error: string): string {
 
 export function Header() {
   const { t, i18n } = useTranslation();
+  const navigate = useNavigate();
   const currentLang = i18n.language?.startsWith('en') ? 'en' : 'zh';
   const headerRef = useRef<HTMLElement>(null);
   const moreMenuRef = useRef<HTMLDivElement>(null);
@@ -358,6 +363,7 @@ export function Header() {
   const handleTabChange = (tab: HeaderTabId) => {
     setActiveTab(tab);
     setShowMoreTabs(false);
+    navigate(TAB_PATHS[tab]);
   };
 
   const handleConnect = async () => {
@@ -605,11 +611,14 @@ export function Header() {
               }, new Map<string, typeof llmProviders>()),
             ).map(([group, providers]) => (
               <optgroup key={group} label={group} className="bg-slate-800">
-                {providers.map((p) => (
-                  <option key={p.id} value={p.id} className="bg-slate-800 text-slate-200">
-                    {providerOptionLabel(p.id)}
-                  </option>
-                ))}
+                {providers.map((p) => {
+                  const isCodex = p.id === 'codex' || (p.platform || '') === 'codex_app_server';
+                  return (
+                    <option key={p.id} value={p.id} className="bg-slate-800 text-slate-200">
+                      {providerOptionLabel(p.id)}{isCodex ? ' [Experimental]' : ''}
+                    </option>
+                  );
+                })}
               </optgroup>
             ))}
           </select>

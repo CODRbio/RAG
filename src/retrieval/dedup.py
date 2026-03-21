@@ -56,6 +56,131 @@ _DOI_RE = re.compile(
 _CROSSREF_API = "https://api.crossref.org/works"
 _CROSSREF_TIMEOUT_SECONDS = 4
 
+_OPENALEX_API = "https://api.openalex.org/works"
+_OPENALEX_TIMEOUT = 10
+
+
+def _get_openalex_cfg():
+    """返回 OpenAlexConfig，读取失败时返回带默认值的 fallback 对象。"""
+    try:
+        from config.settings import settings
+        return settings.openalex
+    except Exception:
+        class _Fallback:
+            enabled = True
+            api_key = ""
+            base_url = "https://api.openalex.org"
+            timeout_seconds = _OPENALEX_TIMEOUT
+            max_results = 3
+        return _Fallback()
+
+
+def _parse_openalex_work(work: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """将 OpenAlex work 对象解析为标准 {doi,title,authors,year,venue} 字典。"""
+    if not work or not isinstance(work, dict):
+        return None
+    doi = normalize_doi(work.get("doi") or "")
+    if not doi:
+        return None
+    title = (work.get("title") or "").strip()
+    year = work.get("publication_year")
+    authors = []
+    for auth in (work.get("authorships") or []):
+        name = ((auth.get("author") or {}).get("display_name") or "").strip()
+        if name:
+            authors.append(name)
+    pl = work.get("primary_location") or {}
+    src = pl.get("source") or {}
+    venue = (src.get("display_name") or "").strip()
+    ids = work.get("ids") or {}
+    pmid = (ids.get("pmid") or "").replace("https://pubmed.ncbi.nlm.nih.gov/", "").strip("/")
+    result: Dict[str, Any] = {
+        "doi": doi,
+        "title": title or None,
+        "authors": authors or None,
+        "year": int(year) if year else None,
+        "venue": venue or None,
+    }
+    if pmid:
+        result["pmid"] = pmid
+    return result
+
+
+def _openalex_fetch_by_doi(doi: str) -> Optional[Dict[str, Any]]:
+    """通过 DOI 从 OpenAlex 获取论文元数据，结果结构与 CrossRef 返回一致。"""
+    ndoi = normalize_doi(doi)
+    if not ndoi:
+        return None
+    cfg = _get_openalex_cfg()
+    if not cfg.enabled:
+        return None
+    api_key = (cfg.api_key or "").strip()
+    timeout = cfg.timeout_seconds
+
+    url = f"{_OPENALEX_API}/doi:{quote(ndoi, safe='/')}"
+    headers = {"Accept": "application/json", "User-Agent": "DeepSea-RAG/1.0"}
+    if "@" in api_key:
+        url += f"?mailto={quote(api_key)}"
+    elif api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    try:
+        req = Request(url, headers=headers, method="GET")
+        with urlopen(req, timeout=timeout) as resp:
+            if getattr(resp, "status", 200) != 200:
+                return None
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+    return _parse_openalex_work(data)
+
+
+def _openalex_lookup_by_title(title: str) -> Optional[Dict[str, Any]]:
+    """通过标题从 OpenAlex 搜索，返回最佳匹配或 None。"""
+    if not title or len(title) < 10:
+        return None
+    cfg = _get_openalex_cfg()
+    if not cfg.enabled:
+        return None
+    api_key = (cfg.api_key or "").strip()
+    timeout = cfg.timeout_seconds
+
+    qs = urlencode({
+        "search": title,
+        "select": "doi,title,authorships,publication_year,primary_location,ids",
+        "per_page": cfg.max_results,
+    })
+    url = f"{_OPENALEX_API}?{qs}"
+    headers = {"Accept": "application/json", "User-Agent": "DeepSea-RAG/1.0"}
+    if "@" in api_key:
+        url += f"&mailto={quote(api_key)}"
+    elif api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    try:
+        req = Request(url, headers=headers, method="GET")
+        with urlopen(req, timeout=timeout) as resp:
+            if getattr(resp, "status", 200) != 200:
+                return None
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+    results = (data.get("results") or [])
+    if not results:
+        return None
+    best, best_score = None, 0.0
+    for item in results:
+        t = ((item.get("title") or "")).strip()
+        score = _title_overlap(title, t)
+        if score > best_score:
+            best_score = score
+            best = item
+    if not best or best_score < 0.45:
+        return None
+    return _parse_openalex_work(best)
+
 
 def _get_paper_meta_store():
     """延迟加载 PaperMetadataStore，避免循环导入。"""
@@ -88,6 +213,80 @@ _ARXIV_ID_RE = re.compile(
     r"(?:arxiv\.org/(?:abs|pdf)/)?(\d{4}\.\d{4,5}(?:v\d+)?)",
     re.IGNORECASE,
 )
+
+
+def _extract_first_author_last_lower(author: Any) -> str:
+    """Extract the normalized last name for the first author across common input shapes."""
+    if not author:
+        return ""
+    if isinstance(author, dict):
+        for key in ("family", "family_name", "last", "last_name", "surname"):
+            value = author.get(key)
+            if value:
+                return re.sub(r"[^a-z0-9]", "", str(value).lower())
+        author = author.get("name") or author.get("full_name") or ""
+    raw = str(author).strip()
+    if not raw:
+        return ""
+    if "," in raw:
+        last = raw.split(",", 1)[0]
+    else:
+        parts = raw.split()
+        last = parts[-1] if parts else ""
+    return re.sub(r"[^a-z0-9]", "", last.lower())
+
+
+def compute_paper_uid(
+    doi: Optional[str] = None,
+    title: Optional[str] = None,
+    authors: Optional[List[Any]] = None,
+    year: Optional[int] = None,
+    url: Optional[str] = None,
+    pmid: Optional[str] = None,
+) -> str:
+    """
+    计算论文全局唯一标识符（paper_uid）。
+
+    这是项目唯一权威实现，所有模块必须调用此函数，不得私自构造论文级 ID。
+    结果确定性、跨会话稳定，可作为跨模块 join 键。
+
+    优先级：doi > arxiv（从 url/title 提取）> pmid > sha(norm_title+first_author+year)
+
+    示例：
+        compute_paper_uid(doi="10.1038/s41586-023-06345-3")
+        → "doi:10.1038/s41586-023-06345-3"
+
+        compute_paper_uid(url="https://arxiv.org/abs/2306.01234v2")
+        → "arxiv:2306.01234"
+
+        compute_paper_uid(title="Deep Learning", authors=["LeCun, Yann"], year=2015)
+        → "sha:a3f2b1c4d5e6f789"  (确定性 hex)
+    """
+    # 1. DOI（最高优先级）
+    ndoi = normalize_doi(doi)
+    if ndoi:
+        return f"doi:{ndoi}"
+
+    # 2. arXiv ID（从 url 或 title 中提取，去版本号后缀保证跨版本稳定）
+    for text in [url or "", title or ""]:
+        m = _ARXIV_ID_RE.search(text)
+        if m:
+            arxiv_id = re.sub(r"v\d+$", "", m.group(1).lower())
+            return f"arxiv:{arxiv_id}"
+
+    # 3. PMID
+    if pmid and str(pmid).strip():
+        return f"pmid:{str(pmid).strip()}"
+
+    # 4. SHA fallback（确定性内容哈希）
+    ntitle = normalize_title(title or "")
+    first_author = ""
+    if authors:
+        raw = authors[0] if isinstance(authors, list) else str(authors)
+        first_author = _extract_first_author_last_lower(raw)
+    payload = f"{ntitle}|{first_author}|{year or ''}"
+    digest = hashlib.sha256(payload.encode()).hexdigest()[:16]
+    return f"sha:{digest}"
 
 # 从前两页正文中选取“像标题”的短句时跳过的标签（与 pdf_parser 中标题启发式对齐）
 _SKIP_TITLE_LABELS = frozenset([
@@ -434,13 +633,6 @@ def _crossref_lookup_by_title(title: str) -> Optional[Dict[str, Any]]:
 
     data = _request()
     items = (data.get("message") or {}).get("items") or []
-    if not items:
-        _crossref_lru[key] = None
-        try:
-            _get_paper_meta_store().crossref_put(title, None)
-        except Exception:
-            pass
-        return None
 
     best: Optional[Dict[str, Any]] = None
     best_score = 0.0
@@ -451,7 +643,20 @@ def _crossref_lookup_by_title(title: str) -> Optional[Dict[str, Any]]:
             best_score = score
             best = it
 
-    if not best or best_score < 0.45:
+    if not items or not best or best_score < 0.45:
+        # CrossRef 未命中 → 尝试 OpenAlex fallback
+        oa = _openalex_lookup_by_title(title)
+        if oa:
+            _crossref_lru[key] = oa
+            try:
+                store = _get_paper_meta_store()
+                store.crossref_put(title, oa)
+                if oa.get("doi"):
+                    store.crossref_put_by_doi(oa["doi"], oa)
+                    _crossref_lru[f"d:{oa['doi']}"] = oa
+            except Exception:
+                pass
+            return oa
         _crossref_lru[key] = None
         try:
             _get_paper_meta_store().crossref_put(title, None)
@@ -544,10 +749,25 @@ def crossref_fetch_by_doi(doi: str) -> Optional[Dict[str, Any]]:
     try:
         with urlopen(req, timeout=_CROSSREF_TIMEOUT_SECONDS) as resp:
             if getattr(resp, "status", 200) != 200:
-                return None
-            data = json.loads(resp.read().decode("utf-8"))
+                data = None
+            else:
+                data = json.loads(resp.read().decode("utf-8"))
     except (URLError, socket.timeout, Exception):
-        return None
+        data = None
+
+    if data is None:
+        # CrossRef 失败 → 尝试 OpenAlex fallback
+        oa = _openalex_fetch_by_doi(ndoi)
+        if oa:
+            try:
+                store = _get_paper_meta_store()
+                store.crossref_put_by_doi(oa["doi"], oa)
+                if oa.get("title"):
+                    store.crossref_put(oa["title"], oa)
+            except Exception:
+                pass
+            _crossref_lru[f"d:{oa['doi']}"] = oa
+        return oa
 
     message = (data.get("message") or {}) if isinstance(data, dict) else {}
     cr_doi = normalize_doi(message.get("DOI")) or ndoi

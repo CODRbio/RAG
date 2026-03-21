@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
+from src.llm.llm_manager import build_cache_hint
 from src.log import get_logger
 from src.utils.prompt_manager import PromptManager
 from src.utils.context_limits import summarize_if_needed, CLAIM_VERIFICATION_MAX_CHARS
@@ -108,8 +109,12 @@ def extract_claims(
                 {"role": "user", "content": prompt},
             ],
             model=model,
-
             response_model=_ExtractedClaimsResponse,
+            cache=build_cache_hint(
+                scope="section",
+                name="extract_claims",
+                parts=[text_limited[:2048]],
+            ),
         )
         parsed: Optional[_ExtractedClaimsResponse] = resp.get("parsed_object")
         if parsed is None:
@@ -181,8 +186,12 @@ def verify_claims(
                 {"role": "user", "content": prompt},
             ],
             model=model,
-
             response_model=_VerificationsResponse,
+            cache=build_cache_hint(
+                scope="section",
+                name="verify_claims",
+                parts=[claims_text[:2048], citation_limited[:2048]],
+            ),
         )
         parsed_verif: Optional[_VerificationsResponse] = resp.get("parsed_object")
         if parsed_verif is None:

@@ -111,7 +111,7 @@ def test_dedupe_papers_by_doi_percent_encoded_same_doi():
 # ─── Paper store list_papers return shape ─────────────────────────────────────
 
 def test_list_papers_return_keys_include_library_link():
-    """list_papers must include library_id, library_paper_id, source in each paper dict."""
+    """list_papers must include library_id, library_paper_id, source, paper_uid in each paper dict."""
     from src.indexing.paper_store import list_papers
     # Call with a non-existent collection to get empty list; we only check the code path
     # returns dicts that can contain these keys (actual DB may not have them).
@@ -125,6 +125,7 @@ def test_list_papers_return_keys_include_library_link():
         assert "library_id" in p
         assert "library_paper_id" in p
         assert "source" in p
+        assert "paper_uid" in p
 
 
 def test_library_paper_id_fallback_no_doi():

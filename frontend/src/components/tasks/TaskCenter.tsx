@@ -63,6 +63,25 @@ export function TaskCenter({ open, onClose, anchor }: TaskCenterProps) {
     }
   };
 
+  const taskLabel = (kind: string, payload: Record<string, unknown>): string => {
+    if (kind === 'scholar') {
+      return payload.type === 'recommend'
+        ? t('taskCenter.recommend', '推荐文献')
+        : `${t('taskCenter.batchDownload', '批量下载')}: ${payload.completed ?? 0}/${payload.total ?? 0}`;
+    }
+    if (kind === 'dr') {
+      return t('taskCenter.dr', 'Deep Research');
+    }
+    if (kind === 'academic_assistant') {
+      const type = String(payload.type || '');
+      const mode = payload.mode ? ` · ${String(payload.mode)}` : '';
+      if (type === 'media-analysis') return t('taskCenter.mediaAnalysis', 'Media analysis');
+      if (type === 'discovery') return `${t('taskCenter.discovery', 'Discovery')}${mode}`;
+      return t('taskCenter.academicAssistant', 'Academic assistant');
+    }
+    return t('taskCenter.chat', 'Chat');
+  };
+
   if (!open) return anchor ? <>{anchor}</> : null;
 
   return (
@@ -104,15 +123,9 @@ export function TaskCenter({ open, onClose, anchor }: TaskCenterProps) {
                       failed?: number;
                       stage?: string;
                       type?: string;
+                      mode?: string;
                     };
-                    const label =
-                      a.kind === 'scholar'
-                        ? payload.type === 'recommend'
-                          ? t('taskCenter.recommend', '推荐文献')
-                          : t('taskCenter.batchDownload', '批量下载') + `: ${payload.completed ?? 0}/${payload.total ?? 0}`
-                        : a.kind === 'dr'
-                          ? t('taskCenter.dr', 'Deep Research')
-                          : t('taskCenter.chat', 'Chat');
+                    const label = taskLabel(a.kind, payload);
                     return (
                       <li
                         key={a.task_id}
@@ -164,7 +177,7 @@ export function TaskCenter({ open, onClose, anchor }: TaskCenterProps) {
                     >
                       <span className="flex items-center gap-2 truncate text-slate-300">
                         <Clock size={14} className="shrink-0 text-amber-500" />
-                        #{q.queue_position} · {q.kind === 'dr' ? t('taskCenter.dr', 'DR') : t('taskCenter.chat', 'Chat')}
+                        #{q.queue_position} · {taskLabel(q.kind, ((q.state?.payload || {}) as Record<string, unknown>))}
                         {q.session_id ? ` · ${q.session_id.slice(0, 8)}` : ''}
                       </span>
                       <button

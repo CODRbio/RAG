@@ -95,6 +95,11 @@ curl http://localhost:9999/metrics
 - `http_request_duration_seconds`：响应延迟
 - `active_tasks`：当前活跃任务数
 - `milvus_search_duration_seconds`：向量检索耗时
+- `rag_llm_requests_total`：LLM 请求总数
+- `rag_llm_duration_seconds`：LLM 延迟
+- `rag_llm_tokens_total`：LLM 输入/输出 token
+- `rag_llm_cached_tokens_total`：provider cache 相关 token
+- `rag_llm_cache_events_total`：app/provider cache hit/miss/write 事件
 
 ### 2.3 日志文件位置
 
@@ -175,6 +180,41 @@ redis-cli GET "rag:active_slots:count"
 
 # 若槽位泄漏（活跃数异常高但无实际任务运行），重启服务可自动清理
 ```
+
+---
+
+## 3.5 LLM Cache Rollout Playbook
+
+### 推荐上线顺序
+
+1. 先开启 provider 原生缓存：
+   - OpenAI：`llm.providers.<name>.params.cache.mode=provider_only`
+   - Anthropic：`strategy=auto` 作为默认起点
+   - Gemini：先观察 implicit cache，只有需要显式复用大上下文时再传 `cached_content`
+2. 观察 24-48 小时，再按需开启 `performance.llm.cache_enabled=true`
+3. 只有结构化、模板稳定、可重复的调用点才建议升级为 `provider_plus_app`
+
+### 回滚开关
+
+- 关闭 provider 原生缓存：把对应 provider 的 `params.cache.mode` 设为 `off`
+- 关闭应用层 response cache：把 `performance.llm.cache_enabled` 设为 `false`
+- 缩短应用层缓存保留时间：调低 `performance.llm.cache_ttl_seconds`
+
+### 需要重点监控
+
+- `rag_llm_cache_events_total{source="provider",result="hit"}`
+- `rag_llm_cache_events_total{source="app",result="hit"}`
+- `rag_llm_cached_tokens_total`
+- `rag_llm_duration_seconds`
+- `rag_llm_errors_total`
+
+### 异常排查
+
+- 命中率低：检查 prompt 前缀是否稳定，确认动态内容是否被放到了后半段。
+- Anthropic 未命中：检查请求是否真的带了 `cache_control`，以及是否走到了自动缓存或显式断点路径。
+- OpenAI 命中不稳定：检查 `prompt_cache_key` 粒度是否过细，或同一 key 是否被高频并发打散。
+- Gemini 未复用：检查是否实际传入了 `cachedContent`，以及调用是否仍走 native 路径而非 compat fallback。
+- 应用层命中异常：确认该调用点是否包含 tools / streaming / 强时效上下文，这些场景默认不适合 response cache。
 
 ---
 

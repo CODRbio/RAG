@@ -1020,6 +1020,7 @@ export const useScholarStore = create<ScholarState>()((set, get) => ({
     const state = get();
     const { activeLibraryId } = state;
     if (activeLibraryId == null || !paper.paper_id) return null;
+    const paperId = paper.paper_id;
     const libId = activeLibraryId >= 0 ? activeLibraryId : null;
     try {
       const res = await batchDownloadPapers(
@@ -1052,7 +1053,7 @@ export const useScholarStore = create<ScholarState>()((set, get) => ({
         pendingDownloadAndOpen: {
           taskId: res.task_id,
           libId,
-          paperId: paper.paper_id,
+          paperId,
           title: paper.title,
         },
       }));

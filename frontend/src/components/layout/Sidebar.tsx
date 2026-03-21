@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import {
   Layers,
@@ -25,7 +26,7 @@ import {
 import { useAuthStore, useConfigStore, useUIStore, useToastStore, useChatStore, useCanvasStore } from '../../stores';
 import { checkHealth } from '../../api/health';
 import { listSessions, deleteSession, listDeepResearchJobs, cancelDeepResearchJob, deleteDeepResearchJob } from '../../api/chat';
-import { listLLMProviders, listAllLiveModels, type LLMProviderInfo } from '../../api/ingest';
+import { listLLMProviders, listAllLiveModels } from '../../api/ingest';
 import { getModelStatus, syncModels } from '../../api/models';
 import { exportCanvas, getCanvas } from '../../api/canvas';
 import { toggleDebug } from '../../api/debug';
@@ -89,6 +90,7 @@ function HelpTooltip({
 
 export function Sidebar({ onStartResize }: SidebarProps) {
   const { t } = useTranslation();
+  const navigate = useNavigate();
   const user = useAuthStore((s) => s.user);
   const logout = useAuthStore((s) => s.logout);
   const addToast = useToastStore((s) => s.addToast);
@@ -98,11 +100,9 @@ export function Sidebar({ onStartResize }: SidebarProps) {
     setDbAddress,
     dbStatus,
     setDbStatus,
-    currentCollection,
     selectedCollections,
     collections,
     collectionInfos,
-    setCurrentCollection,
     toggleCollection,
     ragConfig,
     updateRagConfig,
@@ -259,6 +259,7 @@ export function Sidebar({ onStartResize }: SidebarProps) {
     if (isLoadingSession) return;
     try {
       setActiveTab('chat'); // 切换到对话页，确保加载的会话在对话窗中显示
+      navigate('/chat');
       await loadSession(sessionId);
       requestSessionListRefresh(); // 后端 GET 已 touch_session，刷新列表使该会话上移到最新
       addToast(t('sidebar.sessionLoaded'), 'success');
@@ -292,6 +293,7 @@ export function Sidebar({ onStartResize }: SidebarProps) {
     const runnable = ['planning', 'pending', 'running', 'pausing', 'paused', 'cancelling', 'waiting_review'];
     try {
       setActiveTab('chat'); // 恢复任务时切换到对话页，确保会话内容在对话窗显示
+      navigate('/chat');
       localStorage.setItem(DEEP_RESEARCH_JOB_KEY, job.job_id);
       setDeepResearchTopic(job.topic || '');
       setResearchDashboard((job.result_dashboard as unknown as ResearchDashboardData) || null);
@@ -1536,7 +1538,7 @@ export function Sidebar({ onStartResize }: SidebarProps) {
                     {(Object.values(streamingTasks).some(
                       (t) => t.sessionId === h.session_id && (t.status === 'queued' || t.status === 'running')
                     ) || (isLoadingSession && currentSessionId !== h.session_id)) && (
-                      <Loader2 size={12} className="animate-spin text-sky-500 flex-shrink-0" title={t('sidebar.streaming', 'Streaming')} />
+                      <Loader2 size={12} className="animate-spin text-sky-500 flex-shrink-0" />
                     )}
                   </div>
                   <div className="text-[10px] text-slate-500 flex items-center gap-1 mt-1">

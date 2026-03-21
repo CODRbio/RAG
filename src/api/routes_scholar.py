@@ -65,6 +65,39 @@ async def wait_scholar_background_tasks_or_timeout(timeout_seconds: float) -> No
         logger.warning("[scholar] shutdown wait failed: %s", e)
 
 
+def _mark_graph_scopes_stale_for_library(
+    user_id: str,
+    lib_id: int,
+    *,
+    collection_name: Optional[str] = None,
+    reason: str,
+) -> None:
+    try:
+        from src.services.global_graph_service import mark_graph_scope_stale
+
+        mark_graph_scope_stale(
+            user_id=user_id,
+            scope_type="library",
+            scope_key=str(int(lib_id)),
+            reason=reason,
+        )
+        if (collection_name or "").strip():
+            mark_graph_scope_stale(
+                user_id=user_id,
+                scope_type="collection",
+                scope_key=str(collection_name).strip(),
+                reason=reason,
+            )
+    except Exception as e:
+        logger.debug(
+            "mark graph scopes stale for library failed user=%s lib_id=%s collection=%s err=%s",
+            user_id,
+            lib_id,
+            collection_name,
+            e,
+        )
+
+
 class ScholarSearchRequest(BaseModel):
     query: str
     source: str = "google_scholar"  # google_scholar | google | semantic | semantic_relevance | semantic_bulk | ncbi | annas_archive
@@ -253,6 +286,7 @@ class LibraryRecommendRequest(BaseModel):
 class LibraryRecommendItem(BaseModel):
     library_paper_id: int
     collection_paper_id: str
+    paper_uid: Optional[str] = None
     title: str
     doi: Optional[str] = None
     year: Optional[int] = None
@@ -1266,8 +1300,31 @@ def delete_scholar_library(lib_id: int, user_id: str = Depends(get_current_user_
         if not lib or getattr(lib, "user_id", None) != user_id:
             raise HTTPException(status_code=404, detail="库不存在")
         folder_path = getattr(lib, "folder_path", None)
+        paper_ids = [
+            int(p.id)
+            for p in session.exec(select(ScholarLibraryPaper).where(ScholarLibraryPaper.library_id == lib_id)).all()
+            if getattr(p, "id", None) is not None
+        ]
         session.delete(lib)
         session.commit()
+    try:
+        from src.indexing.assistant_artifact_store import delete_resource_annotations_for_resource
+        from src.services.resource_state_service import get_resource_state_service
+
+        resource_state_service = get_resource_state_service()
+        for paper_id in paper_ids:
+            delete_resource_annotations_for_resource(
+                user_id=user_id,
+                resource_type="scholar_library_paper",
+                resource_id=str(paper_id),
+            )
+            resource_state_service.delete_resource_overlays(
+                user_id=user_id,
+                resource_type="scholar_library_paper",
+                resource_id=str(paper_id),
+            )
+    except Exception as e:
+        logger.warning("delete scholar library overlay cleanup failed lib_id=%s: %s", lib_id, e)
     if folder_path:
         import shutil
         try:
@@ -1405,13 +1462,18 @@ def _extract_doi_and_dedup_library_papers(
 
 
 def _paper_from_search_item(item: Dict[str, Any]) -> ScholarLibraryPaper:
+    from src.retrieval.dedup import compute_paper_uid
     meta = item.get("metadata") or {}
     authors = meta.get("authors") or []
+    doi = (meta.get("doi") or "") or ""
+    title = (meta.get("title") or "").strip() or "(无标题)"
+    year = meta.get("year") if isinstance(meta.get("year"), (int, type(None))) else None
+    authors_list = authors if isinstance(authors, list) else []
     return ScholarLibraryPaper(
-        title=(meta.get("title") or "").strip() or "(无标题)",
-        authors=json.dumps(authors) if isinstance(authors, list) else "[]",
-        year=meta.get("year") if isinstance(meta.get("year"), (int, type(None))) else None,
-        doi=(meta.get("doi") or "") or "",
+        title=title,
+        authors=json.dumps(authors_list) if isinstance(authors, list) else "[]",
+        year=year,
+        doi=doi,
         pdf_url=(meta.get("pdf_url") or "") or "",
         url=(meta.get("url") or "") or "",
         source=(meta.get("source") or "") or "",
@@ -1419,11 +1481,21 @@ def _paper_from_search_item(item: Dict[str, Any]) -> ScholarLibraryPaper:
         annas_md5=(meta.get("annas_md5") or "") or "",
         venue=(meta.get("venue") or "") or "",
         normalized_journal_name=(meta.get("normalized_journal_name") or "") or "",
+        paper_uid=compute_paper_uid(
+            doi=doi,
+            title=title,
+            authors=authors_list,
+            year=year,
+            url=meta.get("url") or "",
+            pmid=meta.get("pmid") or "",
+        ),
     )
 
 
 def _temp_paper_from_search_item(item: Dict[str, Any], lib_id: int) -> Dict[str, Any]:
     """Build a temp-library paper dict with a negative paper id."""
+    from src.retrieval.dedup import compute_paper_uid
+
     global _temp_paper_id_counter
     _temp_paper_id_counter -= 1
     meta = item.get("metadata") or {}
@@ -1447,6 +1519,14 @@ def _temp_paper_from_search_item(item: Dict[str, Any], lib_id: int) -> Dict[str,
         "downloaded_at": None,
         "venue": (meta.get("venue") or "") or "",
         "normalized_journal_name": (meta.get("normalized_journal_name") or "") or "",
+        "paper_uid": compute_paper_uid(
+            doi=(meta.get("doi") or "") or "",
+            title=(meta.get("title") or "").strip() or "(无标题)",
+            authors=authors,
+            year=meta.get("year") if isinstance(meta.get("year"), (int, type(None))) else None,
+            url=(meta.get("url") or "") or "",
+            pmid=(meta.get("pmid") or "") or "",
+        ),
     }
     if meta.get("impact_factor") is not None:
         out["impact_factor"] = meta["impact_factor"]
@@ -1601,6 +1681,86 @@ def _build_library_row_index(rows: List[ScholarLibraryPaper]) -> Tuple[Dict[str,
     return by_doi, by_title
 
 
+def _normalize_authors_for_paper_uid(authors: Any) -> List[str]:
+    if isinstance(authors, list):
+        return [str(a) for a in authors if str(a).strip()]
+    if isinstance(authors, str) and authors.strip():
+        return [authors.strip()]
+    return []
+
+
+def _resolve_paper_uid_aux(collection_paper_id: Optional[str]) -> Tuple[Optional[str], Optional[str], Optional[Dict[str, Any]]]:
+    if not collection_paper_id:
+        return None, None, None
+    try:
+        from src.indexing.paper_metadata_store import paper_meta_store
+
+        meta = paper_meta_store.get(collection_paper_id)
+    except Exception:
+        meta = None
+    if not meta:
+        return None, None, None
+    extra = meta.get("extra") or {}
+    url = (extra.get("url") or extra.get("pdf_url") or "").strip() or None
+    pmid = (extra.get("pmid") or "").strip() or None
+    return url, pmid, meta
+
+
+def _resolve_library_paper_uid(paper: Any) -> Optional[str]:
+    from src.retrieval.dedup import compute_paper_uid
+
+    raw_uid = getattr(paper, "paper_uid", None) if hasattr(paper, "paper_uid") else paper.get("paper_uid")
+    uid = (raw_uid or "").strip()
+    if uid:
+        return uid
+    authors = paper.get_authors() if hasattr(paper, "get_authors") else _normalize_authors_for_paper_uid(paper.get("authors"))
+    coll_paper_id = getattr(paper, "collection_paper_id", None) if hasattr(paper, "collection_paper_id") else paper.get("collection_paper_id")
+    url, pmid, meta = _resolve_paper_uid_aux((coll_paper_id or "").strip() or None)
+    doi = getattr(paper, "doi", None) if hasattr(paper, "doi") else paper.get("doi")
+    title = getattr(paper, "title", None) if hasattr(paper, "title") else paper.get("title")
+    year = getattr(paper, "year", None) if hasattr(paper, "year") else paper.get("year")
+    if meta:
+        doi = doi or meta.get("doi")
+        title = title or meta.get("title")
+        year = year if year is not None else meta.get("year")
+        if not authors:
+            authors = _normalize_authors_for_paper_uid(meta.get("authors"))
+    if not (doi or title or pmid):
+        return None
+    return compute_paper_uid(
+        doi=doi,
+        title=title,
+        authors=authors,
+        year=year,
+        url=url or (getattr(paper, "url", None) if hasattr(paper, "url") else paper.get("url")),
+        pmid=pmid,
+    )
+
+
+def _chunk_lookup_key(chunk: Any) -> str:
+    from src.retrieval.dedup import compute_paper_uid
+
+    paper_uid = (getattr(chunk, "paper_uid", None) or "").strip()
+    if paper_uid:
+        return paper_uid
+    doi = getattr(chunk, "doi", None)
+    title = getattr(chunk, "doc_title", None)
+    authors = getattr(chunk, "authors", None)
+    year = getattr(chunk, "year", None)
+    url = getattr(chunk, "url", None)
+    pmid = getattr(chunk, "pmid", None)
+    if doi or title or pmid:
+        return compute_paper_uid(
+            doi=doi,
+            title=title,
+            authors=authors,
+            year=year,
+            url=url,
+            pmid=pmid,
+        )
+    return (getattr(chunk, "doc_id", None) or getattr(chunk, "chunk_id", None) or "").strip()
+
+
 @router.get("/libraries/{lib_id:int}/papers")
 def list_scholar_library_papers(
     lib_id: int,
@@ -1626,6 +1786,7 @@ def list_scholar_library_papers(
             d["is_downloaded"] = bool(d.get("downloaded_at"))
             d["in_collection"] = False
             d["collection_paper_id"] = None
+            d["paper_uid"] = _resolve_library_paper_uid(d)
             out.append(d)
         return _attach_impact_factor_metadata(out)
     with Session(get_engine()) as session:
@@ -1654,6 +1815,7 @@ def list_scholar_library_papers(
                 "downloaded_at": getattr(p, "downloaded_at", None),
                 "venue": getattr(p, "venue", None) or None,
                 "normalized_journal_name": getattr(p, "normalized_journal_name", None) or None,
+                "paper_uid": _resolve_library_paper_uid(p),
                 "paper_id": _library_paper_id(
                     (p.doi or "").strip() or None,
                     p.title or "",
@@ -1675,22 +1837,22 @@ def _aggregate_chunks_to_library_papers(
     max_snippets: int = 3,
 ) -> List[Dict[str, Any]]:
     """
-    Group EvidenceChunk objects by doc_id and join them to library papers via eligible_lookup.
+    Group EvidenceChunk objects by paper_uid-first lookup and join them to library papers.
 
-    eligible_lookup: dict mapping collection_paper_id -> ScholarLibraryPaper (or dict with same keys).
+    eligible_lookup: dict mapping paper_uid -> ScholarLibraryPaper (or dict with same keys).
     Returns list of aggregated dicts sorted by (best_chunk_score desc, matched_chunks desc), capped at top_k.
     """
     from collections import defaultdict
 
     doc_chunks: Dict[str, List[Any]] = defaultdict(list)
     for chunk in chunks:
-        doc_id = getattr(chunk, "doc_id", None) or getattr(chunk, "chunk_id", None) or ""
-        if doc_id and doc_id in eligible_lookup:
-            doc_chunks[doc_id].append(chunk)
+        lookup_key = _chunk_lookup_key(chunk)
+        if lookup_key and lookup_key in eligible_lookup:
+            doc_chunks[lookup_key].append(chunk)
 
     results: List[Dict[str, Any]] = []
-    for coll_paper_id, chunk_list in doc_chunks.items():
-        paper = eligible_lookup[coll_paper_id]
+    for lookup_key, chunk_list in doc_chunks.items():
+        paper = eligible_lookup[lookup_key]
         scores = [getattr(c, "score", 0.0) for c in chunk_list]
         best_score = max(scores) if scores else 0.0
         # Sort chunks by score desc for snippet selection
@@ -1707,10 +1869,25 @@ def _aggregate_chunks_to_library_papers(
         p_year = getattr(paper, "year", None) if hasattr(paper, "year") else paper.get("year")
         p_venue = getattr(paper, "venue", None) if hasattr(paper, "venue") else paper.get("venue")
         p_if = getattr(paper, "impact_factor", None) if hasattr(paper, "impact_factor") else paper.get("impact_factor")
+        p_coll_pid = (
+            getattr(paper, "collection_paper_id", None)
+            if hasattr(paper, "collection_paper_id")
+            else paper.get("collection_paper_id")
+            if isinstance(paper, dict)
+            else None
+        )
+        p_uid = (
+            getattr(paper, "paper_uid", None)
+            if hasattr(paper, "paper_uid")
+            else paper.get("paper_uid")
+            if isinstance(paper, dict)
+            else None
+        )
 
         results.append({
             "library_paper_id": p_id,
-            "collection_paper_id": coll_paper_id,
+            "collection_paper_id": (p_coll_pid or lookup_key),
+            "paper_uid": (p_uid or lookup_key),
             "title": p_title or "",
             "doi": (p_doi or "").strip() or None,
             "year": p_year,
@@ -1757,6 +1934,7 @@ def _recommend_sync_step(
             "id": r["library_paper_id"],
             "library_paper_id": r["library_paper_id"],
             "collection_paper_id": r["collection_paper_id"],
+            "paper_uid": r.get("paper_uid"),
             "title": r["title"],
             "doi": r["doi"],
             "year": r["year"],
@@ -1774,6 +1952,7 @@ def _recommend_sync_step(
         {
             "library_paper_id": row["library_paper_id"],
             "collection_paper_id": row["collection_paper_id"],
+            "paper_uid": row.get("paper_uid"),
             "title": row["title"],
             "doi": row.get("doi"),
             "year": row.get("year"),
@@ -1978,9 +2157,12 @@ async def recommend_library_papers_start(
             continue
         coll_name = (getattr(p, "collection_name", None) or "").strip()
         coll_paper_id = (getattr(p, "collection_paper_id", None) or "").strip()
-        if coll_name == collection and coll_paper_id:
-            eligible_lookup[coll_paper_id] = {
+        paper_uid = _resolve_library_paper_uid(p)
+        if coll_name == collection and coll_paper_id and paper_uid:
+            eligible_lookup[paper_uid] = {
                 "id": p.id,
+                "collection_paper_id": coll_paper_id,
+                "paper_uid": paper_uid,
                 "title": p.title or "",
                 "doi": p.doi,
                 "year": p.year,
@@ -2085,8 +2267,9 @@ async def recommend_library_papers(
             continue
         coll_name = (getattr(p, "collection_name", None) or "").strip()
         coll_paper_id = (getattr(p, "collection_paper_id", None) or "").strip()
-        if coll_name == collection and coll_paper_id:
-            eligible_lookup[coll_paper_id] = p
+        paper_uid = _resolve_library_paper_uid(p)
+        if coll_name == collection and coll_paper_id and paper_uid:
+            eligible_lookup[paper_uid] = p
         else:
             excluded_count += 1
 
@@ -2127,6 +2310,7 @@ async def recommend_library_papers(
             "id": r["library_paper_id"],
             "library_paper_id": r["library_paper_id"],
             "collection_paper_id": r["collection_paper_id"],
+            "paper_uid": r.get("paper_uid"),
             "title": r["title"],
             "doi": r["doi"],
             "year": r["year"],
@@ -2145,6 +2329,7 @@ async def recommend_library_papers(
         LibraryRecommendItem(
             library_paper_id=row["library_paper_id"],
             collection_paper_id=row["collection_paper_id"],
+            paper_uid=row.get("paper_uid"),
             title=row["title"],
             doi=row.get("doi"),
             year=row.get("year"),
@@ -2396,12 +2581,20 @@ async def upload_library_paper_pdf(
     target = pdfs_path / f"{paper_id}.pdf"
     target.write_bytes(content)
     now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+    collection_name = ""
     with Session(get_engine()) as session:
         row = session.get(ScholarLibraryPaper, record_id)
         if row:
+            collection_name = getattr(row, "collection_name", "") or ""
             row.downloaded_at = now
             session.add(row)
             session.commit()
+    _mark_graph_scopes_stale_for_library(
+        user_id=user_id,
+        lib_id=lib_id,
+        collection_name=collection_name,
+        reason="library_paper_pdf_uploaded",
+    )
     return {"success": True, "paper_id": paper_id, "filename": f"{paper_id}.pdf"}
 
 
@@ -2689,6 +2882,7 @@ async def import_library_pdfs(
 
                 if target_path.exists():
                     # File already on disk but no DB row matched (orphan file). Create library row and link so directory stays in sync.
+                    from src.retrieval.dedup import compute_paper_uid
                     new_row = ScholarLibraryPaper(
                         library_id=lib_id,
                         title=title,
@@ -2703,6 +2897,7 @@ async def import_library_pdfs(
                         added_at=now_iso,
                         downloaded_at=now_iso,
                         venue=venue or "",
+                        paper_uid=compute_paper_uid(doi=ndoi or "", title=title, authors=authors, year=year),
                     )
                     session.add(new_row)
                     session.flush()
@@ -2744,6 +2939,7 @@ async def import_library_pdfs(
                     added_at=now_iso,
                     downloaded_at=now_iso,
                     venue=venue or "",
+                    paper_uid=compute_paper_uid(doi=ndoi or "", title=title, authors=authors, year=year),
                 )
                 session.add(new_row)
                 session.flush()
@@ -2854,6 +3050,11 @@ def add_papers_to_scholar_library(lib_id: int, body: AddPapersToLibraryRequest, 
             existing_titles.add(paper.title.strip().lower())
             added += 1
         session.commit()
+        _mark_graph_scopes_stale_for_library(
+            user_id=user_id,
+            lib_id=lib_id,
+            reason="scholar_library_papers_changed",
+        )
         return {"added": added, "total_requested": len(body.papers)}
 
 
@@ -2887,9 +3088,16 @@ def delete_library_paper_pdf(lib_id: int, record_id: int, user_id: str = Depends
             except OSError as e:
                 logger.warning("delete_library_paper_pdf unlink failed: %s", e)
                 raise HTTPException(status_code=500, detail="删除文件失败")
+        collection_name = getattr(paper, "collection_name", "") or ""
         paper.downloaded_at = None
         session.add(paper)
         session.commit()
+    _mark_graph_scopes_stale_for_library(
+        user_id=user_id,
+        lib_id=lib_id,
+        collection_name=collection_name,
+        reason="library_paper_pdf_deleted",
+    )
 
     # Remove the ingested Paper record and its Milvus vectors if this PDF was previously ingested
     removed_from_collection = False
@@ -2931,8 +3139,31 @@ def remove_paper_from_scholar_library(lib_id: int, paper_id: int, user_id: str =
         paper = session.get(ScholarLibraryPaper, paper_id)
         if not paper or paper.library_id != lib_id:
             raise HTTPException(status_code=404, detail="文献不存在")
+        collection_name = getattr(paper, "collection_name", "") or ""
         session.delete(paper)
         session.commit()
+        try:
+            from src.indexing.assistant_artifact_store import delete_resource_annotations_for_resource
+            from src.services.resource_state_service import get_resource_state_service
+
+            delete_resource_annotations_for_resource(
+                user_id=user_id,
+                resource_type="scholar_library_paper",
+                resource_id=str(paper_id),
+            )
+            get_resource_state_service().delete_resource_overlays(
+                user_id=user_id,
+                resource_type="scholar_library_paper",
+                resource_id=str(paper_id),
+            )
+        except Exception as e:
+            logger.warning("remove scholar library paper overlay cleanup failed paper_id=%s: %s", paper_id, e)
+        _mark_graph_scopes_stale_for_library(
+            user_id=user_id,
+            lib_id=lib_id,
+            collection_name=collection_name,
+            reason="scholar_library_paper_deleted",
+        )
         return {"ok": True}
 
 
